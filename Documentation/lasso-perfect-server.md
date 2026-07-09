@@ -65,9 +65,24 @@ Environment variables:
     expression). That page now returns `200 OK`, though it still renders no
     visible content until `library()`, custom-tag registration, and template
     includes (below) are implemented.
-  - A representative script-mode real page reaches the runtime and reports
-    `unknownFunction("library")` — Lasso 9 library imports aren't implemented
-    yet.
+  - A representative script-mode real page previously reported
+    `unknownFunction("library")`; fixed 2026-07-09 — `library()` now loads and
+    caches a file's `define`d tags once per server process, shared across
+    every request. See `Documentation/library-and-custom-tags.md`. That page
+    now gets past the `library()` call and reaches a separate, newly-exposed
+    gap (below) rather than failing immediately at line 1.
+  - Loading a real startup library through the now-working `library()`
+    surfaced a distinct, pre-existing gap: `<?lasso ... ?>`/`<?= ... ?>`
+    delimiter content (as opposed to `<?lassoscript ... ?>` or bracket-dialect
+    `[ ]` tags) is parsed purely as a flat expression list
+    (`ExpressionParser.parseList()`), which has no concept of blocks at all.
+    A real startup library using bare `if(...) ... /if` control flow inside
+    `<?lasso ?>` (common — it's the delimiter real Lasso library files
+    typically use) parses `if(...)` as an ordinary function call named `if`,
+    which then fails at render time with `unknownFunction("if")`. This was
+    unreachable before today, since `library()` used to throw before ever
+    loading a real library's content — it is a distinct, newly-visible gap,
+    not a defect in the `library()`/custom-tag work itself.
 
 The parser/runtime source and its smoke suite (`Sources/LassoParserSmoke`,
 `Tests/LassoParserTests`) never hardcode a real site path or real page
@@ -78,11 +93,16 @@ by pointing `lasso-perfect-server` itself at a real `LASSO_SITE_ROOT` locally.
 
 ## Next Compatibility Work
 
-1. Add a `library` compatibility shim or parser model for Lasso 9 library
-   imports.
-2. Add the custom-tag registration path for site-defined tags, and execute a
-   real template include chain end to end, so a real page produces visible
-   output instead of an empty `200`.
+1. Route `<?lasso ... ?>`/`<?= ... ?>` delimiter content through the same
+   block-aware parsing `<?lassoscript ?>` already has (or otherwise give it
+   `if`/loop/block support), so real startup libraries using that delimiter
+   with bare control flow don't misparse `if(...)` as a function call. This
+   is now the primary blocker for real-corpus rendering — surfaced by the
+   `library()` work above, not caused by it.
+2. Add the custom-tag registration path for further site-defined tags
+   encountered beyond `define`, and execute a real template include chain
+   end to end, so a real page produces visible output instead of an empty
+   `200`.
 3. Expand request/response support for POST bodies, redirects, status, and
    cookies.
 4. Add a crawl/report mode that requests many site paths and records the first

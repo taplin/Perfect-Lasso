@@ -114,8 +114,9 @@ public struct LassoNativeRegistry: Sendable {
         register("log_critical") { _, _ in
             .void
         }
-        register("return") { arguments, _ in
-            arguments.first?.value ?? .void
+        register("return") { arguments, context in
+            context.setReturnSignal(arguments.first?.value ?? .void)
+            return .void
         }
         register("field") { arguments, context in
             let name = arguments.firstValue(named: "name")?.outputString ??
@@ -232,6 +233,9 @@ public struct LassoContext: Sendable {
     public var sessionProvider: (any LassoSessionProvider)?
     public var responseSink: (any LassoResponseSink)?
     public var inlineProvider: (any LassoInlineProvider)?
+    public var tagRegistry: LassoTagRegistry
+    var returnSignal: LassoValue?
+    var tagCallStack: [String]
 
     public init(
         globals: [String: LassoValue] = [:],
@@ -242,7 +246,8 @@ public struct LassoContext: Sendable {
         requestProvider: (any LassoRequestProvider)? = nil,
         sessionProvider: (any LassoSessionProvider)? = nil,
         responseSink: (any LassoResponseSink)? = nil,
-        inlineProvider: (any LassoInlineProvider)? = nil
+        inlineProvider: (any LassoInlineProvider)? = nil,
+        tagRegistry: LassoTagRegistry = LassoTagRegistry()
     ) {
         self.globals = Dictionary(uniqueKeysWithValues: globals.map { ($0.key.lowercased(), $0.value) })
         self.locals = Dictionary(uniqueKeysWithValues: locals.map { ($0.key.lowercased(), $0.value) })
@@ -255,6 +260,9 @@ public struct LassoContext: Sendable {
         self.sessionProvider = sessionProvider
         self.responseSink = responseSink
         self.inlineProvider = inlineProvider
+        self.tagRegistry = tagRegistry
+        returnSignal = nil
+        tagCallStack = []
     }
 
     public subscript(_ name: String) -> LassoValue {
@@ -297,6 +305,47 @@ public struct LassoContext: Sendable {
         guard !inlineFrames.isEmpty else { return }
         inlineFrames[inlineFrames.count - 1].currentRow = row
     }
+
+    mutating func setReturnSignal(_ value: LassoValue) {
+        returnSignal = value
+    }
+
+    mutating func consumeReturnSignal() -> LassoValue? {
+        defer { returnSignal = nil }
+        return returnSignal
+    }
+
+    mutating func clearReturnSignal() {
+        returnSignal = nil
+    }
+
+    func snapshotLocals() -> [String: LassoValue] {
+        locals
+    }
+
+    mutating func replaceLocals(_ newLocals: [String: LassoValue]) {
+        locals = newLocals
+    }
+
+    // Each level of Lasso-level tag recursion costs several real Swift
+    // stack frames (the renderNodes closure, a fresh RendererEngine, the
+    // Evaluator call chain), not one — confirmed empirically: 100 levels
+    // overflowed the C stack outright in a constrained-stack execution
+    // context (an XCTest worker thread) before this guard's own check ever
+    // got a chance to fire. Kept low enough to have real margin rather than
+    // being maximally permissive.
+    private static let maximumTagCallDepth = 20
+
+    mutating func pushTagCall(_ name: String) throws {
+        guard tagCallStack.count < Self.maximumTagCallDepth else {
+            throw LassoRuntimeError.tagCallDepthExceeded
+        }
+        tagCallStack.append(name)
+    }
+
+    mutating func popTagCall() {
+        _ = tagCallStack.popLast()
+    }
 }
 
 public extension Array where Element == EvaluatedArgument {
@@ -338,4 +387,5 @@ public enum LassoRuntimeError: Error, Equatable {
     case includeCycle(String)
     case includeDepthExceeded
     case inlineNotConfigured
+    case tagCallDepthExceeded
 }

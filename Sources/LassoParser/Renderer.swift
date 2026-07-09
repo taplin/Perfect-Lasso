@@ -8,7 +8,15 @@ public struct LassoRenderer: Sendable {
 
     public func render(_ document: LassoDocument, context: inout LassoContext) throws -> String {
         var engine = RendererEngine(context: context)
-        let output = try engine.render(document.nodes)
+        var output = try engine.render(document.nodes)
+        // A `return` at page/include level (not inside a called custom tag,
+        // which already consumes its own signal) contributes its value to
+        // the page's output — the same behavior `<?lassoscript ... return
+        // json_serialize(...) ?>`-style API pages already relied on before
+        // `return` gained real short-circuiting control flow.
+        if let returned = engine.evaluator.context.consumeReturnSignal() {
+            output += returned.outputString
+        }
         context = engine.evaluator.context
         return output
     }
@@ -19,6 +27,12 @@ private struct RendererEngine {
 
     init(context: LassoContext) {
         evaluator = Evaluator(context: context)
+        evaluator.renderNodes = { nodes, context in
+            var engine = RendererEngine(context: context)
+            let output = try engine.render(nodes)
+            context = engine.evaluator.context
+            return output
+        }
     }
 
     mutating func render(_ nodes: [LassoNode]) throws -> String {
@@ -35,6 +49,7 @@ private struct RendererEngine {
             case let .code(expressions, _, _, _):
                 for expression in expressions {
                     output += try renderExpression(expression)
+                    if evaluator.context.returnSignal != nil { break }
                 }
             case let .block(name, arguments, body, alternate, _, _):
                 output += try renderBlock(
@@ -46,6 +61,7 @@ private struct RendererEngine {
             case .tag:
                 continue
             }
+            if evaluator.context.returnSignal != nil { break }
         }
         return output
     }
@@ -87,6 +103,14 @@ private struct RendererEngine {
             return output
         case "protect":
             return try render(body)
+        case "define":
+            guard case let .string(tagName)? = arguments.first?.value else { return "" }
+            evaluator.context.tagRegistry.registerTag(LassoCustomTagDefinition(
+                name: tagName,
+                parameters: Array(arguments.dropFirst()),
+                body: body
+            ))
+            return ""
         case "inline":
             guard let inlineProvider = evaluator.context.inlineProvider else {
                 throw LassoRuntimeError.inlineNotConfigured
@@ -139,11 +163,36 @@ private struct RendererEngine {
 
     private mutating func renderExpression(_ expression: LassoExpression) throws -> String {
         if case let .call(callee, arguments) = expression,
-           case let .identifier(name) = callee,
-           name.caseInsensitiveCompare("include") == .orderedSame {
-            return try renderInclude(arguments)
+           case let .identifier(name) = callee {
+            if name.caseInsensitiveCompare("include") == .orderedSame {
+                return try renderInclude(arguments)
+            }
+            if name.caseInsensitiveCompare("library") == .orderedSame {
+                try renderLibrary(arguments)
+                return ""
+            }
         }
         return try evaluator.evaluate(expression).outputString
+    }
+
+    /// Loads and registers a library's `define`d tags exactly once per
+    /// `LassoTagRegistry` (shared across every request on the same server
+    /// instance when the context is wired with a shared registry) — repeat
+    /// calls for an already-loaded path are no-ops. The library's own text
+    /// output, if any, is intentionally discarded; only its registry side
+    /// effects (registered tags, any top-level setup code it ran) persist.
+    private mutating func renderLibrary(_ arguments: [LassoArgument]) throws {
+        guard let loader = evaluator.context.includeLoader else {
+            throw LassoRuntimeError.includeNotConfigured
+        }
+        let evaluated = try evaluator.evaluateArguments(arguments)
+        let path = evaluated.firstValue(named: "file")?.outputString ??
+            evaluated.firstValue(named: "path")?.outputString ??
+            evaluated.first?.value.outputString ?? ""
+        guard evaluator.context.tagRegistry.markLibraryLoaded(path) else { return }
+
+        let source = try loader.loadInclude(path: path, from: evaluator.context.includePath)
+        _ = try render(LassoParser().parse(source).nodes)
     }
 
     private mutating func renderInclude(_ arguments: [LassoArgument]) throws -> String {
@@ -169,7 +218,21 @@ private struct RendererEngine {
             _ = evaluator.context.includeStack.popLast()
         }
 
+        // Always read the source — it's the only way to detect a change,
+        // since LassoIncludeLoader exposes no separate staleness signal —
+        // but skip re-parsing (and update the cache) only when it differs
+        // from what was cached last time. Unlike a library, an include can
+        // produce output on every use, so its cached document is always
+        // re-rendered fresh here rather than reused wholesale.
         let source = try loader.loadInclude(path: path, from: previousPath)
-        return try render(LassoParser().parse(source).nodes)
+        let cacheKey = "\(previousPath ?? "")\u{0}\(path)"
+        let document: LassoDocument
+        if let cached = evaluator.context.tagRegistry.cachedInclude(forKey: cacheKey, matchingSource: source) {
+            document = cached
+        } else {
+            document = LassoParser().parse(source)
+            evaluator.context.tagRegistry.cacheInclude(forKey: cacheKey, source: source, document: document)
+        }
+        return try render(document.nodes)
     }
 }

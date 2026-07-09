@@ -308,6 +308,153 @@ import PerfectCRUD
     #expect(output == "247:Black;701:Navy;")
 }
 
+@Test func customTagDefinesCallsAndIsolatesLocals() throws {
+    var context = LassoContext()
+    let source = """
+    <?lassoscript
+    define greet_tag(#name, #greeting='Hello') => {
+        return #greeting + ', ' + #name + '!'
+    }
+    define increment_tag(#value) => {
+        local(result = #value + 1)
+        return #result
+    }
+    define short_circuit_tag(#flag) => {
+        if(#flag)
+            return 'early'
+        /if
+        return 'late'
+    }
+    ?>
+    [greet_tag('Ada')] / [greet_tag('Bo', 'Hi')] / [local(result = 100)][increment_tag(5)] / [#result] / [short_circuit_tag(true)] / [short_circuit_tag(false)]
+    """
+    let output = try LassoRenderer().render(source, context: &context)
+        .trimmingCharacters(in: .whitespacesAndNewlines)
+    #expect(output == "Hello, Ada! / Hi, Bo! / 6 / 100 / early / late")
+}
+
+@Test func customTagRecursionSucceedsAndDeepRecursionThrows() throws {
+    var context = LassoContext()
+    let output = try LassoRenderer().render(
+        """
+        <?lassoscript
+        define recurse_tag(#n) => {
+            if(#n <= 0)
+                return 0
+            /if
+            return 1 + recurse_tag(#n - 1)
+        }
+        ?>
+        [recurse_tag(3)]
+        """,
+        context: &context
+    ).trimmingCharacters(in: .whitespacesAndNewlines)
+    #expect(output == "3")
+
+    var deepContext = LassoContext()
+    #expect(throws: LassoRuntimeError.tagCallDepthExceeded) {
+        try LassoRenderer().render(
+            """
+            <?lassoscript
+            define deep_recurse_tag(#n) => {
+                if(#n <= 0)
+                    return 0
+                /if
+                return 1 + deep_recurse_tag(#n - 1)
+            }
+            ?>
+            [deep_recurse_tag(30)]
+            """,
+            context: &deepContext
+        )
+    }
+}
+
+@Test func libraryLoadsAndCachesAcrossIndependentContexts() throws {
+    final class CountingLibraryLoader: LassoIncludeLoader, @unchecked Sendable {
+        private(set) var loadCount = 0
+        let librarySource: String
+
+        init(librarySource: String) {
+            self.librarySource = librarySource
+        }
+
+        func loadInclude(path: String, from includingPath: String?) throws -> String {
+            loadCount += 1
+            return librarySource
+        }
+    }
+
+    let loader = CountingLibraryLoader(librarySource: """
+    <?lassoscript
+    define shared_tag(#x) => {
+        return #x * 2
+    }
+    ?>
+    """)
+    let registry = LassoTagRegistry()
+
+    var firstRequestContext = LassoContext(includeLoader: loader, tagRegistry: registry)
+    let firstOutput = try LassoRenderer().render(
+        "<?lassoscript library('/shared.lasso') ?>[shared_tag(21)]",
+        context: &firstRequestContext
+    )
+    var secondRequestContext = LassoContext(includeLoader: loader, tagRegistry: registry)
+    let secondOutput = try LassoRenderer().render(
+        "<?lassoscript library('/shared.lasso') ?>[shared_tag(10)]",
+        context: &secondRequestContext
+    )
+
+    #expect(firstOutput == "42")
+    #expect(secondOutput == "20")
+    #expect(loader.loadCount == 1)
+}
+
+@Test func includeAlwaysRereadsButSkipsReparseWhenUnchanged() throws {
+    final class MutableIncludeLoader: LassoIncludeLoader, @unchecked Sendable {
+        private(set) var loadCount = 0
+        var content: String
+
+        init(content: String) {
+            self.content = content
+        }
+
+        func loadInclude(path: String, from includingPath: String?) throws -> String {
+            loadCount += 1
+            return content
+        }
+    }
+
+    let registry = LassoTagRegistry()
+    let loader = MutableIncludeLoader(content: "v1: [local(x = 1)][#x]")
+
+    func render(_ source: String) throws -> String {
+        var context = LassoContext(includeLoader: loader, tagRegistry: registry)
+        return try LassoRenderer().render(source, context: &context)
+    }
+
+    #expect(try render("[include('shared.lasso')]") == "v1: 1")
+    #expect(try render("[include('shared.lasso')]") == "v1: 1")
+    #expect(loader.loadCount == 2, "An include is re-read (I/O) on every use, unlike a library")
+
+    loader.content = "v2: [local(x = 2)][#x]"
+    #expect(
+        try render("[include('shared.lasso')]") == "v2: 2",
+        "A real content change must not serve stale cached output"
+    )
+}
+
+@Test func includeCacheHitsOnIdenticalSourceAndMissesOnChange() throws {
+    let registry = LassoTagRegistry()
+    #expect(registry.cachedInclude(forKey: "probe", matchingSource: "abc") == nil)
+
+    let document = LassoParser().parse("abc")
+    registry.cacheInclude(forKey: "probe", source: "abc", document: document)
+
+    #expect(registry.cachedInclude(forKey: "probe", matchingSource: "abc") == document)
+    #expect(registry.cachedInclude(forKey: "probe", matchingSource: "changed") == nil)
+}
+
 private func corpusFixtureContext(
     loader: any LassoIncludeLoader,
     includePath: String

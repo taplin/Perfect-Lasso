@@ -143,6 +143,11 @@ private struct TemplateScanner {
             return
         }
 
+        if let defineTag = Self.parseDefineTag(body: body, dialect: dialect, range: range) {
+            nodes.append(defineTag)
+            return
+        }
+
         if delimiter == .lassoscript {
             var parser = ScriptBodyParser(source: body, range: range)
             nodes.append(contentsOf: parser.parse())
@@ -165,6 +170,53 @@ private struct TemplateScanner {
         } else {
             nodes.append(.code(expressions, dialect, delimiter, range))
         }
+    }
+
+    /// Handles `[define tagname(params)] ... [/define]`. The generic
+    /// call-shape detection above only looks at the first parsed
+    /// expression, which for this input is the bare keyword `define` —
+    /// `tagname` and its parameter list would otherwise be silently
+    /// dropped. Keeps the emitted tag's `name` as the literal `"define"`
+    /// keyword (so the existing `[/define]` open/close pairing in
+    /// `BlockBuilder` keeps working unchanged) and carries the real tag
+    /// name as a synthetic first argument, matching the shape script-mode
+    /// `define` produces.
+    private static func parseDefineTag(
+        body: String,
+        dialect: LassoDialect,
+        range: SourceRange
+    ) -> LassoNode? {
+        guard body.lowercased().hasPrefix("define") else { return nil }
+        let afterKeyword = body.index(body.startIndex, offsetBy: "define".count)
+        guard afterKeyword < body.endIndex, body[afterKeyword].isWhitespace else { return nil }
+
+        let remainder = String(body[afterKeyword...]).trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !remainder.isEmpty else { return nil }
+
+        var parser = ExpressionParser(remainder)
+        let expression = parser.parseExpression()
+        let name: String
+        let parameters: [LassoArgument]
+        switch expression {
+        case let .call(callee, arguments):
+            guard case let .identifier(calleeName) = callee else { return nil }
+            name = calleeName
+            parameters = arguments
+        case let .identifier(bareName):
+            name = bareName
+            parameters = []
+        default:
+            return nil
+        }
+
+        let nameArgument = LassoArgument(label: nil, value: .string(name))
+        return .tag(
+            name: "define",
+            arguments: [nameArgument] + parameters,
+            closing: false,
+            dialect: dialect,
+            range: range
+        )
     }
 
     mutating private func emitText(through end: Int) {

@@ -26,9 +26,11 @@ local project notes for the source mapping.
 | Legacy closing tags | Primary | Compatibility | 20,000+ sightings | M1 |
 | `if`, `else`, loops | Yes | Yes | Heavy use | M1 parse, M2 execute |
 | Assignments / `var` / `local` | Yes | Yes | Heavy use | M1 parse, M2 execute |
-| `define` and typed parameters | Different | Primary | Startup libraries | M1 parse, Later execute |
-| Includes | Yes | Yes | 4,000+ sightings | M1 parse, M2 execute |
-| Custom/native tags | Yes | Yes | Site startup libraries | M2 registry |
+| `define name(params) => { ... }` custom tags | Different | Primary | Startup libraries | M2 implemented |
+| `define Foo => type { ... }` object/type definitions | Different | Primary | Startup libraries, `api.lasso`-style pages | Later |
+| `library(path)` | N/A | Primary | `_begin.lasso`-style startup files | M2 implemented, cached per server instance |
+| Includes | Yes | Yes | 4,000+ sightings | M1 parse, M2 execute, reparse-skipped when unchanged |
+| Custom/native tags | Yes | Yes | Site startup libraries | M2 implemented, shared across requests on one server instance |
 | Request params, headers, cookies | Yes | Yes | Both corpora | M2 |
 | Sessions and auth | Yes | Yes | First corpus | Later provider |
 | `inline`, `records`, `field` | Yes | Yes | Core application behavior | DB |

@@ -2,6 +2,10 @@ import Foundation
 
 struct Evaluator {
     var context: LassoContext
+    /// Lets expression evaluation invoke full node rendering (for custom
+    /// tag bodies) without `Evaluator` depending on `Renderer.swift`, which
+    /// already wraps `Evaluator` — injected by `RendererEngine.init`.
+    var renderNodes: ((_ nodes: [LassoNode], _ context: inout LassoContext) throws -> String)? = nil
 
     mutating func evaluate(_ expression: LassoExpression) throws -> LassoValue {
         switch expression {
@@ -40,10 +44,13 @@ struct Evaluator {
                 name.caseInsensitiveCompare("local") == .orderedSame {
                 return try declare(arguments, local: name.lowercased() == "local")
             }
-            guard let function = context.natives.function(named: name) else {
-                throw LassoRuntimeError.unknownFunction(name)
+            if let function = context.natives.function(named: name) {
+                return try function(try evaluate(arguments), &context)
             }
-            return try function(try evaluate(arguments), &context)
+            if let definition = context.tagRegistry.tag(named: name) {
+                return try invokeCustomTag(definition, callArguments: arguments)
+            }
+            throw LassoRuntimeError.unknownFunction(name)
         case let .member(base, name, arguments):
             if case let .identifier(baseName) = base {
                 return try nativeMember(baseName: baseName, memberName: name, arguments: arguments ?? [])
@@ -67,6 +74,71 @@ struct Evaluator {
 
     mutating func evaluateArguments(_ arguments: [LassoArgument]) throws -> [EvaluatedArgument] {
         try evaluate(arguments)
+    }
+
+    /// Invokes a compiled custom tag: binds call-site arguments to the
+    /// definition's declared parameters in a fresh, isolated local scope
+    /// (so the tag body's `#locals` can't leak into or clobber the
+    /// caller's), runs the body, and returns whatever `return` produced
+    /// (or `.void` if the body never hit one). Any incidental text the body
+    /// emits is discarded — a called tag produces a *value*, not output,
+    /// mirroring real Lasso method-call semantics.
+    private mutating func invokeCustomTag(
+        _ definition: LassoCustomTagDefinition,
+        callArguments: [LassoArgument]
+    ) throws -> LassoValue {
+        let evaluatedCallArguments = try evaluate(callArguments)
+        let boundLocals = try bindParameters(definition.parameters, to: evaluatedCallArguments)
+
+        let savedLocals = context.snapshotLocals()
+        try context.pushTagCall(definition.name)
+        context.replaceLocals(boundLocals)
+        defer {
+            context.replaceLocals(savedLocals)
+            context.popTagCall()
+        }
+
+        guard let renderNodes else { return .void }
+        context.clearReturnSignal()
+        _ = try renderNodes(definition.body, &context)
+        return context.consumeReturnSignal() ?? .void
+    }
+
+    private mutating func bindParameters(
+        _ parameters: [LassoArgument],
+        to callArguments: [EvaluatedArgument]
+    ) throws -> [String: LassoValue] {
+        let positional = callArguments.filter { $0.label == nil }
+        var positionalIndex = 0
+        var bound: [String: LassoValue] = [:]
+
+        for parameter in parameters {
+            let (name, defaultExpression) = Self.parameterNameAndDefault(parameter.value)
+            guard let name else { continue }
+
+            if let labeled = callArguments.first(where: {
+                $0.label?.caseInsensitiveCompare(name) == .orderedSame
+            }) {
+                bound[name.lowercased()] = labeled.value
+            } else if positionalIndex < positional.count {
+                bound[name.lowercased()] = positional[positionalIndex].value
+                positionalIndex += 1
+            } else if let defaultExpression {
+                bound[name.lowercased()] = try evaluate(defaultExpression)
+            } else {
+                bound[name.lowercased()] = .null
+            }
+        }
+        return bound
+    }
+
+    private static func parameterNameAndDefault(
+        _ expression: LassoExpression
+    ) -> (String?, LassoExpression?) {
+        if case let .assignment(target, value) = expression {
+            return (Self.assignmentLabel(target), value)
+        }
+        return (Self.assignmentLabel(expression), nil)
     }
 
     private mutating func declare(_ arguments: [LassoArgument], local: Bool) throws -> LassoValue {

@@ -384,6 +384,195 @@ if let apiPath = environment["LASSO_SMOKE_REAL_API_PAGE_PATH"],
     print("Real API page smoke check parsed \(inlineCount) inline block(s) from \(apiPath).")
 }
 
+// MARK: - Custom tags: definition, parameter defaults, return, recursion depth
+
+var tagContext = LassoContext()
+let greetSource = """
+<?lassoscript
+define greet_tag(#name, #greeting='Hello') => {
+    return #greeting + ', ' + #name + '!'
+}
+?>
+[greet_tag('Ada')] / [greet_tag('Bo', 'Hi')]
+"""
+let greetOutput = try LassoRenderer().render(greetSource, context: &tagContext)
+precondition(greetOutput.trimmingCharacters(in: .whitespacesAndNewlines) == "Hello, Ada! / Hi, Bo!", "Custom tag define/call failed: \(greetOutput)")
+
+let isolationSource = """
+<?lassoscript
+define increment_tag(#value) => {
+    local(result = #value + 1)
+    return #result
+}
+?>
+[local(result = 100)][increment_tag(5)] / [#result]
+"""
+let isolationOutput = try LassoRenderer().render(isolationSource, context: &tagContext)
+precondition(
+    isolationOutput.trimmingCharacters(in: .whitespacesAndNewlines) == "6 / 100",
+    "Custom tag local-scope isolation failed: \(isolationOutput)"
+)
+
+let shortCircuitSource = """
+<?lassoscript
+define short_circuit_tag(#flag) => {
+    if(#flag)
+        return 'early'
+    /if
+    return 'late'
+}
+?>
+[short_circuit_tag(true)] / [short_circuit_tag(false)]
+"""
+let shortCircuitOutput = try LassoRenderer().render(shortCircuitSource, context: &tagContext)
+precondition(
+    shortCircuitOutput.trimmingCharacters(in: .whitespacesAndNewlines) == "early / late",
+    "Custom tag return short-circuiting failed: \(shortCircuitOutput)"
+)
+
+let recursionSource = """
+<?lassoscript
+define recurse_tag(#n) => {
+    if(#n <= 0)
+        return 0
+    /if
+    return 1 + recurse_tag(#n - 1)
+}
+?>
+[recurse_tag(3)]
+"""
+let recursionOutput = try LassoRenderer().render(recursionSource, context: &tagContext)
+precondition(recursionOutput.trimmingCharacters(in: .whitespacesAndNewlines) == "3", "Custom tag recursion failed: \(recursionOutput)")
+
+do {
+    var deepContext = LassoContext()
+    _ = try LassoRenderer().render(
+        """
+        <?lassoscript
+        define deep_recurse_tag(#n) => {
+            if(#n <= 0)
+                return 0
+            /if
+            return 1 + deep_recurse_tag(#n - 1)
+        }
+        ?>
+        [deep_recurse_tag(30)]
+        """,
+        context: &deepContext
+    )
+    fatalError("Expected tag call depth exceeded for 30-deep recursion")
+} catch LassoRuntimeError.tagCallDepthExceeded {
+    // Expected: the recursion-depth guard tripped before a stack overflow.
+} catch {
+    fatalError("Unexpected error for deep custom tag recursion: \(error)")
+}
+
+// MARK: - library(): loads and caches across independently-constructed contexts
+
+final class CountingLibraryLoader: LassoIncludeLoader, @unchecked Sendable {
+    private(set) var loadCount = 0
+    private let librarySource: String
+
+    init(librarySource: String) {
+        self.librarySource = librarySource
+    }
+
+    func loadInclude(path: String, from includingPath: String?) throws -> String {
+        loadCount += 1
+        return librarySource
+    }
+}
+
+let countingLoader = CountingLibraryLoader(librarySource: """
+<?lassoscript
+define shared_tag(#x) => {
+    return #x * 2
+}
+?>
+""")
+let sharedTagRegistry = LassoTagRegistry()
+
+func renderAgainstSharedRegistry(_ source: String) throws -> String {
+    var requestContext = LassoContext(includeLoader: countingLoader, tagRegistry: sharedTagRegistry)
+    return try LassoRenderer().render(source, context: &requestContext)
+}
+
+let firstRequestOutput = try renderAgainstSharedRegistry(
+    "<?lassoscript library('/shared.lasso') ?>[shared_tag(21)]"
+)
+let secondRequestOutput = try renderAgainstSharedRegistry(
+    "<?lassoscript library('/shared.lasso') ?>[shared_tag(10)]"
+)
+precondition(firstRequestOutput == "42", "Library-defined tag call failed: \(firstRequestOutput)")
+precondition(secondRequestOutput == "20", "Library-defined tag call failed on second request: \(secondRequestOutput)")
+precondition(
+    countingLoader.loadCount == 1,
+    "Expected library to load exactly once across two independent contexts sharing one registry, got \(countingLoader.loadCount)"
+)
+
+// MARK: - include(): always re-read and re-rendered (it can produce output
+// on every use, unlike a library), but re-parsing is skipped whenever the
+// freshly read source matches what was cached last time.
+
+final class MutableIncludeLoader: LassoIncludeLoader, @unchecked Sendable {
+    private(set) var loadCount = 0
+    var content: String
+
+    init(content: String) {
+        self.content = content
+    }
+
+    func loadInclude(path: String, from includingPath: String?) throws -> String {
+        loadCount += 1
+        return content
+    }
+}
+
+let includeRegistry = LassoTagRegistry()
+let mutableLoader = MutableIncludeLoader(content: "v1: [local(x = 1)][#x]")
+
+func renderAgainstIncludeRegistry(_ source: String) throws -> String {
+    var requestContext = LassoContext(includeLoader: mutableLoader, tagRegistry: includeRegistry)
+    return try LassoRenderer().render(source, context: &requestContext)
+}
+
+let includeFirstOutput = try renderAgainstIncludeRegistry("[include('shared.lasso')]")
+let includeSecondOutput = try renderAgainstIncludeRegistry("[include('shared.lasso')]")
+precondition(includeFirstOutput == "v1: 1", "Include rendering failed: \(includeFirstOutput)")
+precondition(includeSecondOutput == "v1: 1", "Include rendering failed on second use: \(includeSecondOutput)")
+precondition(
+    mutableLoader.loadCount == 2,
+    "Expected include to be re-read (I/O) on every use, got \(mutableLoader.loadCount) reads"
+)
+
+// Output alone can't distinguish a cache hit from a fresh reparse (both
+// produce identical text), so verify the cache directly: a hit on identical
+// source, a miss on changed source.
+let cacheProbeRegistry = LassoTagRegistry()
+precondition(
+    cacheProbeRegistry.cachedInclude(forKey: "probe", matchingSource: "abc") == nil,
+    "Expected a cache miss before anything has been cached"
+)
+let probeDocument = LassoParser().parse("abc")
+cacheProbeRegistry.cacheInclude(forKey: "probe", source: "abc", document: probeDocument)
+precondition(
+    cacheProbeRegistry.cachedInclude(forKey: "probe", matchingSource: "abc") == probeDocument,
+    "Expected a cache hit for identical source"
+)
+precondition(
+    cacheProbeRegistry.cachedInclude(forKey: "probe", matchingSource: "changed") == nil,
+    "Expected a cache miss once the source changes"
+)
+
+// Changing the included file's content between uses must not serve stale
+// output — caching is content-based, not "first result wins forever".
+mutableLoader.content = "v2: [local(x = 2)][#x]"
+let includeThirdOutput = try renderAgainstIncludeRegistry("[include('shared.lasso')]")
+precondition(
+    includeThirdOutput == "v2: 2",
+    "Stale include content served after a real change: \(includeThirdOutput)"
+)
+
 let malformed = LassoParser().parse("[if:true]Unclosed")
 precondition(!malformed.diagnostics.isEmpty, "Expected an unclosed block diagnostic")
 

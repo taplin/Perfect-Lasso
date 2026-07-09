@@ -59,6 +59,12 @@ struct LassoSiteServer: Sendable {
     let config: ServerConfig
     let includeLoader: LassoFileSystemIncludeLoader
     let inlineProvider: LassoDynamicInlineProvider?
+    /// One registry for the life of this server process. Every request
+    /// gets a `LassoContext` wired with this same instance, so `library()`
+    /// caching and `define`d custom tags are shared across every request
+    /// and every site path this instance serves — not re-parsed or
+    /// re-registered per request.
+    let tagRegistry = LassoTagRegistry()
 
     init(config: ServerConfig) throws {
         self.config = config
@@ -176,7 +182,8 @@ struct LassoSiteServer: Sendable {
             includePath: includePath,
             requestProvider: ServerRequestProvider(request: request),
             responseSink: ServerResponseSink(),
-            inlineProvider: inlineProvider
+            inlineProvider: inlineProvider,
+            tagRegistry: tagRegistry
         )
         let html = try LassoRenderer().render(source, context: &context)
         return BytesOutput(

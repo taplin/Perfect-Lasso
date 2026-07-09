@@ -18,6 +18,7 @@ struct ScriptBodyParser {
 
             if parseClosingTag() { continue }
             if parseElseTag() { continue }
+            if parseDefineOpening() { continue }
             if parseBlockOpening() { continue }
             if parseIgnoredBrace() { continue }
 
@@ -80,6 +81,83 @@ struct ScriptBodyParser {
         consumeArrowBlockStartIfPresent()
         skipLineRemainder()
         nodes.append(.tag(name: name, arguments: arguments, closing: false, dialect: .lasso9, range: range))
+        return true
+    }
+
+    /// Handles `define name(params) => { body }`, compiling a reusable
+    /// custom tag directly (bypassing the flat open/close-tag pairing the
+    /// rest of this parser uses, since the whole nested body is already in
+    /// hand once the balanced `{ }` is extracted). `define Foo => type {
+    /// ... }` object/type definitions are recognized and skipped past
+    /// (consumed, not registered) — full object-model support is out of
+    /// scope for now.
+    private mutating func parseDefineOpening() -> Bool {
+        let start = index
+        guard readKeyword("define") else { return false }
+        skipHorizontalWhitespace()
+
+        let name = readIdentifier()
+        guard !name.isEmpty else {
+            index = start
+            return false
+        }
+        skipHorizontalWhitespace()
+
+        var parameters: [LassoArgument] = []
+        if index < characters.count, characters[index] == "(" {
+            let body = readBalanced(open: "(", close: ")")
+            parameters = parseCallArguments(name: name, body: body)
+            skipHorizontalWhitespace()
+        }
+
+        if matches("::") {
+            index += 2
+            _ = readIdentifier()
+            skipHorizontalWhitespace()
+        }
+
+        guard matches("=>") else {
+            index = start
+            return false
+        }
+        index += 2
+        skipHorizontalWhitespace()
+
+        if readKeyword("type") {
+            skipHorizontalWhitespace()
+            if index < characters.count, characters[index] == "{" {
+                _ = readBalanced(open: "{", close: "}")
+            }
+            skipLineRemainder()
+            return true
+        }
+
+        guard index < characters.count, characters[index] == "{" else {
+            index = start
+            return false
+        }
+        let bodySource = readBalanced(open: "{", close: "}")
+        skipLineRemainder()
+
+        var nestedParser = ScriptBodyParser(source: bodySource, range: range)
+        let flatNestedBody = nestedParser.parse()
+        // parse() returns a flat open/close-tag stream — pairing it into
+        // nested .block structures (if/loop/inline/etc.) is normally a
+        // separate BlockBuilder pass that only runs at the top-level
+        // LassoParser.parse() entry. Run it here too, since this body is
+        // parsed independently of that entry point.
+        var nestedBuilder = BlockBuilder(nodes: flatNestedBody, diagnostics: [])
+        let nestedBody = nestedBuilder.build().nodes
+
+        let nameArgument = LassoArgument(label: nil, value: .string(name))
+        nodes.append(.block(
+            name: "define",
+            arguments: [nameArgument] + parameters,
+            body: nestedBody,
+            alternate: nil,
+            dialect: .lasso9,
+            range: range
+        ))
         return true
     }
 
