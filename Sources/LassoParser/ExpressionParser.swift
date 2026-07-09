@@ -138,7 +138,7 @@ struct ExpressionParser {
     mutating func parseExpression(minimumPrecedence: Int = 0) -> LassoExpression {
         var left = parsePrefix()
         while consume("::") {
-            _ = advance()
+            left = .binary(left: left, operator: "::", right: parseTypeConstraint())
         }
         while case let .symbol(op) = peek,
               let precedence = Self.precedence[op],
@@ -168,6 +168,8 @@ struct ExpressionParser {
             }
         case let .symbol(op) where ["!", "-", "+"].contains(op):
             expression = .unary(operator: op, value: parseExpression(minimumPrecedence: 8))
+        case .symbol("."):
+            expression = .member(base: .identifier("self"), name: readMemberName(), arguments: nil)
         case .symbol("("):
             expression = parseExpression()
             _ = consume(")")
@@ -187,7 +189,7 @@ struct ExpressionParser {
                 expression = .call(callee: expression, arguments: parseArguments(closing: nil))
             } else if consume("->") {
                 let wrapped = consume("(")
-                let name = readIdentifier()
+                let name = readMemberName()
                 let arguments: [LassoArgument]?
                 if wrapped {
                     arguments = consume(":") ? parseArguments(closing: ")") : finishWrappedMember()
@@ -198,6 +200,15 @@ struct ExpressionParser {
             } else {
                 return expression
             }
+        }
+    }
+
+    mutating private func parseTypeConstraint() -> LassoExpression {
+        switch advance() {
+        case let .identifier(name), let .string(name):
+            return .identifier(name)
+        default:
+            return .unknown("<type>")
         }
     }
 
@@ -235,6 +246,15 @@ struct ExpressionParser {
     mutating private func readIdentifier() -> String {
         guard case let .identifier(name) = advance() else { return "<unknown>" }
         return name
+    }
+
+    mutating private func readMemberName() -> String {
+        switch advance() {
+        case let .identifier(name), let .string(name):
+            return name
+        default:
+            return "<unknown>"
+        }
     }
 
     private var peek: Token { tokens[min(index, tokens.count - 1)] }

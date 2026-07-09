@@ -25,6 +25,7 @@ private struct LassoCachedInclude {
 public final class LassoTagRegistry: @unchecked Sendable {
     private let lock = NSLock()
     private var tags: [String: LassoCustomTagDefinition] = [:]
+    private var types: [String: LassoTypeDefinition] = [:]
     private var loadedLibraries: Set<String> = []
     private var includeCache: [String: LassoCachedInclude] = [:]
 
@@ -46,6 +47,24 @@ public final class LassoTagRegistry: @unchecked Sendable {
         lock.lock()
         defer { lock.unlock() }
         return tags[name.lowercased()] != nil
+    }
+
+    public func registerType(_ definition: LassoTypeDefinition) {
+        lock.lock()
+        defer { lock.unlock() }
+        types[definition.name.lowercased()] = definition
+    }
+
+    public func type(named name: String) -> LassoTypeDefinition? {
+        lock.lock()
+        defer { lock.unlock() }
+        return types[name.lowercased()]
+    }
+
+    public func containsType(named name: String) -> Bool {
+        lock.lock()
+        defer { lock.unlock() }
+        return types[name.lowercased()] != nil
     }
 
     /// Returns `true` the first time a given path is seen, meaning the

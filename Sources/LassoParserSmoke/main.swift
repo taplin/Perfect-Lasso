@@ -407,6 +407,36 @@ precondition(
     "tag_exists/lasso_tagexists failed: \(tagExistsOutput)"
 )
 
+var typeContext = LassoContext()
+let typeOutput = try LassoRenderer().render(
+    """
+    <?lassoscript
+    define Widget => type {
+        data public name::string
+        public onCreate(name::string) => {
+            self->name = #name
+        }
+        public greet(prefix='Hello') => {
+            return #prefix + ', ' + self->name
+        }
+        public classify(value::integer) => {
+            return 'integer'
+        }
+        public classify(value) => {
+            return 'any'
+        }
+    }
+    local(widget::Widget = Widget('Ada'))
+    ?>
+    [#widget->name]|[#widget->greet()]|[#widget->greet('Hi')]|[#widget->classify(7)]|[#widget->classify('seven')]
+    """,
+    context: &typeContext
+).trimmingCharacters(in: .whitespacesAndNewlines)
+precondition(
+    typeOutput == "Ada|Hello, Ada|Hi, Ada|integer|any",
+    "Type definition/object dispatch failed: \(typeOutput)"
+)
+
 let isolationSource = """
 <?lassoscript
 define increment_tag(#value) => {

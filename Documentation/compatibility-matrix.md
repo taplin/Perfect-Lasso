@@ -27,7 +27,7 @@ local project notes for the source mapping.
 | `if`, `else`, loops | Yes | Yes | Heavy use | M1 parse, M2 execute |
 | Assignments / `var` / `local` | Yes | Yes | Heavy use | M1 parse, M2 execute |
 | `define name(params) => { ... }` custom tags | Different | Primary | Startup libraries | M2 implemented |
-| `define Foo => type { ... }` object/type definitions | Different | Primary | Startup libraries, `api.lasso`-style pages | Later |
+| `define Foo => type { ... }` object/type definitions | Different | Primary | Startup libraries, `api.lasso`-style pages | M2 first pass: data, methods, `onCreate`, `self`, object construction, basic multiple dispatch |
 | `lasso_tagexists` / `tag_exists` | Yes | Yes | Startup-library guards | M2 implemented; checks native functions and shared custom-tag registry |
 | `library(path)` | N/A | Primary | `_begin.lasso`-style startup files | M2 implemented, cached per server instance |
 | Includes | Yes | Yes | 4,000+ sightings | M1 parse, M2 execute, reparse-skipped when unchanged |

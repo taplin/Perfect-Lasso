@@ -110,9 +110,8 @@ struct ScriptBodyParser {
     /// custom tag directly (bypassing the flat open/close-tag pairing the
     /// rest of this parser uses, since the whole nested body is already in
     /// hand once the balanced `{ }` is extracted). `define Foo => type {
-    /// ... }` object/type definitions are recognized and skipped past
-    /// (consumed, not registered) — full object-model support is out of
-    /// scope for now.
+    /// ... }` object/type definitions are parsed into a first-pass runtime
+    /// type definition and registered when rendered.
     private mutating func parseDefineOpening() -> Bool {
         let start = index
         guard readKeyword("define") else { return false }
@@ -149,14 +148,16 @@ struct ScriptBodyParser {
 
         if readKeyword("type") {
             skipHorizontalWhitespace()
-            if index < characters.count, characters[index] == "{" {
-                _ = readBalanced(open: "{", close: "}")
+            guard index < characters.count, characters[index] == "{" else {
+                diagnostics.append(Diagnostic(message: "Malformed 'define \(name) => type': expected '{'", range: range))
+                return true
             }
+            let bodySource = readBalanced(open: "{", close: "}")
             skipLineRemainder()
-            diagnostics.append(Diagnostic(
-                message: "Object/type definitions ('=> type { ... }') are not yet supported",
-                range: range
-            ))
+            var typeParser = TypeBodyParser(source: bodySource, typeName: name, range: range)
+            let definition = typeParser.parse()
+            diagnostics.append(contentsOf: typeParser.diagnostics)
+            nodes.append(.typeDefinition(definition, .lasso9, range))
             return true
         }
 

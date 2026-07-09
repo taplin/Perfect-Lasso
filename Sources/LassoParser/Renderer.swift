@@ -58,6 +58,8 @@ private struct RendererEngine {
                     body: body,
                     alternate: alternate
                 )
+            case let .typeDefinition(definition, _, _):
+                evaluator.context.tagRegistry.registerType(definition)
             case .tag:
                 continue
             }

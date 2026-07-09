@@ -43,6 +43,69 @@ public struct LassoDocument: Equatable, Sendable {
     public let diagnostics: [Diagnostic]
 }
 
+public enum LassoMemberVisibility: String, Equatable, Sendable {
+    case `public`
+    case `protected`
+    case `private`
+}
+
+public struct LassoDataMemberDefinition: Equatable, Sendable {
+    public let name: String
+    public let typeConstraint: String?
+    public let defaultValue: LassoExpression?
+    public let visibility: LassoMemberVisibility?
+
+    public init(
+        name: String,
+        typeConstraint: String?,
+        defaultValue: LassoExpression?,
+        visibility: LassoMemberVisibility?
+    ) {
+        self.name = name
+        self.typeConstraint = typeConstraint
+        self.defaultValue = defaultValue
+        self.visibility = visibility
+    }
+}
+
+public struct LassoMethodDefinition: Equatable, Sendable {
+    public let name: String
+    public let parameters: [LassoArgument]
+    public let returnType: String?
+    public let visibility: LassoMemberVisibility
+    public let body: [LassoNode]
+
+    public init(
+        name: String,
+        parameters: [LassoArgument],
+        returnType: String?,
+        visibility: LassoMemberVisibility,
+        body: [LassoNode]
+    ) {
+        self.name = name
+        self.parameters = parameters
+        self.returnType = returnType
+        self.visibility = visibility
+        self.body = body
+    }
+}
+
+public struct LassoTypeDefinition: Equatable, Sendable {
+    public let name: String
+    public let dataMembers: [LassoDataMemberDefinition]
+    public let methods: [LassoMethodDefinition]
+
+    public init(
+        name: String,
+        dataMembers: [LassoDataMemberDefinition],
+        methods: [LassoMethodDefinition]
+    ) {
+        self.name = name
+        self.dataMembers = dataMembers
+        self.methods = methods
+    }
+}
+
 public enum VariableScope: Equatable, Sendable {
     case unscoped
     case global
@@ -88,4 +151,5 @@ public indirect enum LassoNode: Equatable, Sendable {
         dialect: LassoDialect,
         range: SourceRange
     )
+    case typeDefinition(LassoTypeDefinition, LassoDialect, SourceRange)
 }

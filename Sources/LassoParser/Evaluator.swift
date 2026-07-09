@@ -16,6 +16,9 @@ struct Evaluator {
         case .null: return .null
         case let .variable(name, scope): return context.value(for: name, scope: scope)
         case let .identifier(name):
+            if name.caseInsensitiveCompare("self") == .orderedSame, let object = context.currentSelf {
+                return .object(object)
+            }
             if let function = context.natives.function(named: name) {
                 return try function([], &context)
             }
@@ -46,6 +49,9 @@ struct Evaluator {
             }
             if let function = context.natives.function(named: name) {
                 return try function(try evaluate(arguments), &context)
+            }
+            if let type = context.tagRegistry.type(named: name) {
+                return try instantiate(type, callArguments: arguments)
             }
             if let definition = context.tagRegistry.tag(named: name) {
                 return try invokeCustomTag(definition, callArguments: arguments)
@@ -135,10 +141,63 @@ struct Evaluator {
     private static func parameterNameAndDefault(
         _ expression: LassoExpression
     ) -> (String?, LassoExpression?) {
-        if case let .assignment(target, value) = expression {
-            return (Self.assignmentLabel(target), value)
+        let metadata = LassoMethodDispatcher.parameterMetadata(expression)
+        return (metadata.name, metadata.defaultExpression)
+    }
+
+    private mutating func instantiate(
+        _ type: LassoTypeDefinition,
+        callArguments: [LassoArgument]
+    ) throws -> LassoValue {
+        let object = LassoObjectInstance(typeName: type.name)
+        for member in type.dataMembers {
+            if let defaultValue = member.defaultValue {
+                object.set(try evaluate(defaultValue), for: member.name)
+            } else {
+                object.set(.null, for: member.name)
+            }
         }
-        return (Self.assignmentLabel(expression), nil)
+        if let onCreate = try invokeMemberMethod(
+            named: "onCreate",
+            on: object,
+            type: type,
+            arguments: callArguments,
+            missingIsVoid: true
+        ) {
+            _ = onCreate
+        }
+        return .object(object)
+    }
+
+    private mutating func invokeMemberMethod(
+        named name: String,
+        on object: LassoObjectInstance,
+        type: LassoTypeDefinition,
+        arguments: [LassoArgument],
+        missingIsVoid: Bool = false
+    ) throws -> LassoValue? {
+        let evaluatedCallArguments = try evaluate(arguments)
+        guard let resolved = LassoMethodDispatcher.resolve(
+            method: name,
+            on: type,
+            arguments: evaluatedCallArguments
+        ) else {
+            if missingIsVoid { return .void }
+            return nil
+        }
+        let boundLocals = try bindParameters(resolved.definition.parameters, to: resolved.evaluatedArguments)
+        let savedLocals = context.snapshotLocals()
+        context.replaceLocals(boundLocals)
+        context.pushSelf(object)
+        defer {
+            context.popSelf()
+            context.replaceLocals(savedLocals)
+        }
+
+        guard let renderNodes else { return .void }
+        context.clearReturnSignal()
+        _ = try renderNodes(resolved.definition.body, &context)
+        return context.consumeReturnSignal() ?? .void
     }
 
     private mutating func declare(_ arguments: [LassoArgument], local: Bool) throws -> LassoValue {
@@ -157,12 +216,27 @@ struct Evaluator {
         defaultScope: VariableScope
     ) throws {
         switch target {
+        case let .binary(left, "::", _):
+            try assign(value, to: left, defaultScope: defaultScope)
         case let .variable(name, scope):
             context.set(value, for: name, scope: scope == .unscoped ? defaultScope : scope)
         case let .identifier(name):
             context.set(value, for: name, scope: defaultScope)
         case let .string(name):
             context.set(value, for: name, scope: defaultScope)
+        case let .member(base, name, _):
+            let baseValue: LassoValue
+            if case let .identifier(baseName) = base,
+               baseName.caseInsensitiveCompare("self") == .orderedSame,
+               let object = context.currentSelf {
+                baseValue = .object(object)
+            } else {
+                baseValue = try evaluate(base)
+            }
+            guard case let .object(object) = baseValue else {
+                throw LassoRuntimeError.invalidAssignment
+            }
+            object.set(value, for: name)
         default:
             throw LassoRuntimeError.invalidAssignment
         }
@@ -241,6 +315,14 @@ struct Evaluator {
             let index = max(Int(requested ?? 1) - 1, 0)
             return values.indices.contains(index) ? values[index] : .null
         case let (.map(values), _): return values[normalized] ?? .null
+        case let (.object(object), _):
+            guard let type = context.tagRegistry.type(named: object.typeName) else {
+                return object.value(for: name)
+            }
+            if let value = try invokeMemberMethod(named: name, on: object, type: type, arguments: arguments) {
+                return value
+            }
+            return object.value(for: name)
         default: throw LassoRuntimeError.unsupportedExpression("Member \(name)")
         }
     }
@@ -279,6 +361,8 @@ struct Evaluator {
             return name
         case let .variable(name, _):
             return name
+        case let .binary(left, "::", _):
+            return assignmentLabel(left)
         default:
             return nil
         }

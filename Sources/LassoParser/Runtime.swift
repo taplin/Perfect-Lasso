@@ -9,6 +9,7 @@ public indirect enum LassoValue: Equatable, Sendable {
     case string(String)
     case array([LassoValue])
     case map([String: LassoValue])
+    case object(LassoObjectInstance)
 
     public var isTruthy: Bool {
         switch self {
@@ -19,6 +20,7 @@ public indirect enum LassoValue: Equatable, Sendable {
         case let .string(value): !value.isEmpty && value.lowercased() != "false"
         case let .array(value): !value.isEmpty
         case let .map(value): !value.isEmpty
+        case .object: true
         }
     }
 
@@ -31,6 +33,7 @@ public indirect enum LassoValue: Equatable, Sendable {
         case let .string(value): value
         case let .array(value): value.map(\.outputString).joined()
         case let .map(value): String(describing: value)
+        case let .object(value): value.typeName
         }
     }
 
@@ -40,6 +43,20 @@ public indirect enum LassoValue: Equatable, Sendable {
         case let .decimal(value): value
         case let .string(value): Double(value)
         default: nil
+        }
+    }
+
+    var typeName: String {
+        switch self {
+        case .void: "void"
+        case .null: "null"
+        case .boolean: "boolean"
+        case .integer: "integer"
+        case .decimal: "decimal"
+        case .string: "string"
+        case .array: "array"
+        case .map: "map"
+        case let .object(value): value.typeName
         }
     }
 }
@@ -218,6 +235,8 @@ extension LassoValue {
             values.map(\.jsonObject)
         case let .map(values):
             Dictionary(uniqueKeysWithValues: values.map { ($0.key, $0.value.jsonObject) })
+        case let .object(value):
+            value.snapshotData().mapValues(\.jsonObject)
         }
     }
 }
@@ -247,6 +266,7 @@ public struct LassoContext: Sendable {
     public var tagRegistry: LassoTagRegistry
     var returnSignal: LassoValue?
     var tagCallStack: [String]
+    var selfStack: [LassoObjectInstance]
 
     public init(
         globals: [String: LassoValue] = [:],
@@ -274,6 +294,7 @@ public struct LassoContext: Sendable {
         self.tagRegistry = tagRegistry
         returnSignal = nil
         tagCallStack = []
+        selfStack = []
     }
 
     public subscript(_ name: String) -> LassoValue {
@@ -336,6 +357,18 @@ public struct LassoContext: Sendable {
 
     mutating func replaceLocals(_ newLocals: [String: LassoValue]) {
         locals = newLocals
+    }
+
+    var currentSelf: LassoObjectInstance? {
+        selfStack.last
+    }
+
+    mutating func pushSelf(_ object: LassoObjectInstance) {
+        selfStack.append(object)
+    }
+
+    mutating func popSelf() {
+        _ = selfStack.popLast()
     }
 
     // Each level of Lasso-level tag recursion costs several real Swift

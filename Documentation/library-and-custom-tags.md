@@ -210,12 +210,11 @@ registers them.
 
 ## Explicitly out of scope for now
 
-- **`define Foo => type { ... }`** — Lasso 9 object/type definitions
-  (properties, `self`, method dispatch on instances). The parser detects and
-  safely skips this shape (consumes the balanced body, registers nothing) so
-  it doesn't crash the surrounding page, but the type/method model itself is
-  not implemented. Full object-model support is a materially larger,
-  separate feature.
+- **Full `define Foo => type { ... }` semantics** — a first pass now exists
+  for data members, `onCreate`, `self`, object construction, member access,
+  and basic multiple dispatch. Traits, inheritance, `_unknowntag`, rest
+  parameters, and complete visibility/type-matching behavior remain out of
+  scope for now. See `Documentation/lasso-type-object-support.md`.
 - **Lasso 8 `define_tag`/`define_type`** legacy syntax — not observed with
   real frequency in the gathered corpus evidence (`define`: 12 sightings
   total in the first corpus, see `compatibility-matrix.md`).

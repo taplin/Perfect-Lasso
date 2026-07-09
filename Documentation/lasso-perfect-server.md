@@ -99,15 +99,17 @@ Environment variables:
     `lasso_tagexists(name)` and `tag_exists(name)` now check both the native
     registry and the shared custom-tag registry, so startup-library guards can
     ask about built-in tags and `define`d tags.
-  - The same real `/api.lasso` smoke request now reaches the next distinct
-    compatibility gap: `unknownFunction("excludeBots")`. The developer error
-    page also reports the source path (`/api.lasso` resolved to the real file)
-    and a parser diagnostic seen before the runtime failure:
-    `Object/type definitions ('=> type { ... }') are not yet supported`.
-    That means the next stage needs to inspect where `excludeBots` is meant to
-    come from: it may be a custom tag hidden behind the still-unsupported
-    object/type definition model, or another startup construct not yet being
-    registered.
+  - The next distinct compatibility gap from the live server run was
+    `unknownFunction("excludeBots")`. Follow-up inspection showed
+    `excludeBots` is a normal `define`d custom tag in
+    `components/site_setup_tags.inc`, while `_begin.lasso` only loads
+    `components/koi_setup.inc` before calling it. Treat this as a
+    startup/include ordering or missing-library-load issue, not as part of the
+    `ApiHandler` object model.
+  - `define Foo => type { ... }` is now partially implemented for the
+    `ApiHandler` shape in `/api.lasso`: data members, public methods,
+    `onCreate`, `self`, object construction, member access, and basic multiple
+    dispatch. See `Documentation/lasso-type-object-support.md`.
 
 The parser/runtime source and its smoke suite (`Sources/LassoParserSmoke`,
 `Tests/LassoParserTests`) never hardcode a real site path or real page
@@ -118,13 +120,13 @@ by pointing `lasso-perfect-server` itself at a real `LASSO_SITE_ROOT` locally.
 
 ## Next Compatibility Work
 
-1. Investigate `excludeBots` in the real startup/page chain and determine
-   whether it is a normal custom tag that should be registered, a method on a
-   `define Foo => type { ... }` object, or a separate site-specific construct.
-2. Design the first-pass Lasso 9 object/type-definition model (`=> type {
-   ... }`) enough to preserve and dispatch methods used by the real startup
-   code, or explicitly shim the narrower construct if the corpus only needs a
-   small subset.
+1. Resolve the `excludeBots` startup gap by determining whether
+   `components/site_setup_tags.inc` should be loaded by `_begin.lasso`, by the
+   local site harness, or by another startup file that the current server path
+   is not executing.
+2. Continue the object runtime toward the next corpus need: likely
+   `_unknowntag`, rest parameters, or richer type/trait dispatch once a page
+   actually exercises those constructs.
 3. Expand request/response support for POST bodies, redirects, status, and
    cookies.
 4. Add a crawl/report mode that requests many site paths and records the first
