@@ -1,0 +1,1 @@
+<?lasso local(name) = 'Ada' ?>

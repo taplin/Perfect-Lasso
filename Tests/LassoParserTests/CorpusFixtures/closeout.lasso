@@ -1,0 +1,1 @@
+[inline(-database='catalog_mysql',-table='skus',-op='cn','store_id'=$product_subset,-op='cn','featured'='seasonal_sale',-ReturnField='mfr_style_no',-ReturnField='color',-search)][records][field('mfr_style_no')]:[field('color')];[/records][/inline]

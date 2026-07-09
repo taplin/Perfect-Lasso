@@ -1,0 +1,89 @@
+# Lasso Perfect Test Server
+
+Date: 2026-07-09
+
+## Purpose
+
+`lasso-perfect-server` is the first integration harness for serving existing
+site files through the Swift Lasso parser/runtime and Perfect backend pieces.
+It is intentionally a developer server, not a compatibility claim for a full
+legacy site.
+
+## Configuration
+
+```bash
+LASSO_SITE_ROOT='/path/to/your/site/root' \
+LASSO_SERVER_PORT=8183 \
+LASSO_DATASOURCE_ALIAS=catalog_mysql \
+LASSO_MYSQL_HOST=localhost \
+LASSO_MYSQL_DATABASE=catalog_mysql \
+LASSO_MYSQL_USER=perfect \
+LASSO_MYSQL_PASSWORD='...' \
+swift run lasso-perfect-server
+```
+
+Environment variables:
+
+- `LASSO_SITE_ROOT`: filesystem root to serve.
+- `LASSO_SERVER_PORT`: port, default `8181`.
+- `LASSO_RENDER_EXTENSIONS`: comma-separated extensions rendered through Lasso,
+  default `lasso,inc,html,htm`.
+- `LASSO_DATASOURCE_ALIAS`: datasource name used by Lasso pages, for example
+  `catalog_mysql`.
+- `LASSO_MYSQL_HOST`, `LASSO_MYSQL_PORT`, `LASSO_MYSQL_DATABASE`,
+  `LASSO_MYSQL_USER`, `LASSO_MYSQL_PASSWORD`: backend MySQL connection.
+
+## Current Behavior
+
+- GET-only test server using Perfect-NIO.
+- Non-rendered files are served as static files.
+- Lasso-rendered files receive filesystem include loading rooted at
+  `LASSO_SITE_ROOT`.
+- Query parameters, headers, and cookies are exposed through the current
+  `LassoRequestProvider` boundary.
+- Structured `inline` reads can reach PerfectCRUD and Perfect-MySQL when a
+  datasource alias is configured.
+- Render failures return a developer HTML error page with the request path and
+  Swift runtime/parser error.
+
+## Verified
+
+- Fixture root:
+  - `/__lasso_health` returns `ok`.
+  - `/billboard.lasso` renders an include-backed fixture page.
+  - `/category.lasso` renders nested include/request-path output.
+- Real corpus site root (an external, non-committed site checkout, pointed at
+  via `LASSO_SITE_ROOT`):
+  - `/__lasso_health` returns `ok`.
+  - A static, non-rendered file serves successfully.
+  - A representative real page using the `[/* ... */]` bracket-comment idiom
+    previously crashed the renderer with `unsupportedExpression("*")`; fixed
+    2026-07-09 (the template scanner now treats `/*` immediately inside a
+    bracket tag as the start of a real Lasso comment that spans raw text and
+    nested `[ ]` tags until the next literal `*/`, matching real Lasso
+    semantics, instead of misparsing it as a closing tag or a bad
+    expression). That page now returns `200 OK`, though it still renders no
+    visible content until `library()`, custom-tag registration, and template
+    includes (below) are implemented.
+  - A representative script-mode real page reaches the runtime and reports
+    `unknownFunction("library")` — Lasso 9 library imports aren't implemented
+    yet.
+
+The parser/runtime source and its smoke suite (`Sources/LassoParserSmoke`,
+`Tests/LassoParserTests`) never hardcode a real site path or real page
+content. Real-corpus verification of this kind is opt-in via
+`LASSO_SMOKE_REAL_PAGE_PATH`/`LASSO_SMOKE_REAL_SITE_ROOT` (template pages) and
+`LASSO_SMOKE_REAL_API_PAGE_PATH` (script-mode pages) on `LassoParserSmoke`, or
+by pointing `lasso-perfect-server` itself at a real `LASSO_SITE_ROOT` locally.
+
+## Next Compatibility Work
+
+1. Add a `library` compatibility shim or parser model for Lasso 9 library
+   imports.
+2. Add the custom-tag registration path for site-defined tags, and execute a
+   real template include chain end to end, so a real page produces visible
+   output instead of an empty `200`.
+3. Expand request/response support for POST bodies, redirects, status, and
+   cookies.
+4. Add a crawl/report mode that requests many site paths and records the first
+   unsupported construct per page.
