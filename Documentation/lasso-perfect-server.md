@@ -72,17 +72,31 @@ Environment variables:
     now gets past the `library()` call and reaches a separate, newly-exposed
     gap (below) rather than failing immediately at line 1.
   - Loading a real startup library through the now-working `library()`
-    surfaced a distinct, pre-existing gap: `<?lasso ... ?>`/`<?= ... ?>`
-    delimiter content (as opposed to `<?lassoscript ... ?>` or bracket-dialect
-    `[ ]` tags) is parsed purely as a flat expression list
-    (`ExpressionParser.parseList()`), which has no concept of blocks at all.
-    A real startup library using bare `if(...) ... /if` control flow inside
-    `<?lasso ?>` (common — it's the delimiter real Lasso library files
-    typically use) parses `if(...)` as an ordinary function call named `if`,
-    which then fails at render time with `unknownFunction("if")`. This was
-    unreachable before today, since `library()` used to throw before ever
-    loading a real library's content — it is a distinct, newly-visible gap,
-    not a defect in the `library()`/custom-tag work itself.
+    surfaced a distinct, pre-existing gap, fixed 2026-07-09: `<?lasso ... ?>`
+    and `<?= ... ?>` delimiter content (as opposed to `<?lassoscript ... ?>`
+    or bracket-dialect `[ ]` tags) used to parse purely as a flat expression
+    list (`ExpressionParser.parseList()`), with no concept of blocks at all.
+    A real startup library using `if(!tag_exists(...)) => { library(...) }`
+    control flow inside plain `<?lasso ?>` (the delimiter real Lasso library
+    files typically use) parsed `if(...)` as an ordinary function call named
+    `if`, failing at render time with `unknownFunction("if")`. This was
+    unreachable before `library()` worked, since `library()` used to throw
+    before ever loading a real library's content.
+  - The fix: `.lasso`/`.echo` content now routes through the same
+    block-aware `ScriptBodyParser` `.lassoscript` already used, and
+    `ScriptBodyParser` was taught to close blocks opened with Lasso 9's
+    arrow-brace style (`if(...) => { ... }`, including `if`/`else` pairs and
+    mixed brace/slash-style nesting), not just the legacy slash-closed style
+    (`if(...) ... /if`) it already handled. `ScriptBodyParser` also gained
+    diagnostics collection along the way (unterminated brace bodies, stray
+    closing braces, malformed `define`s) — it previously collected none at
+    all.
+  - Verified against the real corpus: `/api.lasso` no longer fails on
+    `unknownFunction("if")` — it now gets all the way past the site's block
+    control flow and reaches a distinct, expected next gap:
+    `unknownFunction("lasso_tagexists")`, a native function not yet
+    implemented. That's a clean, well-understood, separately tracked gap,
+    not a parsing or crash issue.
 
 The parser/runtime source and its smoke suite (`Sources/LassoParserSmoke`,
 `Tests/LassoParserTests`) never hardcode a real site path or real page
@@ -93,12 +107,9 @@ by pointing `lasso-perfect-server` itself at a real `LASSO_SITE_ROOT` locally.
 
 ## Next Compatibility Work
 
-1. Route `<?lasso ... ?>`/`<?= ... ?>` delimiter content through the same
-   block-aware parsing `<?lassoscript ?>` already has (or otherwise give it
-   `if`/loop/block support), so real startup libraries using that delimiter
-   with bare control flow don't misparse `if(...)` as a function call. This
-   is now the primary blocker for real-corpus rendering — surfaced by the
-   `library()` work above, not caused by it.
+1. Implement missing native functions surfaced by real-corpus testing —
+   `lasso_tagexists` is the current one blocking `/api.lasso` — likely
+   several more once that's past, each individually small.
 2. Add the custom-tag registration path for further site-defined tags
    encountered beyond `define`, and execute a real template include chain
    end to end, so a real page produces visible output instead of an empty

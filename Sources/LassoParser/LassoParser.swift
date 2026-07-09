@@ -143,14 +143,23 @@ private struct TemplateScanner {
             return
         }
 
-        if let defineTag = Self.parseDefineTag(body: body, dialect: dialect, range: range) {
+        if delimiter == .square, let defineTag = Self.parseDefineTag(body: body, dialect: dialect, range: range) {
             nodes.append(defineTag)
             return
         }
 
-        if delimiter == .lassoscript {
-            var parser = ScriptBodyParser(source: body, range: range)
+        // <?lasso ?> and <?= ?> content is one continuous span of code
+        // between the delimiters — not template text interspersed with
+        // tags, the shape bracket dialect has — so it needs the same
+        // statement/block-aware grammar <?lassoscript ?> already has
+        // (ScriptBodyParser), not the flat expression list ExpressionParser
+        // produces on its own. Real startup libraries commonly hold
+        // if/loop control flow inside plain <?lasso ?>, which ExpressionParser
+        // has no concept of at all.
+        if delimiter == .lassoscript || delimiter == .lasso || delimiter == .echo {
+            var parser = ScriptBodyParser(source: body, range: range, delimiter: delimiter)
             nodes.append(contentsOf: parser.parse())
+            diagnostics.append(contentsOf: parser.diagnostics)
             return
         }
 

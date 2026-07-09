@@ -13,7 +13,7 @@ local project notes for the source mapping.
 | --- | --- | --- | --- | --- |
 | HTML/template text | Yes | Yes | Universal | M1 |
 | Square delimiters | Primary | Supported | Dominant in both corpora | M1 |
-| `<?lasso ?>` / `<?= ?>` | No | Yes | First corpus and its startup files | M1 |
+| `<?lasso ?>` / `<?= ?>` (block/control-flow support) | No | Yes | First corpus and its startup files | M1 parse, M2 execute — now shares `.lassoscript`'s block-aware parsing, including arrow-brace (`=> { ... }`) block closing, not just slash-closed (`/if`) |
 | `[no_square_brackets]` | Yes | Yes | Documented compatibility | M1 |
 | Strings, integers, decimals, booleans | Yes | Yes | Universal | M1 |
 | `$global` variables | Primary | Compatibility | 26,000+ sightings | M1 |

@@ -3,12 +3,21 @@ import Foundation
 struct ScriptBodyParser {
     private let characters: [Character]
     private let range: SourceRange
+    private let delimiter: LassoDelimiter
     private var index = 0
     private var nodes: [LassoNode] = []
+    private(set) var diagnostics: [Diagnostic] = []
+    /// Names of block keywords currently open via an arrow-brace body
+    /// (`if(...) => { ... }`), so a later bare `}` — which by itself
+    /// carries no name — knows which block it's closing. Slash-closed
+    /// blocks (`if(...) ... /if`) never touch this; they're matched by
+    /// `parseClosingTag` directly.
+    private var openBraceBlockStack: [String] = []
 
-    init(source: String, range: SourceRange) {
+    init(source: String, range: SourceRange, delimiter: LassoDelimiter = .lassoscript) {
         characters = Array(source)
         self.range = range
+        self.delimiter = delimiter
     }
 
     mutating func parse() -> [LassoNode] {
@@ -25,6 +34,10 @@ struct ScriptBodyParser {
             let statement = readStatement()
             emitStatement(statement)
         }
+        for openName in openBraceBlockStack.reversed() {
+            diagnostics.append(Diagnostic(message: "Unclosed \(openName) block", range: range))
+        }
+        openBraceBlockStack.removeAll()
         return nodes
     }
 
@@ -52,7 +65,14 @@ struct ScriptBodyParser {
             let body = readBalanced(open: "(", close: ")")
             arguments = parseCallArguments(name: "else", body: body)
         }
-        consumeArrowBlockStartIfPresent()
+        // If this branch itself opens with an arrow-brace body, no push is
+        // needed here: the preceding if's own closing brace deliberately
+        // left its "if" entry on the stack instead of popping it (see
+        // parseIgnoredBrace) precisely so this branch's closing brace is
+        // what finally pops it — matching how a trailing `/if` already
+        // closes both branches of a slash-style `if(...) ... else ...
+        // /if` today with a single closing signal.
+        _ = consumeArrowBlockStartIfPresent()
         skipLineRemainder()
         if characters.indices.contains(start) {
             nodes.append(.tag(name: "else", arguments: arguments, closing: false, dialect: .lasso9, range: range))
@@ -78,7 +98,9 @@ struct ScriptBodyParser {
 
         let body = readBalanced(open: "(", close: ")")
         let arguments = parseCallArguments(name: name, body: body)
-        consumeArrowBlockStartIfPresent()
+        if consumeArrowBlockStartIfPresent() {
+            openBraceBlockStack.append(name)
+        }
         skipLineRemainder()
         nodes.append(.tag(name: name, arguments: arguments, closing: false, dialect: .lasso9, range: range))
         return true
@@ -98,6 +120,7 @@ struct ScriptBodyParser {
 
         let name = readIdentifier()
         guard !name.isEmpty else {
+            diagnostics.append(Diagnostic(message: "Malformed 'define': expected a tag name", range: range))
             index = start
             return false
         }
@@ -117,6 +140,7 @@ struct ScriptBodyParser {
         }
 
         guard matches("=>") else {
+            diagnostics.append(Diagnostic(message: "Malformed 'define \(name)': expected '=>'", range: range))
             index = start
             return false
         }
@@ -129,10 +153,15 @@ struct ScriptBodyParser {
                 _ = readBalanced(open: "{", close: "}")
             }
             skipLineRemainder()
+            diagnostics.append(Diagnostic(
+                message: "Object/type definitions ('=> type { ... }') are not yet supported",
+                range: range
+            ))
             return true
         }
 
         guard index < characters.count, characters[index] == "{" else {
+            diagnostics.append(Diagnostic(message: "Malformed 'define \(name) => ': expected '{'", range: range))
             index = start
             return false
         }
@@ -141,19 +170,21 @@ struct ScriptBodyParser {
 
         var nestedParser = ScriptBodyParser(source: bodySource, range: range)
         let flatNestedBody = nestedParser.parse()
+        diagnostics.append(contentsOf: nestedParser.diagnostics)
         // parse() returns a flat open/close-tag stream — pairing it into
         // nested .block structures (if/loop/inline/etc.) is normally a
         // separate BlockBuilder pass that only runs at the top-level
         // LassoParser.parse() entry. Run it here too, since this body is
         // parsed independently of that entry point.
         var nestedBuilder = BlockBuilder(nodes: flatNestedBody, diagnostics: [])
-        let nestedBody = nestedBuilder.build().nodes
+        let nestedResult = nestedBuilder.build()
+        diagnostics.append(contentsOf: nestedResult.diagnostics)
 
         let nameArgument = LassoArgument(label: nil, value: .string(name))
         nodes.append(.block(
             name: "define",
             arguments: [nameArgument] + parameters,
-            body: nestedBody,
+            body: nestedResult.nodes,
             alternate: nil,
             dialect: .lasso9,
             range: range
@@ -164,6 +195,21 @@ struct ScriptBodyParser {
     private mutating func parseIgnoredBrace() -> Bool {
         guard characters[index] == "}" else { return false }
         index += 1
+        // A brace-style if's own closing brace, when immediately followed
+        // by `else`, does not close the if/else construct yet — only "if"
+        // can have a following else in this language, so this check is
+        // scoped to that case. Leaving the "if" entry on the stack here is
+        // what lets the else branch's own closing brace (below) be the one
+        // that finally pops it, matching how a trailing `/if` already
+        // closes both branches of a slash-style if/else with one signal.
+        if openBraceBlockStack.last?.caseInsensitiveCompare("if") == .orderedSame, peekIsElseKeyword() {
+            return true
+        }
+        if let closedName = openBraceBlockStack.popLast() {
+            nodes.append(.tag(name: closedName, arguments: [], closing: true, dialect: .lasso9, range: range))
+        } else {
+            diagnostics.append(Diagnostic(message: "Unexpected closing brace", range: range))
+        }
         skipLineRemainder()
         return true
     }
@@ -174,7 +220,7 @@ struct ScriptBodyParser {
         var parser = ExpressionParser(normalizeReturn(trimmed))
         let expressions = parser.parseList()
         if !expressions.isEmpty {
-            nodes.append(.code(expressions, .lasso9, .lassoscript, range))
+            nodes.append(.code(expressions, .lasso9, delimiter, range))
         }
     }
 
@@ -293,11 +339,16 @@ struct ScriptBodyParser {
         let end = min(index, characters.count)
         if index < characters.count, characters[index] == close {
             index += 1
+        } else {
+            diagnostics.append(Diagnostic(message: "Unterminated '\(open)' ... '\(close)'", range: range))
         }
         return String(characters[start..<end])
     }
 
-    private mutating func consumeArrowBlockStartIfPresent() {
+    /// Returns `true` if a brace body start (`"=> {"` or a bare `"{"`) was
+    /// consumed, so the caller knows to track this block for later
+    /// implicit closing by a bare `}` (see `openBraceBlockStack`).
+    private mutating func consumeArrowBlockStartIfPresent() -> Bool {
         skipHorizontalWhitespace()
         if matches("=>") {
             index += 2
@@ -305,7 +356,9 @@ struct ScriptBodyParser {
         }
         if index < characters.count, characters[index] == "{" {
             index += 1
+            return true
         }
+        return false
     }
 
     private func parseCallArguments(name: String, body: String) -> [LassoArgument] {
@@ -322,6 +375,18 @@ struct ScriptBodyParser {
             index += 1
         }
         return String(characters[start..<index])
+    }
+
+    /// Non-mutating lookahead: does an `else` keyword appear next, once
+    /// trivia is skipped? Used by `parseIgnoredBrace` to decide whether a
+    /// brace-style if's closing `}` should close it immediately or wait
+    /// for a following else branch's own closing brace.
+    private mutating func peekIsElseKeyword() -> Bool {
+        let saved = index
+        skipTrivia()
+        let isElse = readKeyword("else")
+        index = saved
+        return isElse
     }
 
     private mutating func readKeyword(_ keyword: String) -> Bool {

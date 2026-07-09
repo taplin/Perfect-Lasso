@@ -455,6 +455,106 @@ import PerfectCRUD
     #expect(registry.cachedInclude(forKey: "probe", matchingSource: "changed") == nil)
 }
 
+@Test func lassoDelimiterSupportsBraceStyleBlocks() throws {
+    var context = LassoContext()
+    let source = """
+    <?lasso
+    var(triggered::boolean = false)
+    if(!$triggered) => {
+        $triggered = true
+        $inside = 'yes'
+    }
+    var(after::string = 'done')
+    ?>
+    [$triggered]/[$inside]/[$after]
+    """
+    let output = try LassoRenderer().render(source, context: &context)
+        .trimmingCharacters(in: .whitespacesAndNewlines)
+    #expect(
+        output == "true/yes/done",
+        "Content after the closing '}' must not be swallowed into the if's body"
+    )
+}
+
+@Test func lassoDelimiterBraceStyleIfElseChoosesCorrectBranch() throws {
+    var context = LassoContext()
+
+    let trueOutput = try LassoRenderer().render(
+        """
+        <?lasso
+        if(true) => {
+            $branch = 'if'
+        } else => {
+            $branch = 'else'
+        }
+        ?>
+        [$branch]
+        """,
+        context: &context
+    ).trimmingCharacters(in: .whitespacesAndNewlines)
+    #expect(trueOutput == "if")
+
+    let falseOutput = try LassoRenderer().render(
+        """
+        <?lasso
+        if(false) => {
+            $branch = 'if'
+        } else => {
+            $branch = 'else'
+        }
+        ?>
+        [$branch]
+        """,
+        context: &context
+    ).trimmingCharacters(in: .whitespacesAndNewlines)
+    #expect(falseOutput == "else")
+}
+
+@Test func lassoDelimiterMixesBraceAndSlashStyleNesting() throws {
+    var context = LassoContext()
+    let output = try LassoRenderer().render(
+        """
+        <?lasso
+        if(true)
+            if(true) => {
+                $nested = 'yes'
+            }
+        /if
+        ?>
+        [$nested]
+        """,
+        context: &context
+    ).trimmingCharacters(in: .whitespacesAndNewlines)
+    #expect(output == "yes")
+}
+
+@Test func lassoDelimiterRealCorpusShapeNoLongerThrowsUnknownFunctionIf() throws {
+    var context = LassoContext()
+    let output = try LassoRenderer().render(
+        """
+        <?lasso
+        if(!$demo_setup_done) => {
+            $demo_setup_done = true
+        }
+        ?>
+        [$demo_setup_done]
+        """,
+        context: &context
+    ).trimmingCharacters(in: .whitespacesAndNewlines)
+    #expect(output == "true")
+}
+
+@Test func scriptBodyParserProducesDiagnostics() {
+    let unterminated = LassoParser().parse("<?lasso if(true) => { $x = 1 ?>")
+    #expect(!unterminated.diagnostics.isEmpty)
+
+    let stray = LassoParser().parse("<?lasso } ?>")
+    #expect(stray.diagnostics.contains { $0.message == "Unexpected closing brace" })
+
+    let malformedDefine = LassoParser().parse("<?lassoscript define ?>")
+    #expect(malformedDefine.diagnostics.contains { $0.message.hasPrefix("Malformed 'define'") })
+}
+
 private func corpusFixtureContext(
     loader: any LassoIncludeLoader,
     includePath: String

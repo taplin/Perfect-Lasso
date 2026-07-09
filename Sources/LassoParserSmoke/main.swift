@@ -573,6 +573,111 @@ precondition(
     "Stale include content served after a real change: \(includeThirdOutput)"
 )
 
+// MARK: - <?lasso ?> / <?= ?> block support (arrow-brace and slash-closed)
+
+var lassoBlockContext = LassoContext()
+let braceIfSource = """
+<?lasso
+var(triggered::boolean = false)
+if(!$triggered) => {
+    $triggered = true
+    $inside = 'yes'
+}
+var(after::string = 'done')
+?>
+[$triggered]/[$inside]/[$after]
+"""
+let braceIfOutput = try LassoRenderer().render(braceIfSource, context: &lassoBlockContext)
+precondition(
+    braceIfOutput.trimmingCharacters(in: .whitespacesAndNewlines) == "true/yes/done",
+    "Brace-style <?lasso ?> if failed, or content after '}' was swallowed into its body: \(braceIfOutput)"
+)
+
+let braceIfElseTrueSource = """
+<?lasso
+if(true) => {
+    $branch = 'if'
+} else => {
+    $branch = 'else'
+}
+?>
+[$branch]
+"""
+let braceIfElseTrueOutput = try LassoRenderer().render(braceIfElseTrueSource, context: &lassoBlockContext)
+precondition(
+    braceIfElseTrueOutput.trimmingCharacters(in: .whitespacesAndNewlines) == "if",
+    "Brace-style if/else (true branch) failed: \(braceIfElseTrueOutput)"
+)
+
+let braceIfElseFalseSource = """
+<?lasso
+if(false) => {
+    $branch = 'if'
+} else => {
+    $branch = 'else'
+}
+?>
+[$branch]
+"""
+let braceIfElseFalseOutput = try LassoRenderer().render(braceIfElseFalseSource, context: &lassoBlockContext)
+precondition(
+    braceIfElseFalseOutput.trimmingCharacters(in: .whitespacesAndNewlines) == "else",
+    "Brace-style if/else (false branch) failed: \(braceIfElseFalseOutput)"
+)
+
+let mixedNestingSource = """
+<?lasso
+if(true)
+    if(true) => {
+        $nested = 'yes'
+    }
+/if
+?>
+[$nested]
+"""
+let mixedNestingOutput = try LassoRenderer().render(mixedNestingSource, context: &lassoBlockContext)
+precondition(
+    mixedNestingOutput.trimmingCharacters(in: .whitespacesAndNewlines) == "yes",
+    "Brace-style if nested inside a slash-style if failed: \(mixedNestingOutput)"
+)
+
+// Direct regression for the originally reported real-corpus symptom: a
+// bare `if(...) => { ... }` inside plain <?lasso ?> (not <?lassoscript ?>)
+// used to parse "if" as a call to an undefined function named "if".
+let realWorldShapeSource = """
+<?lasso
+if(!$demo_setup_done) => {
+    $demo_setup_done = true
+}
+?>
+[$demo_setup_done]
+"""
+let realWorldShapeOutput = try LassoRenderer().render(realWorldShapeSource, context: &lassoBlockContext)
+precondition(
+    realWorldShapeOutput.trimmingCharacters(in: .whitespacesAndNewlines) == "true",
+    "Real-corpus if(...) => {...} shape under <?lasso ?> failed: \(realWorldShapeOutput)"
+)
+
+// MARK: - ScriptBodyParser diagnostics
+
+let unterminatedBrace = LassoParser().parse("<?lasso if(true) => { $x = 1 ?>")
+precondition(
+    !unterminatedBrace.diagnostics.isEmpty,
+    "Expected a diagnostic for an unterminated brace body"
+)
+
+let strayBrace = LassoParser().parse("<?lasso } ?>")
+precondition(
+    strayBrace.diagnostics.contains { $0.message == "Unexpected closing brace" },
+    "Expected an 'Unexpected closing brace' diagnostic"
+)
+
+let malformedDefine = LassoParser().parse("<?lassoscript define ?>")
+precondition(
+    malformedDefine.diagnostics.contains { $0.message.hasPrefix("Malformed 'define'") },
+    "Expected a malformed-define diagnostic"
+)
+
 let malformed = LassoParser().parse("[if:true]Unclosed")
 precondition(!malformed.diagnostics.isEmpty, "Expected an unclosed block diagnostic")
 
