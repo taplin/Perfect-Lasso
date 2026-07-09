@@ -398,6 +398,15 @@ define greet_tag(#name, #greeting='Hello') => {
 let greetOutput = try LassoRenderer().render(greetSource, context: &tagContext)
 precondition(greetOutput.trimmingCharacters(in: .whitespacesAndNewlines) == "Hello, Ada! / Hi, Bo!", "Custom tag define/call failed: \(greetOutput)")
 
+let tagExistsOutput = try LassoRenderer().render(
+    "[lasso_tagexists('string')]|[tag_exists('greet_tag')]|[tag_exists('missing_tag')]",
+    context: &tagContext
+)
+precondition(
+    tagExistsOutput == "true|true|false",
+    "tag_exists/lasso_tagexists failed: \(tagExistsOutput)"
+)
+
 let isolationSource = """
 <?lassoscript
 define increment_tag(#value) => {

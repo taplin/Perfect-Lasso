@@ -42,6 +42,12 @@ public final class LassoTagRegistry: @unchecked Sendable {
         return tags[name.lowercased()]
     }
 
+    public func containsTag(named name: String) -> Bool {
+        lock.lock()
+        defer { lock.unlock() }
+        return tags[name.lowercased()] != nil
+    }
+
     /// Returns `true` the first time a given path is seen, meaning the
     /// caller should load and process it. Returns `false` on every
     /// subsequent call for the same path — already cached, nothing to do.

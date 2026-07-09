@@ -333,6 +333,22 @@ import PerfectCRUD
     #expect(output == "Hello, Ada! / Hi, Bo! / 6 / 100 / early / late")
 }
 
+@Test func tagExistsChecksNativeFunctionsAndCustomTags() throws {
+    var nativeContext = LassoContext()
+    let nativeOutput = try LassoRenderer().render(
+        "[lasso_tagexists('string')]|[tag_exists('lasso_tagexists')]|[tag_exists('missing_tag')]",
+        context: &nativeContext
+    )
+    #expect(nativeOutput == "true|true|false")
+
+    var customContext = LassoContext()
+    let customOutput = try LassoRenderer().render(
+        "<?lassoscript define sample_tag() => { return 'ok' } ?>[lasso_tagexists('sample_tag')]|[tag_exists('sample_tag')]",
+        context: &customContext
+    )
+    #expect(customOutput == "true|true")
+}
+
 @Test func customTagRecursionSucceedsAndDeepRecursionThrows() throws {
     var context = LassoContext()
     let output = try LassoRenderer().render(

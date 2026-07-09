@@ -43,8 +43,10 @@ Environment variables:
   `LassoRequestProvider` boundary.
 - Structured `inline` reads can reach PerfectCRUD and Perfect-MySQL when a
   datasource alias is configured.
-- Render failures return a developer HTML error page with the request path and
-  Swift runtime/parser error.
+- Render failures return a developer HTML error page and stderr log line with
+  the request URI, route path, resolved site path, filesystem path, Swift error
+  type, include stack, and any parser diagnostics collected before the runtime
+  failure.
 
 ## Verified
 
@@ -92,11 +94,20 @@ Environment variables:
     closing braces, malformed `define`s) — it previously collected none at
     all.
   - Verified against the real corpus: `/api.lasso` no longer fails on
-    `unknownFunction("if")` — it now gets all the way past the site's block
-    control flow and reaches a distinct, expected next gap:
-    `unknownFunction("lasso_tagexists")`, a native function not yet
-    implemented. That's a clean, well-understood, separately tracked gap,
-    not a parsing or crash issue.
+    `unknownFunction("if")`, and the subsequent
+    `unknownFunction("lasso_tagexists")` gap is fixed 2026-07-09.
+    `lasso_tagexists(name)` and `tag_exists(name)` now check both the native
+    registry and the shared custom-tag registry, so startup-library guards can
+    ask about built-in tags and `define`d tags.
+  - The same real `/api.lasso` smoke request now reaches the next distinct
+    compatibility gap: `unknownFunction("excludeBots")`. The developer error
+    page also reports the source path (`/api.lasso` resolved to the real file)
+    and a parser diagnostic seen before the runtime failure:
+    `Object/type definitions ('=> type { ... }') are not yet supported`.
+    That means the next stage needs to inspect where `excludeBots` is meant to
+    come from: it may be a custom tag hidden behind the still-unsupported
+    object/type definition model, or another startup construct not yet being
+    registered.
 
 The parser/runtime source and its smoke suite (`Sources/LassoParserSmoke`,
 `Tests/LassoParserTests`) never hardcode a real site path or real page
@@ -107,13 +118,13 @@ by pointing `lasso-perfect-server` itself at a real `LASSO_SITE_ROOT` locally.
 
 ## Next Compatibility Work
 
-1. Implement missing native functions surfaced by real-corpus testing —
-   `lasso_tagexists` is the current one blocking `/api.lasso` — likely
-   several more once that's past, each individually small.
-2. Add the custom-tag registration path for further site-defined tags
-   encountered beyond `define`, and execute a real template include chain
-   end to end, so a real page produces visible output instead of an empty
-   `200`.
+1. Investigate `excludeBots` in the real startup/page chain and determine
+   whether it is a normal custom tag that should be registered, a method on a
+   `define Foo => type { ... }` object, or a separate site-specific construct.
+2. Design the first-pass Lasso 9 object/type-definition model (`=> type {
+   ... }`) enough to preserve and dispatch methods used by the real startup
+   code, or explicitly shim the narrower construct if the corpus only needs a
+   small subset.
 3. Expand request/response support for POST bodies, redirects, status, and
    cookies.
 4. Add a crawl/report mode that requests many site paths and records the first

@@ -107,9 +107,13 @@ struct LassoSiteServer: Sendable {
     }
 
     private func handle(request: any HTTPRequest, trailingPath: String) async throws -> HTTPOutput {
+        var resolvedPath = trailingPath
+        var resolvedFileURL: URL?
         do {
             let path = try resolveRequestPath(trailingPath)
+            resolvedPath = path
             let fileURL = try fileURL(for: path)
+            resolvedFileURL = fileURL
             if shouldRender(fileURL) {
                 return try render(fileURL: fileURL, request: request, includePath: path)
             }
@@ -117,7 +121,13 @@ struct LassoSiteServer: Sendable {
         } catch let error as ErrorOutput {
             throw error
         } catch {
-            return developerErrorOutput(error, request: request, path: trailingPath)
+            return developerErrorOutput(
+                error,
+                request: request,
+                routePath: trailingPath,
+                resolvedPath: resolvedPath,
+                fileURL: resolvedFileURL
+            )
         }
     }
 
@@ -176,6 +186,7 @@ struct LassoSiteServer: Sendable {
 
     private func render(fileURL: URL, request: any HTTPRequest, includePath: String) throws -> HTTPOutput {
         let source = try String(contentsOf: fileURL, encoding: .utf8)
+        let document = LassoParser().parse(source)
         var context = LassoContext(
             globals: baseGlobals(for: request),
             includeLoader: includeLoader,
@@ -185,7 +196,16 @@ struct LassoSiteServer: Sendable {
             inlineProvider: inlineProvider,
             tagRegistry: tagRegistry
         )
-        let html = try LassoRenderer().render(source, context: &context)
+        let html: String
+        do {
+            html = try LassoRenderer().render(document, context: &context)
+        } catch {
+            throw LassoSiteRenderError(
+                underlying: error,
+                includeStack: context.includeStack,
+                parserDiagnostics: document.diagnostics.map(\.message)
+            )
+        }
         return BytesOutput(
             head: HTTPHead(headers: HTTPHeaders([
                 ("Content-Type", "text/html; charset=utf-8"),
@@ -197,8 +217,19 @@ struct LassoSiteServer: Sendable {
     private func developerErrorOutput(
         _ error: Error,
         request: any HTTPRequest,
-        path: String
+        routePath: String,
+        resolvedPath: String,
+        fileURL: URL?
     ) -> HTTPOutput {
+        let details = RenderFailureDetails(
+            error: error,
+            requestURI: request.uri,
+            routePath: routePath,
+            resolvedPath: resolvedPath,
+            filePath: fileURL?.path
+        )
+        fputs(details.logLine + "\n", stderr)
+
         let html = """
         <!doctype html>
         <html>
@@ -213,9 +244,16 @@ struct LassoSiteServer: Sendable {
         </head>
         <body>
             <h1>Lasso Render Error</h1>
-            <p><strong>Request:</strong> <code>\(request.uri.htmlEscaped)</code></p>
-            <p><strong>Site path:</strong> <code>\(path.htmlEscaped)</code></p>
-            <pre>\(String(describing: error).htmlEscaped)</pre>
+            <p><strong>Request:</strong> <code>\(details.requestURI.htmlEscaped)</code></p>
+            <p><strong>Route path:</strong> <code>\(details.routePath.htmlEscaped)</code></p>
+            <p><strong>Resolved site path:</strong> <code>\(details.resolvedPath.htmlEscaped)</code></p>
+            <p><strong>Filesystem path:</strong> <code>\((details.filePath ?? "(unresolved)").htmlEscaped)</code></p>
+            <p><strong>Error type:</strong> <code>\(details.errorType.htmlEscaped)</code></p>
+            <pre>\(details.errorDescription.htmlEscaped)</pre>
+            <h2>Include Stack</h2>
+            <pre>\(details.includeStackText.htmlEscaped)</pre>
+            <h2>Parser Diagnostics</h2>
+            <pre>\(details.parserDiagnosticsText.htmlEscaped)</pre>
         </body>
         </html>
         """
@@ -232,6 +270,59 @@ struct LassoSiteServer: Sendable {
             "response_filepath": .string(request.path),
             "url_prefix": .string(""),
         ]
+    }
+}
+
+struct LassoSiteRenderError: Error, CustomStringConvertible {
+    let underlying: Error
+    let includeStack: [String]
+    let parserDiagnostics: [String]
+
+    var description: String {
+        String(describing: underlying)
+    }
+}
+
+struct RenderFailureDetails {
+    let error: Error
+    let requestURI: String
+    let routePath: String
+    let resolvedPath: String
+    let filePath: String?
+
+    var renderError: LassoSiteRenderError? {
+        error as? LassoSiteRenderError
+    }
+
+    var displayError: Error {
+        renderError?.underlying ?? error
+    }
+
+    var errorType: String {
+        String(reflecting: type(of: displayError))
+    }
+
+    var errorDescription: String {
+        String(describing: displayError)
+    }
+
+    var includeStackText: String {
+        guard let includeStack = renderError?.includeStack, includeStack.isEmpty == false else {
+            return "(empty)"
+        }
+        return includeStack.joined(separator: "\n")
+    }
+
+    var parserDiagnosticsText: String {
+        guard let diagnostics = renderError?.parserDiagnostics, diagnostics.isEmpty == false else {
+            return "(none)"
+        }
+        return diagnostics.joined(separator: "\n")
+    }
+
+    var logLine: String {
+        let file = filePath ?? "(unresolved)"
+        return "Lasso render error request=\(requestURI) route=\(routePath) resolved=\(resolvedPath) file=\(file) type=\(errorType) error=\(errorDescription)"
     }
 }
 

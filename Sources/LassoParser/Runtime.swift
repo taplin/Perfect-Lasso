@@ -70,6 +70,10 @@ public struct LassoNativeRegistry: Sendable {
         functions[name.lowercased()] = function
     }
 
+    public func contains(_ name: String) -> Bool {
+        functions[name.lowercased()] != nil
+    }
+
     func function(named name: String) -> LassoNativeFunction? {
         functions[name.lowercased()]
     }
@@ -88,6 +92,13 @@ public struct LassoNativeRegistry: Sendable {
             default: return .boolean(true)
             }
         }
+        let tagExists: LassoNativeFunction = { arguments, context in
+            let name = arguments.first?.value.outputString ?? ""
+            guard name.isEmpty == false else { return .boolean(false) }
+            return .boolean(context.natives.contains(name) || context.tagRegistry.containsTag(named: name))
+        }
+        register("lasso_tagexists", function: tagExists)
+        register("tag_exists", function: tagExists)
         register("encode_html") { arguments, _ in
             let value = arguments.first?.value.outputString ?? ""
             return .string(value.htmlEncoded)

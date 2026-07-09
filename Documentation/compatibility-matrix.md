@@ -28,6 +28,7 @@ local project notes for the source mapping.
 | Assignments / `var` / `local` | Yes | Yes | Heavy use | M1 parse, M2 execute |
 | `define name(params) => { ... }` custom tags | Different | Primary | Startup libraries | M2 implemented |
 | `define Foo => type { ... }` object/type definitions | Different | Primary | Startup libraries, `api.lasso`-style pages | Later |
+| `lasso_tagexists` / `tag_exists` | Yes | Yes | Startup-library guards | M2 implemented; checks native functions and shared custom-tag registry |
 | `library(path)` | N/A | Primary | `_begin.lasso`-style startup files | M2 implemented, cached per server instance |
 | Includes | Yes | Yes | 4,000+ sightings | M1 parse, M2 execute, reparse-skipped when unchanged |
 | Custom/native tags | Yes | Yes | Site startup libraries | M2 implemented, shared across requests on one server instance |
@@ -48,4 +49,3 @@ local project notes for the source mapping.
 - AST nodes retain source ranges and original syntax dialect.
 - Unsupported syntax produces diagnostics and recoverable unknown nodes.
 - No fixture contains production credentials or personal data.
-

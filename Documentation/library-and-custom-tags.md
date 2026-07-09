@@ -191,6 +191,23 @@ before finally throwing `unknownFunction`. On a hit:
   thread. 20 was chosen for real margin, not as the largest number that
   happened to survive testing.
 
+## `lasso_tagexists(name)` / `tag_exists(name)`
+
+Both aliases are implemented as native functions. They return `true` when
+`name` exists in either of the places real startup code cares about:
+
+- the native registry (`string`, `integer`, `library`, `lasso_tagexists`,
+  `tag_exists`, database helpers, request/session helpers, and so on);
+- the shared `LassoTagRegistry` for `define`d custom tags loaded into the
+  current context, including tags registered by a process-wide startup
+  `library(...)`.
+
+An empty or missing name returns `false`. The check is case-insensitive, using
+the same lowercased lookup convention as native dispatch and custom-tag
+dispatch. This is deliberately not a hardcoded list: a test server context
+sharing one registry across requests will see tags as soon as a loaded library
+registers them.
+
 ## Explicitly out of scope for now
 
 - **`define Foo => type { ... }`** — Lasso 9 object/type definitions
