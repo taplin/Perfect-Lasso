@@ -1,0 +1,150 @@
+-----------------------------------------------
+Traits in Lasso 9
+-----------------------------------------------
+
+Introduction
+
+	This specification introduces the concept of Traits to the Lasso 9 language. Traits add a new layer of modularity and reusability to the Lasso 9 type system. Traits add functionality to types by providing them sets of tags and corresponding implementations. Traits fit into a type's inheritance hierarchy and provide members that can be called as if they were implemented in self->.
+	
+	In addition to adding tags to types, traits can require from types that they themselves implement certain tag members. If a type does not implement the requirements of a trait, then the type can not use that trait. Traits can be composed of sub-traits to build more sophisticated type hierarchies.
+	
+	Traits can not possess data members and so rely on types to provide this "glue" for their implementations.
+	
+	This document covers the following topics:
+	
+		Traits
+			What they are made of. How they are created.
+
+		Applying Traits
+			How they are defined. How they are applied to types. How conflicts are handled.
+		
+		Effects on Dispatch
+			How traits fit in to tag selection.
+		
+		IsA
+			How traits fit in to ->isA tests.
+		
+Compatibility
+
+	Traits are a new feature to Lasso 9 and present no compatibility issues.
+
+Goals
+
+	Provide for modularity within types.
+	Provide a means for defining interface restrictions on types.
+
+Q: traits can provide structural typing?
+A: ?? seems like it, but not implemented
+
+Traits
+
+	Each trait is composed of a name (which may be blank), a membermap containing the tags the trait provides, a list of signatures that the trait requires and a list of sub-traits composing the trait.
+	
+Q: and also a description?
+A: not hooked up
+
+	A trait is created by using the trait constructor:
+	
+	trait { ... }
+	
+	The body of a trait constructor consists of a series of 3 sections, each beginning with one of the following reserved words:
+	
+	import, provide, require
+	
+	Import:
+		Begins a comma separated list of trait names from which the new trait should import. Importing a trait pulls in that trait's sub-traits, name, provides and requires sections. Each trait name must reference a valid existing trait object. The trait must exist at the time the trait constructor is executed. Traits are usually defined in the trait_ namespace (with the exception of the trait "any" which is defined by the system and not contained within a namespace).
+		
+	trait {
+		import trait_foo // trait_foo should exist before using it
+	}
+		
+		A trait constructor is only permitted to contain 1 import section. The import section is optional and can occur at any point within the trait constructor.
+		
+	Provide:
+		Begins a comma separated list of defining-associataions (signature => expression). Each definition is added to the trait and made available to any types which implement that trait.
+
+	trait {
+		provide
+			lift() => {
+				...
+			},
+			push(value) => {
+				...
+			},
+			pull(amount::integer)::boolean => {
+				...
+			}
+	}
+
+	A trait constructor can contain zero or more provide sections. They can occur at any point.
+
+	Require:
+		Begins a comma separated list of signatures. The signatures are given by themselves, with no associated values. Any type wanting to use the trait must contain a tag member with a matching signature. When a trait is added to a type, if the type does not contain a matching member, a failure occurs.
+			
+		Simple signatures are permitted (signatures consisting of just the tag name - no param list or type spec). Using a simple signature indicates that the exact signature of the requirement is not mandated by the trait. As long as that tag exists in the type, it can have any signature(s) and will be considered valid.
+
+	trait {
+		require status, leverage(pivot::point), force(dir, val)
+	}
+
+Applying Traits
+
+	Traits are defined by using a defining association with a trait constructor.
+	
+	define trait_foo => trait { ... }
+	
+	Only simple signatures are permitted when defining a trait.
+	
+	Traits can be embedded into new types in the type constructor.
+	
+	type {
+		trait {
+			import ...
+			provide ...
+		}
+		...
+	}
+	
+	Traits can be added to types at runtime through the ->addTrait or ->setTrait members. Every object in Lasso 9 has these member tags.
+	
+	#myObj->addTrait(trait_foo) // has trait_foo + whatever it already had
+	#myObj->setTrait(trait_foo) // has only trait_foo plus its sub-traits
+	
+	The trait that a type currently possesses can be accessed through the ->trait member. Once created, a trait is read-only. New traits are created through the trait constructor or through trait composition. Trait composition is accomplished by using the + operator with two existing trait operands.
+	
+	#myObj->setTrait(#myObj->trait + trait_foo) // equivalent to ->addTrait
+
+	Utilizing the + operator on two traits is directly equivalent to creating a new trait that imports the previous two.
+	
+	trait_foo + trait_baz
+	trait { import trait_foo, trait_baz }
+	
+	However, it's important to note that while the import section of a trait constructor requires any imported traits to have been previously defined, the + operator does not.
+	
+	If the same tag/signature is provided by two different traits, then that tag is in conflict. Composing two traits, each providing a conflicting tag, will cause the tag to be changed from a "provide" to "require". Any type utilizing such a trait will be forced to provide an appropriate implementation. However, if one trait provides a particular tag and another trait requires that tag, then the traits can be composed and the requirement will be considered fulfilled.
+
+Effects on Dispatch
+
+	A trait fits into a type's inheritance hierarchy along side its parent link. The search order for member tags is as follows:
+	
+	type
+	trait
+	parent
+	parent's trait
+	...
+	
+	Therefore, a member tag in a type will shadow one provided by its trait. While inherited-> (or ..) allows deferment to a parent type's implementation, there is no way to first intercept and then defer to a trait member.
+
+IsA
+
+	While not all traits will have names, many will. The possession of a named trait can be tested for in the ->isA tag, just as it could with any parent types.
+	
+	#myObj->addTrati(trait_foo)
+	#myObj->isA(::trait_foo) // true
+
+-----------------------------
+Copyright 2007 LassoSoft, LLC
+
+-- 
+All information about Trifecta is covered by an NDA.
+Please write to <beta@lassosoft.com> to unsubscribeor if you have any questions.

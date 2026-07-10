@@ -80,19 +80,39 @@ extension LassoNativeTypeRegistry {
     // header/param/cookie accessors, bulk accessors, request-line/transport
     // metadata backed by `LassoRequestProvider`'s widened surface, and the
     // cheap header-name aliases. `postParam`/`postParams`/`postString`
-    // are wired but return empty — this interpreter has never parsed POST
-    // bodies (tracked separately in lasso-perfect-server.md's "Next
-    // Compatibility Work"); they return empty results rather than throwing,
-    // matching how a real request with no matching data behaves, not a
-    // pretend implementation. `fileUploads()` and the CGI-era fields with
-    // no meaning in a standalone Perfect-NIO server (gatewayInterface,
-    // scriptFilename, pathTranslated, serverAdmin, serverSignature,
-    // serverSoftware) are deliberately not implemented.
+    // read real application/x-www-form-urlencoded POST data now (see
+    // Documentation/post-body-support-plan.md) — Perfect-NIO's own
+    // `QueryDecoder` does the parsing, this layer only projects it into
+    // Lasso shapes. `param(name, joiner)` uses the ordered `postPairs`/
+    // `queryPairs` for real duplicate-name join/array behavior; the plain
+    // single-argument form stays dict-based for backward compatibility with
+    // every existing conformer. `fileUploads()`/multipart bodies are
+    // deferred to session-upload-support-plan.md's upload milestone. The
+    // CGI-era fields with no meaning in a standalone Perfect-NIO server
+    // (gatewayInterface, scriptFilename, pathTranslated, serverAdmin,
+    // serverSignature, serverSoftware) are deliberately not implemented.
     fileprivate static func makeWebRequestType() -> LassoNativeType {
         var type = LassoNativeType(name: "web_request")
 
         type.register("param") { _, arguments, context in
-            context.requestProvider?.parameter(named: firstArgumentString(arguments)) ?? .void
+            let name = arguments.firstValue(named: "name")?.outputString ?? firstArgumentString(arguments)
+            let joiner = arguments.firstValue(named: "joiner") ?? arguments.dropFirst().first?.value
+            guard let joiner else {
+                // No joiner requested — plain single-value combined lookup
+                // (POST before GET, per real Lasso's documented order).
+                // Goes through parameter(named:), a required protocol
+                // method every conformer (old dict-based fixtures and new
+                // pair-based real providers alike) already implements.
+                return context.requestProvider?.parameter(named: name) ?? .void
+            }
+            // A joiner was explicitly requested — real Lasso's documented
+            // duplicate-name behavior needs the ordered, duplicate-
+            // preserving pair lists, not the collapsing dictionaries.
+            let combined = (context.requestProvider?.postPairs ?? []) + (context.requestProvider?.queryPairs ?? [])
+            let matches = combined.filter { $0.name.caseInsensitiveCompare(name) == .orderedSame }.map(\.value)
+            guard !matches.isEmpty else { return .void }
+            if case .void = joiner { return .array(matches) }
+            return .string(matches.map(\.outputString).joined(separator: joiner.outputString))
         }
         type.register("params") { _, _, context in
             .map(context.requestProvider?.parameters ?? [:])
@@ -127,10 +147,16 @@ extension LassoNativeTypeRegistry {
             return .string(params.map { "\($0.key)=\($0.value.outputString)" }.joined(separator: "&"))
         }
 
-        // No POST body reading exists yet — see doc comment above.
-        type.register("postparam") { _, _, _ in .void }
-        type.register("postparams") { _, _, _ in .map([:]) }
-        type.register("poststring") { _, _, _ in .string("") }
+        type.register("postparam") { _, arguments, context in
+            let name = firstArgumentString(arguments)
+            return (context.requestProvider?.postParameters ?? [:])[name.lowercased()] ?? .void
+        }
+        type.register("postparams") { _, _, context in
+            .map(context.requestProvider?.postParameters ?? [:])
+        }
+        type.register("poststring") { _, _, context in
+            .string(context.requestProvider?.rawPostString ?? "")
+        }
 
         type.register("requestmethod") { _, _, context in .string(context.requestProvider?.requestMethod ?? "") }
         type.register("requesturi") { _, _, context in .string(context.requestProvider?.requestURI ?? "") }

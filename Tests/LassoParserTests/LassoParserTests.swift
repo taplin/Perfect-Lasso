@@ -1196,6 +1196,58 @@ import PerfectCRUD
     #expect(output == "|")
 }
 
+@Test func postBodySupportsRealFormDataWithPostBeforeGetOrdering() throws {
+    // Documentation/post-body-support-plan.md Phase 1: real POST body data
+    // reaches Lasso code now, not just wired-but-empty stubs. Duplicate
+    // names, POST-before-GET combined ordering, and the joiner behavior for
+    // param(name, joiner) all need real coverage, not just "doesn't throw."
+    struct FormRequestProvider: LassoRequestProvider {
+        let queryPairs: [LassoRequestPair] = [
+            LassoRequestPair(name: "term", value: .string("from-query")),
+            LassoRequestPair(name: "tag", value: .string("q1")),
+            LassoRequestPair(name: "tag", value: .string("q2")),
+        ]
+        let postPairs: [LassoRequestPair] = [
+            LassoRequestPair(name: "term", value: .string("from-post")),
+            LassoRequestPair(name: "color", value: .string("red")),
+            LassoRequestPair(name: "color", value: .string("blue")),
+        ]
+        var rawPostString: String { "term=from-post&color=red&color=blue" }
+
+        func parameter(named name: String) -> LassoValue {
+            (postPairs + queryPairs).first { $0.name.caseInsensitiveCompare(name) == .orderedSame }?.value ?? .void
+        }
+        func header(named name: String) -> LassoValue { .void }
+        func cookie(named name: String) -> LassoValue { .void }
+        var parameters: [String: LassoValue] {
+            Dictionary((postPairs + queryPairs).map { ($0.name.lowercased(), $0.value) }, uniquingKeysWith: { first, _ in first })
+        }
+        var queryParameters: [String: LassoValue] {
+            Dictionary(queryPairs.map { ($0.name.lowercased(), $0.value) }, uniquingKeysWith: { first, _ in first })
+        }
+        var postParameters: [String: LassoValue] {
+            Dictionary(postPairs.map { ($0.name.lowercased(), $0.value) }, uniquingKeysWith: { first, _ in first })
+        }
+    }
+
+    var context = LassoContext(requestProvider: FormRequestProvider())
+    let output = try LassoRenderer().render(
+        """
+        [web_request->postParam('term')]|\
+        [web_request->postString]|\
+        [web_request->param('term')]|\
+        [web_request->queryParam('term')]|\
+        [web_request->param('color', ',')]|\
+        [web_request->param('color', void)->size]|\
+        [client_postargs->color]|\
+        [action_param('color')]|\
+        [form_param('color')]
+        """,
+        context: &context
+    )
+    #expect(output == "from-post|term=from-post&color=red&color=blue|from-post|from-query|red,blue|2|red|red|red")
+}
+
 @Test func voidLookupMissBehavesLikeEmptyStringButNullStaysStrict() throws {
     // Real Lasso 9 returns `void` (not `null`) when web_request->param /
     // action_param / header / cookie lookups miss, and keeps `null` itself
@@ -1305,6 +1357,74 @@ import PerfectCRUD
         context: &context
     )
     #expect(output == "open/open")
+}
+
+@Test func protectCatchesRecoverableErrorAndSetsCurrentError() throws {
+    // Documentation/error-protect-model-plan.md's core contract: protect
+    // catches ONLY LassoRecoverableError, sets context.currentError, and
+    // continues rendering after the block. No native tag throws this yet
+    // (that lands with the inline-write-raw-sql work) — register a
+    // synthetic one, matching how the plan's own test plan specifies
+    // "protect catches a synthetic LassoRecoverableError."
+    var natives = LassoNativeRegistry()
+    natives.register("fail_with_db_error") { _, _ in
+        throw LassoRecoverableError(LassoErrorState(code: 42, message: "Add failed", kind: "add"))
+    }
+    var context = LassoContext(natives: natives)
+    let output = try LassoRenderer().render(
+        "before-[protect]during-[fail_with_db_error]-unreached[/protect]-after-[error_currenterror]-[error_currenterror(-errorcode)]",
+        context: &context
+    )
+    #expect(output == "before--after-Add failed-42")
+}
+
+@Test func protectDoesNotCatchReturnOrFatalErrors() throws {
+    // return/abort ride the existing returnSignal short-circuit, not a
+    // thrown error, so protect's do/catch never even sees them — but this
+    // is worth a real regression test rather than trusting the mechanism
+    // description. Separately, genuine fatal errors (LassoRuntimeError)
+    // must stay fatal — protect only catches LassoRecoverableError.
+    var returnContext = LassoContext()
+    let returnOutput = try LassoRenderer().render(
+        "before-[protect]during-[return('early')]-unreached[/protect]-after",
+        context: &returnContext
+    )
+    // return('early') is a bracket expression whose evaluated value ("early")
+    // is output like any other, before the returnSignal short-circuit stops
+    // further rendering — so "-unreached" (inside protect, after the return)
+    // and "-after" (outside protect entirely) correctly never appear, but
+    // "early" itself does. This proves protect let the signal pass through
+    // uncaught rather than treating it as a recoverable error to swallow.
+    #expect(returnOutput == "before-during-early")
+
+    var fatalContext = LassoContext()
+    #expect(throws: LassoRuntimeError.unknownFunction("totally_undefined_native")) {
+        _ = try LassoRenderer().render(
+            "[protect]during-[totally_undefined_native()][/protect]-after",
+            context: &fatalContext
+        )
+    }
+}
+
+@Test func errorCurrentErrorDefaultsToNoErrorAndInlineFramesUpdateIt() throws {
+    // Milestone 3/4: a fresh context starts at real Lasso's "No Error"
+    // state, and pushing an inline frame (the mechanism every inline
+    // action already goes through) updates context.currentError from the
+    // frame's own error state — the wiring inline-write-raw-sql-plan's
+    // executor work will populate with real connector failures later.
+    var context = LassoContext()
+    let defaultOutput = try LassoRenderer().render(
+        "[error_currenterror]/[error_currenterror(-errorcode)]",
+        context: &context
+    )
+    #expect(defaultOutput == "No Error/0")
+
+    context.pushInlineFrame(LassoInlineFrame(
+        rows: [],
+        error: LassoErrorState(code: 7, message: "Update failed", kind: "update")
+    ))
+    #expect(context.currentError.code == 7)
+    #expect(context.currentError.message == "Update failed")
 }
 
 private func corpusFixtureContext(

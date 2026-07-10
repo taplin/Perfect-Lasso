@@ -175,10 +175,45 @@ public struct LassoNativeRegistry: Sendable {
         register("action_statement") { _, context in
             .string(context.currentInlineFrame?.actionStatement ?? "")
         }
+        register("error_currenterror") { arguments, context in
+            arguments.hasTruthyFlag("errorcode")
+                ? .integer(context.currentError.code)
+                : .string(context.currentError.message)
+        }
         register("action_param") { arguments, context in
             let name = arguments.firstValue(named: "name")?.outputString ??
                 arguments.first?.value.outputString ?? ""
             return context.requestProvider?.parameter(named: name) ?? .void
+        }
+        // Lasso 8 request tags — see Documentation/post-body-support-plan.md.
+        // `form_param` is documented as equivalent to the modern combined
+        // `action_param` lookup (POST before GET). The `client_*` tags map
+        // directly onto the widened LassoRequestProvider surface.
+        register("form_param") { arguments, context in
+            let name = arguments.firstValue(named: "name")?.outputString ??
+                arguments.first?.value.outputString ?? ""
+            return context.requestProvider?.parameter(named: name) ?? .void
+        }
+        register("client_postargs") { _, context in
+            .map(context.requestProvider?.postParameters ?? [:])
+        }
+        register("client_postparams") { _, context in
+            .map(context.requestProvider?.postParameters ?? [:])
+        }
+        register("client_getargs") { _, context in
+            .map(context.requestProvider?.queryParameters ?? [:])
+        }
+        register("client_getparams") { _, context in
+            .map(context.requestProvider?.queryParameters ?? [:])
+        }
+        register("client_contentlength") { _, context in
+            .integer(context.requestProvider?.contentLength ?? 0)
+        }
+        register("client_contenttype") { _, context in
+            .string(context.requestProvider?.contentType ?? "")
+        }
+        register("client_formmethod") { _, context in
+            .string(context.requestProvider?.requestMethod ?? "")
         }
         register("cookie") { arguments, context in
             let name = arguments.firstValue(named: "name")?.outputString ??
@@ -287,6 +322,13 @@ public struct LassoContext: Sendable {
     var returnSignal: LassoValue?
     var tagCallStack: [String]
     var selfStack: [LassoObjectInstance]
+    /// Real Lasso's request-local `error_currentError` state — reset to
+    /// `.noError` on every fresh context, updated by `setError`/`clearError`.
+    /// `lastError` preserves the previous error across a `clearError()` call,
+    /// matching how `protect` needs to inspect what failed even after the
+    /// catch handler has already reset `currentError` for code that follows.
+    public var currentError: LassoErrorState
+    public var lastError: LassoErrorState?
 
     public init(
         globals: [String: LassoValue] = [:],
@@ -318,6 +360,18 @@ public struct LassoContext: Sendable {
         returnSignal = nil
         tagCallStack = []
         selfStack = []
+        currentError = .noError
+        lastError = nil
+    }
+
+    public mutating func setError(_ error: LassoErrorState) {
+        lastError = currentError
+        currentError = error
+    }
+
+    public mutating func clearError() {
+        lastError = currentError
+        currentError = .noError
     }
 
     public subscript(_ name: String) -> LassoValue {
@@ -350,6 +404,13 @@ public struct LassoContext: Sendable {
 
     mutating func pushInlineFrame(_ frame: LassoInlineFrame) {
         inlineFrames.append(ActiveInlineFrame(frame: frame, currentRow: nil))
+        // A successful inline sets currentError back to No Error; a failed
+        // database action (once inline executors start constructing frames
+        // with real error state) sets it to the action's own error — matching
+        // real Lasso's request-local error_currentError, inspectable from
+        // inside the inline body per the documented
+        // [Error_CurrentError: -ErrorCode]: [Error_CurrentError] pattern.
+        setError(frame.error)
     }
 
     mutating func popInlineFrame() {

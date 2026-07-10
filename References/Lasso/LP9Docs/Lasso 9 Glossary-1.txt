@@ -1,0 +1,154 @@
+-----------------------------------------------
+Lasso 9 Glossary
+-----------------------------------------------
+
+Introduction
+	
+	This document intends to give a list of Lasso 9 language terms along with their definitions. It will be updated according to the introduction of new terms during the Lasso 9 specification process.
+	
+Terms
+
+* anonymous association
+	An association of an anonymous signature with an expression list. Results in an expr_expressionlist type.
+	
+* association
+	An association is a binding of a left-hand value to a right-hand value when using the association operator "=>". Associations come in three forms: defining, givenblock, anonymous.
+	
+* auto-collect
+	A codeblock compiled so that the result of each body expression is automatically appended to that codeblock's return value.
+	
+* detach
+	Captures can be detached from their homeCapture in order to have them operate more autonomously.
+	
+* capture, closure
+	A capture is a bundling of a codeblock along with environmental state. That state is put into effect when the capture is invoked.
+	
+* codeblock, code
+	A codeblock is a compiled list of language expressions that can be invoked. Codeblocks accept parameters and return values.
+	
+* continuation
+	The element that a capture will execute after it was completed. The current continuation is usually the caller of the current capture.
+	
+* currentCapture
+	Provides access to the currently executing capture.
+
+* data member
+	Custom types can contain data members. Data members are only available to the owning type by using the target operator, "->" and by surrounding the data member name with quotes.
+
+* declaration, decl
+	A statement, modifier, clarification or restriction on another element.
+
+* define
+	An operator consisting of the reserved word "define". Used to add entries to the tag registry.
+	
+* defining association
+	An association between a signature and a codeblock or other expression made when using the "define" operator.
+	
+* dispatch
+	The act of selecting an element to invoke given a tag. Dispatch uses the given parameters to determine its selection.
+	
+* execute, execution
+	Codeblocks and Captures are executed when they are invoked.
+	
+* givenBlock association
+	Association of a codeblock or other element to an invocation. This is the container tag concept. The current givenBlock is available through the "givenBlock" expression.
+	
+* handler	
+	A handle is a capture that has been set to execute after its containing capture exits.
+	
+* homeCapture
+	Some captures have homes to which they are connected. HomeCaptures help determine the self, inherited, locals and params as well as the behavior of return and yield.
+	
+* inherited
+	Inherited is the parent of the instance in which the current codeblock was found. "inherited" is used when calling the original implementation of an overridden tag member.
+	
+* invoke, invocation
+	Objects are invoked in order to trigger their special behavior. Different object types exhibit different behaviors when they are invoked. For example, simple value types such as integers or string produce a duplicate copy when invoked; codeblock execute when invoked; custom types attempt to call the ->invoke member tag.
+	
+* invokeNext
+	invokeNext is called in order to re-dispatch the current call.
+
+* keyword
+	A tag beginning with a unary minus "-" symbol. Used to explicitly name optional parameter values.
+
+* member
+	An element is a member of an object if the element is available through usage of the target operator "->" on the object. All types contain tag members. Some types contain data and tag members.
+	
+* membermap
+	An associative container type which maps tags to objects. All members are stored in a membermap.
+
+* memberstream
+	An object containing all the eligible members for a particular dispatch.
+
+* mutator, member-mutator
+	A member tag with a name that denotes that it modifies that member with one of several possible operators.
+
+* non-local return, yield
+	To return or yield from within a capture that has a home.
+	
+* non-member
+	Non-member refers to a tag which is not contained within an object as a tag member. All non-members are held in the tag registry.
+	
+* null
+	A basic type representing a value which exists but is not set. There is only one instance of type null.
+
+* object
+	An instance of a type.
+
+* pair
+	A basic type containing two other elements: a first and a second. These elements are made available through the ->first and ->second member tags.
+	
+* parameter
+	A value given to an invocation in order to control is behavior.
+	
+* parameter pairing
+	The process of supplying a pair of parameter values by using the "=" operator in a parameter list.
+	
+* parent
+	The immediate ancestor of a given object. Parent is available through the ->parent member tag.
+
+* PC
+	Stands for program counter. All captures have a PCs which indicate the offset into the code/instructions at which execution will next take place.
+
+* return
+	Return can be used within a codeblock to cease execution and optionally present a value to the caller. Using return will reset the capture's PC to zero.
+	
+* self
+	The object which contained the currently executing member.
+	
+* signature, sig
+	A description of the externally visible behavior of a codeblock. Signatures describe the acceptable parameters and the return value type.
+	
+* staticarray
+	A basic "array" like data type. Does not automatically expand or grow but can be explicitly reallocated. Used as a basis for more complex data types.
+	
+* tag, tag name
+	A name used to refer to a definition. Tags are used for both members and non-members. Also, variable and signature names must be valid tags. Tags consist of the following character sequence, in regexp: _?[A-Za-z][A-Za-z0-9_]*
+	
+* tag member
+	A definition within an object that is available through the target operator "->".
+	
+* tag registry, registry
+	A tag registry is a "registry" data type that holds all non-member tag definitions. 
+	
+* type, prototype
+	A model for a potential type instance. All types exist a prototypical type instances.
+
+* type instance
+	An instance of a type.
+
+* type specifier, type descriptor
+	A restriction placed on a parameter, return value or variable in order to enforce proper type safety, usage and programming practice. 
+	
+* VM, virtual machine
+	A virtual machine abstracts hardware and memory access to a special set of routines and operations available to a language. Source code is compiled down to the VM's instruction set. The virtual machine executes the instructions in order to implement the language.
+	
+* VOID
+	A basic type representing a non-existent value. This differs from null in that null represents a value that does exist but has not been set to any particular type, while VOID indicates the total absence of value or potential value. There is only one instance of type VOID. VOID is written in all capital letters by convention, though the name is not case sensitive.
+
+* yield
+	Yield can be used within a codeblock to cease execution and optionally present a value to the caller. Using yield will not reset the capture's PC to zero, enabling the capture to resume from where it left off the next time it is invoked.
+
+
+-----------------------------
+Copyright 2007 LassoSoft, LLC

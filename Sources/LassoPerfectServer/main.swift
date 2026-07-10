@@ -112,7 +112,18 @@ struct LassoSiteServer: Sendable {
         let files = root().GET.trailing { request, path -> HTTPOutput in
             try await handle(request: request, trailingPath: path)
         }
-        return try root().dir(health, rootFile, files)
+        // POST routes mirror the GET ones — real Lasso pages are typically
+        // requested at the same URL for both the form's initial GET and its
+        // POST submission. See Documentation/post-body-support-plan.md;
+        // `handle` already reads/parses the body for either verb via
+        // readPostBody, so no separate handler logic is needed here.
+        let rootFilePost = root().POST.map { request -> HTTPOutput in
+            try await handle(request: request, trailingPath: "")
+        }
+        let filesPost = root().POST.trailing { request, path -> HTTPOutput in
+            try await handle(request: request, trailingPath: path)
+        }
+        return try root().dir(health, rootFile, files, rootFilePost, filesPost)
     }
 
     private func handle(request: any HTTPRequest, trailingPath: String) async throws -> HTTPOutput {
@@ -124,7 +135,8 @@ struct LassoSiteServer: Sendable {
             let fileURL = try fileURL(for: path)
             resolvedFileURL = fileURL
             if shouldRender(fileURL) {
-                return try render(fileURL: fileURL, request: request, includePath: path)
+                let postBody = try await readPostBody(request: request)
+                return try render(fileURL: fileURL, request: request, includePath: path, postBody: postBody)
             }
             return try FileOutput(localPath: fileURL.path)
         } catch let error as ErrorOutput {
@@ -137,6 +149,28 @@ struct LassoSiteServer: Sendable {
                 resolvedPath: resolvedPath,
                 fileURL: resolvedFileURL
             )
+        }
+    }
+
+    /// Reads and parses the request body asynchronously, before the
+    /// synchronous LassoRenderer/Evaluator ever runs — see
+    /// Documentation/post-body-support-plan.md. Phase 1 handles
+    /// application/x-www-form-urlencoded via Perfect-NIO's own QueryDecoder
+    /// and captures any other content type as a raw string; multipart/file
+    /// uploads are deferred to session-upload-support-plan.md's upload
+    /// milestone (Perfect-NIO's MimeReader needs careful temp-file-lifetime
+    /// handling that doesn't belong bolted onto this pass).
+    private func readPostBody(request: any HTTPRequest) async throws -> ParsedPostBody {
+        guard request.contentLength > 0 else { return .empty }
+        switch try await request.readContent() {
+        case .urlForm(let decoder):
+            let pairs = decoder.map { LassoRequestPair(name: $0.0, value: .string($0.1)) }
+            let rawString = pairs.map { "\($0.name)=\($0.value.outputString)" }.joined(separator: "&")
+            return ParsedPostBody(pairs: pairs, rawString: rawString)
+        case .other(let bytes):
+            return ParsedPostBody(pairs: [], rawString: String(decoding: bytes, as: UTF8.self))
+        case .multiPartForm, .none:
+            return .empty
         }
     }
 
@@ -193,7 +227,12 @@ struct LassoSiteServer: Sendable {
         config.lassoExtensions.contains(url.pathExtension.lowercased())
     }
 
-    private func render(fileURL: URL, request: any HTTPRequest, includePath: String) throws -> HTTPOutput {
+    private func render(
+        fileURL: URL,
+        request: any HTTPRequest,
+        includePath: String,
+        postBody: ParsedPostBody
+    ) throws -> HTTPOutput {
         let source = try String(contentsOf: fileURL, encoding: .utf8)
         let document = LassoParser().parse(source)
         // Kept as a local so its collected status/redirect/headers/cookies
@@ -207,7 +246,7 @@ struct LassoSiteServer: Sendable {
             globals: baseGlobals(for: request),
             includeLoader: includeLoader,
             includePath: includePath,
-            requestProvider: ServerRequestProvider(request: request),
+            requestProvider: ServerRequestProvider(request: request, postBody: postBody),
             responseSink: sink,
             inlineProvider: inlineProvider,
             tagRegistry: tagRegistry
@@ -360,8 +399,28 @@ enum LassoSiteServerError: Error, CustomStringConvertible {
     }
 }
 
+/// A request's POST body, already read and parsed asynchronously at the
+/// Perfect route-handler boundary (see `LassoSiteServer.readPostBody`)
+/// before the synchronous `LassoRenderer`/`Evaluator` ever runs — keeps
+/// async I/O out of the renderer entirely, per
+/// `Documentation/post-body-support-plan.md`'s recommended architecture.
+struct ParsedPostBody {
+    let pairs: [LassoRequestPair]
+    let rawString: String
+
+    static let empty = ParsedPostBody(pairs: [], rawString: "")
+}
+
 struct ServerRequestProvider: LassoRequestProvider {
+    /// POST-then-GET combined, first-value-per-name-wins — backs the plain
+    /// single-argument `parameter(named:)`/`action_param`/`web_request->
+    /// param(name)` lookup, matching real Lasso's documented combined order.
     private let parameterValues: [String: LassoValue]
+    private let queryParameterValues: [String: LassoValue]
+    private let postParameterValues: [String: LassoValue]
+    let queryPairs: [LassoRequestPair]
+    let postPairs: [LassoRequestPair]
+    let rawPostString: String
     private let headerValues: [String: LassoValue]
     private let cookieValues: [String: LassoValue]
     let requestMethod: String
@@ -375,14 +434,33 @@ struct ServerRequestProvider: LassoRequestProvider {
     let contentType: String
     let contentLength: Int
 
-    init(request: any HTTPRequest) {
-        var params: [String: LassoValue] = [:]
-        if let query = URLComponents(string: request.uri)?.queryItems {
-            for item in query {
-                params[item.name.lowercased()] = .string(item.value ?? "")
+    init(request: any HTTPRequest, postBody: ParsedPostBody = .empty) {
+        // request.searchArgs is Perfect-NIO's own QueryDecoder, already
+        // parsed from the URI's query string when the request was built —
+        // switching from URLComponents fixes a real pre-existing bug for
+        // free: URLComponents doesn't treat "+" as space in query strings
+        // the way application/x-www-form-urlencoded requires; QueryDecoder
+        // does.
+        let queryPairs = (request.searchArgs?.map { LassoRequestPair(name: $0.0, value: .string($0.1)) }) ?? []
+        let postPairs = postBody.pairs
+
+        func firstValuePerName(_ pairs: [LassoRequestPair]) -> [String: LassoValue] {
+            var result: [String: LassoValue] = [:]
+            for pair in pairs where result[pair.name.lowercased()] == nil {
+                result[pair.name.lowercased()] = pair.value
             }
+            return result
         }
-        parameterValues = params
+
+        self.queryPairs = queryPairs
+        self.postPairs = postPairs
+        rawPostString = postBody.rawString
+        queryParameterValues = firstValuePerName(queryPairs)
+        postParameterValues = firstValuePerName(postPairs)
+        // POST first, matching real Lasso 9's documented combined params()
+        // order — firstValuePerName keeps the first pair it sees per name,
+        // so POST pairs win over GET pairs with the same name.
+        parameterValues = firstValuePerName(postPairs + queryPairs)
         headerValues = Dictionary(uniqueKeysWithValues: request.headers.map {
             ($0.name.lowercased(), LassoValue.string($0.value))
         })
@@ -417,6 +495,14 @@ struct ServerRequestProvider: LassoRequestProvider {
 
     var parameters: [String: LassoValue] {
         parameterValues
+    }
+
+    var queryParameters: [String: LassoValue] {
+        queryParameterValues
+    }
+
+    var postParameters: [String: LassoValue] {
+        postParameterValues
     }
 
     var headers: [String: LassoValue] {

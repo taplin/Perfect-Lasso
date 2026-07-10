@@ -16,22 +16,63 @@ public struct LassoDataRow: Equatable, Sendable {
     }
 }
 
+/// Real Lasso's request-local current-error state, exposed to Lasso code via
+/// `error_currentError`. `code: 0`/`kind: "none"` is real Lasso's "No Error"
+/// state — the default for every fresh context and every successful inline
+/// action. Numeric codes beyond 0 are deliberately not assigned yet (see
+/// `Documentation/error-protect-model-plan.md`'s Milestone 1) — real Lasso
+/// 8.5's exact Error Control chapter codes still need extracting from the
+/// local reference PDF before those are hardcoded here.
+public struct LassoErrorState: Equatable, Sendable {
+    public var code: Int
+    public var message: String
+    public var kind: String
+    public var detail: String?
+
+    public init(code: Int, message: String, kind: String, detail: String? = nil) {
+        self.code = code
+        self.message = message
+        self.kind = kind
+        self.detail = detail
+    }
+
+    public static let noError = LassoErrorState(code: 0, message: "No Error", kind: "none")
+}
+
+/// A recoverable Lasso-level failure — the only error type `protect` catches.
+/// Deliberately distinct from ordinary Swift `throw`s used elsewhere in this
+/// runtime for fatal adapter/parser bugs (`LassoRuntimeError`) and from the
+/// `returnSignal` short-circuit used for `return`/`abort` control flow —
+/// `protect` must catch this and only this, per
+/// `Documentation/error-protect-model-plan.md`'s three-way error/control-flow/
+/// fatal split.
+public struct LassoRecoverableError: Error, Equatable, Sendable {
+    public var state: LassoErrorState
+
+    public init(_ state: LassoErrorState) {
+        self.state = state
+    }
+}
+
 public struct LassoInlineFrame: Equatable, Sendable {
     public let rows: [LassoDataRow]
     public let foundCount: Int
     public let affectedRows: Int
     public let actionStatement: String?
+    public let error: LassoErrorState
 
     public init(
         rows: [LassoDataRow],
         foundCount: Int? = nil,
         affectedRows: Int = 0,
-        actionStatement: String? = nil
+        actionStatement: String? = nil,
+        error: LassoErrorState = .noError
     ) {
         self.rows = rows
         self.foundCount = foundCount ?? rows.count
         self.affectedRows = affectedRows
         self.actionStatement = actionStatement
+        self.error = error
     }
 }
 
@@ -214,6 +255,25 @@ public enum LassoFileSystemIncludeError: Error, Equatable, Sendable {
     case unreadableFile(String)
 }
 
+/// A single ordered name/value pair from a request's query string or POST
+/// body. Real Lasso's `params()`/`postParams()`/`queryParams()` are
+/// documented as ordered, duplicate-preserving collections (POST occurring
+/// before GET in the combined form) — plain dictionaries lose ordering and
+/// silently drop duplicate names. `LassoRequestProvider.postPairs`/
+/// `queryPairs` below are the ordered source of truth; the existing
+/// dictionary-shaped `parameters`/`queryParameters`/`postParameters`
+/// properties stay as convenience projections (first-value-wins per name)
+/// for callers that only need simple lookup.
+public struct LassoRequestPair: Equatable, Sendable {
+    public var name: String
+    public var value: LassoValue
+
+    public init(name: String, value: LassoValue) {
+        self.name = name
+        self.value = value
+    }
+}
+
 /// Real Lasso's `web_request` exposes ~35 documented members (see
 /// `Documentation/compatibility-matrix.md`); this protocol only requires
 /// the handful every conformer must supply, with default (empty/zero/false)
@@ -230,6 +290,9 @@ public protocol LassoRequestProvider: Sendable {
     var cookies: [String: LassoValue] { get }
     var queryParameters: [String: LassoValue] { get }
     var postParameters: [String: LassoValue] { get }
+    var queryPairs: [LassoRequestPair] { get }
+    var postPairs: [LassoRequestPair] { get }
+    var rawPostString: String { get }
     var requestMethod: String { get }
     var requestURI: String { get }
     var path: String { get }
@@ -247,6 +310,9 @@ public extension LassoRequestProvider {
     var cookies: [String: LassoValue] { [:] }
     var queryParameters: [String: LassoValue] { parameters }
     var postParameters: [String: LassoValue] { [:] }
+    var queryPairs: [LassoRequestPair] { [] }
+    var postPairs: [LassoRequestPair] { [] }
+    var rawPostString: String { "" }
     var requestMethod: String { "" }
     var requestURI: String { "" }
     var path: String { "" }

@@ -1,0 +1,477 @@
+-----------------------------------------------
+Types in Lasso 9
+-----------------------------------------------
+
+Contents
+
+1 Introduction
+	1.1 Compatibility
+	1.1.1 Callbacks Removed
+	1.1.1.1 onDestroy
+	1.1.1.2 onConvert
+	1.1.1.3 onAssign
+	1.2 Goals
+2 Types
+	2.1 Name
+	2.2 Tag Members
+	2.3 Data Members
+	2.4 Parent
+	2.5 Trait
+3 Type Expressions
+	3.1 Sections
+		3.1.1 Public
+		3.1.2 Protected
+		3.1.3 Private
+		3.1.4 Data
+		3.1.5 Parent
+		3.1.6 Trait
+	3.2 Member Mutators
+		3.2.1 Set/Get
+		3.2.2 Arithmetic
+4 Prototypes
+	4.1 Defining
+	4.2 Creating New Instances
+		4.2.1 Copying
+		4.2.2 onCreate
+5 Using Types
+	5.1 Accessing Data Members
+	5.2 Calling Tag Members
+	5.3 Calling Inherited Tag Members
+	5.4 Copying Type Instances
+	5.5 Callbacks
+		5.5.1 onCompare
+		5.5.2 onCreate
+		5.5.3 invoke
+		5.5.4 contains
+		5.5.5 +, -, *, /, %
+		5.5.6 +=, -=, *=, /=, %=
+		5.5.6.1 ++, --
+		5.5.7 _unknowntag
+		5.5.8 onSerialize
+		5.5.9 onDeserialize
+6 Introspection
+	6.1 listTagMembers
+	6.2 listAllTagMembers
+	6.3 listTraitTagMembers
+	6.4 listTraitNames
+	6.5 hasTagMember
+	6.6 getTagMember
+	6.7 addTagMember
+	6.8 parent
+	6.9 trait
+	6.10 setTrait
+	6.11 addTrait
+
+
+1 Introduction
+
+	Types are a basic component of a great many programming languages. Considering data as a term for generic information, a Type represents a specific "kind" of data. Lasso is a prototype based language. This means that all individual type instances are derived from other proto-typical type instances (Lasso does not have Classes). The Lasso runtime system provides an initial set of basic prototypes, a means for creating and modifying copies of those types and a means for composing new type instances from existing types.
+	
+1.1 Compatibility
+	
+	This document details a replacement for the Lasso Professional "define_type" construct. Compatibility for define_type will be provided as part of the Lasso 9 compatibility layer.
+	
+	Several conceptual incompatibilities are also being introduced. First, all types are defined as prototypes. There is no need to utilize the -proto keyword or any other mechanism to indicate that a type should be a prototype. Second, namespaces are now always included as part of a type's name when it is defined. There is no need to separately specify the -namespace keyword and value.
+
+1.1.1 Callbacks Removed
+
+	Several LP8.5 callbacks are being dropped, many in favor of replacements or methodology changes which correct problems in those features. Others are being removed because of technology changes or system restrictions.
+
+1.1.1.1 onDestroy
+
+	In LP8.5, onDestroy was called as soon as an object went out of scope. onDestroy can not operate in the same manner under Lasso 9's garbage collection system which destroys objects at indeterminate times. While it is possible to add in the call to onDestroy as objects are finalized, misuse of this feature can have adverse effects on system reliability and so is being dropped from the feature set and will not be supported in Lasso 9.
+
+1.1.1.2 onConvert
+
+	onConvert is being replaced by a more straight forward set of tags providing basic data type conversion. Tags such as asString, asInteger and asDecimal can be added via traits to not only provide conversion for individual types but to provide a means for determining if a type can be converted to another. These conversion tags are not specified in this document.
+
+1.1.1.3 onAssign
+
+	Lasso 9 uses simpler, more logical and more efficient by-reference assignment semantics. With the addition of member mutators, this obviates the need for an onAssign callback to handle assignments TO an object, a concept which does not exist in Lasso 9. onAssign added layers of complexity to type creation and imposed object duplication at unnecessary times. It has been dropped from Lasso 9.
+	
+1.2 Goals
+
+	The goals for these changes are as follows:
+
+		To greatly simplify type creation
+		To standardize many of the behaviors of types
+		To eliminate several legacy mechanisms
+		To bring type creation in line with other Lasso 9 constructs such as codeblocks and traits, so that they all share common concepts and methods
+
+2 Types
+	
+	Types in Lasso 9 represent fundamental units of data. All type instances have a particular states. A type's state is defined by the values of the elements comprising the type at a particular time. Each type possesses the following elements: Name, Tag Members, Data Members, Parent and Trait.
+	
+2.1 Name
+
+	Each type possesses a name. Type names must be valid tags. Types are initially created anonymously and their names are simply _ (underscore/anonymous). When a type is defined, if its type name is anonymous, it will then be given the name it is being defined under. Type names can not be guaranteed to be unique.
+	
+	A type's name is a tag instance and is accessed through the ->type member. It has the following signature: type()::tag
+	
+2.2 Tag Members
+
+	A type's tag members hold the elements for that type which can be accessed through the target operator -> and where the right-hand operand is a tag invocation. Tag members are shared amongst derivative types. That is, all types which come from a particular prototype will share the same set of tag members.
+	
+	Tag members can consist of codeblocks of other values. When a tag member is accessed, the value associated with that member is invoked and given any parameters that are being passed at that time. Invoking a codeblock executes the code. Invoking other values will generally produce a copy of that value. This means that while a tag member may be a plain (non-codeblock) value, it is never presented in a mutable manner to the caller.
+	
+2.3 Data members
+
+	A type's data members are the state elements whose values are unique to that specific type instance. Data members are accessed through the target operator -> where the right-hand operand is a quoted string naming the member to access. When a data member is accessed, the value is returned; it is not invoked.
+	
+	Data members are only available to the owning type. That is, data members always only have private access. Accessors can be provided to enable the sharing of data members with other parties.
+
+2.4 Parent
+
+	Each type has one or more parents. Parents are either immediate or inherited. An immediate parent is the parent that is closest to the type. Inherited parents are the parent of the immediate parent and all of their parents. A type will inherit all of the public and protected tag members of its parents.
+	
+	If a type was not explicitly created with a parent, its parent is implicitly null. This means that the ultimate parent of any type is null. Null's parent is itself. The basic tag members of null are inherited by all types, but the type name of "null" is not passed on to these (every) inheriting types. This means that while every type inherits from null, ->isA(::null) will always return false unless the type is actually the single null type instance.
+	
+2.5 Trait
+	
+	Every type has one trait. This trait may be composed of other sub-traits. A type will inherit all of the tag members that the trait provides, provided that the type, in turn, implements all the the tags that trait requires.
+	
+3 Type Expressions
+
+	New types are generated through a type expression. A type expression begins with the reserved word "type" followed by a pair of curly braces containing a series of sections laying out the type.
+
+3.1 Sections
+	
+	A section in a type expression is a single or series of elements identified by an initial label. Some sections may appear more than once. Sections may appear in any order. The possible sections are: public, protected, private, data, parent, trait.
+
+3.1.1 Public
+
+	A public section defines the tag members which are available to any caller. Public sections begin with the word "public" which is followed by a comma separated list of tag member implementations. This member list has the same form as a defining association, that is, a signature followed by the association operator => followed by a single expression. Public sections may appear any number of times and in any order.
+
+	type {
+		public
+			foo() => { },
+			bar(x, y) => { }
+		
+		public baz() => { }
+	}
+	
+3.1.2 Protected
+	
+	A protected section defines the tag members which are only available to the owning type itself and to types inheriting from the owning type. Protected sections begin with the word "protected" and have the same form as public sections.
+	
+	type {
+		protected
+			foo() => { },
+			bar(x, y) => { }
+		
+		protected baz() => { }
+	}
+	
+3.1.3 Private
+
+	A private section defines the tag members which are only available to the type which owns them. Private sections begins with the word "private" and have the same format as public and protected sections.
+	
+	type {
+		private
+			foo() => { },
+			bar(x, y) => { }
+		
+		private baz() => { }
+	}
+	
+3.1.4 Data
+
+	The Data section defines the data members for the type. This section begins with the word "data" and is followed by a comma separated list of data member names along with optional type specifiers and optional initial values. The data section may appear any number of times and in any order.
+	
+	type {
+		data foo, bar = 42,
+			baz = 'My str'
+	}
+	
+	A type specifier can be applied to a data member definition in order to guarantee that the type of that member stays fixed and can not be changed. Data members with type specifiers must be given with an initial value and the initial value must be valid according to the type specifier.
+
+	type {
+		data foo::integer = 0
+	}
+
+Q: Is this type specifier thing implemented yet?
+A: No
+
+3.1.5 Parent
+
+	The parent section begin with the word "parent" and if followed by a single expression. The expression's value is treated as the parent for the new type. the expression value is taken as-is; it is not copied. The parent section may only appear once, but can appear in any order.
+	
+	type {
+		parent foo_type // foo_type must exist when the type is created
+	}
+	
+	type {
+		parent 42 // inherit from an integer with the value of 42
+	}
+
+3.1.6 Trait
+	
+	The trait section must be a valid trait expression. Trait expressions begin with the word "trait" followed by a set of curly braces containing the trait definition.
+	
+	type {
+		trait {
+			import trait_foo, trait_bar
+		}
+	}
+	
+3.3 Member Mutators
+
+	A member mutator is a tag member designed to intercept modifications (mutations) to an element contained within the type. Member mutators provide a method for intercepting assignments and arithmetic operations on a member. The member may correspond to a data member or may be synthetic and exist only logically.
+	
+3.3.1 Set/Get
+
+	A set/get mutator is one that directly corresponds to a data member. It provides a way for a type to expose an otherwise private data member. A setter enables the act of setting the value of the data member using the assignment operator = as well as with a ->setNAME tag. A getter enables the data member to be retrieved by adding a tag member with a matching name.
+	
+	A data member's set and get accessors can both be added at the same time by adding a public, protected or private tag member with a matching name and using only a simple signature with no associated value.
+	
+	type {
+		data myData
+		public myData
+	}
+
+	The type created above has three member tags added to it: ->myData, ->myData= and ->setMyData
+
+3.3.2 Arithmetic
+	
+4 Prototypes
+	
+	Lasso is a prototype based object-oriented language. This means that all object instances are created by copying earlier object instances. These earlier object instances are called prototypes. Brand new prototypes can be created by using a type expression. A type instance shares its tag members with its prototype, but receives a new set of data members.
+	
+4.1 Defining
+
+	A prototype can be made available for use by being defined under a tag name. This is accomplished using the "define" operator. Prototypes can only be defined using simple signatures. Simple signatures consist of only a tag name.
+	
+	define foo => type {
+		trait { import trait_forEach }
+		
+		data val, src, dst
+		
+		public
+			send(val) => { ... },
+			receive(from) => { ... }
+		
+		private doWork() => { ... }
+	}
+	
+	Above, the tag "foo" is defined as the prototype that was created with the type expression.
+	
+4.2 Creating New Instances
+
+	Once a prototype has been defined, new instances of that type are created by calling the defined tag. This "invokes" the prototype which causes a new instance to be created.
+	
+	foo // creates a new instance of the "foo" type
+	
+4.2.1 Copying
+
+	A new type instance is a copy of a prototype. This copy is made starting at the prototype itself and continues with its parent and all of its parent's parents.
+	
+	The steps in the copy are as follows:
+	
+	1. If the Prototype is marked as "unique"* it is returned as if it were the Copy
+	2. The new blank type instance is created - this is the Copy
+	3. The Copy has its type name set to the type name of the Prototype
+	4. The Copy shares the tag members of the Prototype
+	5. The Copy shares the Prototype's trait
+	6. The Prototype's parent is copied using these same rules
+	7. The Copy's parent is set to that new parent copy
+	
+	* Types such as boolean true, false, null and VOID are all unique, as only one instance of those types exist at any time.
+	
+4.2.2 onCreate
+	
+	After the prototype has been copied, the system will attempt to call the onCreate tag member on that copy. Any parameters that were given along with the initial prototype invocation will be passed to onCreate. Only the first appropriate onCreate member which is found in the copy's inheritance chain is called. Within that onCreate member, a type can choose to call its parent's onCreate by using inherited->onCreate or ..onCreate. It is an error to create a new type given parameters that do not match any of the type's onCreate tags.
+
+5 Using Types
+
+5.1 Accessing Data Members
+
+	Data members can only be accessing within the current "self". They are specified by name, using any of the quoted string types.
+	
+	self->'dName'
+	.'dName'
+	
+	When a data member is accessed, its value is returned. The value can be reassigned or modified.
+
+5.2 Calling Tag Members
+
+	Tag members can be called using the target operator ->. The source of the member is the right-hand operand and the tag name is the left hand operand. A comma delimited list of parameters can be given to the tag call by surrounding them with parenthesis and placing them immediately after the tag name. At least the opening parenthesis must be on the same line as the tag name. If the call has no parameters, an empty set of parentheses may be given. The empty set of parentheses is optional and may be omitted.
+
+5.3 Calling Inherited Tag Members
+
+	Inherited tag members are those tags owned by a type's parent(s). It is often desirable to directly call these inherited members, bypassing any matching tags in the current self. This can only be accomplished within the current self, and is done using the word "inherited" in place of "self", or by using "..".
+	
+	inherited->tag
+	..tag
+	
+5.4 Copying Type Instances
+
+	Any given type instance can be duplicated by calling the ->asCopy or ->asCopyDeep tag members. Every type has these tags. asCopy will perform a shallow copy of the object. This means that any objects contained within that object are not duplicated, but are shared with the new type. asCopyDeep will perform a deep copy. This means that any contained objects are copied, and any objects contained within them are copied as well.
+	
+5.5 Callbacks
+	
+	Callbacks are tag members that are called automatically by the runtime system in certain situations. Al callback tags are optional and a type can choose to implement one or more of them in order to control how that type reacts in certain situations. Callbacks which are only intended to be called by the system have the prefix "on". Callbacks which are called by the system but also generally called in user code have no prefix.
+
+5.5.1 onCompare
+
+	onCompare is called whenever a type is compared for ordinality against another type.
+	
+	onCompare should have the following signature:
+	
+		onCompare(rhs)::integer
+		
+	All uses of the following operators results in a call to ->onCompare:
+	
+	== != < <= > >= === !==
+	
+	onCompare handles these cases by returning in integer which represents the direction and degree of difference between the current self and the parameter given to onCompare. If the two objects are equal, onCompare should return a 0, representing no difference. If the current self is LESS THAN the parameter, onCompare should return LESS THAN 0. If the current self is GREATER THAN the parameter, onCompare should return GREATER THAN 0.
+
+5.5.2 onCreate
+
+	onCreate is called automatically be the system when a new instance of a type is created based on a prototype. Any parameters given at the time of the object creation are sent to the first onCreate member tag that is found in the new object. The system will only call the first valid onCreate member it finds.
+
+5.5.3 invoke
+
+	invoke is called by the system in the event that an object as invoked by applying parenthesis to it. Any parameters given to the invocation will be delivered to the ->invoke member.
+	
+	The behavior when invoking an object that does not have an ->invoke member tag, is to produce, or echo, the target object. Any given parameters are ignored in this case.
+
+5.5.4 contains
+
+	contains is called by the system to perform the >> and !>> operators. contains returns true if the current self has within it, an object matching the parameter.
+	
+	contains should have the following signature:
+	
+	contains(rhs)::boolean
+
+5.5.5 +, -, *, /, %
+
+	The runtime system will delegate certain operations on or with an object to the object itself. These operations include the arithmetic operators for addition, subtraction, multiplication, division and modulo division. To handle a particular operation, a type must contain a member tag whose name matches the operator symbol and whose signature accepts a parameter of appropriate type for that call. The +, -, *, / and % operators all accept only one parameter and should return an object other than the current self.
+	
+	The following shows how a type is created to handle these operators:
+	
+	type {
+		public
+			+(rhs) => { ... },
+			-(rhs) => { ... },
+			*(rhs) => { ... },
+			/(rhs) => { ... },
+			%(rhs) => { ... }
+	}
+
+5.5.6 +=, -=, *=, /=, %=
+
+	The arithmetic operators also have assignment equivalents. These perform the corresponding operation on the current self and assign that value to self. These operations can be delegated to the type in question just as the other non-assignment operators can. Each operator accepts only one parameter and should not return a value.
+	
+	The following shows how a type is created to handle these operators:
+	
+	type {
+		public
+			+=(rhs) => { ... },
+			-=(rhs) => { ... },
+			*=(rhs) => { ... },
+			/=(rhs) => { ... },
+			%=(rhs) => { ... }
+	}	
+
+5.5.6.1 ++, --
+
+	The pre and post increment and decrement operators are always converted by the compiler into suitable calls to += and -=, using 1 as the parameter. Types can not override ++ or -- and should handle += and -= instead.
+
+5.5.7 _unknowntag
+
+	The _unknowntag callback can be utilized in order to let a type handle requests for tag members which it does not have. When a search for a tag member fails, the system will try and lookup the tag _unknowntag. If found, it will be called. The tag that was originally called is available through currentCapture->calledName.
+
+5.5.8 onSerialize
+
+	onSerialize is called by the system when an object graph is to be written to a stream-like entity. Objects written to entities such as files, tcp connections and database columns should serialized first and have the serialized value written in place of the original object. Manual serialization should be accomplished through a serializer object, which handles calling ->onSerialize when appropriate.
+	
+	onSerialize should return a bytes instance, or null. This data will be written along with the structural information about the object and will be made available to the object when it is later de-serialized. This allows an object to store additional configuration information with its stream. onSerialize should have the following signature:
+	
+	onSerialize()::bytes
+
+5.5.9 onDeserialize
+
+	onDeserialize is called by the system when a previously serialized object graph is being recreated. The target object is passed the raw data that was produced by the earlier call to onSerialize. This data may be null. onDeserialize should have the following signature:
+	
+	onDeserialize(with::bytes)
+
+6 Introspection
+
+	Introspection is the examination of a type's tag members and inheritance structure. This ability is provided through a set of tag members that every tag possesses. This set of tags also provides a means for adding new tags to types and also for modifying a type's trait.
+
+Q: How does modifying a type affect its prototype?
+A: TBD
+
+6.1 listTagMembers
+
+	listTagMembers()::trait_forEach
+	
+	This tag returns the tag members possessed by the target object. Tags inherited or provided through traits are not included in the result.
+	
+6.2 listAllTagMembers
+
+	listAllTagMembers()::trait_forEach
+	
+	This tag returns all of the tag members available on the target object. This includes all the tags possessed by that object, all the tags obtained through the object's trait, ad all of the tags obtained through all of the object's parents and their traits.
+
+6.3 listTraitTagMembers
+
+	listTraitTagMembers()::trait_forEach
+	
+	This tag returns all of the tag members this object obtains through its trait. Tags from inherited traits are not included in the list.
+
+6.4 listTraitNames
+
+	listTraitNames()::trait_forEach
+	
+	This tag returns all the the names of the traits the object is composed of.
+
+6.5 hasTagMember
+
+	hasTagMember(named::tag)::boolean
+	
+	This tag accepts one parameter which must be a tag name. It returns true if the target object contains the specified tag. Traits or parents are not searched for the tag.
+
+6.6 getTagMember
+
+	getTagMember(named::tag)
+	
+	This tag accepts one parameter which must be a tag name. It searches the target object for the specified tag and returns it when found. If the tag is not found, a failure is generated.
+
+6.7 addTagMember
+
+	addTagMember(mem::pair)
+	
+	This tag accepts a tag name and value as a pair which will be added to the target object.
+
+6.8 parent
+
+	parent()
+	
+	This tag returns the parent of the target object. If this tag returns null, it indicates the final parent has been reached.
+
+6.9 trait
+
+	trait()::trait
+	
+	This tag returns the trait of the target object. It may return null if the object does not have a trait.
+
+6.10 setTrait
+
+	setTrait(trait::trait)
+	
+	This tag sets the trait of the target object to the parameter. The preexisting trait is replaced.
+
+6.11 addTrait
+
+	addTrait(trait::trait)
+	
+	This tag combines the target object's current trait with the parameter and sets it for that object.
+
+
+-----------------------------
+Copyright 2007 LassoSoft, LLC
+
+-- 
+All information about Trifecta is covered by an NDA.
+Please write to <beta@lassosoft.com> to unsubscribeor if you have any questions.

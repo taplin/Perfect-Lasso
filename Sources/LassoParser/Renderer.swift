@@ -104,7 +104,27 @@ private struct RendererEngine {
             }
             return output
         case "protect":
-            return try render(body)
+            // Catches only LassoRecoverableError — real Lasso failures a page
+            // is expected to inspect and continue past (failed database
+            // actions, etc.). Deliberately does NOT catch the returnSignal
+            // short-circuit `return`/`abort` use (that's Swift control flow,
+            // not a thrown error, so it already passes through untouched)
+            // and does NOT catch LassoRuntimeError or any other fatal
+            // adapter/parser error — those stay fatal per
+            // Documentation/error-protect-model-plan.md's three-way split.
+            // Conservative first-pass output behavior: a protected body that
+            // fails partway discards everything it had already rendered up
+            // to the failure point, since it's unconfirmed real Lasso
+            // preserves partial protected-block output (see the plan's open
+            // question) — safer to under-output than to guess and be wrong.
+            do {
+                let output = try render(body)
+                evaluator.context.clearError()
+                return output
+            } catch let recoverable as LassoRecoverableError {
+                evaluator.context.setError(recoverable.state)
+                return ""
+            }
         case "define":
             guard case let .string(tagName)? = arguments.first?.value else { return "" }
             evaluator.context.tagRegistry.registerTag(LassoCustomTagDefinition(

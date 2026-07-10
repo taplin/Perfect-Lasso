@@ -546,13 +546,90 @@ database connection this quick verification run doesn't have
 files on this local checkout, and 1 is the confirmed missing-`[noprocess]`
 site-content gap above. 52/52 tests pass.
 
+## Planning docs + architect review, then error/protect model — 2026-07-10
+
+Tim had another dev agent research and write five forward-looking planning
+docs while this session's parser work was ongoing: `post-body-support-plan.md`,
+`session-upload-support-plan.md`, `inline-write-raw-sql-plan.md`,
+`error-protect-model-plan.md`, `legacy-define-tag-type-plan.md` — plus a new
+`References/Lasso/` folder with a local copy of the Lasso 8.5 Language Guide
+PDF and Lasso 9 LP9Docs text files, so future sessions don't depend on
+increasingly-dead lassosoft.com mirrors. Per Tim's direction, ran a
+`feature-dev:code-architect` review of all five plans against the actual
+current codebase (not just the plans' own descriptions) before implementing
+anything. Real findings, not a rubber stamp:
+
+- The plans' *chronological* creation order isn't the right *implementation*
+  order. `error-protect-model-plan` (written last) has zero dependencies and
+  is the prerequisite `inline-write-raw-sql-plan`'s write/error paths need to
+  avoid being built wrong and rewritten later.
+- `post-body-support-plan`'s multipart/upload work and
+  `session-upload-support-plan`'s upload milestone are the same slice of work
+  described twice — the session/upload plan has the correct analysis (a real
+  `MimeReader`/`BodySpec` temp-file-lifetime bug the other plan misses
+  entirely). Session-upload-support owns uploads; post-body's multipart phase
+  is superseded.
+- `post-body-support-plan` proposed hand-writing a new form-urlencoded parser
+  that duplicates Perfect-NIO's existing `QueryDecoder` outright.
+- `legacy-define-tag-type-plan` cited a corpus path that doesn't exist on
+  this machine — corrected to the real `LassoStartup` path this project's
+  other sessions have used for live verification (see the `lasso-real-
+  corpus-paths` project memory).
+- Both plans that said they were blocked on missing Lasso 8.5 documentation
+  are less blocked than they thought — the Language Guide PDF is now sitting
+  locally in `References/Lasso/`; the blocker is page extraction, not finding
+  the source.
+
+Confirmed real implementation order: `error-protect-model-plan` →
+`post-body-support-plan` Phase 1 (corrected) → `session-upload-support-plan`
+Milestone 1 (uploads) → `inline-write-raw-sql-plan` →
+`session-upload-support-plan` Milestones 2-4 (sessions, last — depends on the
+error/transaction model from the others). `legacy-define-tag-type-plan` is
+orthogonal parser work, runs in parallel, blocks nothing.
+
+**Implemented `error-protect-model-plan`'s Milestones 1-3 and 6** (the
+architect's "ready now" slice): `LassoErrorState`/`LassoRecoverableError`,
+`LassoContext.currentError`/`lastError`, `LassoInlineFrame.error` (wired
+through `pushInlineFrame`), and `protect` genuinely catching only
+`LassoRecoverableError` — `return`/`abort` and fatal `LassoRuntimeError`s
+pass through untouched. `error_currentError` (message / `-errorCode`)
+implemented. Real database-failure integration and the full Lasso 8.5
+error-code list are deferred to the `inline-write-raw-sql-plan` pass, per the
+architect's dependency analysis. 55/55 tests pass.
+
+**Implemented `post-body-support-plan`'s Phase 1**, corrected per the
+architect review to consume Perfect-NIO's own `QueryDecoder` rather than
+hand-rolling a form-urlencoded parser. Found and fixed a real prerequisite
+gap the plan didn't even mention: the server only ever registered `.GET`
+routes — no POST request could reach `handle` at all before this. Added
+`.POST` routes mirroring the existing `.GET` ones; `handle` now reads/parses
+the body asynchronously (`readPostBody`, using `HTTPRequest.readContent()`)
+before the still-synchronous `LassoRenderer` runs, keeping async I/O
+entirely at the boundary as the plan specified. New `LassoRequestPair`
+ordered/duplicate-preserving pair model; `ServerRequestProvider` now builds
+real `queryPairs`/`postPairs` (POST-then-GET combined for `parameter(named:)`/
+`param(name)`, kept separate for `queryParam`/`postParam`).
+`postParam`/`postParams`/`postString`/`param(name, joiner)`/`params()` are
+real now, plus the Lasso 8 `client_*`/`form_param` aliases. Fixed a real
+pre-existing bug as a byproduct: GET query parsing used `URLComponents`,
+which doesn't treat `+` as space in query strings — switched to
+`QueryDecoder` for GET too, which does. Live-verified end to end against a
+real POST request: `+`-decoding, POST-before-GET combined ordering,
+GET-only `queryParam` staying uncontaminated by POST data even when both
+are present, and duplicate-name joining via `param(name, ',')`/
+`param(name, void)` all confirmed correct over real HTTP. Corpus sweep
+unchanged at 13/17 (no regression). 56/56 tests pass. Multipart/file
+uploads deferred to `session-upload-support-plan.md`'s upload milestone.
+
 ## Next Compatibility Work
 
-1. Implement POST body reading — `web_request->postParam`/`postParams`/
-   `postString` are wired but return empty since this interpreter has
-   never parsed POST bodies; needs async content-reading threaded into
-   `ServerRequestProvider.init` (currently synchronous) via Perfect-NIO's
-   `HTTPRequest.readContent()`.
+1. Implement multipart/form-data and file uploads — `application/x-www-
+   form-urlencoded` POST bodies are real now (see above), but
+   `multipart/form-data` still returns empty; needs Perfect-NIO's
+   `MimeReader` wired in carefully (its `BodySpec` deletes temp upload
+   files on `deinit`, so the reader/temp-file handles must be retained
+   through render). See `Documentation/session-upload-support-plan.md`
+   Milestone 1.
 2. Evaluate whether legacy `define_tag('name', -flags) ... /define_tag`
    (parenthesized-call style, blocks `_begin_tags.inc`'s `send_email2` and
    all of `getGeoIPInfo.inc`) and legacy `define_type:`/`define_tag:`

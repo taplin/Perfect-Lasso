@@ -1,0 +1,313 @@
+[TotW] Query Expressions
+
+[em]The Lasso 9 tip of the week for May 30, 2008 discusses how query expressions provide SQL-like capabilities within Lasso and a powerful alternative to traditional iterates and loops.[/em]
+
+
+[1]Introduction
+
+Query expressions allow data in arrays and other compound data types to be easily iterated, filtered, and manipulated using a natural syntax which is reminiscent of SQL.
+
+In the following code the query expression is written as WITH (temporary variable name) IN (compound data type) DO (codeblock). The temporary variable is set to each element of the compound data type in turn and the codeblock is run.
+
+[pre]
+   local(myArray) = array(1, 2.0, 'three');
+   WITH myElement IN #myArray DO log_always(#myElement)
+[/pre]
+
+Within this tip the query expression terms will be written in uppercase to distinguish them from other reserved words. However, there is no need to write the terms in uppercase. Lowercase works just as well.
+
+[pre]
+   with myElement in #myArray do log_always(#myElement)
+[/pre]
+
+We can see how the query expression resembles a SQL expression that we might pass to MySQL or SQLite except the data source is a local array rather than a database table. Just like in SQL we can add a WHERE clause to our expression in order to filter the results.
+
+The following expression will only log elements from the array which are of type integer. The expression has been reformatted for easier readability.
+
+[pre]
+   WITH myElement IN #myArray
+   WHERE #myElement->IsA(::integer)
+   DO log_always(#myElement)
+[/pre]
+
+There are many other clauses which are possible within the query expression. Each will be discussed below.
+
+
+[1]Anatomy of a Query Expression
+
+Every query expression consists of three parts.
+
+[*] The WITH clause specifies the source of data for the expression and is required for every query expression.
+
+[*] Optional operators allow the data to be filtered, a number of elements to be skipped, data to be sorted, and more. Operators include WHERE, LET, SKIP, TAKE, and ORDER BY.
+
+[*] An action tells Lasso what to do with the elements selected by the expression. Actions include DO, SELECT, SUM, AVERAGE, MIN, MAX
+
+We will discuss the WITH clause briefly followed by the actions and then the operators that are available.
+
+
+[1]WITH Clause
+
+The WITH clause always takes the form shown below. The specified variable name is created as a local in the current scope. The compound type is usually an array, but can be any type which has the trait Trait_Queriable including arrays, captures, files, lists, pairs, inlines, SQLite queries, and others.
+
+[pre]
+   WITH (variable name) IN (array) ACTION
+[/pre]
+
+Lasso can generate a series of numbers using the following syntax. This code will log the numbers from 1 to 100 to the console. Notice that since this isn't a loop the [Loop_Count] can't be used. Instead, the generated number is available in the local variable specified after the WITH keyword.
+
+[pre]
+   WITH n in 1 to 100 DO { log_always(#n) }
+[/pre]
+
+We can add BY to skip through the numbers a fixed amount. This code will log only odd numbers to the console.
+
+[pre]
+   WITH n in 1 to 100 BY 2 DO { log_always(#n) }
+[/pre]
+
+With a SELECT action this code can be used to generate a series of numbers for other purposes. This code will log even numbers to the console. The WITH expression is lazy so the numbers for #numberSource are not actually generated until they are used within the following WITH expression.
+
+[pre]
+   local(numberSource) = (WITH n IN 0 TO 100 SELECT #n)
+
+   WITH myNumber in #numberSource
+   WHERE #myNumber % 2 == 0
+   DO { log_always(#myNumber) };
+[/pre]
+
+
+[1]Actions
+
+The action which is specified in the query expression determines the result of the expression. The DO action is processed immediately. The other actions are "lazy", the result of the action are only returned when they are required.
+
+The following actions are available.
+
+
+[*] DO - Performs a codeblock for each element in the source. The result of this expression is normally Null unless an auto-collect codeblock is used. The DO action is processed immediately. The following expression logs each element to the console and returns no output.
+
+[pre]
+   local(myArray) = array(1, 2, 3, 4, 5, 6, 7);
+   WITH myElement IN #myArray
+   DO {
+       log_always(#myElement)
+   }
+[/pre]
+
+The following expression returns "1234567" since it uses an auto-collect codeblock.
+
+[pre]
+   local(myArray) = array(1, 2, 3, 4, 5, 6, 7);
+   WITH myElement IN #myArray
+   DO {^ #myElement ^}
+[/pre]
+
+The following expression uses an implicit codeblock. The braces can be omitted if only a single statement is being performed. This expression logs each element to the console and returns no output.
+
+[pre]
+   local(myArray) = array(1, 2, 3, 4, 5, 6, 7);
+   WITH myElement IN #myArray
+   DO log_always(#myElement)
+[/pre]
+
+
+[*] SELECT - Returns a Queriable_Select object that contains each of the select objects. The SELECT action can be used to output the values which were selected, to pass the selected values into another tag like Iterate, or to pass the selected values on to another query expression. The SELECT action is "lazy" and only returns a result when it is required.
+
+The following expression simply outputs a string "1, 2, 3, 4, 5, 6, 7". The result of the query expression is a Queriable_Select object which is then automatically cast to string.
+
+[pre]
+   local(myArray) = array(1, 2, 3, 4, 5, 6, 7);
+   WITH myElement IN #myArray
+   SELECT #myElement
+[/pre]
+
+If we want to manipulate the array then we can SELECT a statement rather than the simple variable. The following expression outputs a string "1, 4, 9, 16, 25, 36, 49" with the squares of each of the elements from the array.
+
+[pre]
+   local(myArray) = array(1, 2, 3, 4, 5, 6, 7);
+   WITH myElement IN #myArray
+   SELECT #myElement * #myElement
+[/pre]
+
+We can store this result in a variable by placing the entire query expression in parentheses. The following expression stores the Queriable_Select object in a variable named #mySquares.
+
+[pre]
+   local(myArray) = array(1, 2, 3, 4, 5, 6, 7);
+   local(mySquares) = (WITH myElement IN #myArray
+           SELECT #myElement * #myElement);
+   #mySquares;
+[/pre]
+
+We can pass the selected results to another tag for further processing. The following expression uses Iterate tags to cycle through each of the selected values. In this case the squared values will be returned each on a line by themselves.
+
+[pre]
+   local(myArray) = array(1, 2, 3, 4, 5, 6, 7);
+   iterate(WITH myElement IN #myArray SELECT myElement * #myElement);
+       loop_value; '<br />';
+   /iterate;
+[/pre]
+
+We can pass the selected results into another query expression. The inner expression in the code below creates a pair from each element. These pairs are used as the data source for the outer query expression which then multiplies the two parts of each pair together.
+
+[pre]
+   local(myArray) = array(1, 2, 3, 4, 5, 6, 7);
+   WITH myPair IN
+       (WITH myElement IN #myArray
+       SELECT pair(#myElement = #myElement))
+   SELECT #myPair->First * #myPair->Second;
+[/pre]
+
+
+[*] SUM - The SUM action adds each of the selected elements together. The result of the following expression is 28.
+
+[pre]
+   local(myArray) = array(1, 2, 3, 4, 5, 6, 7);
+   WITH myElement IN #myArray
+   SUM #myElement;
+[/pre]
+
+SUM can be applied to string results as well. The result of the following expression is the string "SunMonTueWedThuFriSat"
+
+[pre]
+   local(daysOfweek) = array('Sun', 'Mon', 'Tue', 'Wed', 'Thu', 'Fri', 'Sat');
+   WITH myElement IN #daysOfweek
+   SUM #myElement;
+[/pre]
+
+
+[*] AVERAGE - The AVERAGE action returns the average of a series of selected numeric values. The result of the following expression is 4.
+
+[pre]
+   local(myArray) = array(1, 2, 3, 4, 5, 6, 7);
+   WITH myElement IN #myArray
+   AVERAGE #myElement;
+[/pre]
+
+
+[*] MIN - The MIN action returns the minimum from a series of selected numeric values. The result of the following expression is 1. The MIN action can also be used with strings.
+
+[pre]
+   local(myArray) = array(1, 2, 3, 4, 5, 6, 7);
+   WITH myElement IN #myArray
+   MIN #myElement;
+[/pre]
+
+
+[*] MAX - The MAX action returns the maximum from a series of selected numeric values. The result of the following expression is 7. The MAX action can also be used with strings.
+
+[pre]
+   local(myArray) = array(1, 2, 3, 4, 5, 6, 7);
+   WITH myElement IN #myArray
+   MAX #myElement;
+[/pre]
+
+
+[1]Operators
+
+Much of the power of query expressions come from the operators that are available. Lasso already contains several constructs for cycling through the values in a compound data type. Query expressions allow much of the power of SQL statements to be applied to Lasso's native data types.
+
+Additional operators including GROUP BY and JOIN will be added in a future build.
+
+
+[*] WHERE - This operator filters the values from the source using the specified expression. It is analogous to using a conditional within iterate tags.
+
+Above we calculated the SUM of an array of integers from 1 to 7 and found the result was 26. The following expression finds the SUM of just the even elements from the array by checking that each value modulo 2 is equal to 0. The result is 12.
+
+[pre]
+   local(myArray) = array(1, 2, 3, 4, 5, 6, 7);
+   WITH myElement IN #myArray
+   WHERE #myElement % 2 == 0
+   SUM #myElement;
+[/pre]
+
+The expression after WHERE can contain additional clauses. The following expressions finds the SUM of even elements greater than 2, returning 6.
+
+[pre]
+   local(myArray) = array(1, 2, 3, 4, 5, 6, 7);
+   WITH myElement IN #myArray
+   WHERE #myElement % 2 == 0 && #myElement > 4
+   SUM #myElement;
+[/pre]
+
+It is also valid to have multiple WHERE clauses.
+
+[pre]
+   local(myArray) = array(1, 2, 3, 4, 5, 6, 7);
+   WITH myElement IN #myArray
+   WHERE #myElement % 2 == 0
+   WHERE #myElement > 4
+   SUM #myElement;
+[/pre]
+
+Rather than specifing a simple expression the WHERE clause can also accept a codeblock. The codeblock must return either True or False.
+
+[pre]
+   local(myArray) = array(1, 2, 3, 4, 5, 6, 7);
+   WITH myElement IN #myArray
+   WHERE {
+       return #myElement % 2 == 0 && #myElement > 4
+   }
+   SUM #myElement;
+[/pre]
+
+
+[*] LET - Allows additional local variables to be defined. These can be useful to simplify other expressions within the query. In the following code the local variable mySquare is defined as the square of the current element. The SUM action then works on #mySquare rather than #myElement. The result of this expression is 140.
+
+[pre]
+   local(myArray) = array(1, 2, 3, 4, 5, 6, 7);
+   WITH myElement IN #myArray
+   LET mySquare = #myElement * #myElement
+   SUM #mySquare;
+[/pre]
+
+
+[*] SKIP - Works much like -SkipRecords in Lasso. The default is to SKIP 0 elements and start with the first element. SKIP 1 skips the first element so processing starts with the second element. In the following code the first three elements are skipped. The SUM of the fourth through seventh elements is calcuated returning 22.
+
+[pre]
+   local(myArray) = array(1, 2, 3, 4, 5, 6, 7);
+   WITH myElement IN #myArray
+   SKIP 3
+   SUM #myElement;
+[/pre]
+
+
+[*] TAKE - Limits the number of elements that will be processed. The default is to TAKE all the elements. TAKE is normally used with SKIP to define a window within the source data. In the following code the first three elements are skipped and then only the next two elements are taken. The result is 9, the sum of elements 4 and 5.
+
+[pre]
+   local(myArray) = array(1, 2, 3, 4, 5, 6, 7);
+   WITH myElement IN #myArray
+   SKIP 3
+   TAKE 2
+   SUM #myElement;
+[/pre]
+
+Note that specifying the SKIP and TAKE operators in the opposite order produces very different results since each of the operators is applied in turn. We normally want to SKIP forward through the entire source, then LIMIT to the desired number of elements.
+
+
+[*] ORDER BY - Orders the elements based on the given criteria. The following code orders the elements numerically and returns them in order "1, 2, 3, 4, 5, 6, 7".
+
+[pre]
+   local(myArray) = array(1, 7, 3, 6, 5, 4, 2);
+   WITH myElement IN #myArray
+   ORDER BY #myElement
+   SELECT #myElement;
+[/pre]
+
+An optional DESCENDING keyword reverse the order. This code returns "7, 6, 5, 4, 3, 2, 1".
+
+[pre]
+   local(myArray) = array(1, 7, 3, 6, 5, 4, 2);
+   WITH myElement IN #myArray
+   ORDER BY #myElement DESCENDING
+   SELECT #myElement;
+[/pre]
+
+
+-- 
+Fletcher Sandbeck                         fletcher@lassosoft.com
+LassoSoft, LLC                          http://www.lassosoft.com
+
+
+-- 
+All information about Trifecta is covered by an NDA.
+Please write to <beta@lassosoft.com> to unsubscribe or if you have any questions.

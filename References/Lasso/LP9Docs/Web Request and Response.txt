@@ -1,0 +1,230 @@
+Lasso 9 includes a more uniform method for getting HTTP data from the web server and sending response data back. The method is driven by two types: web_request and web_response. These types are available exclusively during a web request and all new Lasso 9 solutions should utilize this method over older methods.
+
+What follows is a description of the two new types along with their members.
+
+web_request
+	This type provides the interface between the web server and the script attempting to fulfill the HTTP request. It provides access to the data given by the web server.
+
+	This type is available within a web script by calling 'web_request'.
+	Example:
+	
+		'The host is: ' + web_request->httpHost
+	
+	web_request has the following members. Descriptions have been omitted for some functions which describe standard web server values.
+	
+	contentLength() :: integer
+	contentType() :: string
+	cookies() :: trait_forEach
+		Returns the cookies sent by the client given as a sequence of name/value pairs.
+	documentRoot() :: string
+		Returns the current web server root directory.
+	fileUploads() :: trait_forEach
+		Returns a sequence of maps describing each uploaded file. Map keys will include: contenttype, fieldname, filename, tmpfilename, filesize.
+	gatewayInterface() :: string
+	headers() :: trait_forEach
+		Returns a sequence of all header values with each value given as a name/value pair.
+	header(name::string)
+		Returns the requested header if found, or VOID if not found.
+	httpAcceptEncoding() :: string
+	httpAcceptLanguage() :: string
+	httpAccept() :: string
+	httpAuthorization() :: trait_keyedForEach
+		Returns a map containing any authorization data sent by the browser. Map keys will include: type, username, password and others depending on the authorization type.
+		If no authorization data was sent, the type value will be 'None'.
+	httpCacheControl() :: string
+	httpConnection() :: string
+	httpCookie() :: string
+		Returns the raw unparsed cookie string.
+	httpHost() :: string
+	httpReferer() :: string
+	httpReferrer() :: string
+	httpUserAgent() :: string
+	pathInfo() :: string
+	pathTranslated() :: string
+	path() :: string
+	postParams() :: trait_forEach
+		Returns a sequence of name/value pairs.
+	postParam(name::string)
+		Returns the requested POST parameter, or VOID.
+	postString() :: string
+		Returns the raw unparsed POST data as a string.
+	queryParams() :: trait_forEach
+		Returns a sequence of name/value pairs.
+	queryParam(name::string)
+		Returns the requested query parameter, or VOID.
+	queryString() :: string
+		Returns the raw unparsed query data as a string.
+	raw() :: trait_keyedForEach
+		Returns a mapping of the raw unprocessed variables sent by the web server.
+	remoteAddr() :: string
+	remotePort() :: string
+	requestMethod() :: string
+	requestUri() :: string
+	scriptFilename() :: string
+	scriptName() :: string
+	serverAddr() :: string
+	serverAdmin() :: string
+	serverName() :: string
+	serverPort() :: string
+	serverProtocol() :: string
+	serverSignature() :: string
+	serverSoftware() :: string
+
+web_response
+	This type manages the response data for the request. It manages atEnds, includes, headers and the resulting body data. It sends the resulting data to the web server when the request completes.
+	
+	This type is available within a web script by calling 'web_response'.
+	Example:
+	
+		'The cookies are: ' + web_response->cookies
+	
+	web_response has the following members:
+	
+	addAtEnd(val)
+		Adds an object that will be invoked after the data for the response has been acquired, but before it is sent to the client.
+	setCookie(nv::pair, domain = VOID, expires = void,
+				path = void, secure = void)
+		Sets a response cookie.
+	addHeader(header::pair)
+		Adds a response header.
+	cookies() :: trait_forEach
+		Returns a sequence of maps describing the cookie. Each map contains the following required of optional keys: name, value, path, domain, secure.
+	document() :: document_base
+		This member returns the current response document for this request. The document can also be set through this member.
+		Eg. web_response->document = XX
+		The usage of a content document and web_response->rawContent are mutually exclusive. If a content document is set, rawContent will be ignored.
+	headers() :: trait_forEach
+		Returns all response header names and values as a sequence of pairs.
+	header(name::string)
+		Returns the value for the requested header, or VOID
+	includeBytes(path::string) :: bytes
+		Returns the raw data bytes for the file. The path is restricted to the root as defined by web_request->documentRoot, unless converted to a full path.
+	includeLibraryOnce(path::string)
+		Executes the file as a script. Returns no value. The script file will only be executed once per request. The path is restricted to the root as defined by web_request->documentRoot, unless converted to a full path.
+	includeLibrary(path::string)
+		Executes the file as a script. Returns no value. The path is restricted to the root as defined by web_request->documentRoot, unless converted to a full path.
+	includeOnce(path::string)
+		Executes the file as a script and returns its value. The script file will only be executed once per request. The path is restricted to the root as defined by web_request->documentRoot, unless converted to a full path.
+	include(path::string)
+		Executes the file as a script and returns its value. The path is restricted to the root as defined by web_request->documentRoot, unless converted to a full path.
+	includes() :: trait_forEach
+		Returns a sequence of the file names included for the request.
+	outputEncoding() :: string
+		The encoding that will be used when the rawContent is converted to bytes for transmission. This value can be set as well.
+		Eg. web_response->outputEncoding = encoding_iso88591
+		This value is ignored if a content document is set.
+	rawContent()
+		The raw response data. Analogous to and compatible with $__HTML_REPLY__, used in earlier Lasso versions. Can be set and appended to.
+		Eg. web_response->rawContent = 'Hi, the response.'
+		Eg. web_response->rawContent += 'And, more data'
+	replaceHeader(header::pair)
+		Removes all instances of the indicated header and adds the new value.
+
+Here is an example document that can be run to show the individual members and values of web_request and web_response. I have put this file in the a8 download folder in case it is wrapped badly.
+
+<html>
+<head><title>Test Lasso 9 web_request/web_response</title></head>
+<body>
+<?lasso
+	local(
+		req = web_request, // save these for easy access
+		sponse = web_response,
+		reqMems = (: // list the available members here
+					// along with any parameters we want
+					//
+					// we will output the results dynamically
+					// this list is for web_request
+			(:'contentLength', (:)),
+			(:'contentType', (:)),
+			(:'cookies', (:)),
+			(:'documentRoot', (:)),
+			(:'fileUploads', (:)),
+			(:'gatewayInterface', (:)),
+			(:'headers', (:)),
+			(:'header', (:'Accept')),
+			(:'httpAcceptEncoding', (:)),
+			(:'httpAcceptLanguage', (:)),
+			(:'httpAccept', (:)),
+			(:'httpAuthorization', (:)),
+			(:'httpCacheControl', (:)),
+			(:'httpConnection', (:)),
+			(:'httpCookie', (:)),
+			(:'httpHost', (:)),
+			(:'httpReferer', (:)),
+			(:'httpReferrer', (:)),
+			(:'httpUserAgent', (:)),
+			(:'pathInfo', (:)),
+			(:'pathTranslated', (:)),
+			(:'path', (:)),
+			(:'postParams', (:)),
+			(:'postParam', (:'bar')),
+			(:'postString', (:)),
+			(:'queryParams', (:)),
+			(:'queryParam', (:'foo')),
+			(:'queryString', (:)),
+			(:'raw', (:)),
+			(:'remoteAddr', (:)),
+			(:'remotePort', (:)),
+			(:'requestMethod', (:)),
+			(:'requestUri', (:)),
+			(:'scriptFilename', (:)),
+			(:'scriptName', (:)),
+			(:'serverAddr', (:)),
+			(:'serverAdmin', (:)),
+			(:'serverName', (:)),
+			(:'serverPort', (:)),
+			(:'serverProtocol', (:)),
+			(:'serverSignature', (:)),
+			(:'serverSoftware', (:))
+		),
+		sponseMems = (: // this list is for web_response
+			(:'addAtEnd', (:{
+					#sponse->rawContent += '<!-- Hi from atEnd -->'
+				})),
+			(:'setCookie', (:'C00KYNAM3'='C00KIEVAL', -path='/')),
+			(:'addHeader', (:'X-FooBar'='headerval')),
+			(:'cookies', (:)),
+			(:'document', (:)),
+			(:'headers', (:)),
+			(:'header', (:'X-FooBar')),
+			(:'includeBytes', (:)),
+			(:'includeLibraryOnce', (:)),
+			(:'includeLibrary', (:)),
+			(:'includeOnce', (:)),
+			(:'includes', (:)),
+			(:'include', (:)),
+			(:'outputEncoding', (:)),
+			(:'rawContent', (:)),
+			(:'replaceHeader', (:))
+		)
+	)
+	// make a table for web_request showing names and values for its members
+	'<table border="1">'
+	'<tr><th colspan="2">web_request</th></tr>'
+	'<tr><th>Name</th><th>Result</th></tr>'
+	with mem in #reqMems // loop through the lists made earlier
+	let name = tag(#mem->first)
+	let params = #mem->second
+	do {^
+		// lookup the current name and execute it, passing any parameters we might have specified earlier
+		'<tr><td>' + #name + '</td><td>' + (#req->\#name)->invoke(:#params)->asString->encodeHtml + '</td></tr>'
+	^}
+	'</table>'
+	
+	// now do the same for web_respose
+	'<table border="1">
+	<tr><th colspan="2">web_response</th></tr>
+	<tr><th>Name</th><th>Result</th></tr>'
+	with mem in #sponseMems
+	let name = tag(#mem->first)
+	let params = #mem->second
+	do {^
+		'<tr><td>' + #name + '</td><td>' + (#sponse->\#name)->invoke(:#params)->asString->encodeHtml + '</td></tr>'
+	^}
+	'</table>
+	<form method="POST" action="" enctype="multipart/form-data">
+		<input type="file" name="FILE1" /><br /><input type="submit" name="SUBMIT" value="SUBMIT" />
+	</form>'
+?>
+</body>
+</html>

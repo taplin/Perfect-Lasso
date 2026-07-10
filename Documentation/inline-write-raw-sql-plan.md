@@ -1,0 +1,296 @@
+# Inline Write And Raw SQL Plan
+
+Last reviewed: July 10, 2026
+
+## Goal
+
+Complete the `inline` execution model beyond structured reads:
+
+- raw SQL execution through explicitly enabled datasource capabilities;
+- `-Add`, `-Update`, and `-Delete` actions;
+- generated/action statement reporting;
+- affected-row and returned-record metadata;
+- safe mapping to PerfectCRUD and connector-native Swift APIs without adding
+  application-specific methods.
+
+This plan extends the existing dynamic read work in
+`Documentation/perfectcrud-dynamic-query-contract.md`.
+
+## Sources Reviewed
+
+- `References/Lasso/Lasso 8.5 Language Guide.pdf`
+- `References/Lasso/LP9Docs`
+- `Documentation/perfectcrud-dynamic-query-contract.md`
+- `Sources/LassoParser/Providers.swift`
+- `Sources/LassoPerfectCRUD/PerfectCRUDLassoExecutor.swift`
+- `/Users/timtaplin/Perfect-Resurrection/Perfect-CRUD/Sources/PerfectCRUD`
+- `/Users/timtaplin/Perfect-Resurrection/Perfect-MySQL/Sources/PerfectMySQL`
+
+Relevant Lasso 8.5 pages:
+
+- 90-92: inline overview, `-StatementOnly`, `Action_Statement`, action list.
+- 94-95: `Action_Params` inserts submitted form/URL parameters into an inline.
+- 141-145: `-Add`, required parameters, returned inserted record behavior.
+- 146-149: `-Update`, `-KeyField`/`-KeyValue`, `-Key`, returned record behavior.
+- 150-152: `-Delete`, required parameters, empty found set behavior.
+- 154-162: SQL datasource behavior, SQL-specific search operators and options.
+
+## Current State
+
+Already present in the adapter:
+
+- `LassoInlineAction` includes `.add`, `.update`, `.delete`, `.prepare`,
+  `.nothing`, and `.rawSQL`.
+- `LassoInlineRequest` already captures:
+  - datasource/database alias;
+  - table;
+  - raw `-sql`;
+  - return fields;
+  - sort fields/orders;
+  - max/skip records;
+  - key field/value;
+  - criteria;
+  - raw evaluated arguments.
+- `LassoInlineFrame` already carries:
+  - rows;
+  - found count;
+  - affected rows;
+  - action statement.
+- `PerfectCRUDLassoExecutor` supports structured read actions:
+  - `-Search`
+  - `-Find`
+  - `-FindAll`
+- PerfectCRUD already has dynamic read structures and `DynamicResult`.
+
+Missing:
+
+- raw SQL action execution;
+- dynamic insert/update/delete APIs in PerfectCRUD;
+- write support in `PerfectCRUDLassoExecutor`;
+- `-StatementOnly` capture in `LassoInlineRequest`;
+- field assignment separation from search criteria for write actions;
+- `-Key` array support;
+- insert-id/key-field returned row behavior;
+- explicit raw SQL capability gating;
+- transactional policy for multi-statement/batch raw SQL.
+
+## Lasso Behavior Targets
+
+### Shared Inline Behavior
+
+- Each `inline` represents a database action.
+- Nested inlines are legal and should restore the outer frame when the inner
+  inline exits.
+- `Action_Statement` should expose the generated SQL or connector statement.
+- `-StatementOnly` should generate the statement and metadata but not execute
+  the action.
+- `-Log` can be parsed and stored, but actual log-level routing can be deferred.
+- Page-supplied `-Username`/`-Password` should remain syntactically accepted but
+  should not directly open arbitrary connections. Datasources must resolve
+  through host configuration.
+
+### `-Add`
+
+- Required: `-Database`, `-Table`.
+- Recommended: `-KeyField`.
+- Field name/value arguments become inserted column values.
+- If a key field is present and the connector can determine the new key value,
+  return the inserted record when practical.
+- If no key field is present or `-MaxRecords=0`, return no rows but set error
+  and affected-row metadata.
+
+### `-Update`
+
+- Required: `-Database`, `-Table`.
+- Required targeting:
+  - `-KeyField` plus `-KeyValue`, or
+  - `-Key` array search.
+- Field name/value arguments become updated column values.
+- When possible, return the updated record or records.
+- If `-MaxRecords=0`, skip returning rows.
+- Multi-record updates are valid but dangerous; capability policy should allow
+  host code to require explicit enablement.
+
+### `-Delete`
+
+- Required: `-Database`, `-Table`.
+- Required targeting:
+  - `-KeyField` plus `-KeyValue`, or
+  - `-Key` array search.
+- Returns an empty found set.
+- Sets affected-row metadata.
+- Must be explicitly capability-gated in demos/tests.
+
+### `-SQL`
+
+- Runs raw SQL against SQL-capable datasources.
+- May return rows for `SELECT`.
+- May return no rows and affected-row metadata for writes.
+- Lasso 8.5 says a single inline can perform batch operations when using SQL.
+  For first pass, prefer single statement or connector-supported prepared
+  execution; batch/multi-statement execution should be opt-in.
+- `-SQL` should be disabled by default unless the datasource alias explicitly
+  allows it.
+
+### `-Prepare` / `-Exec`
+
+Defer until raw SQL and normal writes are stable. Document parser/runtime shape
+now, but do not implement first unless corpus evidence requires it.
+
+## Recommended PerfectCRUD Extensions
+
+Keep typed CRUD intact and add dynamic siblings.
+
+Suggested structures:
+
+```swift
+public struct DynamicMutation: Sendable, Equatable {
+    public enum Action: Sendable, Equatable {
+        case insert
+        case update
+        case delete
+    }
+
+    public var action: Action
+    public var table: String
+    public var values: [String: DynamicValue]
+    public var predicates: [DynamicPredicate]
+    public var returningFields: [String]
+    public var limit: Int?
+}
+
+public struct DynamicSQL: Sendable, Equatable {
+    public var sql: String
+    public var bindings: [DynamicValue]
+    public var allowsMultipleStatements: Bool
+}
+```
+
+Extend `DynamicDatabaseProtocol`:
+
+```swift
+func mutate(_ mutation: DynamicMutation) throws -> DynamicResult
+func execute(_ sql: DynamicSQL) throws -> DynamicResult
+func explain(_ request: DynamicInlineStatementRequest) throws -> DynamicResult
+```
+
+Implementation expectations:
+
+- quote dynamic identifiers through existing connector delegates;
+- bind dynamic values;
+- expose generated SQL in `DynamicResult.statement`;
+- expose affected rows;
+- for inserts, expose insert id when connector supports it;
+- reuse existing transaction helpers for multi-step insert/update returning
+  behavior.
+
+## Adapter Mapping
+
+Add to `LassoInlineRequest`:
+
+- `statementOnly: Bool`
+- `logLevel: String?`
+- `inlineName: String?`
+- `host: LassoValue?`
+- `key: LassoValue?`
+- `fieldAssignments: [LassoInlineAssignment]`
+- `writeCriteria: [LassoInlineCriterion]`
+
+Why split assignments from criteria:
+
+- In search actions, unlabeled/name-value field arguments are criteria.
+- In add/update actions, those same shapes are values to write.
+- In update/delete actions, the target records come from `-KeyField`/`-KeyValue`
+  or `-Key`, not from the values being assigned.
+
+Recommended first-pass mapping:
+
+- For `-Add`, all non-reserved name/value arguments become assignments.
+- For `-Update`, non-reserved name/value arguments become assignments; target
+  predicate comes from `-KeyField`/`-KeyValue`.
+- For `-Delete`, target predicate comes from `-KeyField`/`-KeyValue`; ignore
+  assignments.
+- Defer `-Key` array parsing until pair/staticarray support is stronger, unless
+  corpus fixtures require it immediately.
+
+## Capability Policy
+
+Datasource aliases should carry capabilities:
+
+```swift
+struct LassoDatasourceCapabilities {
+    var allowsSelect: Bool
+    var allowsInsert: Bool
+    var allowsUpdate: Bool
+    var allowsDelete: Bool
+    var allowsRawSQL: Bool
+    var allowsMultipleStatements: Bool
+    var allowedTables: Set<String>?
+    var maxRows: Int?
+}
+```
+
+Default recommendation:
+
+- reads enabled for configured aliases;
+- insert/update/delete disabled until explicitly enabled;
+- raw SQL disabled until explicitly enabled;
+- multiple statements disabled unless explicitly enabled;
+- table allowlist optional but recommended for demos.
+
+This keeps the adapter useful for legacy apps without letting arbitrary pages
+become uncontrolled database consoles.
+
+## Test Plan
+
+Unit tests:
+
+1. `LassoInlineRequest` maps `-Add` assignments separately from criteria.
+2. `-Update` maps `-KeyField`/`-KeyValue` to target predicate and field args to
+   assignments.
+3. `-Delete` maps target predicate and ignores write assignments.
+4. `-SQL` maps to `.rawSQL` and preserves SQL string.
+5. `-StatementOnly` returns a frame with statement and no mutation.
+6. Raw SQL is rejected unless capability allows it.
+7. Delete/update are rejected unless capability allows them.
+
+PerfectCRUD tests:
+
+1. Dynamic insert against generic catalog fixture.
+2. Dynamic update by primary key against fixture.
+3. Dynamic delete by primary key against fixture.
+4. Raw `SELECT` returns dynamic rows.
+5. Raw `UPDATE` returns affected rows.
+6. Statement-only produces SQL without changing fixture data.
+
+Renderer tests:
+
+1. `[Affected_Count]` reflects write result.
+2. `[Action_Statement]` reflects generated SQL inside the inline.
+3. Nested write inline restores the outer read frame after exit.
+4. `-Add` can expose inserted row fields when key-field return is enabled.
+
+## Implementation Milestones
+
+1. Extend `LassoInlineRequest` to represent statement-only, assignments, and
+   write targets.
+2. Add dynamic mutation and raw SQL contracts to PerfectCRUD.
+3. Implement connector support in Perfect-MySQL using prepared statements and
+   existing row conversion.
+4. Extend `PerfectCRUDLassoExecutor` for `-Add`, `-Update`, `-Delete`, and
+   gated `-SQL`.
+5. Add generic catalog/cart mutation fixtures.
+6. Add renderer tests for affected count/action statement/returned rows.
+7. Revisit `-Key` arrays and `-Prepare`/`-Exec`.
+
+## Open Decisions
+
+- Whether `-Add` should perform a follow-up `SELECT` by insert id by default or
+  only when return fields/body access require it.
+- Whether raw SQL should accept bindings from Lasso arguments or remain raw
+  string only at first.
+- Whether multi-statement raw SQL should be completely rejected at adapter level
+  or passed through only when the connector explicitly supports it.
+- How much legacy `-Host` behavior to emulate. Recommendation: accept and
+  ignore by default, with diagnostics, because server-managed datasource aliases
+  are safer and fit Perfect better.

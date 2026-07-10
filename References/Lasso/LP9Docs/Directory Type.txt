@@ -1,0 +1,41 @@
+Here is a brief rundown of the new Lasso 9 directory type: dir. It currently does not provide a method for deleting directories, but is otherwise complete.
+--
+
+Lasso 9 includes a new type for representing file system directories. This type is called 'dir'. Dir is intended to provide comprehensive support for operations on directories including the creation of directories and the enumeration of directory contents as either paths or file/dir objects. Optionally, contents can be enumerated recursively.
+
+Dir is created given a path:
+
+dir(path::string)
+	Create a new dir type with the path. The directory at the indicated path is not required to already exist. This path is used for all operations on the object.
+
+Dir supports the following members:	
+
+create()
+	Creates the directory if it does not exist. Will also create any non-existent directories within the dir's path.
+eachPath()
+	This member permits iteration over the contents of the directory. Each content element is presented as a path string to that element.
+	Eg. with path in dir('/Volumes/')->eachPath select #path
+	Gives: /Volumes/Leopard, /Volumes/Install/, /Volumes/Tiger/
+eachPathRecursive()
+	Permits recursive iteration over the contents of the directory. Each content element is presented as a path string to that element.
+	Eg. with path in
+			dir('/Library/Application Support/Lasso 9/')->eachPathRecursive
+		select #path
+eachDir()
+	Permits iteration over each directory contained by the directory. Each content element is a dir object.
+	Eg. with path in dir('/Library/Application Support/Lasso 9/')->eachDir
+		select #path
+eachDirPath()
+	Permits iteration over each contained directory, as a path string.
+eachDirPathRecursive()
+	Permits recursive iteration over each contained directory, as a path string.
+eachFile()
+	Permits iteration over each file contained by the directory. Each content element is presented as a file object.
+eachFilePath()
+	Permits iteration over each contained file, as a path string.
+eachFilePathRecursive()
+	Permits recursive iteration over each file, as a path string.
+each()
+	Permits iteration over each item contained by the directory. Each content element is presented as a file or dir object, depending on the actual element type.
+exists()::boolean
+	Returns true if the dir currently exists.

@@ -1,0 +1,43 @@
+We are pleased to make available a test release of the Lasso 9 language. This release is installable on OS X 10.4 and higher. The goal of this release is to enable Trifecta list subscribers to get their hands on Lasso 9 at an early stage in order to test and experiment with new features as they are made available.
+
+Here are things you can do with this release:
+	Test examples given in specs and on the list.
+	Study the lasso code present in the framework (/Library/Frameworks/Lasso9.framework/Resources/ or choose "Open _init File" in LassoSphere).
+	Experiment, play. Maybe you'd like to contribute a type or maybe you find a bug in an existing type.
+	Report obvious bugs or confusing elements.
+
+Here are things you should not do with this release:
+	Expect it to serve web pages.
+	Expect it to run/parse/compile scripts that you've written in another version of the language.
+	Expect to use colon syntax.
+	Expect all the current Lasso Professional tags and types to exist.
+
+Important things to note:
+	All scripts start off inside script delimiters.
+		This means that you should not start pages with <?Lasso or [. If you do it will be a syntax error.
+	LassoSphere is not the greatest application ever.
+		LassoSphere was created to enable scripts to be parsed compiled executed and debugged. It is not a "product". It is quick and dirty by design. The debugger has some bugs and can sometimes be confusing. That said, it has been invaluable in getting Lasso 9 to the point it is now.
+	Locals and vars must be defined using an unquoted name (aka a tag). local(x)
+	
+This release is comprised of the following components:
+	Lasso9.framework
+		- The Lasso 9 VM. /Library/Frameworks/
+	LassoSphere
+		- A test application containing a script editor, parser, compiler and runtime debugger for Lasso 9.	/Applications
+	LassoCLI
+		- The "lasso" command line utility. /usr/local/bin/
+	Lasso 9 Support Libraries
+		- ICU, libevent, libgc. /usr/local/lib /usr/local/share
+
+Hostname: http://download.lassosoft.com/beta/
+Filepath: Trifecta > Lasso 9 Tech Preview > ...
+Username: trifecta
+Password: SeattleSlew
+
+Please let me know of any problems with the installer.
+Thanks!
+-K
+
+-- 
+All information about Trifecta is covered by an NDA.
+Please write to <beta@lassosoft.com> to unsubscribeor if you have any questions.
