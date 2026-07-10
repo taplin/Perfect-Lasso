@@ -2,6 +2,25 @@
 
 Last reviewed: July 10, 2026
 
+## Implementation Status (2026-07-10)
+
+Milestone 1 (uploads) is implemented, absorbing `post-body-support-plan`'s
+originally-planned multipart phase per the architect review's overlap
+finding (this plan's `MimeReader`/`BodySpec` temp-file-lifetime analysis
+was the correct one). `LassoUploadedFile` (`Providers.swift`), real
+`uploadedFiles` on `ServerRequestProvider` with the `RetainedMimeReader`
+lifetime fix (`LassoPerfectServer/main.swift`), `web_request->fileUploads()`
+(`NativeTypes.swift`), and Lasso 8's `[file_uploads]` (`Runtime.swift`) are
+all live, tested, and live-verified against a real `curl -F` multipart
+upload. `[File_ProcessUploads]` (moving files) deliberately not
+implemented — this pass is metadata only.
+
+Still open: Milestones 2-4 (the `PerfectSessionCore` session bridge),
+sequenced last per the architect's dependency analysis — sessions interact
+with the error/transaction model from `error-protect-model-plan`/
+`inline-write-raw-sql-plan`, better designed against the real thing than
+guessed at in isolation.
+
 ## Goal
 
 Add sessions and uploads in a way that maps early to the native Perfect Swift

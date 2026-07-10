@@ -618,14 +618,37 @@ real POST request: `+`-decoding, POST-before-GET combined ordering,
 GET-only `queryParam` staying uncontaminated by POST data even when both
 are present, and duplicate-name joining via `param(name, ',')`/
 `param(name, void)` all confirmed correct over real HTTP. Corpus sweep
-unchanged at 13/17 (no regression). 56/56 tests pass. Multipart/file
-uploads deferred to `session-upload-support-plan.md`'s upload milestone.
+unchanged at 13/17 (no regression). 56/56 tests pass.
+
+**Implemented `session-upload-support-plan`'s Milestone 1** (uploads,
+absorbing `post-body-support-plan`'s deferred multipart phase per the
+architect's overlap finding). Perfect-NIO's `MimeReader` does the actual
+parsing; `readPostBody` separates its `BodySpec`s into ordinary `postPairs`
+(non-file fields) and `LassoUploadedFile` metadata (file fields), matching
+the exact `spec.file != nil` / empty-placeholder-filtering convention
+Perfect-NIO's own `RequestDecoder.decode(_:content:)` already uses. The
+plan's flagged risk was real and correctly handled: `MimeReader`/`BodySpec`
+delete their temp files on `deinit`, so a naive implementation would have
+the file vanish before Lasso code could read it — the reader is now
+retained (`RetainedMimeReader`, a small `@unchecked Sendable` wrapper) for
+the whole synchronous render, not just the async body-read step.
+`web_request->fileUploads()` and Lasso 8's `[file_uploads]` both
+implemented, projecting the same metadata under each dialect's own key
+names. Live-verified with a real `curl -F` multipart upload: a regular
+field parsed correctly, upload metadata (filename/content-type/size)
+correct, and the file's `tmpfilename` path was genuinely still readable by
+Lasso code during render — proving the retention fix actually matters, not
+just filling in stub values. `[File_ProcessUploads]` (moving files)
+deliberately deferred — this pass is metadata only. Corpus sweep unchanged
+at 13/17. 57/57 tests pass.
 
 ## Next Compatibility Work
 
-1. Implement multipart/form-data and file uploads — `application/x-www-
-   form-urlencoded` POST bodies are real now (see above), but
-   `multipart/form-data` still returns empty; needs Perfect-NIO's
+1. Implement `[File_ProcessUploads]` (Lasso 8) and any equivalent move/copy
+   helper for uploaded temp files — `web_request->fileUploads()`/
+   `[file_uploads]` expose metadata (including the temp file's current
+   path) but nothing yet lets Lasso code move an upload out of the
+   short-lived temp location before the request ends and it's cleaned up.
    `MimeReader` wired in carefully (its `BodySpec` deletes temp upload
    files on `deinit`, so the reader/temp-file handles must be retained
    through render). See `Documentation/session-upload-support-plan.md`

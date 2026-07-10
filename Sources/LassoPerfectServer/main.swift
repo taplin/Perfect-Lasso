@@ -169,7 +169,34 @@ struct LassoSiteServer: Sendable {
             return ParsedPostBody(pairs: pairs, rawString: rawString)
         case .other(let bytes):
             return ParsedPostBody(pairs: [], rawString: String(decoding: bytes, as: UTF8.self))
-        case .multiPartForm, .none:
+        case .multiPartForm(let reader):
+            var pairs: [LassoRequestPair] = []
+            var uploads: [LassoUploadedFile] = []
+            for spec in reader.bodySpecs {
+                if spec.file != nil {
+                    uploads.append(LassoUploadedFile(
+                        fieldName: spec.fieldName,
+                        contentType: spec.contentType,
+                        originalFilename: spec.fileName,
+                        temporaryFilename: spec.tmpFileName,
+                        size: spec.fileSize
+                    ))
+                } else if spec.fileName.isEmpty, spec.contentType == "application/octet-stream" {
+                    // Matches Perfect-NIO's own RequestDecoder.decode(_:content:)
+                    // filter — an empty placeholder BodySpec MimeReader emits
+                    // for a file field the client submitted with no file
+                    // selected, not a real form value.
+                    continue
+                } else {
+                    pairs.append(LassoRequestPair(name: spec.fieldName, value: .string(spec.fieldValue)))
+                }
+            }
+            // Retaining `reader` here (not just letting it fall out of
+            // scope) matters: MimeReader deletes its temp upload files on
+            // deinit, and Lasso code needs to be able to read an upload's
+            // tmpFileName for as long as this request's render lasts.
+            return ParsedPostBody(pairs: pairs, rawString: "", uploads: uploads, retainedMimeReader: RetainedMimeReader(reader))
+        case .none:
             return .empty
         }
     }
@@ -399,14 +426,46 @@ enum LassoSiteServerError: Error, CustomStringConvertible {
     }
 }
 
+/// Wraps Perfect-NIO's `MimeReader` so it can be stored inside `Sendable`
+/// value types (`ParsedPostBody`/`ServerRequestProvider`). `@unchecked` is
+/// safe here specifically because one request's `MimeReader` is only ever
+/// touched by the single task handling that request — read during
+/// `readPostBody`, then only read again (never mutated) by Lasso code
+/// during that same request's synchronous render — never shared across
+/// concurrent tasks the way a long-lived service object would be.
+final class RetainedMimeReader: @unchecked Sendable {
+    let reader: MimeReader
+    init(_ reader: MimeReader) { self.reader = reader }
+}
+
 /// A request's POST body, already read and parsed asynchronously at the
 /// Perfect route-handler boundary (see `LassoSiteServer.readPostBody`)
 /// before the synchronous `LassoRenderer`/`Evaluator` ever runs — keeps
 /// async I/O out of the renderer entirely, per
 /// `Documentation/post-body-support-plan.md`'s recommended architecture.
-struct ParsedPostBody {
+struct ParsedPostBody: Sendable {
     let pairs: [LassoRequestPair]
     let rawString: String
+    let uploads: [LassoUploadedFile]
+    /// Retains Perfect-NIO's `MimeReader` (and therefore its `BodySpec`s'
+    /// temp-file handles) for as long as this value — and anything holding
+    /// a reference to it, like `ServerRequestProvider` below — stays alive.
+    /// `MimeReader` deletes its temp files on deinit; letting it deallocate
+    /// before render (and any Lasso code reading an upload's tmpFileName)
+    /// finishes would delete the file out from under it.
+    let retainedMimeReader: RetainedMimeReader?
+
+    init(
+        pairs: [LassoRequestPair],
+        rawString: String,
+        uploads: [LassoUploadedFile] = [],
+        retainedMimeReader: RetainedMimeReader? = nil
+    ) {
+        self.pairs = pairs
+        self.rawString = rawString
+        self.uploads = uploads
+        self.retainedMimeReader = retainedMimeReader
+    }
 
     static let empty = ParsedPostBody(pairs: [], rawString: "")
 }
@@ -421,6 +480,12 @@ struct ServerRequestProvider: LassoRequestProvider {
     let queryPairs: [LassoRequestPair]
     let postPairs: [LassoRequestPair]
     let rawPostString: String
+    let uploadedFiles: [LassoUploadedFile]
+    /// See `ParsedPostBody.retainedMimeReader` — held here too so it
+    /// survives for this provider's full lifetime (stored in
+    /// `LassoContext`, alive for the whole synchronous render call), not
+    /// just the originating `ParsedPostBody` value's own scope.
+    private let retainedMimeReader: RetainedMimeReader?
     private let headerValues: [String: LassoValue]
     private let cookieValues: [String: LassoValue]
     let requestMethod: String
@@ -455,6 +520,8 @@ struct ServerRequestProvider: LassoRequestProvider {
         self.queryPairs = queryPairs
         self.postPairs = postPairs
         rawPostString = postBody.rawString
+        uploadedFiles = postBody.uploads
+        retainedMimeReader = postBody.retainedMimeReader
         queryParameterValues = firstValuePerName(queryPairs)
         postParameterValues = firstValuePerName(postPairs)
         // POST first, matching real Lasso 9's documented combined params()

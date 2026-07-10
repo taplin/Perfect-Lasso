@@ -1248,6 +1248,49 @@ import PerfectCRUD
     #expect(output == "from-post|term=from-post&color=red&color=blue|from-post|from-query|red,blue|2|red|red|red")
 }
 
+@Test func fileUploadsExposeMetadataUnderBothLasso9And8KeyNames() throws {
+    // Documentation/session-upload-support-plan.md Milestone 1:
+    // web_request->fileUploads() (Lasso 9 keys) and [file_uploads] (Lasso 8
+    // keys) both project the same real upload metadata, just under each
+    // dialect's own documented field names. The temp file's actual bytes
+    // aren't this interpreter's concern — only the metadata Lasso code
+    // needs to locate and read/move the file itself.
+    struct UploadRequestProvider: LassoRequestProvider {
+        let uploadedFiles: [LassoUploadedFile] = [
+            LassoUploadedFile(
+                fieldName: "avatar",
+                contentType: "image/png",
+                originalFilename: "photo.png",
+                temporaryFilename: "/tmp/upload-abc123",
+                size: 4096
+            ),
+        ]
+        func parameter(named name: String) -> LassoValue { .void }
+        func header(named name: String) -> LassoValue { .void }
+        func cookie(named name: String) -> LassoValue { .void }
+        var parameters: [String: LassoValue] { [:] }
+    }
+
+    var context = LassoContext(requestProvider: UploadRequestProvider())
+    let output = try LassoRenderer().render(
+        """
+        [web_request->fileUploads->size]|\
+        [web_request->fileUploads->get(1)->fieldname]|\
+        [web_request->fileUploads->get(1)->contenttype]|\
+        [web_request->fileUploads->get(1)->filename]|\
+        [web_request->fileUploads->get(1)->tmpfilename]|\
+        [web_request->fileUploads->get(1)->filesize]|\
+        [file_uploads->get(1)->param]|\
+        [file_uploads->get(1)->origname]|\
+        [file_uploads->get(1)->type]|\
+        [file_uploads->get(1)->size]|\
+        [file_uploads->get(1)->origextension]
+        """,
+        context: &context
+    )
+    #expect(output == "1|avatar|image/png|photo.png|/tmp/upload-abc123|4096|avatar|photo.png|image/png|4096|png")
+}
+
 @Test func voidLookupMissBehavesLikeEmptyStringButNullStaysStrict() throws {
     // Real Lasso 9 returns `void` (not `null`) when web_request->param /
     // action_param / header / cookie lookups miss, and keeps `null` itself

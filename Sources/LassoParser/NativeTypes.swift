@@ -86,8 +86,10 @@ extension LassoNativeTypeRegistry {
     // Lasso shapes. `param(name, joiner)` uses the ordered `postPairs`/
     // `queryPairs` for real duplicate-name join/array behavior; the plain
     // single-argument form stays dict-based for backward compatibility with
-    // every existing conformer. `fileUploads()`/multipart bodies are
-    // deferred to session-upload-support-plan.md's upload milestone. The
+    // every existing conformer. `fileUploads()` reads real multipart
+    // uploads now (see Documentation/session-upload-support-plan.md) —
+    // Perfect-NIO's own `MimeReader` does the parsing; this layer only
+    // projects upload metadata into Lasso 9's documented key names. The
     // CGI-era fields with no meaning in a standalone Perfect-NIO server
     // (gatewayInterface, scriptFilename, pathTranslated, serverAdmin,
     // serverSignature, serverSoftware) are deliberately not implemented.
@@ -156,6 +158,17 @@ extension LassoNativeTypeRegistry {
         }
         type.register("poststring") { _, _, context in
             .string(context.requestProvider?.rawPostString ?? "")
+        }
+        type.register("fileuploads") { _, _, context in
+            .array((context.requestProvider?.uploadedFiles ?? []).map { upload in
+                .map([
+                    "fieldname": .string(upload.fieldName),
+                    "contenttype": .string(upload.contentType),
+                    "filename": .string(upload.originalFilename),
+                    "tmpfilename": .string(upload.temporaryFilename),
+                    "filesize": .integer(upload.size),
+                ])
+            })
         }
 
         type.register("requestmethod") { _, _, context in .string(context.requestProvider?.requestMethod ?? "") }

@@ -215,6 +215,28 @@ public struct LassoNativeRegistry: Sendable {
         register("client_formmethod") { _, context in
             .string(context.requestProvider?.requestMethod ?? "")
         }
+        // Lasso 8's [File_Uploads] — see
+        // Documentation/session-upload-support-plan.md. Projects the same
+        // upload metadata web_request->fileUploads() exposes, but under
+        // Lasso 8's own documented key names. OrigPath has no real
+        // equivalent (browsers only ever send a bare filename, never a
+        // client-side path) — approximated with the filename itself, same
+        // as OrigName, rather than fabricating a fake path.
+        register("file_uploads") { _, context in
+            .array((context.requestProvider?.uploadedFiles ?? []).map { upload in
+                let ext = (upload.originalFilename as NSString).pathExtension
+                return .map([
+                    "path": .string(upload.temporaryFilename),
+                    "file": .string(upload.temporaryFilename),
+                    "size": .integer(upload.size),
+                    "type": .string(upload.contentType),
+                    "param": .string(upload.fieldName),
+                    "origname": .string(upload.originalFilename),
+                    "origpath": .string(upload.originalFilename),
+                    "origextension": .string(ext),
+                ])
+            })
+        }
         register("cookie") { arguments, context in
             let name = arguments.firstValue(named: "name")?.outputString ??
                 arguments.first?.value.outputString ?? ""

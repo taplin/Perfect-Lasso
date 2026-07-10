@@ -274,6 +274,36 @@ public struct LassoRequestPair: Equatable, Sendable {
     }
 }
 
+/// Metadata for one `multipart/form-data` file upload — see
+/// `Documentation/session-upload-support-plan.md`. Deliberately just
+/// metadata, not the file's bytes: real Lasso exposes uploads the same way
+/// (`web_request->fileUploads()`/Lasso 8's `[File_Uploads]`), backed by a
+/// server-side temporary file Lasso code can then read/move itself. The
+/// temporary file's actual lifetime is a server-boundary concern (Perfect-
+/// NIO's `MimeReader` deletes its temp files on deinit) — this type only
+/// carries where that file currently lives, per `temporaryFilename`.
+public struct LassoUploadedFile: Equatable, Sendable {
+    public var fieldName: String
+    public var contentType: String
+    public var originalFilename: String
+    public var temporaryFilename: String
+    public var size: Int
+
+    public init(
+        fieldName: String,
+        contentType: String,
+        originalFilename: String,
+        temporaryFilename: String,
+        size: Int
+    ) {
+        self.fieldName = fieldName
+        self.contentType = contentType
+        self.originalFilename = originalFilename
+        self.temporaryFilename = temporaryFilename
+        self.size = size
+    }
+}
+
 /// Real Lasso's `web_request` exposes ~35 documented members (see
 /// `Documentation/compatibility-matrix.md`); this protocol only requires
 /// the handful every conformer must supply, with default (empty/zero/false)
@@ -293,6 +323,7 @@ public protocol LassoRequestProvider: Sendable {
     var queryPairs: [LassoRequestPair] { get }
     var postPairs: [LassoRequestPair] { get }
     var rawPostString: String { get }
+    var uploadedFiles: [LassoUploadedFile] { get }
     var requestMethod: String { get }
     var requestURI: String { get }
     var path: String { get }
@@ -313,6 +344,7 @@ public extension LassoRequestProvider {
     var queryPairs: [LassoRequestPair] { [] }
     var postPairs: [LassoRequestPair] { [] }
     var rawPostString: String { "" }
+    var uploadedFiles: [LassoUploadedFile] { [] }
     var requestMethod: String { "" }
     var requestURI: String { "" }
     var path: String { "" }
