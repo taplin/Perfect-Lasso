@@ -1,24 +1,6 @@
 {
-  "originHash" : "cf3feca5c6d6e63e5d63a6f6c2ab6b0a4d03a6cc4520479f306e886cd35a995a",
+  "originHash" : "92f2fd9840acc679ffe15df6074298eaca28111d063846e67b80a1c8f7b3fd05",
   "pins" : [
-    {
-      "identity" : "perfect-mustache",
-      "kind" : "remoteSourceControl",
-      "location" : "https://github.com/PerfectlySoft/Perfect-Mustache.git",
-      "state" : {
-        "revision" : "0d5e45e95ca06c4ba7696a0cfc250e0ed35aff00",
-        "version" : "4.0.0"
-      }
-    },
-    {
-      "identity" : "perfectlib",
-      "kind" : "remoteSourceControl",
-      "location" : "https://github.com/PerfectlySoft/PerfectLib.git",
-      "state" : {
-        "revision" : "859e696457fa91a9f998ad94080632f20b47fe58",
-        "version" : "4.0.1"
-      }
-    },
     {
       "identity" : "swift-algorithms",
       "kind" : "remoteSourceControl",
