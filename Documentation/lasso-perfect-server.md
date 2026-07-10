@@ -280,8 +280,94 @@ Environment variables:
     `unsupportedExpression("Member httpHost")`, from `botRedirect`'s
     `web_request->httpHost` (called from *inside* `excludeBots`'s own
     body, reached only after the `with` loop actually iterates and matches
-    a bot). `web_request->httpHost` member access is a new, not-yet-scoped
-    gap for later work — not part of this pass.
+    a bot).
+  - **`web_request->httpHost` implemented, 2026-07-09.** Real Lasso's
+    `httpHost` is just the request's `Host` HTTP header — no new provider
+    protocol needed, `LassoRequestProvider.header(named:)` already exists
+    and is already case-insensitive in every concrete implementation
+    (`ServerRequestProvider` in this file, and the test fixtures). One new
+    case in `Evaluator.nativeMember`:
+    `("web_request", "httphost") -> header(named: "Host")`. Verified via a
+    dedicated test reproducing the real `botRedirect`/`excludeBots` shape
+    end to end (bot match → redirect URL built from the request's real
+    host), not just that the member access itself resolves.
+  - **`web_request`/`web_response` comprehensively implemented, native
+    types unified with the object system, 2026-07-09.** Implementing
+    `httpHost` (above) surfaced a much bigger gap: real Lasso documents
+    ~35 `web_request` members and ~20 `web_response` members; this
+    interpreter had 5 and 1 (a no-op stub). Before implementing more
+    one-at-a-time, a research spike (two independent deep-dive passes —
+    Lasso 8/9's actual language semantics, and this codebase's dispatch
+    architecture) established why: real Lasso is a genuine
+    object-oriented language whose own engine registers `web_request`
+    through the *same* mechanism user-defined types use — there's no
+    architectural native/user split, only a historical one in vocabulary.
+    Two semantics that mattered directly: no property/method distinction
+    (`web_request->httpHost` and `->httpHost()` are the same zero-arg
+    dispatch, Ruby-like), and `-name=value` keyword params are a
+    first-class calling convention, not sugar.
+
+    Tracing this codebase's actual dispatch found the root cause: before
+    this, `web_request` wasn't modeled as an object at all — a hardcoded
+    `Evaluator.nativeMember` string-switch intercepted any bare-identifier
+    receiver *before it was ever evaluated*, precisely because evaluating
+    "web_request" as a real identifier yielded `.null`. `local(r) =
+    web_request; #r->param('x')` silently broke as a result. Fixed by
+    minting native receivers as real `.object(LassoObjectInstance)`
+    values (same carrier user-defined types use) backed by a new
+    `LassoNativeTypeRegistry`/`LassoNativeType`
+    (`Sources/LassoParser/NativeTypes.swift`) — a flat name→Swift-closure
+    method table per native type (deliberately *not*
+    `LassoMethodDefinition`/`LassoMethodDispatcher`, which are Lasso-AST-
+    bodied and arity-scored — real overkill for name-unique native
+    builtins), checked in the same `.object` dispatch arm
+    `invokeMemberMethod` already uses for user types. `nativeMember` is
+    gone entirely.
+
+    Implemented ~24 of ~35 `web_request` members and ~12 of ~20
+    `web_response` members — see `Documentation/compatibility-matrix.md`
+    for the full tiered list (implemented vs. explicitly deferred, each
+    with a concrete reason: no POST body reading yet, no binary streaming
+    response infrastructure, no server-lifecycle hook registration, etc.
+    — nothing silently missing without explanation).
+
+    **A second, more serious pre-existing bug found verifying the
+    response side:** `main.swift`'s `render(...)` constructed
+    `ServerResponseSink()` inline with no local variable holding a
+    reference to it, then never read its collected `status`/
+    `redirectURL`/cookies back after rendering — meaning the
+    *already-existing* native functions `redirect_url`, `response_status`,
+    and `cookie_set` were silently non-functional in the real server,
+    not just the new `web_response` members. Fixed as part of this pass:
+    `render(...)` keeps a local `sink` reference and assembles the real
+    `HTTPHead`/`BytesOutput`/`RedirectOutput` from its collected state
+    after rendering completes.
+
+    47 Swift Testing cases pass (up from 41), including a dedicated
+    regression proving native receivers are now real assignable values
+    (the specific gap that motivated the redesign) and a full-suite
+    re-run confirming the `.member` dispatch collapse didn't regress
+    `.string`/`.array`/`.map`/`.object` access.
+  - **Live-verified again after the fix**: the real corpus no longer
+    throws on `httpHost` anywhere — 7 of 10 real startup files still load
+    cleanly (unchanged; the 3 legacy-dialect failures are unrelated to
+    this pass). The error on `/api.lasso` moved to a distinctly different,
+    deeper gap: `unsupportedExpression("Member contains")`. Investigated
+    precisely rather than assumed: confirmed *not* caused by the
+    native-type work (identical error before and after this pass's
+    changes) and *not* `.array`/`.map` missing a `.contains` method (no
+    evidence of that shape anywhere in the traced corpus). Grep across
+    the real site found the likely site: `_begin.lasso:66`'s one live
+    (non-commented — most of that file is `/* ... */`-wrapped historical
+    code, correctly skipped) statement,
+    `excludeBots(web_request->header('USER-AGENT'), web_request->httpHost)`,
+    whose body (`site_setup_tags.inc:99`) does `#request->contains(#bot)`
+    — the exact same pattern this pass's own
+    `excludeBotsFullRealShapeRedirectsUsingWebRequestHttpHost` test
+    proves works correctly with a real `.string` receiver. Why the header
+    value isn't behaving as a `.string` in this specific live-request
+    context is unresolved — genuinely needs its own focused debugging
+    pass, not something to guess at or silently absorb into this one.
 
 The parser/runtime source and its smoke suite (`Sources/LassoParserSmoke`,
 `Tests/LassoParserTests`) never hardcode a real site path or real page
@@ -292,11 +378,19 @@ by pointing `lasso-perfect-server` itself at a real `LASSO_SITE_ROOT` locally.
 
 ## Next Compatibility Work
 
-1. Implement `web_request->httpHost` member access — the next real gap
-   `excludeBots` hits, found live-verifying the fixes above; it's called
-   from `botRedirect`'s body, only reachable after the `with` loop actually
-   matches a bot, so this was invisible until this pass's work landed.
-2. Evaluate whether legacy `define_tag('name', -flags) ... /define_tag`
+1. Root-cause why `web_request->header('USER-AGENT')->contains(...)`
+   throws `unsupportedExpression("Member contains")` in the real
+   `_begin.lasso:66` → `excludeBots` → `site_setup_tags.inc:99` call chain,
+   given a dedicated regression test proves the identical pattern works
+   with a real `.string` receiver — likely needs live request-value
+   inspection (a temporary diagnostic page against the real site root) to
+   see what `#request` actually is at that point, not further guessing.
+2. Implement POST body reading — `web_request->postParam`/`postParams`/
+   `postString` are wired but return empty since this interpreter has
+   never parsed POST bodies; needs async content-reading threaded into
+   `ServerRequestProvider.init` (currently synchronous) via Perfect-NIO's
+   `HTTPRequest.readContent()`.
+3. Evaluate whether legacy `define_tag('name', -flags) ... /define_tag`
    (parenthesized-call style, blocks `_begin_tags.inc`'s `send_email2` and
    all of `getGeoIPInfo.inc`) and legacy `define_type:`/`define_tag:`
    colon-call style (blocks all of `js_timer.inc`) are worth real support,
@@ -304,10 +398,13 @@ by pointing `lasso-perfect-server` itself at a real `LASSO_SITE_ROOT` locally.
    `Documentation/compatibility-matrix.md`) but neither is implemented;
    deliberately deferred as a separate, larger follow-up (each is
    effectively a second, Lasso-8-shaped type-definition sub-parser).
-3. Continue the object runtime toward the next corpus need: likely
+4. Bridge `web_response->include*`/`sendFile` with the existing
+   `include()`/`library()` machinery (currently in `Renderer.swift`'s
+   `renderExpression`, not reachable from the Evaluator-level native-type
+   method tables) — deliberately deferred out of the comprehensive
+   `web_response` pass as a separate integration.
+5. Continue the object runtime toward the next corpus need: likely
    `_unknowntag`, rest parameters, or richer type/trait dispatch once a page
    actually exercises those constructs.
-4. Expand request/response support for POST bodies, redirects, status, and
-   cookies.
-5. Add a crawl/report mode that requests many site paths and records the first
+6. Add a crawl/report mode that requests many site paths and records the first
    unsupported construct per page.

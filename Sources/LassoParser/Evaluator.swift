@@ -19,6 +19,18 @@ struct Evaluator {
             if name.caseInsensitiveCompare("self") == .orderedSame, let object = context.currentSelf {
                 return .object(object)
             }
+            // Checked before native functions: a couple of names (e.g.
+            // "session") are registered as both a zero-arg-callable native
+            // function (colon-call style, "session:'cart'" — a .call
+            // expression, unaffected by this order since .call resolves
+            // separately and always checks natives first) and a native
+            // type (for "session->value(...)" member access, which must
+            // evaluate this bare identifier to a real .object first).
+            // Bare identifier evaluation is the only place these collide;
+            // resolving the type here is what makes member access work.
+            if context.nativeTypes.containsType(named: name) {
+                return .object(LassoObjectInstance(typeName: name))
+            }
             if let function = context.natives.function(named: name) {
                 return try function([], &context)
             }
@@ -61,9 +73,6 @@ struct Evaluator {
             }
             throw LassoRuntimeError.unknownFunction(name)
         case let .member(base, name, arguments):
-            if case let .identifier(baseName) = base {
-                return try nativeMember(baseName: baseName, memberName: name, arguments: arguments ?? [])
-            }
             return try member(try evaluate(base), name, arguments ?? [])
         case let .unknown(value):
             throw LassoRuntimeError.unsupportedExpression(value)
@@ -319,6 +328,10 @@ struct Evaluator {
             return values.indices.contains(index) ? values[index] : .null
         case let (.map(values), _): return values[normalized] ?? .null
         case let (.object(object), _):
+            if let nativeMethod = context.nativeTypes.type(named: object.typeName)?.method(named: name) {
+                let evaluatedArguments = try evaluate(arguments)
+                return try nativeMethod(object, evaluatedArguments, &context)
+            }
             guard let type = context.tagRegistry.type(named: object.typeName) else {
                 return object.value(for: name)
             }
@@ -327,34 +340,6 @@ struct Evaluator {
             }
             return object.value(for: name)
         default: throw LassoRuntimeError.unsupportedExpression("Member \(name)")
-        }
-    }
-
-    private mutating func nativeMember(
-        baseName: String,
-        memberName: String,
-        arguments: [LassoArgument]
-    ) throws -> LassoValue {
-        let base = baseName.lowercased()
-        let normalizedMember = memberName.lowercased()
-        let evaluated = try evaluate(arguments)
-        let first = evaluated.first?.value.outputString ?? ""
-
-        switch (base, normalizedMember) {
-        case ("web_request", "param"):
-            return context.requestProvider?.parameter(named: first) ?? .null
-        case ("web_request", "params"):
-            return .map(context.requestProvider?.parameters ?? [:])
-        case ("web_request", "header"):
-            return context.requestProvider?.header(named: first) ?? .null
-        case ("web_request", "cookie"):
-            return context.requestProvider?.cookie(named: first) ?? .null
-        case ("session", "value"), ("session", "get"):
-            return context.sessionProvider?.value(for: first) ?? .null
-        case ("web_response", "replaceheader"):
-            return .void
-        default:
-            return try member(try evaluate(.identifier(baseName)), memberName, arguments)
         }
     }
 

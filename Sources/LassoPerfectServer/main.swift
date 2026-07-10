@@ -196,12 +196,19 @@ struct LassoSiteServer: Sendable {
     private func render(fileURL: URL, request: any HTTPRequest, includePath: String) throws -> HTTPOutput {
         let source = try String(contentsOf: fileURL, encoding: .utf8)
         let document = LassoParser().parse(source)
+        // Kept as a local so its collected status/redirect/headers/cookies
+        // can be read back after rendering — context.responseSink alone
+        // wouldn't let us do that once context goes out of scope, and
+        // previously nothing did, which is why redirect_url/response_status/
+        // cookie_set never actually affected the HTTP response despite
+        // correctly mutating this same (reference-type) sink instance.
+        let sink = ServerResponseSink()
         var context = LassoContext(
             globals: baseGlobals(for: request),
             includeLoader: includeLoader,
             includePath: includePath,
             requestProvider: ServerRequestProvider(request: request),
-            responseSink: ServerResponseSink(),
+            responseSink: sink,
             inlineProvider: inlineProvider,
             tagRegistry: tagRegistry
         )
@@ -215,10 +222,18 @@ struct LassoSiteServer: Sendable {
                 parserDiagnostics: document.diagnostics.map(\.message)
             )
         }
+        if let redirectURL = sink.redirectURL {
+            return RedirectOutput(to: redirectURL, status: .found)
+        }
+        var headers = HTTPHeaders([
+            ("Content-Type", "text/html; charset=utf-8"),
+        ])
+        headers.add(contentsOf: sink.headerPairs)
+        for cookieValue in sink.cookieHeaderValues {
+            headers.add(name: "Set-Cookie", value: cookieValue)
+        }
         return BytesOutput(
-            head: HTTPHead(headers: HTTPHeaders([
-                ("Content-Type", "text/html; charset=utf-8"),
-            ])),
+            head: HTTPHead(status: HTTPResponseStatus(statusCode: sink.status), headers: headers),
             body: Array(html.utf8)
         )
     }
@@ -349,6 +364,16 @@ struct ServerRequestProvider: LassoRequestProvider {
     private let parameterValues: [String: LassoValue]
     private let headerValues: [String: LassoValue]
     private let cookieValues: [String: LassoValue]
+    let requestMethod: String
+    let requestURI: String
+    let path: String
+    let isHTTPS: Bool
+    let remoteAddress: String
+    let remotePort: Int
+    let serverName: String
+    let serverPort: Int
+    let contentType: String
+    let contentLength: Int
 
     init(request: any HTTPRequest) {
         var params: [String: LassoValue] = [:]
@@ -364,6 +389,18 @@ struct ServerRequestProvider: LassoRequestProvider {
         cookieValues = Dictionary(uniqueKeysWithValues: request.cookies.map {
             ($0.key.lowercased(), LassoValue.string($0.value))
         })
+        requestMethod = request.method.rawValue
+        requestURI = request.uri
+        path = request.path
+        // Pragmatic heuristic: trust a reverse proxy's X-Forwarded-Proto
+        // header over deep NIO channel/TLS pipeline introspection.
+        isHTTPS = request.headers["x-forwarded-proto"].first?.lowercased() == "https"
+        remoteAddress = request.remoteAddress?.ipAddress ?? ""
+        remotePort = request.remoteAddress?.port ?? 0
+        serverName = request.localAddress?.ipAddress ?? ""
+        serverPort = request.localAddress?.port ?? 0
+        contentType = request.contentType ?? ""
+        contentLength = request.contentLength
     }
 
     func parameter(named name: String) -> LassoValue {
@@ -381,23 +418,58 @@ struct ServerRequestProvider: LassoRequestProvider {
     var parameters: [String: LassoValue] {
         parameterValues
     }
+
+    var headers: [String: LassoValue] {
+        headerValues
+    }
+
+    var cookies: [String: LassoValue] {
+        cookieValues
+    }
 }
 
 final class ServerResponseSink: LassoResponseSink, @unchecked Sendable {
     private(set) var status: Int = 200
     private(set) var redirectURL: String?
-    private(set) var cookies: [(name: String, value: String)] = []
+    private(set) var headerPairs: [(name: String, value: String)] = []
+    private(set) var cookieHeaderValues: [String] = []
 
     func setStatus(_ status: Int) throws {
         self.status = status
+    }
+
+    func getStatus() -> Int {
+        status
     }
 
     func redirect(to url: String) throws {
         redirectURL = url
     }
 
+    func setHeader(name: String, value: String) throws {
+        headerPairs.append((name, value))
+    }
+
     func setCookie(name: String, value: String) throws {
-        cookies.append((name, value))
+        try setCookie(name: name, value: value, domain: nil, expires: nil, path: nil, secure: false, httpOnly: false)
+    }
+
+    func setCookie(
+        name: String,
+        value: String,
+        domain: String?,
+        expires: String?,
+        path: String?,
+        secure: Bool,
+        httpOnly: Bool
+    ) throws {
+        var parts = ["\(name)=\(value)"]
+        if let domain { parts.append("Domain=\(domain)") }
+        if let expires { parts.append("Expires=\(expires)") }
+        if let path { parts.append("Path=\(path)") }
+        if secure { parts.append("Secure") }
+        if httpOnly { parts.append("HttpOnly") }
+        cookieHeaderValues.append(parts.joined(separator: "; "))
     }
 }
 

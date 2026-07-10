@@ -201,11 +201,49 @@ public enum LassoFileSystemIncludeError: Error, Equatable, Sendable {
     case unreadableFile(String)
 }
 
+/// Real Lasso's `web_request` exposes ~35 documented members (see
+/// `Documentation/compatibility-matrix.md`); this protocol only requires
+/// the handful every conformer must supply, with default (empty/zero/false)
+/// implementations for the rest via the extension below — so existing
+/// conformers (test fixtures, `SmokeRequestProvider`) keep compiling
+/// unchanged, and only a real, live-traffic conformer needs to override
+/// the defaults with actual data.
 public protocol LassoRequestProvider: Sendable {
     func parameter(named name: String) -> LassoValue
     func header(named name: String) -> LassoValue
     func cookie(named name: String) -> LassoValue
     var parameters: [String: LassoValue] { get }
+    var headers: [String: LassoValue] { get }
+    var cookies: [String: LassoValue] { get }
+    var queryParameters: [String: LassoValue] { get }
+    var postParameters: [String: LassoValue] { get }
+    var requestMethod: String { get }
+    var requestURI: String { get }
+    var path: String { get }
+    var isHTTPS: Bool { get }
+    var remoteAddress: String { get }
+    var remotePort: Int { get }
+    var serverName: String { get }
+    var serverPort: Int { get }
+    var contentType: String { get }
+    var contentLength: Int { get }
+}
+
+public extension LassoRequestProvider {
+    var headers: [String: LassoValue] { [:] }
+    var cookies: [String: LassoValue] { [:] }
+    var queryParameters: [String: LassoValue] { parameters }
+    var postParameters: [String: LassoValue] { [:] }
+    var requestMethod: String { "" }
+    var requestURI: String { "" }
+    var path: String { "" }
+    var isHTTPS: Bool { false }
+    var remoteAddress: String { "" }
+    var remotePort: Int { 0 }
+    var serverName: String { "" }
+    var serverPort: Int { 0 }
+    var contentType: String { "" }
+    var contentLength: Int { 0 }
 }
 
 public protocol LassoSessionProvider: Sendable {
@@ -213,10 +251,40 @@ public protocol LassoSessionProvider: Sendable {
     func set(_ value: LassoValue, for name: String) throws
 }
 
+/// Real Lasso's `web_response` exposes ~20 documented members; same
+/// default-implementation pattern as `LassoRequestProvider` above so
+/// existing conformers are unaffected.
 public protocol LassoResponseSink: Sendable {
     func setStatus(_ status: Int) throws
     func redirect(to url: String) throws
     func setCookie(name: String, value: String) throws
+    func setHeader(name: String, value: String) throws
+    func setCookie(
+        name: String,
+        value: String,
+        domain: String?,
+        expires: String?,
+        path: String?,
+        secure: Bool,
+        httpOnly: Bool
+    ) throws
+    func getStatus() -> Int
+}
+
+public extension LassoResponseSink {
+    func setHeader(name: String, value: String) throws {}
+    func setCookie(
+        name: String,
+        value: String,
+        domain: String?,
+        expires: String?,
+        path: String?,
+        secure: Bool,
+        httpOnly: Bool
+    ) throws {
+        try setCookie(name: name, value: value)
+    }
+    func getStatus() -> Int { 200 }
 }
 
 public protocol LassoInlineProvider: Sendable {

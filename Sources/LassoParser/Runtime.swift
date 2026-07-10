@@ -259,6 +259,7 @@ public struct LassoContext: Sendable {
     private var locals: [String: LassoValue]
     private var inlineFrames: [ActiveInlineFrame]
     public var natives: LassoNativeRegistry
+    public var nativeTypes: LassoNativeTypeRegistry
     public var includeLoader: (any LassoIncludeLoader)?
     public var includePath: String?
     public var includeStack: [String]
@@ -275,6 +276,7 @@ public struct LassoContext: Sendable {
         globals: [String: LassoValue] = [:],
         locals: [String: LassoValue] = [:],
         natives: LassoNativeRegistry = LassoNativeRegistry(),
+        nativeTypes: LassoNativeTypeRegistry = LassoNativeTypeRegistry(),
         includeLoader: (any LassoIncludeLoader)? = nil,
         includePath: String? = nil,
         requestProvider: (any LassoRequestProvider)? = nil,
@@ -287,6 +289,7 @@ public struct LassoContext: Sendable {
         self.locals = Dictionary(uniqueKeysWithValues: locals.map { ($0.key.lowercased(), $0.value) })
         inlineFrames = []
         self.natives = natives
+        self.nativeTypes = nativeTypes
         self.includeLoader = includeLoader
         self.includePath = includePath
         includeStack = []

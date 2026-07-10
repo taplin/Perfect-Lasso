@@ -177,10 +177,10 @@ import PerfectCRUD
     #expect(includeOutput == "<h1>Catalog</h1>")
 
     let requestOutput = try LassoRenderer().render(
-        "[web_request->param('term')]|[web_request->header('host')]|[cookie:'sid']",
+        "[web_request->param('term')]|[web_request->header('host')]|[web_request->httpHost]|[cookie:'sid']",
         context: &context
     )
-    #expect(requestOutput == "clogs|example.test|abc123")
+    #expect(requestOutput == "clogs|example.test|example.test|abc123")
 
     let sessionOutput = try LassoRenderer().render(
         "[session_addvar:'cart','open'][session:'cart']",
@@ -930,6 +930,45 @@ import PerfectCRUD
     #expect(output == "true/false")
 }
 
+@Test func excludeBotsFullRealShapeRedirectsUsingWebRequestHttpHost() throws {
+    // The exact next gap found live-verifying excludeBots against the real
+    // startup folder: excludeBots's with...do loop calls botRedirect,
+    // whose body reads web_request->httpHost — reached only once a bot
+    // actually matches, so this was invisible until the with...do fix
+    // above unblocked the loop itself.
+    struct RequestProvider: LassoRequestProvider {
+        let parameters: [String: LassoValue] = [:]
+        func parameter(named name: String) -> LassoValue { .null }
+        func header(named name: String) -> LassoValue {
+            name.lowercased() == "host" ? .string("shop.example.test") : .null
+        }
+        func cookie(named name: String) -> LassoValue { .null }
+    }
+
+    var context = LassoContext(requestProvider: RequestProvider())
+    let output = try LassoRenderer().render(
+        """
+        <?lasso
+        define botMap => array('SemRush', 'DotBot', 'AhrefsBot')
+        define botRedirect(host::String) => {
+            return 'https://' + web_request->httpHost + '/bot_response.lasso'
+        }
+        define excludeBots(request::String, host::String) => {
+            with bot in botMap do {
+                if(#request->contains(#bot)) => {
+                    return botRedirect(#host)
+                }
+            }
+            return 'no match'
+        }
+        ?>
+        [excludeBots(-request='Mozilla/5.0 SemRush Crawler', -host='shop.example.test')]
+        """,
+        context: &context
+    ).trimmingCharacters(in: .whitespacesAndNewlines)
+    #expect(output == "https://shop.example.test/bot_response.lasso")
+}
+
 @Test func malformedWithFallsBackToOrdinaryCodeWithoutSwallowingNextStatement() throws {
     // Regression guard, same class as slashStyleBlockBodyIsNotSwallowedWhenNoArrowFollows:
     // a bare 'with' not actually followed by 'name in expr do {' must not
@@ -946,6 +985,182 @@ import PerfectCRUD
         context: &context
     ).trimmingCharacters(in: .whitespacesAndNewlines)
     #expect(output == "reached")
+}
+
+@Test func nativeReceiverIsAssignableFirstClassValue() throws {
+    // The specific gap that motivated unifying native types with the
+    // object system: before this, `web_request` only "worked" as a
+    // receiver by spelling — it was intercepted before ever being
+    // evaluated, so evaluating it as a plain identifier (e.g. via
+    // assignment) yielded .null and broke immediately. Now it's a real
+    // .object(LassoObjectInstance(typeName: "web_request")) value.
+    struct RequestProvider: LassoRequestProvider {
+        let parameters: [String: LassoValue] = ["term": .string("clogs")]
+        func parameter(named name: String) -> LassoValue { parameters[name.lowercased()] ?? .null }
+        func header(named name: String) -> LassoValue { .null }
+        func cookie(named name: String) -> LassoValue { .null }
+    }
+    var context = LassoContext(requestProvider: RequestProvider())
+    let output = try LassoRenderer().render(
+        "<?lasso local(r = web_request) ?>[#r->param('term')]",
+        context: &context
+    ).trimmingCharacters(in: .whitespacesAndNewlines)
+    #expect(output == "clogs")
+}
+
+@Test func webRequestMembersReflectRealRequestData() throws {
+    struct RichRequestProvider: LassoRequestProvider {
+        let parameters: [String: LassoValue] = ["term": .string("clogs")]
+        let headers: [String: LassoValue] = [
+            "host": .string("shop.example.test"),
+            "user-agent": .string("Mozilla/5.0 TestAgent"),
+            "accept": .string("text/html"),
+        ]
+        let cookies: [String: LassoValue] = ["sid": .string("abc123")]
+        let requestMethod = "POST"
+        let requestURI = "/checkout?term=clogs"
+        let path = "/checkout"
+        let isHTTPS = true
+        let remoteAddress = "203.0.113.7"
+        let remotePort = 54321
+        let serverName = "shop.example.test"
+        let serverPort = 443
+        let contentType = "application/x-www-form-urlencoded"
+        let contentLength = 42
+
+        func parameter(named name: String) -> LassoValue { parameters[name.lowercased()] ?? .null }
+        func header(named name: String) -> LassoValue { headers[name.lowercased()] ?? .null }
+        func cookie(named name: String) -> LassoValue { cookies[name.lowercased()] ?? .null }
+    }
+
+    var context = LassoContext(requestProvider: RichRequestProvider())
+    let output = try LassoRenderer().render(
+        """
+        [web_request->requestMethod]|\
+        [web_request->requestURI]|\
+        [web_request->path]|\
+        [web_request->isHttps]|\
+        [web_request->remoteAddr]|\
+        [web_request->remotePort]|\
+        [web_request->serverName]|\
+        [web_request->serverPort]|\
+        [web_request->contentType]|\
+        [web_request->contentLength]|\
+        [web_request->httpHost]|\
+        [web_request->httpUserAgent]|\
+        [web_request->httpAccept]|\
+        [web_request->rawHeader('host')]|\
+        [web_request->cookie('sid')]|\
+        [web_request->param('term')]
+        """,
+        context: &context
+    )
+    #expect(output == "POST|/checkout?term=clogs|/checkout|true|203.0.113.7|54321|shop.example.test|443|" +
+        "application/x-www-form-urlencoded|42|shop.example.test|Mozilla/5.0 TestAgent|text/html|" +
+        "shop.example.test|abc123|clogs")
+
+    // Bulk accessors (headers()/cookies()/params()) return a real .map,
+    // verified via direct key-name member access — .map's current member
+    // dispatch does plain key lookup, not method calls like ->find(key),
+    // so this checks the same way ordinary Lasso map access already works
+    // elsewhere in this test file.
+    let bulkOutput = try LassoRenderer().render(
+        "[web_request->headers->host]/[web_request->cookies->sid]/[web_request->params->term]",
+        context: &context
+    )
+    #expect(bulkOutput == "shop.example.test/abc123/clogs")
+}
+
+@Test func webRequestPostParamsAreEmptyNotBroken() throws {
+    // Documented limitation, not a silent failure: this interpreter has
+    // never parsed POST bodies (tracked separately). postParam/postParams/
+    // postString return empty results — the same shape a real request
+    // with no matching data would produce — rather than throwing.
+    var context = LassoContext()
+    let output = try LassoRenderer().render(
+        "[web_request->postParam('x')]|[web_request->postString]",
+        context: &context
+    )
+    #expect(output == "|")
+}
+
+@Test func webResponseMembersRecordThroughResponseSink() throws {
+    final class RecordingResponseSink: LassoResponseSink, @unchecked Sendable {
+        private(set) var status = 200
+        private(set) var headerPairs: [(name: String, value: String)] = []
+        private(set) var cookiePairs: [(name: String, value: String, secure: Bool, httpOnly: Bool)] = []
+
+        func setStatus(_ status: Int) throws { self.status = status }
+        func getStatus() -> Int { status }
+        func redirect(to url: String) throws {}
+        func setHeader(name: String, value: String) throws { headerPairs.append((name, value)) }
+        func setCookie(name: String, value: String) throws {
+            try setCookie(name: name, value: value, domain: nil, expires: nil, path: nil, secure: false, httpOnly: false)
+        }
+        func setCookie(
+            name: String, value: String, domain: String?, expires: String?,
+            path: String?, secure: Bool, httpOnly: Bool
+        ) throws {
+            cookiePairs.append((name, value, secure, httpOnly))
+        }
+    }
+
+    let sink = RecordingResponseSink()
+    var context = LassoContext(responseSink: sink)
+    _ = try LassoRenderer().render(
+        """
+        <?lasso
+        web_response->setStatus(201)
+        web_response->addHeader(-name='X-Custom', -value='value1')
+        web_response->replaceHeader(-name='X-Other', -value='value2')
+        web_response->setCookie(-name='sid', -value='xyz', -secure, -httponly, -path='/')
+        ?>
+        """,
+        context: &context
+    )
+
+    #expect(sink.getStatus() == 201)
+    #expect(sink.headerPairs.contains { $0.name == "X-Custom" && $0.value == "value1" })
+    #expect(sink.headerPairs.contains { $0.name == "X-Other" && $0.value == "value2" })
+    #expect(sink.cookiePairs.count == 1)
+    #expect(sink.cookiePairs.first?.name == "sid")
+    #expect(sink.cookiePairs.first?.value == "xyz")
+    #expect(sink.cookiePairs.first?.secure == true)
+    #expect(sink.cookiePairs.first?.httpOnly == true)
+}
+
+@Test func webResponseAbortStopsRenderingLikeReturn() throws {
+    // abort() rides the existing return-signal short-circuit mechanism —
+    // no new control-flow needed. Verified the same way return's
+    // short-circuit already is: output truncates at the abort point.
+    // Needs real visible output before the abort() call to prove
+    // truncation — a bare variable assignment doesn't itself produce any
+    // output, so a test built only around one (as an earlier draft of
+    // this test was) can't distinguish "stopped early" from "never
+    // executed anything in the first place."
+    var context = LassoContext()
+    let output = try LassoRenderer().render(
+        "BEFORE<?lasso web_response->abort() ?>AFTER",
+        context: &context
+    )
+    #expect(output == "BEFORE")
+}
+
+@Test func sessionMembersStillWorkAfterMovingOffNativeMember() throws {
+    // Regression guard: session->value/get used to be handled by the
+    // now-deleted nativeMember string switch; confirm identical behavior
+    // now that they're registered on the native session type instead.
+    final class SessionProvider: LassoSessionProvider, @unchecked Sendable {
+        private var values: [String: LassoValue] = [:]
+        func value(for name: String) -> LassoValue { values[name.lowercased()] ?? .null }
+        func set(_ value: LassoValue, for name: String) throws { values[name.lowercased()] = value }
+    }
+    var context = LassoContext(sessionProvider: SessionProvider())
+    let output = try LassoRenderer().render(
+        "[session_addvar:'cart','open'][session->value('cart')]/[session->get('cart')]",
+        context: &context
+    )
+    #expect(output == "open/open")
 }
 
 private func corpusFixtureContext(
