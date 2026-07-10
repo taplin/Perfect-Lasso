@@ -54,6 +54,9 @@ private struct TemplateScanner {
             } else if squareBracketsEnabled, characters[index] == "[", startsBracketComment(at: index) {
                 emitText(through: index)
                 scanBracketComment()
+            } else if squareBracketsEnabled, characters[index] == "[", startsNoProcess(at: index) != nil {
+                emitText(through: index)
+                scanNoProcess()
             } else if squareBracketsEnabled, characters[index] == "[" {
                 emitText(through: index)
                 scanSquare()
@@ -100,6 +103,75 @@ private struct TemplateScanner {
             diagnostics.append(Diagnostic(message: "Unterminated square delimiter for block comment", range: range(start, index)))
         }
         textStart = index
+    }
+
+    /// `[noprocess]`/`[no_process]` (real Lasso's raw-content escape hatch —
+    /// used throughout the real corpus to embed non-Lasso content, most
+    /// often JavaScript, that would otherwise collide with `[ ]` bracket-tag
+    /// scanning) with nothing but optional whitespace between the name and
+    /// the closing `]`. Returns the matched span's total length (through
+    /// the opening `]`) or `nil` if this isn't actually a noprocess opener.
+    private func startsNoProcess(at position: Int) -> Int? {
+        var cursor = position + 1
+        let name = readIdentifierLookahead(from: &cursor)
+        guard name.lowercased() == "noprocess" || name.lowercased() == "no_process" else { return nil }
+        while cursor < characters.count, characters[cursor] == " " || characters[cursor] == "\t" {
+            cursor += 1
+        }
+        guard cursor < characters.count, characters[cursor] == "]" else { return nil }
+        return cursor + 1 - position
+    }
+
+    private func readIdentifierLookahead(from cursor: inout Int) -> String {
+        let start = cursor
+        while cursor < characters.count,
+              characters[cursor].isLetter || characters[cursor].isNumber || characters[cursor] == "_" {
+            cursor += 1
+        }
+        return String(characters[start..<cursor])
+    }
+
+    /// Everything between the opening `[noprocess]`/`[no_process]` and its
+    /// matching literal closing tag is real Lasso's documented raw-content
+    /// escape: emitted verbatim as plain text, never scanned for nested
+    /// `<?lasso ?>`/`[ ]` constructs at all — unlike every other block tag
+    /// in this scanner, which stays inside the normal recursive scan.
+    /// Accepts either spelling on the close regardless of which spelling
+    /// opened it (real corpus content is inconsistent about which one it
+    /// uses, though `noprocess` is by far the dominant spelling).
+    mutating private func scanNoProcess() {
+        let start = index
+        guard let openLength = startsNoProcess(at: index) else { return }
+        index += openLength
+        let bodyStart = index
+
+        while index < characters.count {
+            if characters[index] == "[", let closeLength = matchesNoProcessClose(at: index) {
+                let body = String(characters[bodyStart..<index])
+                nodes.append(.text(body, range(bodyStart, index)))
+                index += closeLength
+                textStart = index
+                return
+            }
+            index += 1
+        }
+
+        diagnostics.append(Diagnostic(message: "Unterminated [noprocess] block", range: range(start, index)))
+        nodes.append(.text(String(characters[bodyStart..<index]), range(bodyStart, index)))
+        textStart = index
+    }
+
+    private func matchesNoProcessClose(at position: Int) -> Int? {
+        var cursor = position + 1
+        guard cursor < characters.count, characters[cursor] == "/" else { return nil }
+        cursor += 1
+        let name = readIdentifierLookahead(from: &cursor)
+        guard name.lowercased() == "noprocess" || name.lowercased() == "no_process" else { return nil }
+        while cursor < characters.count, characters[cursor] == " " || characters[cursor] == "\t" {
+            cursor += 1
+        }
+        guard cursor < characters.count, characters[cursor] == "]" else { return nil }
+        return cursor + 1 - position
     }
 
     mutating private func scanDelimited(openLength: Int, close: String, delimiter: LassoDelimiter) {

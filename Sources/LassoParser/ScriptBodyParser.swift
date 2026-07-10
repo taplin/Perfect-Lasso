@@ -92,6 +92,17 @@ struct ScriptBodyParser {
         }
 
         skipHorizontalWhitespace()
+        // Lasso 8's colon-call convention (`if:(condition);` ... `/if;`)
+        // is just as valid an opener as the parenthesized-call style
+        // (`if(condition)`) — found live-verifying a real corpus page,
+        // where `if:(...)` fell through to being parsed as an ordinary
+        // colon-call expression statement (`if` treated as a bare
+        // function name), throwing unknownFunction("if") at evaluation
+        // time instead of ever reaching real if/else control flow.
+        if index < characters.count, characters[index] == ":" {
+            index += 1
+            skipHorizontalWhitespace()
+        }
         guard index < characters.count, characters[index] == "(" else {
             index = start
             return false

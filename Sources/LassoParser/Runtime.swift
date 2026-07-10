@@ -199,6 +199,16 @@ public struct LassoNativeRegistry: Sendable {
             return .void
         }
         register("session_start") { _, _ in .void }
+        // Real Lasso 8's [Cache(-Name=..., -Expires=...)] ... [/Cache]
+        // wraps a body of markup to memoize for a duration — a
+        // performance layer, not a correctness one. This interpreter has
+        // no output-caching layer at all (every render is already
+        // computed fresh), so treating the opening call as a no-op is
+        // exactly equivalent: the wrapped body still renders normally as
+        // ordinary template text/nodes, just never cached. The matching
+        // `[/Cache]` close needs no handling of its own — it's already
+        // covered by the existing generic legacy-closing-tag support.
+        register("cache") { _, _ in .void }
         register("redirect_url") { arguments, context in
             let url = arguments.firstValue(named: "url")?.outputString ??
                 arguments.first?.value.outputString ?? ""

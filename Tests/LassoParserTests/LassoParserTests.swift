@@ -92,6 +92,27 @@ import PerfectCRUD
     #expect(output == "hi there")
 }
 
+@Test func noProcessPassesThroughRawContentWithoutScanningItAsLasso() throws {
+    // Real Lasso's documented escape hatch for embedding non-Lasso content
+    // (almost always Dreamweaver-era JavaScript) inside a template — used
+    // throughout the real corpus. Found live-verifying a real page whose
+    // template embedded unwrapped JS containing `[j++]` (ordinary array
+    // indexing plus a post-increment), which crashed: `++` isn't a valid
+    // Lasso operator, so the bracket's content failed to parse as an
+    // expression at all, producing an unrecoverable `unsupportedExpression`
+    // at evaluation time. A *correctly* [noprocess]-wrapped equivalent must
+    // never even attempt to parse its body as Lasso — everything between
+    // the open and close tags is emitted completely verbatim.
+    var context = LassoContext(globals: ["x": .string("outside-still-works")])
+    let output = try LassoRenderer().render(
+        """
+        before-[noprocess]<script>var i,j; d.MM_p[j++].src=a[i];</script>[/noprocess]-after-[$x]
+        """,
+        context: &context
+    )
+    #expect(output == "before-<script>var i,j; d.MM_p[j++].src=a[i];</script>-after-outside-still-works")
+}
+
 @Test func rendersGoldenFixtures() throws {
     let fixtureURL = try #require(Bundle.module.resourceURL?.appendingPathComponent("RenderFixtures"))
     let inputs = try FileManager.default.contentsOfDirectory(
@@ -121,6 +142,20 @@ import PerfectCRUD
     var context = LassoContext(natives: natives)
     let output = try LassoRenderer().render("[greet('Ada')]", context: &context)
     #expect(output == "Hello, Ada")
+}
+
+@Test func cacheTagIsANoOpButItsBodyStillRenders() throws {
+    // Real Lasso 8's [Cache(-Name=..., -Expires=...)] ... [/Cache] wraps a
+    // body of markup to memoize for a duration — this interpreter has no
+    // output-caching layer, so the opening call is a no-op and the body
+    // still renders normally as ordinary template content. Found live
+    // -verifying a real corpus page whose template used this exact shape.
+    var context = LassoContext()
+    let output = try LassoRenderer().render(
+        "before-[Cache(-Name='x', -Expires=10)]middle[/Cache]-after",
+        context: &context
+    )
+    #expect(output == "before-middle-after")
 }
 
 @Test func rendersIncludesRequestSessionAndInlineFrames() throws {
@@ -285,6 +320,26 @@ import PerfectCRUD
     #expect(throws: LassoFileSystemIncludeError.pathOutsideRoot("../../outside.lasso")) {
         try loader.loadInclude(path: "../../outside.lasso", from: "pages/home.lasso")
     }
+}
+
+@Test func relativeIncludeFromALeadingSlashIncludingPathResolvesWithinRoot() throws {
+    // Real Lasso source overwhelmingly writes include()/library() paths
+    // with a leading slash (site-root-relative), e.g.
+    // include('/includes/b2b/siteconfig_cookies.inc'). A relative include
+    // from *inside* that file must resolve against the site root, not
+    // against the real filesystem root — found live-verifying against the
+    // real corpus, where this exact shape threw pathOutsideRoot.
+    let root = FileManager.default.temporaryDirectory
+        .appendingPathComponent("lasso-loader-\(UUID().uuidString)")
+    let nested = root.appendingPathComponent("includes/b2b")
+    try FileManager.default.createDirectory(at: nested, withIntermediateDirectories: true)
+    try "OUTER".write(to: root.appendingPathComponent("includes/siteconfig.inc"), atomically: true, encoding: .utf8)
+    try "INNER".write(to: nested.appendingPathComponent("siteconfig_cookies.inc"), atomically: true, encoding: .utf8)
+    defer { try? FileManager.default.removeItem(at: root) }
+
+    let loader = try LassoFileSystemIncludeLoader(root: root)
+    #expect(try loader.loadInclude(path: "siteconfig_cookies.inc", from: "/includes/b2b/parent.lasso") == "INNER")
+    #expect(try loader.loadInclude(path: "includes/siteconfig.inc", from: "/includes/b2b/parent.lasso") == "OUTER")
 }
 
 @Test func startupDirectoryLoadsMatchingExtensionsAndSkipsOthers() throws {
@@ -698,6 +753,46 @@ import PerfectCRUD
         } else => {
             $branch = 'else'
         }
+        ?>
+        [$branch]
+        """,
+        context: &context
+    ).trimmingCharacters(in: .whitespacesAndNewlines)
+    #expect(falseOutput == "else")
+}
+
+@Test func colonCallIfOpenerIsRecognizedAsRealControlFlow() throws {
+    // Lasso 8's colon-call convention (`if:(condition);` ... `else;` ...
+    // `/if;`) is just as valid an opener as the parenthesized-call style —
+    // found live-verifying a real corpus page, where `if:(...)` fell
+    // through to being parsed as an ordinary colon-call expression
+    // statement (`if` treated as a bare function name), throwing
+    // unknownFunction("if") instead of ever reaching real control flow.
+    var context = LassoContext()
+
+    let trueOutput = try LassoRenderer().render(
+        """
+        <?lasso
+        if:(true);
+            $branch = 'if'
+        else;
+            $branch = 'else'
+        /if;
+        ?>
+        [$branch]
+        """,
+        context: &context
+    ).trimmingCharacters(in: .whitespacesAndNewlines)
+    #expect(trueOutput == "if")
+
+    let falseOutput = try LassoRenderer().render(
+        """
+        <?lasso
+        if:(false);
+            $branch = 'if'
+        else;
+            $branch = 'else'
+        /if;
         ?>
         [$branch]
         """,

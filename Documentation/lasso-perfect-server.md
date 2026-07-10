@@ -483,6 +483,69 @@ distinct legacy `if` dialect gap, a path-boundary check, one unrelated
 `unsupportedExpression("")`) — none connected to library scoping, the
 ternary operator, or void/null dispatch. 48/48 tests pass.
 
+## Resolved: the three remaining real-page failures
+
+Followed up on the 3 remaining real-corpus page failures cataloged above.
+All three were real, root-caused, and fixed — grounded in direct
+comparison against other real pages/templates in the same corpus, not
+guesswork:
+
+- **Colon-call `if:(condition);` control flow.**
+  `ScriptBodyParser.parseBlockOpening()` required a block keyword
+  (`if`/`loop`/`iterate`/...) to be immediately followed by `(` — Lasso
+  8's colon-call convention (`if:(condition); ... else; ... /if;`) put a
+  `:` there instead, so the guard declined to treat it as control flow at
+  all. It fell through to being parsed as an ordinary colon-call
+  expression statement (`if` treated as a bare function name), throwing
+  `unknownFunction("if")` at evaluation. Fixed by accepting an optional
+  `:` immediately before the `(`.
+- **A relative `include()`/`library()` path resolved against the real
+  filesystem root instead of the site root.** `LassoFileSystemIncludeLoader
+  .loadInclude` stores `includingPath` verbatim — and real Lasso source
+  overwhelmingly uses the leading-slash, site-root-relative style
+  (`include('/includes/b2b/whatever.inc')`). `URL(fileURLWithPath:
+  relativeTo:)` treats any string starting with `/` as a literal
+  filesystem-absolute path and silently ignores `relativeTo`, so an
+  un-stripped leading slash resolved the parent directory against the
+  real filesystem root instead of the site root — every subsequent
+  relative `include()` from inside that file then failed
+  `pathOutsideRoot`. Fixed by stripping the leading slash from
+  `includingPath` before use, matching the normalization already applied
+  to `path` itself.
+- **Real Lasso 8's `[Cache(-Name=..., -Expires=...)]` output-caching tag**
+  wasn't recognized at all (`unknownFunction`). This interpreter has no
+  output-caching layer — every render is already computed fresh — so the
+  opening call is registered as a no-op native; the wrapped body still
+  renders normally, matching real semantics minus the memoization. The
+  matching `[/Cache]` needed no handling of its own — already covered by
+  the existing generic legacy-closing-tag support.
+- **`[noprocess]`/`[no_process]` — real Lasso's raw-content escape hatch —
+  was never implemented at all.** The actual crash (`unsupportedExpression
+  ("")`) traced to a real template's *unwrapped* embedded JavaScript:
+  `[j++]` inside `<script>` content got scanned as an ordinary Lasso
+  bracket tag (every `[...]` is, regardless of surrounding context), and
+  `++` isn't a valid Lasso operator, so the expression parser hit EOF
+  mid-token, producing an unrecoverable `.unknown("")` node. Checking the
+  real corpus (Tim's direction, rather than guessing at a fallback
+  behavior) showed `[noprocess]` already correctly wrapping equivalent JS
+  in ~10 other real templates — confirming the crashing page was simply
+  missing a wrapper other pages already use correctly, and that the real,
+  correct fix was implementing the actual Lasso mechanism, not inventing
+  speculative "malformed expression" recovery behavior. Implemented in
+  `TemplateScanner`: content between `[noprocess]` and `[/noprocess]` is
+  now emitted as verbatim text, never scanned for nested `<?lasso ?>`/
+  `[ ]` constructs. The one real page still missing its wrapper continues
+  to fail — correctly, since that's real content, not an interpreter gap
+  — but every page that already uses `[noprocess]` properly now renders.
+
+Corpus sweep after all three fixes: 13 of 17 real pages now render
+cleanly end to end (up from 12 after the previous pass, 0 before this
+whole investigation began). Of the 4 remaining failures: 2 need a real
+database connection this quick verification run doesn't have
+(`inlineNotConfigured` — expected, not a bug), 2 are missing include
+files on this local checkout, and 1 is the confirmed missing-`[noprocess]`
+site-content gap above. 52/52 tests pass.
+
 ## Next Compatibility Work
 
 1. Implement POST body reading — `web_request->postParam`/`postParams`/

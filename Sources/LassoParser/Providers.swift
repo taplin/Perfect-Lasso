@@ -161,7 +161,20 @@ public struct LassoFileSystemIncludeLoader: LassoIncludeLoader {
         let normalizedPath = path.hasPrefix("/") ? String(path.dropFirst()) : path
         var bases: [URL] = [root]
         if !path.hasPrefix("/"), let includingPath {
-            let parent = URL(fileURLWithPath: includingPath, relativeTo: root)
+            // includingPath is stored verbatim from whatever the including
+            // file passed to include()/library() — real Lasso source
+            // overwhelmingly uses the leading-slash, site-root-relative
+            // style (e.g. include('/includes/b2b/siteconfig_cookies.inc')).
+            // URL(fileURLWithPath:relativeTo:) treats any string starting
+            // with "/" as a literal filesystem absolute path and silently
+            // ignores relativeTo, so an un-stripped leading slash here
+            // resolved the parent directory against the real filesystem
+            // root instead of the site root — every subsequent relative
+            // include() from inside that file then failed pathOutsideRoot.
+            let normalizedIncludingPath = includingPath.hasPrefix("/")
+                ? String(includingPath.dropFirst())
+                : includingPath
+            let parent = URL(fileURLWithPath: normalizedIncludingPath, relativeTo: root)
                 .deletingLastPathComponent()
             bases.insert(parent, at: 0)
         }
