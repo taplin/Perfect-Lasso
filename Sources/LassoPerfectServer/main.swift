@@ -10,6 +10,7 @@ struct ServerConfig: Sendable {
     let siteRoot: URL
     let port: Int
     let lassoExtensions: Set<String>
+    let startupPath: URL?
     let datasourceAlias: String?
     let mysqlHost: String
     let mysqlPort: Int?
@@ -30,11 +31,19 @@ struct ServerConfig: Sendable {
             .split(separator: ",")
             .map { $0.trimmingCharacters(in: .whitespacesAndNewlines).lowercased() }
             .filter { $0.isEmpty == false }
+        // Same extension preferences as page-serving (LASSO_RENDER_EXTENSIONS)
+        // apply to the startup folder — a real Lasso instance's file-extension
+        // setting governs both, and some deployments register additional
+        // custom extensions there too.
+        let startupPathValue = env["LASSO_STARTUP_PATH"].map {
+            URL(fileURLWithPath: $0).standardizedFileURL.resolvingSymlinksInPath()
+        }
 
         return ServerConfig(
             siteRoot: root,
             port: env["LASSO_SERVER_PORT"].flatMap(Int.init) ?? 8181,
             lassoExtensions: Set(extensions),
+            startupPath: startupPathValue,
             datasourceAlias: env["LASSO_DATASOURCE_ALIAS"],
             mysqlHost: env["LASSO_MYSQL_HOST"] ?? "localhost",
             mysqlPort: env["LASSO_MYSQL_PORT"].flatMap(Int.init),
@@ -406,6 +415,19 @@ let config = try ServerConfig.load()
 let siteServer = try LassoSiteServer(config: config)
 print("Lasso Perfect test server")
 print("Site root: \(config.siteRoot.path)")
+if let startupPath = config.startupPath {
+    let result = loadLassoStartupDirectory(
+        at: startupPath,
+        allowedExtensions: config.lassoExtensions,
+        tagRegistry: siteServer.tagRegistry
+    )
+    print("Startup folder: \(startupPath.path) (\(result.loadedFiles.count) loaded, \(result.failedFiles.count) failed)")
+    for failure in result.failedFiles {
+        fputs("Startup load failed: \(failure.file): \(failure.error)\n", stderr)
+    }
+} else {
+    print("Startup folder: none")
+}
 print("Listening: http://localhost:\(config.port)")
 if let alias = config.datasourceAlias {
     print("Datasource alias: \(alias) -> \(config.mysqlDatabase)@\(config.mysqlHost)")

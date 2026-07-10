@@ -144,10 +144,14 @@ struct ScriptBodyParser {
             return false
         }
         index += 2
-        skipHorizontalWhitespace()
+        // The body's opening brace commonly sits on its own line after
+        // `=>` in real code (`define name(...) =>\n{`), not just on the
+        // same line. Full trivia skipping (whitespace and comments, not
+        // just same-line spaces) here is what makes that layout parse.
+        skipTrivia()
 
         if readKeyword("type") {
-            skipHorizontalWhitespace()
+            skipTrivia()
             guard index < characters.count, characters[index] == "{" else {
                 diagnostics.append(Diagnostic(message: "Malformed 'define \(name) => type': expected '{'", range: range))
                 return true
@@ -350,10 +354,18 @@ struct ScriptBodyParser {
     /// consumed, so the caller knows to track this block for later
     /// implicit closing by a bare `}` (see `openBraceBlockStack`).
     private mutating func consumeArrowBlockStartIfPresent() -> Bool {
+        // Only same-line whitespace here, deliberately: this probe can
+        // fail (a slash-style block has no '=>' at all), and on failure
+        // the caller unconditionally calls skipLineRemainder() next. If
+        // this skip crossed a newline while probing, that unconditional
+        // call would then swallow the block body's first line instead of
+        // just the block-opening line's own trailer. Once '=>' itself is
+        // actually matched below, we're committed to arrow-brace mode and
+        // multi-line skipping before '{' is safe.
         skipHorizontalWhitespace()
         if matches("=>") {
             index += 2
-            skipHorizontalWhitespace()
+            skipTrivia()
         }
         if index < characters.count, characters[index] == "{" {
             index += 1

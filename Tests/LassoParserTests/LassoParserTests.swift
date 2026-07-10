@@ -57,6 +57,41 @@ import PerfectCRUD
     #expect(text.contains("[1, 2, 3]"))
 }
 
+@Test func squareBracketScanningSkipsCommentsWhenFindingTheClosingBracket() throws {
+    // Real Lasso lets a whole `[ ... ]` span hold a full `define ... =>
+    // { ... }` custom tag with a leading `//lasso` comment as a human hint
+    // that the bracket contains Lasso code — a real idiom found in
+    // startup-folder tag definitions downloaded from
+    // lassosoft.com/tagswap. Two things had to be fixed together for this
+    // to actually work, not just avoid throwing:
+    //  1. TemplateScanner.scanSquare()'s naive quote-tracking had no
+    //     comment awareness at all: an apostrophe or a `]` inside a `//`
+    //     or `/* */` comment (a possessive name, a `[tag(...)]` usage
+    //     example in a file-header comment) was indistinguishable from a
+    //     real string delimiter or the bracket's own closing `]`.
+    //  2. emitCode's legacy-closing-tag check (`body.hasPrefix("/")`)
+    //     misfired on the leading `//` comment marker itself, swallowing
+    //     the entire body — including the real `define` — as a bogus
+    //     closing tag. The bracket "loaded" with no error, but the tag it
+    //     defined was silently never registered.
+    var context = LassoContext()
+    let output = try LassoRenderer().render(
+        """
+        [//lasso
+        /* Header comment mentioning someone's tag usage: [example_tag(1)]
+           and a line with 'a quoted word' inside it too. */
+        define greetFromBracket(name = void) => {
+            // a plain line comment with a bracket example: [also_not_real]
+            return('hi ' + #name)
+        }
+        ]
+        [greetFromBracket(-name='there')]
+        """,
+        context: &context
+    ).trimmingCharacters(in: .whitespacesAndNewlines)
+    #expect(output == "hi there")
+}
+
 @Test func rendersGoldenFixtures() throws {
     let fixtureURL = try #require(Bundle.module.resourceURL?.appendingPathComponent("RenderFixtures"))
     let inputs = try FileManager.default.contentsOfDirectory(
@@ -250,6 +285,104 @@ import PerfectCRUD
     #expect(throws: LassoFileSystemIncludeError.pathOutsideRoot("../../outside.lasso")) {
         try loader.loadInclude(path: "../../outside.lasso", from: "pages/home.lasso")
     }
+}
+
+@Test func startupDirectoryLoadsMatchingExtensionsAndSkipsOthers() throws {
+    let root = FileManager.default.temporaryDirectory
+        .appendingPathComponent("lasso-startup-\(UUID().uuidString)")
+    try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
+    defer { try? FileManager.default.removeItem(at: root) }
+
+    try "<?lassoscript define greet => { return('hi') } ?>".write(
+        to: root.appendingPathComponent("a.inc"), atomically: true, encoding: .utf8
+    )
+    try "<?lassoscript define farewell => { return('bye') } ?>".write(
+        to: root.appendingPathComponent("b.lasso"), atomically: true, encoding: .utf8
+    )
+    try "{\"ignored\": true}".write(
+        to: root.appendingPathComponent("c.json"), atomically: true, encoding: .utf8
+    )
+
+    let registry = LassoTagRegistry()
+    let result = loadLassoStartupDirectory(
+        at: root,
+        allowedExtensions: ["lasso", "inc"],
+        tagRegistry: registry
+    )
+
+    #expect(Set(result.loadedFiles) == ["a.inc", "b.lasso"])
+    #expect(result.failedFiles.isEmpty)
+    #expect(registry.containsTag(named: "greet"))
+    #expect(registry.containsTag(named: "farewell"))
+}
+
+@Test func startupDirectoryContinuesPastAFailingFileAndReportsIt() throws {
+    let root = FileManager.default.temporaryDirectory
+        .appendingPathComponent("lasso-startup-\(UUID().uuidString)")
+    try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
+    defer { try? FileManager.default.removeItem(at: root) }
+
+    try "<?lassoscript define good => { return('ok') } ?>".write(
+        to: root.appendingPathComponent("a-good.inc"), atomically: true, encoding: .utf8
+    )
+    try "<?lassoscript totallyUndefinedFunctionCall() ?>".write(
+        to: root.appendingPathComponent("b-broken.inc"), atomically: true, encoding: .utf8
+    )
+    try "<?lassoscript define alsoGood => { return('ok too') } ?>".write(
+        to: root.appendingPathComponent("c-good.inc"), atomically: true, encoding: .utf8
+    )
+
+    let registry = LassoTagRegistry()
+    let result = loadLassoStartupDirectory(
+        at: root,
+        allowedExtensions: ["inc"],
+        tagRegistry: registry
+    )
+
+    #expect(Set(result.loadedFiles) == ["a-good.inc", "c-good.inc"])
+    #expect(result.failedFiles.count == 1)
+    #expect(result.failedFiles.first?.file == "b-broken.inc")
+    #expect(result.failedFiles.first?.error.contains("totallyUndefinedFunctionCall") == true)
+    #expect(registry.containsTag(named: "good"))
+    #expect(registry.containsTag(named: "alsoGood"))
+}
+
+@Test func startupDirectoryHandlesMissingDirectoryGracefully() {
+    let missing = FileManager.default.temporaryDirectory
+        .appendingPathComponent("lasso-startup-does-not-exist-\(UUID().uuidString)")
+    let registry = LassoTagRegistry()
+
+    let result = loadLassoStartupDirectory(
+        at: missing,
+        allowedExtensions: ["lasso", "inc"],
+        tagRegistry: registry
+    )
+
+    #expect(result.loadedFiles.isEmpty)
+    #expect(result.failedFiles.count == 1)
+    #expect(result.failedFiles.first?.error == "not a directory or does not exist")
+}
+
+@Test func startupDirectoryTagsAreVisibleToLaterContextsSharingTheRegistry() throws {
+    let root = FileManager.default.temporaryDirectory
+        .appendingPathComponent("lasso-startup-\(UUID().uuidString)")
+    try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
+    defer { try? FileManager.default.removeItem(at: root) }
+
+    try "<?lassoscript define shout(msg = void) => { return(#msg + '!') } ?>".write(
+        to: root.appendingPathComponent("setup.inc"), atomically: true, encoding: .utf8
+    )
+
+    let registry = LassoTagRegistry()
+    let result = loadLassoStartupDirectory(at: root, allowedExtensions: ["inc"], tagRegistry: registry)
+    #expect(result.failedFiles.isEmpty)
+
+    var pageContext = LassoContext(tagRegistry: registry)
+    let output = try LassoRenderer().render(
+        "[shout(-msg='hello')]",
+        context: &pageContext
+    )
+    #expect(output == "hello!")
 }
 
 @Test func dynamicInlineProviderMapsDatasourceForPerfectCRUDExecutor() throws {
@@ -599,6 +732,68 @@ import PerfectCRUD
 
     let malformedDefine = LassoParser().parse("<?lassoscript define ?>")
     #expect(malformedDefine.diagnostics.contains { $0.message.hasPrefix("Malformed 'define'") })
+}
+
+@Test func arrowBraceBodyOnItsOwnLineIsNotMalformed() throws {
+    // Real startup-folder code commonly puts the opening brace on the line
+    // after '=>' rather than immediately following it (found verifying
+    // against a real LassoStartup folder — a `define name(...) =>` /
+    // `{` split like this used to make parseDefineOpening back out
+    // entirely, silently reinterpreting the define as a plain statement
+    // and later throwing unknownFunction for the tag's own name).
+    var context = LassoContext()
+    let output = try LassoRenderer().render(
+        """
+        <?lassoscript
+        define greet(name = void) =>
+        {
+            return('hi ' + #name)
+        }
+        ?>
+        [greet(-name='there')]
+        """,
+        context: &context
+    ).trimmingCharacters(in: .whitespacesAndNewlines)
+    #expect(output == "hi there")
+}
+
+@Test func arrowBraceIfBodyOnItsOwnLineIsRecognized() throws {
+    var context = LassoContext()
+    let output = try LassoRenderer().render(
+        """
+        <?lasso
+        if(true) =>
+        {
+            $branch = 'taken'
+        }
+        ?>
+        [$branch]
+        """,
+        context: &context
+    ).trimmingCharacters(in: .whitespacesAndNewlines)
+    #expect(output == "taken")
+}
+
+@Test func slashStyleBlockBodyIsNotSwallowedWhenNoArrowFollows() throws {
+    // Regression guard for a bug introduced while fixing the arrow-brace
+    // newline case above: consumeArrowBlockStartIfPresent() must not
+    // cross a newline while merely probing for '=>' — doing so left the
+    // parser positioned on the block body's first line, which the
+    // caller's unconditional skipLineRemainder() then silently swallowed
+    // instead of just cleaning up the block-opening line's own trailer.
+    var context = LassoContext()
+    let output = try LassoRenderer().render(
+        """
+        <?lasso
+        if(true)
+            $branch = 'taken'
+        /if
+        ?>
+        [$branch]
+        """,
+        context: &context
+    ).trimmingCharacters(in: .whitespacesAndNewlines)
+    #expect(output == "taken")
 }
 
 private func corpusFixtureContext(

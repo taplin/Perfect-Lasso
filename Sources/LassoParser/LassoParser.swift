@@ -112,7 +112,33 @@ private struct TemplateScanner {
             let character = characters[index]
             if let activeQuote = quote {
                 if character == activeQuote { quote = nil }
-            } else if character == "'" || character == "\"" {
+                index += 1
+                continue
+            }
+            // A real bracket span can hold a `//` or `/* ... */` comment
+            // (e.g. the `[//lasso` file-header idiom borrowed from
+            // lassosoft.com/tagswap) whose content is not itself Lasso
+            // code — quotes and `]` characters inside it (an apostrophe in
+            // a name, a `[tag(...)]` example in prose) must not be
+            // mistaken for a real string delimiter or the bracket's own
+            // closing `]`. Skipped here purely to find the true close;
+            // the comment text itself still reaches `emitCode`'s body,
+            // same as it always has.
+            if matches("//") {
+                while index < characters.count, characters[index] != "\n" {
+                    index += 1
+                }
+                continue
+            }
+            if matches("/*") {
+                index += 2
+                while index < characters.count, !matches("*/") {
+                    index += 1
+                }
+                index = min(index + 2, characters.count)
+                continue
+            }
+            if character == "'" || character == "\"" {
                 quote = character
             } else if character == "]" {
                 break
@@ -137,7 +163,14 @@ private struct TemplateScanner {
         delimiter: LassoDelimiter,
         range: SourceRange
     ) {
-        if body.hasPrefix("/") {
+        // A legacy closing tag is a single '/' immediately followed by a
+        // tag name (`[/if]`, `[/lp_client_browser]`) — never '//' or '/*'.
+        // Excluding those keeps a bracket body that opens with a comment
+        // (the `[//lasso ... ]` file-header idiom found in real startup
+        // libraries) from being misread as a bogus closing tag whose
+        // "name" swallows the entire rest of the body, silently discarding
+        // all the real code that follows.
+        if body.hasPrefix("/"), !body.hasPrefix("//"), !body.hasPrefix("/*") {
             let name = body.dropFirst().trimmingCharacters(in: .whitespacesAndNewlines)
             nodes.append(.tag(name: name, arguments: [], closing: true, dialect: .lasso8, range: range))
             return
@@ -145,6 +178,23 @@ private struct TemplateScanner {
 
         if delimiter == .square, let defineTag = Self.parseDefineTag(body: body, dialect: dialect, range: range) {
             nodes.append(defineTag)
+            return
+        }
+
+        // A whole `define name(...) => { ... }` custom tag can be wrapped
+        // in a single `[ ... ]` span rather than the `[define ...] ...
+        // [/define]` paired style `parseDefineTag` above handles — a real
+        // idiom (`[//lasso ... define ... => { ... } ]`) found in startup
+        // libraries downloaded from lassosoft.com/tagswap, where `//lasso`
+        // is just an ordinary leading comment, not a directive. This needs
+        // the same statement/block-aware parsing `<?lasso ?>` content
+        // gets, not the single-expression path below, which would only
+        // keep the first (comment-garbled) parsed expression and silently
+        // drop the tag's real body entirely.
+        if delimiter == .square, Self.bodyOpensWithDefine(body) {
+            var parser = ScriptBodyParser(source: body, range: range, delimiter: .square)
+            nodes.append(contentsOf: parser.parse())
+            diagnostics.append(contentsOf: parser.diagnostics)
             return
         }
 
@@ -231,6 +281,38 @@ private struct TemplateScanner {
     mutating private func emitText(through end: Int) {
         guard end > textStart else { return }
         nodes.append(.text(String(characters[textStart..<end]), range(textStart, end)))
+    }
+
+    /// True if `body`, once any leading `//` or `/* ... */` comments and
+    /// whitespace are skipped, starts with the `define` keyword as a whole
+    /// word. Unlike `parseDefineTag` above, this tolerates leading
+    /// comments (needed for the `[//lasso ... define ... ]` idiom) and
+    /// doesn't attempt to parse out a name/parameter list itself — the
+    /// caller routes a match through `ScriptBodyParser`, which already
+    /// knows how to do that correctly for a full `define ... => { ... }`
+    /// body, comments and all.
+    private static func bodyOpensWithDefine(_ body: String) -> Bool {
+        let characters = Array(body)
+        var index = 0
+        while index < characters.count {
+            if characters[index].isWhitespace {
+                index += 1
+            } else if index + 1 < characters.count, characters[index] == "/", characters[index + 1] == "/" {
+                while index < characters.count, characters[index] != "\n" { index += 1 }
+            } else if index + 1 < characters.count, characters[index] == "/", characters[index + 1] == "*" {
+                index += 2
+                while index + 1 < characters.count, !(characters[index] == "*" && characters[index + 1] == "/") {
+                    index += 1
+                }
+                index = min(index + 2, characters.count)
+            } else {
+                break
+            }
+        }
+        let remainder = String(characters[index...])
+        guard remainder.lowercased().hasPrefix("define") else { return false }
+        let afterKeyword = remainder.index(remainder.startIndex, offsetBy: "define".count)
+        return afterKeyword == remainder.endIndex || remainder[afterKeyword].isWhitespace
     }
 
     private func inferDialect(_ body: String) -> LassoDialect {

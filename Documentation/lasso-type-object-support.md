@@ -50,7 +50,7 @@ the resolver a place to grow toward the full documented behavior.
 
 ## Current Corpus Findings
 
-`/Library/WebServer/scrubsSite/api.lasso` defines:
+The real corpus `api.lasso` (site root outside this repo) defines:
 
 - `ApiHandler`
 - `data public store::string`
@@ -71,9 +71,9 @@ test fixture.
 Separately, the live `/api.lasso` blocker found before this work,
 `unknownFunction("excludeBots")`, is not part of `ApiHandler`. It is a normal
 custom tag defined in `components/site_setup_tags.inc`, while `_begin.lasso`
-only loads `components/koi_setup.inc` before calling `excludeBots`. That
-should be investigated as a startup/include ordering issue or as a missing
-startup library load, not as object dispatch.
+only loads another, unrelated setup include before calling `excludeBots`.
+That should be investigated as a startup/include ordering issue or as a
+missing startup library load, not as object dispatch.
 
 ## Known Gaps
 
