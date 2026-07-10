@@ -128,6 +128,7 @@ public indirect enum LassoExpression: Equatable, Sendable {
     case decimal(Double)
     case boolean(Bool)
     case null
+    case void
     case variable(String, VariableScope)
     case identifier(String)
     case call(callee: LassoExpression, arguments: [LassoArgument])
@@ -135,6 +136,7 @@ public indirect enum LassoExpression: Equatable, Sendable {
     case unary(operator: String, value: LassoExpression)
     case binary(left: LassoExpression, operator: String, right: LassoExpression)
     case assignment(target: LassoExpression, value: LassoExpression)
+    case ternary(condition: LassoExpression, whenTrue: LassoExpression, whenFalse: LassoExpression)
     case unknown(String)
 }
 

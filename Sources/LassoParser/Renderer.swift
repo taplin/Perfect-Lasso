@@ -198,12 +198,18 @@ private struct RendererEngine {
         return try evaluator.evaluate(expression).outputString
     }
 
-    /// Loads and registers a library's `define`d tags exactly once per
-    /// `LassoTagRegistry` (shared across every request on the same server
-    /// instance when the context is wired with a shared registry) — repeat
-    /// calls for an already-loaded path are no-ops. The library's own text
-    /// output, if any, is intentionally discarded; only its registry side
-    /// effects (registered tags, any top-level setup code it ran) persist.
+    /// Loads and runs a library exactly once per path *for this request's
+    /// render* (`evaluator.context.loadedLibraries`, not the shared
+    /// `tagRegistry`) — repeat calls for an already-loaded path within the
+    /// same render are no-ops, matching LassoSoft's own `library_once`
+    /// documentation ("if used multiple times referencing the same Lasso
+    /// page then only the first will actually perform the include"). Tag/
+    /// type definitions the library registers land on the shared
+    /// `tagRegistry` and so persist process-wide as normal, but any other
+    /// top-level executable code in the file (e.g. a per-request check like
+    /// a bot-exclusion redirect) genuinely re-runs on every new request,
+    /// since `loadedLibraries` starts empty on every fresh `LassoContext`.
+    /// The library's own text output, if any, is intentionally discarded.
     private mutating func renderLibrary(_ arguments: [LassoArgument]) throws {
         guard let loader = evaluator.context.includeLoader else {
             throw LassoRuntimeError.includeNotConfigured
@@ -212,7 +218,7 @@ private struct RendererEngine {
         let path = evaluated.firstValue(named: "file")?.outputString ??
             evaluated.firstValue(named: "path")?.outputString ??
             evaluated.first?.value.outputString ?? ""
-        guard evaluator.context.tagRegistry.markLibraryLoaded(path) else { return }
+        guard evaluator.context.loadedLibraries.insert(path).inserted else { return }
 
         let source = try loader.loadInclude(path: path, from: evaluator.context.includePath)
         _ = try render(LassoParser().parse(source).nodes)

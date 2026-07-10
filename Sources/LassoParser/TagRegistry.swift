@@ -17,16 +17,24 @@ private struct LassoCachedInclude {
     let document: LassoDocument
 }
 
-/// Shared, thread-safe store for compiled custom tags, the set of libraries
-/// already loaded, and parsed include documents. A single instance can be
-/// handed to every `LassoContext` a server process constructs so tags
-/// compile once and stay callable for the lifetime of the process, not just
-/// one request.
+/// Shared, thread-safe store for compiled custom tags and parsed include
+/// documents. A single instance can be handed to every `LassoContext` a
+/// server process constructs so tags compile once and stay callable for the
+/// lifetime of the process, not just one request.
+///
+/// Deliberately does NOT track which `library()` paths have been loaded —
+/// per LassoSoft's own `library_once`/`[Library_Once]` documentation, that
+/// dedup is scoped to a single page's own render ("if used multiple times
+/// referencing the same Lasso page then only the first will actually
+/// perform the include"), not to the server process's lifetime. That
+/// per-request set lives on `LassoContext` instead (see `loadedLibraries`
+/// there) — keeping it here made a file's top-level executable code (e.g.
+/// a bot-exclusion check at the top of `_begin.lasso`) run only once, ever,
+/// for the whole server process, silently no-opping on every later request.
 public final class LassoTagRegistry: @unchecked Sendable {
     private let lock = NSLock()
     private var tags: [String: LassoCustomTagDefinition] = [:]
     private var types: [String: LassoTypeDefinition] = [:]
-    private var loadedLibraries: Set<String> = []
     private var includeCache: [String: LassoCachedInclude] = [:]
 
     public init() {}
@@ -65,16 +73,6 @@ public final class LassoTagRegistry: @unchecked Sendable {
         lock.lock()
         defer { lock.unlock() }
         return types[name.lowercased()] != nil
-    }
-
-    /// Returns `true` the first time a given path is seen, meaning the
-    /// caller should load and process it. Returns `false` on every
-    /// subsequent call for the same path — already cached, nothing to do.
-    @discardableResult
-    public func markLibraryLoaded(_ path: String) -> Bool {
-        lock.lock()
-        defer { lock.unlock() }
-        return loadedLibraries.insert(path).inserted
     }
 
     /// Unlike a library, an include can produce output on every use, so it

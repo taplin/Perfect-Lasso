@@ -135,15 +135,15 @@ import PerfectCRUD
         let parameters: [String: LassoValue] = ["term": .string("clogs")]
 
         func parameter(named name: String) -> LassoValue {
-            parameters[name.lowercased()] ?? .null
+            parameters[name.lowercased()] ?? .void
         }
 
         func header(named name: String) -> LassoValue {
-            name.lowercased() == "host" ? .string("example.test") : .null
+            name.lowercased() == "host" ? .string("example.test") : .void
         }
 
         func cookie(named name: String) -> LassoValue {
-            name.lowercased() == "sid" ? .string("abc123") : .null
+            name.lowercased() == "sid" ? .string("abc123") : .void
         }
     }
 
@@ -549,7 +549,12 @@ import PerfectCRUD
     }
 }
 
-@Test func libraryLoadsAndCachesAcrossIndependentContexts() throws {
+@Test func libraryDedupesWithinOneRenderButReloadsPerIndependentContext() throws {
+    // Per LassoSoft's own library_once/[Library_Once] documentation, repeat
+    // calls only no-op "if used multiple times referencing the same Lasso
+    // page" — i.e. within one page's own render, not across the server
+    // process's lifetime. `_begin.lasso`-style top-level executable code
+    // (like a bot-exclusion check) must genuinely re-run on every request.
     final class CountingLibraryLoader: LassoIncludeLoader, @unchecked Sendable {
         private(set) var loadCount = 0
         let librarySource: String
@@ -575,18 +580,30 @@ import PerfectCRUD
 
     var firstRequestContext = LassoContext(includeLoader: loader, tagRegistry: registry)
     let firstOutput = try LassoRenderer().render(
-        "<?lassoscript library('/shared.lasso') ?>[shared_tag(21)]",
+        """
+        <?lassoscript
+        library('/shared.lasso')
+        library('/shared.lasso')
+        ?>[shared_tag(21)]
+        """,
         context: &firstRequestContext
     )
+    // Two `library()` calls to the same path within the SAME render only
+    // load once — the within-one-page dedup real Lasso documents.
+    #expect(loader.loadCount == 1)
+    #expect(firstOutput == "42")
+
     var secondRequestContext = LassoContext(includeLoader: loader, tagRegistry: registry)
     let secondOutput = try LassoRenderer().render(
         "<?lassoscript library('/shared.lasso') ?>[shared_tag(10)]",
         context: &secondRequestContext
     )
-
-    #expect(firstOutput == "42")
+    // A second, independent context sharing the same registry (a second
+    // request) reloads and re-runs the library's top-level code again —
+    // `shared_tag` stays callable because its definition persists on the
+    // shared registry, but the load itself is NOT permanently cached.
+    #expect(loader.loadCount == 2)
     #expect(secondOutput == "20")
-    #expect(loader.loadCount == 1)
 }
 
 @Test func includeAlwaysRereadsButSkipsReparseWhenUnchanged() throws {
@@ -938,11 +955,11 @@ import PerfectCRUD
     // above unblocked the loop itself.
     struct RequestProvider: LassoRequestProvider {
         let parameters: [String: LassoValue] = [:]
-        func parameter(named name: String) -> LassoValue { .null }
+        func parameter(named name: String) -> LassoValue { .void }
         func header(named name: String) -> LassoValue {
-            name.lowercased() == "host" ? .string("shop.example.test") : .null
+            name.lowercased() == "host" ? .string("shop.example.test") : .void
         }
-        func cookie(named name: String) -> LassoValue { .null }
+        func cookie(named name: String) -> LassoValue { .void }
     }
 
     var context = LassoContext(requestProvider: RequestProvider())
@@ -996,9 +1013,9 @@ import PerfectCRUD
     // .object(LassoObjectInstance(typeName: "web_request")) value.
     struct RequestProvider: LassoRequestProvider {
         let parameters: [String: LassoValue] = ["term": .string("clogs")]
-        func parameter(named name: String) -> LassoValue { parameters[name.lowercased()] ?? .null }
-        func header(named name: String) -> LassoValue { .null }
-        func cookie(named name: String) -> LassoValue { .null }
+        func parameter(named name: String) -> LassoValue { parameters[name.lowercased()] ?? .void }
+        func header(named name: String) -> LassoValue { .void }
+        func cookie(named name: String) -> LassoValue { .void }
     }
     var context = LassoContext(requestProvider: RequestProvider())
     let output = try LassoRenderer().render(
@@ -1028,9 +1045,9 @@ import PerfectCRUD
         let contentType = "application/x-www-form-urlencoded"
         let contentLength = 42
 
-        func parameter(named name: String) -> LassoValue { parameters[name.lowercased()] ?? .null }
-        func header(named name: String) -> LassoValue { headers[name.lowercased()] ?? .null }
-        func cookie(named name: String) -> LassoValue { cookies[name.lowercased()] ?? .null }
+        func parameter(named name: String) -> LassoValue { parameters[name.lowercased()] ?? .void }
+        func header(named name: String) -> LassoValue { headers[name.lowercased()] ?? .void }
+        func cookie(named name: String) -> LassoValue { cookies[name.lowercased()] ?? .void }
     }
 
     var context = LassoContext(requestProvider: RichRequestProvider())
@@ -1082,6 +1099,38 @@ import PerfectCRUD
         context: &context
     )
     #expect(output == "|")
+}
+
+@Test func voidLookupMissBehavesLikeEmptyStringButNullStaysStrict() throws {
+    // Real Lasso 9 returns `void` (not `null`) when web_request->param /
+    // action_param / header / cookie lookups miss, and keeps `null` itself
+    // strict — an unhandled member on a real null throws unless the type
+    // defines `_unknowntag`. The real corpus's near-universal
+    // `action_param('template')->size` pattern (used in a log_critical
+    // line on almost every real page) crashed before this: action_param
+    // returned `.null` on a miss, and `.null` had no member-dispatch case
+    // at all.
+    var context = LassoContext()
+    let output = try LassoRenderer().render(
+        "[action_param('missing')->size]|[action_param('missing')->contains('x')]|[action_param('missing')->uppercase]",
+        context: &context
+    )
+    #expect(output == "0|false|")
+
+    // A genuine null (not a lookup-miss void) must still throw on an
+    // unhandled member — this fix must not weaken null's real strictness.
+    var nullContext = LassoContext()
+    #expect(throws: LassoRuntimeError.unsupportedExpression("Member bogusMember")) {
+        _ = try LassoRenderer().render("[null->bogusMember]", context: &nullContext)
+    }
+
+    // The literal `void` keyword must itself parse to a real .void value
+    // (previously both `null` and `void` collapsed to the same .null
+    // expression node — harmless before this fix, but now `void` needs
+    // its own distinct, permissive dispatch).
+    var voidContext = LassoContext()
+    let voidOutput = try LassoRenderer().render("[void->size]", context: &voidContext)
+    #expect(voidOutput == "0")
 }
 
 @Test func webResponseMembersRecordThroughResponseSink() throws {

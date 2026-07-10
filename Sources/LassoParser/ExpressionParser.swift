@@ -148,6 +148,22 @@ struct ExpressionParser {
             left = op == "=" ? .assignment(target: left, value: right) :
                 .binary(left: left, operator: op, right: right)
         }
+        // Lasso 8's `condition ? whenTrue | whenFalse` conditional-expression
+        // operator — not a binary operator (not in `precedence`, and its
+        // `|` separator would collide with bitwise/other single-`|` use if
+        // it were). Bound looser than everything above: only recognized
+        // starting a fresh top-level expression (`minimumPrecedence == 0`),
+        // never mid-recursion for a binary operator's right-hand side, so
+        // `left` here is the FULL condition already parsed at normal
+        // precedence, matching the real corpus's exclusive usage as a
+        // complete value expression (e.g. a call argument), not nested
+        // inside a larger binary/assignment expression.
+        if minimumPrecedence == 0, consume("?") {
+            let whenTrue = parseExpression()
+            _ = consume("|")
+            let whenFalse = parseExpression()
+            left = .ternary(condition: left, whenTrue: whenTrue, whenFalse: whenFalse)
+        }
         return left
     }
 
@@ -162,7 +178,8 @@ struct ExpressionParser {
             switch name.lowercased() {
             case "true": expression = .boolean(true)
             case "false": expression = .boolean(false)
-            case "null", "void": expression = .null
+            case "null": expression = .null
+            case "void": expression = .void
             case "not": expression = .unary(operator: "not", value: parseExpression(minimumPrecedence: 8))
             default: expression = .identifier(name)
             }

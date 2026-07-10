@@ -404,15 +404,15 @@ struct ServerRequestProvider: LassoRequestProvider {
     }
 
     func parameter(named name: String) -> LassoValue {
-        parameterValues[name.lowercased()] ?? .null
+        parameterValues[name.lowercased()] ?? .void
     }
 
     func header(named name: String) -> LassoValue {
-        headerValues[name.lowercased()] ?? .null
+        headerValues[name.lowercased()] ?? .void
     }
 
     func cookie(named name: String) -> LassoValue {
-        cookieValues[name.lowercased()] ?? .null
+        cookieValues[name.lowercased()] ?? .void
     }
 
     var parameters: [String: LassoValue] {

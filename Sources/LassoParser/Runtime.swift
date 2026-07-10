@@ -178,12 +178,12 @@ public struct LassoNativeRegistry: Sendable {
         register("action_param") { arguments, context in
             let name = arguments.firstValue(named: "name")?.outputString ??
                 arguments.first?.value.outputString ?? ""
-            return context.requestProvider?.parameter(named: name) ?? .null
+            return context.requestProvider?.parameter(named: name) ?? .void
         }
         register("cookie") { arguments, context in
             let name = arguments.firstValue(named: "name")?.outputString ??
                 arguments.first?.value.outputString ?? ""
-            return context.requestProvider?.cookie(named: name) ?? .null
+            return context.requestProvider?.cookie(named: name) ?? .void
         }
         register("session") { arguments, context in
             let name = arguments.firstValue(named: "name")?.outputString ??
@@ -268,6 +268,12 @@ public struct LassoContext: Sendable {
     public var responseSink: (any LassoResponseSink)?
     public var inlineProvider: (any LassoInlineProvider)?
     public var tagRegistry: LassoTagRegistry
+    /// Paths already processed by `library()` for THIS request's render —
+    /// deliberately per-`LassoContext`, not on the shared `tagRegistry`.
+    /// LassoSoft's `library_once` docs scope the "only the first call does
+    /// anything" dedup to a single page's own render, not the server
+    /// process's lifetime.
+    var loadedLibraries: Set<String>
     var returnSignal: LassoValue?
     var tagCallStack: [String]
     var selfStack: [LassoObjectInstance]
@@ -298,6 +304,7 @@ public struct LassoContext: Sendable {
         self.responseSink = responseSink
         self.inlineProvider = inlineProvider
         self.tagRegistry = tagRegistry
+        loadedLibraries = []
         returnSignal = nil
         tagCallStack = []
         selfStack = []

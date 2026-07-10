@@ -14,6 +14,7 @@ struct Evaluator {
         case let .decimal(value): return .decimal(value)
         case let .boolean(value): return .boolean(value)
         case .null: return .null
+        case .void: return .void
         case let .variable(name, scope): return context.value(for: name, scope: scope)
         case let .identifier(name):
             if name.caseInsensitiveCompare("self") == .orderedSame, let object = context.currentSelf {
@@ -42,6 +43,8 @@ struct Evaluator {
             let evaluated = try evaluate(value)
             try assign(evaluated, to: target, defaultScope: .unscoped)
             return .void
+        case let .ternary(condition, whenTrue, whenFalse):
+            return try evaluate(condition).isTruthy ? try evaluate(whenTrue) : try evaluate(whenFalse)
         case let .unary(op, value):
             return try unary(op, try evaluate(value))
         case let .binary(left, op, right):
@@ -308,6 +311,16 @@ struct Evaluator {
     ) throws -> LassoValue {
         let normalized = name.lowercased()
         switch (base, normalized) {
+        case (.void, _):
+            // Real Lasso 9 returns `void` (not `null`) for lookup-miss
+            // results — web_request->param/header/cookie et al. — and
+            // keeps `null` itself strict (an unhandled member throws
+            // unless the type defines `_unknowntag`). `void` is where
+            // Lasso 8-style graceful degradation actually lives: treat it
+            // as an empty string for member access, matching how it
+            // already behaves for truthiness (`false`) and string output
+            // (`""`) elsewhere in this runtime.
+            return try member(.string(""), name, arguments)
         case let (.string(value), "size"): return .integer(value.count)
         case let (.string(value), "uppercase"): return .string(value.uppercased())
         case let (.string(value), "lowercase"): return .string(value.lowercased())

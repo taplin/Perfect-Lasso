@@ -92,28 +92,28 @@ extension LassoNativeTypeRegistry {
         var type = LassoNativeType(name: "web_request")
 
         type.register("param") { _, arguments, context in
-            context.requestProvider?.parameter(named: firstArgumentString(arguments)) ?? .null
+            context.requestProvider?.parameter(named: firstArgumentString(arguments)) ?? .void
         }
         type.register("params") { _, _, context in
             .map(context.requestProvider?.parameters ?? [:])
         }
         type.register("header") { _, arguments, context in
-            context.requestProvider?.header(named: firstArgumentString(arguments)) ?? .null
+            context.requestProvider?.header(named: firstArgumentString(arguments)) ?? .void
         }
         type.register("rawheader") { _, arguments, context in
-            context.requestProvider?.header(named: firstArgumentString(arguments)) ?? .null
+            context.requestProvider?.header(named: firstArgumentString(arguments)) ?? .void
         }
         type.register("headers") { _, _, context in
             .map(context.requestProvider?.headers ?? [:])
         }
         type.register("cookie") { _, arguments, context in
-            context.requestProvider?.cookie(named: firstArgumentString(arguments)) ?? .null
+            context.requestProvider?.cookie(named: firstArgumentString(arguments)) ?? .void
         }
         type.register("cookies") { _, _, context in
             .map(context.requestProvider?.cookies ?? [:])
         }
         type.register("httphost") { _, _, context in
-            context.requestProvider?.header(named: "Host") ?? .null
+            context.requestProvider?.header(named: "Host") ?? .void
         }
 
         type.register("queryparam") { _, arguments, context in
@@ -128,7 +128,7 @@ extension LassoNativeTypeRegistry {
         }
 
         // No POST body reading exists yet — see doc comment above.
-        type.register("postparam") { _, _, _ in .null }
+        type.register("postparam") { _, _, _ in .void }
         type.register("postparams") { _, _, _ in .map([:]) }
         type.register("poststring") { _, _, _ in .string("") }
 
@@ -156,7 +156,7 @@ extension LassoNativeTypeRegistry {
         ]
         for alias in headerAliases {
             type.register(alias.method) { _, _, context in
-                context.requestProvider?.header(named: alias.header) ?? .null
+                context.requestProvider?.header(named: alias.header) ?? .void
             }
         }
 

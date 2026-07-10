@@ -376,21 +376,121 @@ content. Real-corpus verification of this kind is opt-in via
 `LASSO_SMOKE_REAL_API_PAGE_PATH` (script-mode pages) on `LassoParserSmoke`, or
 by pointing `lasso-perfect-server` itself at a real `LASSO_SITE_ROOT` locally.
 
+## Native-type resolved: `library()` was caching at the wrong scope
+
+Chasing the `->contains` gap above led to the real question: what is
+`_begin.lasso`, mechanically, and does the interpreter treat it the way
+real Lasso does? Checking confirmed `_begin.lasso` is **not** a Lasso
+built-in convention at all — it isn't in the real instance's `LassoStartup`
+folder, and there's no `define_atBegin` wrapping anywhere in it. It's a
+plain site file that every real top-level page calls by hand as literally
+its first line: `library('/_begin.lasso')`. So whether its logic "runs before every
+request" is governed entirely by what `library()` itself does — worth
+checking against LassoSoft's own documentation rather than assuming.
+
+LassoSoft's `library_once`/`[Library_Once]` docs are explicit: "if used
+multiple times referencing the **same Lasso page** then only the first...
+will actually perform the include" — the dedup is scoped to a single
+page's own render, not the server process's lifetime. This interpreter got
+that scope wrong: `loadedLibraries` lived on the shared, process-wide
+`LassoTagRegistry` (the code even said so — "One registry for the life of
+this server process... `library()` caching... shared across every
+request"). That meant any top-level executable code inside a `library()`'d
+file — like `_begin.lasso:66`'s live `excludeBots(...)` call — only ever
+ran once, ever, for the whole server process; every subsequent request
+silently no-opped. Fixed by moving `loadedLibraries` onto `LassoContext`
+(fresh per request, per `TagRegistry.swift`/`Runtime.swift`/`Renderer.swift`),
+while tag/type *definitions* stay on the shared `tagRegistry` as before —
+those genuinely are meant to persist process-wide. This is the most likely
+real explanation for the original `->contains` symptom: whatever
+`web_request->header('USER-AGENT')` evaluated to on the one first-ever
+request got permanently baked in.
+
+Verified via a rewritten, more precise unit test
+(`libraryDedupesWithinOneRenderButReloadsPerIndependentContext`) proving
+both halves at once: two `library()` calls to the same path *within one
+render* still dedup to a single load (matching the real "same page" scope),
+while two independent contexts (simulating separate requests) sharing the
+same registry each reload and re-run the library's top-level code fresh.
+47/47 tests pass.
+
+Live end-to-end HTTP re-verification against the real corpus turned out to
+be blocked by two further gaps, both previously masked by the very caching
+bug just fixed (since before this fix, almost no request ever actually
+reached this deep into `_begin.lasso`'s real dependency chain):
+
+- Lasso 8's `condition ? whenTrue | whenFalse` ternary operator, used both
+  inside one of `_begin.lasso`'s own component dependencies and
+  independently across nearly every top-level page. Fixed (value form only — a bare
+  `condition ? statement` guard form with no `|` branch, seen in
+  `Auto_Record.inc`/`mini_cart_tag.inc`, is a separate dialect, not
+  implemented) since it was small, single-purpose, and blocked literally
+  every page identically.
+- `X->member(...)` on a `.null` receiver (e.g. `action_param('template')
+  ->size` when no such request param is present) — `Evaluator.member` had
+  no case for `.null` at all, so any member call on a missing value threw,
+  rather than behaving permissively the way real Lasso does.
+
+## Resolved: `void` vs `null` member dispatch
+
+Checked Lasso 8/9 documentation directly for this one rather than picking
+a design by feel, since Tim suspected — correctly — that Lasso 9 has
+genuinely stricter null handling than Lasso 8, alongside some path that
+still supports the older, looser behavior.
+
+Confirmed: `null` really is strict in Lasso 9, on purpose. It's the root
+of the whole type hierarchy, and member-dispatch failure only degrades
+gracefully if the type defines `_unknowntag` — "if `_unknowntag` is not
+included in the type, an error will result that may terminate
+processing." LassoSoft's own 8.5→9 migration notes independently confirm
+this was a deliberate tightening: code that treated null and empty-string
+as interchangeable in Lasso 8 only matches empty-string in Lasso 9.
+
+But the resolving detail: lookup-miss methods like `web_request->param()`/
+`action_param()`/header/cookie don't return `null` in real Lasso at all —
+LassoGuide's docs state plainly "if no argument matches, a `void` value is
+returned." `void` is its own distinct built-in type, separate from `null`.
+This interpreter had every param/header/cookie "not found" fallback
+returning `.null` (11 call sites across `NativeTypes.swift`/
+`Runtime.swift`/`main.swift`), which was itself wrong regardless of the
+dispatch question.
+
+**Fix**: those 11 sites now return `.void`. `Evaluator.member` treats
+`.void` as an empty string for any member access — delegates straight to
+the existing `.string("")` dispatch, so `->size` → 0, `->contains(...)` →
+false, etc. — matching how `.void` already behaved for truthiness (`false`)
+and string output (`""`) elsewhere in this runtime. `.null` itself is
+untouched and stays fully strict; a regression test confirms `null->
+bogusMember` still throws. Also fixed a related latent bug: the parser
+previously mapped the literal `void` keyword to the same `.null` AST node
+as `null` (harmless before this distinction existed, wrong now) — `void`
+now parses to its own `.void` node.
+
+This cleanly maps onto the split Tim was after: strict `null` matches
+Lasso 9's real, deliberately-tightened behavior; permissive `void` is
+where Lasso 8-style looseness legitimately still lives, because that's
+the sentinel Lasso 9 itself chose for "didn't find it."
+
+**Live-verified end to end against the real corpus** (previously blocked
+by this gap): a normal/bot/normal/bot/normal user-agent sequence against a
+real top-level page correctly alternates `200/200/200/302/200` — the
+bot-exclusion redirect fires exactly on the request with a matching UA,
+not stuck from an earlier request, not silently disabled. A sweep of the
+real site's top-level pages shows the large majority now rendering
+cleanly end to end (0 did before this whole investigation began); the
+remaining failures are unrelated (missing include files on disk, a
+distinct legacy `if` dialect gap, a path-boundary check, one unrelated
+`unsupportedExpression("")`) — none connected to library scoping, the
+ternary operator, or void/null dispatch. 48/48 tests pass.
+
 ## Next Compatibility Work
 
-1. Root-cause why `web_request->header('USER-AGENT')->contains(...)`
-   throws `unsupportedExpression("Member contains")` in the real
-   `_begin.lasso:66` → `excludeBots` → `site_setup_tags.inc:99` call chain,
-   given a dedicated regression test proves the identical pattern works
-   with a real `.string` receiver — likely needs live request-value
-   inspection (a temporary diagnostic page against the real site root) to
-   see what `#request` actually is at that point, not further guessing.
-2. Implement POST body reading — `web_request->postParam`/`postParams`/
+1. Implement POST body reading — `web_request->postParam`/`postParams`/
    `postString` are wired but return empty since this interpreter has
    never parsed POST bodies; needs async content-reading threaded into
    `ServerRequestProvider.init` (currently synchronous) via Perfect-NIO's
    `HTTPRequest.readContent()`.
-3. Evaluate whether legacy `define_tag('name', -flags) ... /define_tag`
+2. Evaluate whether legacy `define_tag('name', -flags) ... /define_tag`
    (parenthesized-call style, blocks `_begin_tags.inc`'s `send_email2` and
    all of `getGeoIPInfo.inc`) and legacy `define_type:`/`define_tag:`
    colon-call style (blocks all of `js_timer.inc`) are worth real support,
@@ -398,13 +498,22 @@ by pointing `lasso-perfect-server` itself at a real `LASSO_SITE_ROOT` locally.
    `Documentation/compatibility-matrix.md`) but neither is implemented;
    deliberately deferred as a separate, larger follow-up (each is
    effectively a second, Lasso-8-shaped type-definition sub-parser).
-4. Bridge `web_response->include*`/`sendFile` with the existing
+3. Bridge `web_response->include*`/`sendFile` with the existing
    `include()`/`library()` machinery (currently in `Renderer.swift`'s
    `renderExpression`, not reachable from the Evaluator-level native-type
    method tables) — deliberately deferred out of the comprehensive
    `web_response` pass as a separate integration.
-5. Continue the object runtime toward the next corpus need: likely
-   `_unknowntag`, rest parameters, or richer type/trait dispatch once a page
-   actually exercises those constructs.
-6. Add a crawl/report mode that requests many site paths and records the first
+4. Continue the object runtime toward the next corpus need: likely
+   `_unknowntag` (real Lasso 9's general per-type opt-in mechanism for
+   graceful unknown-member dispatch — confirmed real and documented while
+   researching the void/null fix above, still unimplemented here), rest
+   parameters, or richer type/trait dispatch once a page actually
+   exercises those constructs.
+5. Add a crawl/report mode that requests many site paths and records the first
    unsupported construct per page.
+6. Real corpus pages still hitting distinct gaps after this pass: one page
+   hits `unknownFunction("if")` (a different legacy dialect than the
+   arrow-brace one already supported), another hits
+   `unsupportedExpression("")`, and a third hits `pathOutsideRoot` on a
+   relative include path (may be a real site-structure quirk, not
+   necessarily an interpreter bug). Not yet investigated.

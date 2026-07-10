@@ -77,15 +77,15 @@ struct SmokeRequestProvider: LassoRequestProvider {
     let parameters: [String: LassoValue] = ["term": .string("clogs")]
 
     func parameter(named name: String) -> LassoValue {
-        parameters[name.lowercased()] ?? .null
+        parameters[name.lowercased()] ?? .void
     }
 
     func header(named name: String) -> LassoValue {
-        name.lowercased() == "host" ? .string("example.test") : .null
+        name.lowercased() == "host" ? .string("example.test") : .void
     }
 
     func cookie(named name: String) -> LassoValue {
-        name.lowercased() == "sid" ? .string("abc123") : .null
+        name.lowercased() == "sid" ? .string("abc123") : .void
     }
 }
 
