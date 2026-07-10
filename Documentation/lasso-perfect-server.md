@@ -139,18 +139,20 @@ Environment variables:
     website even when the tag using them is called from a page, since only
     the tag's *output* renders, never its source — this is treated as
     already-adequate protection for this class of secret, not a gap to close.
-  - **Live-verified against a real instance's startup folder** (10 files): 5
-    load cleanly with no errors (a site-setup include, a hash-test file, a
-    cart-tag include, and two browser/bot-detection tag files — see the
-    bracket-comment fix below for why those last two needed a real fix, not
-    just verification). The other 5 fail on distinct, now-cataloged
-    legacy-syntax gaps — see `Documentation/compatibility-matrix.md`'s new
-    startup-folder rows for the full list (legacy `define_tag(...)`
-    parenthesized-call style, legacy `define_type:`/`define_tag:` colon-call
-    style, top-level expression-bodied `define name => 'literal'` with no
-    braces, and `with x in y do { ... }` iteration). None of these are bugs
-    in the loading mechanism itself — each is a real, unimplemented syntax
-    form, confirmed by reading the exact failing line in each file.
+  - **Live-verified against a real instance's startup folder** (10 files): 7
+    now load cleanly with no errors (a site-setup include, a hash-test file,
+    a cart-tag include, two browser/bot-detection tag files — see the
+    bracket-comment fix below for why those two needed a real fix, not just
+    verification — plus `paypal_express.inc` and `site_setup_tags.inc`, both
+    unblocked by the expression-bodied-`define`/bare-tag-call/`with...do`
+    work further below). The other 3 fail on distinct, cataloged legacy
+    syntax deliberately deferred as a separate, larger follow-up (legacy
+    `define_tag(...)` parenthesized-call style, legacy
+    `define_type:`/`define_tag:` colon-call style) — see
+    `Documentation/compatibility-matrix.md`'s startup-folder rows for the
+    full list. None of these are bugs in the loading mechanism itself — each
+    is a real, unimplemented syntax form, confirmed by reading the exact
+    failing line in each file.
   - **Bracket-comment fix, found and fixed via the same live verification.**
     Two of the ten real files use a real idiom (downloaded from
     lassosoft.com/tagswap): an entire custom tag — `define name(...) => {
@@ -228,22 +230,58 @@ Environment variables:
     the parser is committed to arrow-brace mode. A regression test
     (`slashStyleBlockBodyIsNotSwallowedWhenNoArrowFollows`) now guards this
     specifically.
-  - `excludeBots` is still unresolved, but the reason is now precisely
-    known and different from the original guess (a startup/include ordering
-    problem). `site_setup_tags.inc` — the file `excludeBots` lives in —
-    fails to load at all, on its own *earlier* statement `define br =>
-    '<br />'` (an expression-bodied, no-brace `define`, a different,
-    still-unimplemented gap — see the compatibility matrix). Because
-    `RendererEngine.render` aborts the whole file on the first throwing
-    top-level statement, that one early failure prevents every later
-    `define` in the file — including `excludeBots` — from ever registering,
-    regardless of whether `excludeBots`'s own body would otherwise parse.
-    Implementing expression-bodied top-level `define` support (mirroring
-    `TypeBodyParser.parseExpressionMethodBody`, which already does this for
-    type methods) is now the single highest-leverage next step for this
-    gap — likely higher-leverage than `with...in...do` itself, since
-    `excludeBots` can't even be reached to test that construct until this
-    unblocks the file.
+  - **`excludeBots` resolved.** Three tightly coupled gaps were closed in
+    one pass — see `Documentation/compatibility-matrix.md`'s rows for each:
+    top-level expression-bodied `define name => <expr>` (no braces, needed
+    for `site_setup_tags.inc`'s `br`/`keywordMap`/`botMap` and
+    `paypal_express.inc`'s six PayPal constants — the earlier of which was
+    blocking every later `define` in each file, `excludeBots` included,
+    since `RendererEngine.render` aborts a file's whole render on its first
+    throwing statement); bare-identifier zero-arg custom tag calls (needed
+    for `botMap` referenced with no parens inside `with bot in botMap do`,
+    and for `pp_express`'s `data public returnURL = pp_return` default
+    value); and `with x in y do { ... }` iteration itself (`excludeBots`'s
+    own body, plus 3 more spots in `paypal_express.inc`'s checkout type).
+    Implementing "with" also surfaced a real, unrelated gap in
+    `BlockBuilder.swift`: its `blockNames` allowlist gates which *opening*
+    tags get recursively paired with their close at all — a brand-new
+    block-style keyword needs adding there too, not just teaching
+    `ScriptBodyParser` to emit the open/close tag pair, which the original
+    plan for this work had assumed wasn't necessary.
+  - **`array(...)` was missing entirely.** Testing the fixes above against
+    `define botMap => array(...)` surfaced a genuinely separate bug:
+    `map(...)` was already a registered native (used for `keywordMap`), but
+    `array(...)` — needed by the very same file, one `define` later — was
+    never registered as a callable native at all. Added alongside `map` in
+    `Runtime.swift`.
+  - **CRLF line endings silently dropped block content — found live-verifying,
+    not something this plan anticipated.** `site_setup_tags.inc` (like every
+    real file in this startup folder) is CRLF-terminated. Swift's
+    `Character` type treats `\r\n` as a single extended grapheme cluster
+    that equals neither the standalone `\r` nor `\n` most of this parser's
+    newline checks compare against — `skipLineRemainder()` in particular,
+    called right after an arrow-brace block's `{` opens, never recognized a
+    CRLF as the newline it was scanning for, so it silently consumed
+    everything up to the next *lone* `\n` it could find: in practice, the
+    rest of the block's body and its own closing brace. A minimal
+    reproduction (`if(true) => {\r\n\t$x = 1\r\n}\r\n`) reliably triggered
+    "Unclosed if block" with an empty body even outside any real file.
+    Fixed at the single earliest entry point, `TemplateScanner.init` —
+    normalizing `\r\n`/`\r` to `\n` there means every downstream parser
+    (`ScriptBodyParser`, `TypeBodyParser`, `ExpressionParser`) operates on
+    already-normalized substrings with no changes needed anywhere else.
+    This was a real, pre-existing bug (not introduced by this pass's other
+    changes) that had simply never been exercised before, since every
+    existing fixture and test used LF-only content.
+  - **Live-verified end to end**: `excludeBots` now registers, is called
+    (via `/api.lasso`), and runs its full `with bot in botMap do { ... }`
+    loop — confirmed by watching the error change from
+    `unknownFunction("excludeBots")` to a distinctly different, deeper gap:
+    `unsupportedExpression("Member httpHost")`, from `botRedirect`'s
+    `web_request->httpHost` (called from *inside* `excludeBots`'s own
+    body, reached only after the `with` loop actually iterates and matches
+    a bot). `web_request->httpHost` member access is a new, not-yet-scoped
+    gap for later work — not part of this pass.
 
 The parser/runtime source and its smoke suite (`Sources/LassoParserSmoke`,
 `Tests/LassoParserTests`) never hardcode a real site path or real page
@@ -254,23 +292,22 @@ by pointing `lasso-perfect-server` itself at a real `LASSO_SITE_ROOT` locally.
 
 ## Next Compatibility Work
 
-1. Support top-level expression-bodied `define name => 'literal'` (no
-   braces) in `ScriptBodyParser.parseDefineOpening` — the single
-   highest-leverage remaining startup-folder gap; it's what blocks
-   `excludeBots` from registering at all (see above), and it independently
-   blocks all of `paypal_express.inc`'s constant tags.
-2. Implement `with x in y do { ... }` iteration — needed once `excludeBots`
-   itself can be reached, to actually call it (not just register it).
-3. Evaluate whether legacy `define_tag('name', -flags) ... /define_tag`
+1. Implement `web_request->httpHost` member access — the next real gap
+   `excludeBots` hits, found live-verifying the fixes above; it's called
+   from `botRedirect`'s body, only reachable after the `with` loop actually
+   matches a bot, so this was invisible until this pass's work landed.
+2. Evaluate whether legacy `define_tag('name', -flags) ... /define_tag`
    (parenthesized-call style, blocks `_begin_tags.inc`'s `send_email2` and
    all of `getGeoIPInfo.inc`) and legacy `define_type:`/`define_tag:`
    colon-call style (blocks all of `js_timer.inc`) are worth real support,
    given real corpus frequency — both are now precisely characterized (see
-   `Documentation/compatibility-matrix.md`) but neither is implemented.
-4. Continue the object runtime toward the next corpus need: likely
+   `Documentation/compatibility-matrix.md`) but neither is implemented;
+   deliberately deferred as a separate, larger follow-up (each is
+   effectively a second, Lasso-8-shaped type-definition sub-parser).
+3. Continue the object runtime toward the next corpus need: likely
    `_unknowntag`, rest parameters, or richer type/trait dispatch once a page
    actually exercises those constructs.
-5. Expand request/response support for POST bodies, redirects, status, and
+4. Expand request/response support for POST bodies, redirects, status, and
    cookies.
-6. Add a crawl/report mode that requests many site paths and records the first
+5. Add a crawl/report mode that requests many site paths and records the first
    unsupported construct per page.

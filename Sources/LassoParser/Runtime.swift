@@ -129,6 +129,9 @@ public struct LassoNativeRegistry: Sendable {
             }
             return .map(values)
         }
+        register("array") { arguments, _ in
+            .array(arguments.map { $0.value })
+        }
         register("json_serialize") { arguments, _ in
             let value = arguments.first?.value ?? .null
             let object = value.jsonObject

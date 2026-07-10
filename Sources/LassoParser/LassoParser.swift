@@ -20,7 +20,24 @@ private struct TemplateScanner {
     var diagnostics: [Diagnostic] = []
 
     init(_ source: String) {
-        characters = Array(source)
+        // Swift's `Character` is an extended grapheme cluster, and "\r\n"
+        // is exactly one grapheme cluster — a single array element that
+        // equals neither the standalone "\r" nor "\n" Character used
+        // throughout this file's and ScriptBodyParser's newline checks
+        // (readStatement's statement-boundary test, skipLineRemainder's
+        // "read until newline", etc.). Real corpus files are commonly
+        // CRLF-terminated (Windows-authored Lasso code); left unnormalized,
+        // every one of those checks silently fails to recognize a CRLF as
+        // a line ending, which let skipLineRemainder swallow everything up
+        // to the next *lone* "\n" it could find — in practice, often the
+        // rest of a multi-line block body. Normalizing once here, before
+        // any downstream parser ever sees a raw Character, fixes every
+        // consumer at once (all of ScriptBodyParser/TypeBodyParser operate
+        // on substrings sliced from this already-normalized array).
+        let normalized = source
+            .replacingOccurrences(of: "\r\n", with: "\n")
+            .replacingOccurrences(of: "\r", with: "\n")
+        characters = Array(normalized)
     }
 
     mutating func scan() -> LassoDocument {

@@ -22,6 +22,9 @@ struct Evaluator {
             if let function = context.natives.function(named: name) {
                 return try function([], &context)
             }
+            if let definition = context.tagRegistry.tag(named: name) {
+                return try invokeCustomTag(definition, callArguments: [])
+            }
             return context.value(for: name)
         case let .assignment(target, value):
             let evaluated = try evaluate(value)

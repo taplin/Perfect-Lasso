@@ -71,7 +71,7 @@ struct BlockBuilder {
     }
 
     private static let blockNames: Set<String> = [
-        "if", "inline", "records", "rows", "loop", "iterate", "while", "define", "protect",
+        "if", "inline", "records", "rows", "loop", "iterate", "while", "define", "protect", "with",
     ]
 }
 

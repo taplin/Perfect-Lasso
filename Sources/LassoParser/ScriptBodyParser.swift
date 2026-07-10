@@ -28,6 +28,7 @@ struct ScriptBodyParser {
             if parseClosingTag() { continue }
             if parseElseTag() { continue }
             if parseDefineOpening() { continue }
+            if parseWithOpening() { continue }
             if parseBlockOpening() { continue }
             if parseIgnoredBrace() { continue }
 
@@ -166,9 +167,31 @@ struct ScriptBodyParser {
         }
 
         guard index < characters.count, characters[index] == "{" else {
-            diagnostics.append(Diagnostic(message: "Malformed 'define \(name) => ': expected '{'", range: range))
-            index = start
-            return false
+            // No brace body at all — a constant-style define
+            // (`define name => <expr>`), real in startup libraries for
+            // string/array/map literals. readStatement() already tracks
+            // paren depth and quotes, so a multi-line array(...)/map(...)
+            // body reads as one statement rather than stopping at each
+            // internal newline. Mirrors TypeBodyParser.parseExpressionMethodBody,
+            // which solves the identical problem for type methods.
+            let expressionSource = readStatement()
+            let trimmedExpression = expressionSource.trimmingCharacters(in: .whitespacesAndNewlines)
+            guard !trimmedExpression.isEmpty else {
+                diagnostics.append(Diagnostic(message: "Malformed 'define \(name) => ': expected an expression or '{'", range: range))
+                index = start
+                return false
+            }
+            var expressionParser = ExpressionParser("return(\(trimmedExpression))")
+            let nameArgument = LassoArgument(label: nil, value: .string(name))
+            nodes.append(.block(
+                name: "define",
+                arguments: [nameArgument] + parameters,
+                body: [.code(expressionParser.parseList(), .lasso9, .lassoscript, range)],
+                alternate: nil,
+                dialect: .lasso9,
+                range: range
+            ))
+            return true
         }
         let bodySource = readBalanced(open: "{", close: "}")
         skipLineRemainder()
@@ -194,6 +217,65 @@ struct ScriptBodyParser {
             dialect: .lasso9,
             range: range
         ))
+        return true
+    }
+
+    /// Handles `with name in expression do { body }` iteration — a real
+    /// startup-library construct with no slash-closed form in evidence,
+    /// only the brace-bodied shape. Unlike `iterate` (fixed `loop_value`
+    /// local), the per-iteration binding name is whatever the source wrote
+    /// (`with bot in botMap do { ... #bot ... }`), so the name travels as a
+    /// synthetic first argument, matching the `define`/`[define ...]`
+    /// pattern of carrying a real identifier as a `.string` argument.
+    private mutating func parseWithOpening() -> Bool {
+        let start = index
+        guard readKeyword("with") else { return false }
+        skipHorizontalWhitespace()
+
+        let variableName = readIdentifier()
+        guard !variableName.isEmpty else {
+            diagnostics.append(Diagnostic(message: "Malformed 'with': expected a variable name", range: range))
+            index = start
+            return false
+        }
+        skipHorizontalWhitespace()
+
+        guard readKeyword("in") else {
+            diagnostics.append(Diagnostic(message: "Malformed 'with \(variableName)': expected 'in'", range: range))
+            index = start
+            return false
+        }
+        skipHorizontalWhitespace()
+
+        let sourceText = readUntilKeyword("do")
+        let trimmedSource = sourceText.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmedSource.isEmpty else {
+            diagnostics.append(Diagnostic(message: "Malformed 'with \(variableName) in': expected an expression before 'do'", range: range))
+            index = start
+            return false
+        }
+        skipHorizontalWhitespace()
+
+        guard readKeyword("do") else {
+            diagnostics.append(Diagnostic(message: "Malformed 'with \(variableName) in ...': expected 'do'", range: range))
+            index = start
+            return false
+        }
+        skipTrivia()
+
+        guard index < characters.count, characters[index] == "{" else {
+            diagnostics.append(Diagnostic(message: "Malformed 'with \(variableName) in ... do': expected '{'", range: range))
+            index = start
+            return false
+        }
+        index += 1
+        openBraceBlockStack.append("with")
+
+        var sourceParser = ExpressionParser(trimmedSource)
+        let sourceExpression = sourceParser.parseExpression()
+        let nameArgument = LassoArgument(label: nil, value: .string(variableName))
+        let sourceArgument = LassoArgument(label: nil, value: sourceExpression)
+        nodes.append(.tag(name: "with", arguments: [nameArgument, sourceArgument], closing: false, dialect: .lasso9, range: range))
         return true
     }
 
@@ -309,6 +391,64 @@ struct ScriptBodyParser {
             index += 1
         }
         return statement
+    }
+
+    /// Reads up to (not including) a case-insensitive, word-boundary match
+    /// of `keyword` at paren-depth 0 outside any quote — used for `with
+    /// name in <expression> do { ... }`, where the source expression has
+    /// no delimiter of its own besides the following `do` keyword.
+    private mutating func readUntilKeyword(_ keyword: String) -> String {
+        let start = index
+        var parenDepth = 0
+        var quote: Character?
+
+        while index < characters.count {
+            let character = characters[index]
+            if let activeQuote = quote {
+                index += 1
+                if character == "\\" {
+                    index = min(index + 1, characters.count)
+                } else if character == activeQuote {
+                    quote = nil
+                }
+                continue
+            }
+
+            if character == "'" || character == "\"" {
+                quote = character
+            } else if character == "(" {
+                parenDepth += 1
+            } else if character == ")" {
+                parenDepth = max(parenDepth - 1, 0)
+            } else if parenDepth == 0, isKeywordBoundary(keyword, at: index) {
+                break
+            } else if character == "\n", parenDepth == 0 {
+                break
+            }
+            index += 1
+        }
+
+        return String(characters[start..<index])
+    }
+
+    /// True if `keyword` (case-insensitive) appears at `position` as a
+    /// whole word — not as a prefix of a longer identifier on either side.
+    private func isKeywordBoundary(_ keyword: String, at position: Int) -> Bool {
+        let candidate = Array(keyword.lowercased())
+        guard position + candidate.count <= characters.count else { return false }
+        guard characters[position..<(position + candidate.count)].map({ Character($0.lowercased()) }) == candidate else {
+            return false
+        }
+        if position > 0 {
+            let previous = characters[position - 1]
+            if previous.isLetter || previous.isNumber || previous == "_" { return false }
+        }
+        let after = position + candidate.count
+        if after < characters.count {
+            let next = characters[after]
+            if next.isLetter || next.isNumber || next == "_" { return false }
+        }
+        return true
     }
 
     private mutating func readBalanced(open: Character, close: Character) -> String {

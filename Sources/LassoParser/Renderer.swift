@@ -155,6 +155,27 @@ private struct RendererEngine {
                 output += try render(body)
             }
             return output
+        case "with":
+            // `with name in <expr> do { ... }` — same array/map/scalar
+            // iteration as `iterate`, but binding whatever variable name
+            // the source used (carried as arguments[0]) instead of the
+            // fixed `loop_value`.
+            guard arguments.count >= 2, case let .string(variableName) = arguments[0].value else {
+                return ""
+            }
+            let withValues: [LassoValue]
+            switch try evaluator.evaluate(arguments[1].value) {
+            case let .array(items): withValues = items
+            case let .map(items): withValues = items.values.map { $0 }
+            case .void, .null: withValues = []
+            case let value: withValues = [value]
+            }
+            var withOutput = ""
+            for value in withValues {
+                evaluator.context.set(value, for: variableName, scope: .local)
+                withOutput += try render(body)
+            }
+            return withOutput
         default:
             if let function = evaluator.context.natives.function(named: name) {
                 _ = try function(try evaluator.evaluateArguments(arguments), &evaluator.context)

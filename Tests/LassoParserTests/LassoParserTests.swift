@@ -796,6 +796,158 @@ import PerfectCRUD
     #expect(output == "taken")
 }
 
+@Test func crlfLineEndingsDoNotSwallowArrowBraceBlockBodies() throws {
+    // Real corpus files are commonly CRLF-terminated (Windows-authored
+    // Lasso code). Swift's Character type treats "\r\n" as a single
+    // extended grapheme cluster that equals neither the standalone "\r"
+    // nor "\n" Character most newline checks in this parser compare
+    // against — before normalizing at TemplateScanner's entry point,
+    // skipLineRemainder() (called right after an arrow-brace block opens)
+    // never recognized a CRLF as "the newline it's looking for," so it
+    // swallowed everything up to the next *lone* "\n" it could find —
+    // in this shape, the rest of the block's body and its own closing
+    // brace, silently discarding both.
+    var context = LassoContext()
+    let source = "<?lasso\r\nif(true) => {\r\n\t$x = 1\r\n}\r\n?>\r\n[$x]"
+    let output = try LassoRenderer().render(source, context: &context)
+        .trimmingCharacters(in: .whitespacesAndNewlines)
+    #expect(output == "1")
+}
+
+@Test func expressionBodiedDefineRegistersStringLiteralConstant() throws {
+    // Real startup-folder shape: `define br => '<br />'` — no braces at
+    // all, just a bare expression. Before this fix, parseDefineOpening
+    // backed out entirely on seeing no '{', so `br` was never registered
+    // and got parsed as an ordinary (undefined) function call instead.
+    var context = LassoContext()
+    let output = try LassoRenderer().render(
+        """
+        <?lasso
+        define br => '<br />'
+        ?>
+        [br]
+        """,
+        context: &context
+    ).trimmingCharacters(in: .whitespacesAndNewlines)
+    #expect(output == "<br />")
+}
+
+@Test func expressionBodiedDefineSupportsMultiLineArrayAndMapLiterals() throws {
+    // Real shape: `define botMap => array(...)` / `define keywordMap =>
+    // map(...)` spanning multiple lines. readStatement()'s paren-depth
+    // tracking must treat the whole multi-line call as one statement, not
+    // stop at each internal newline.
+    var context = LassoContext()
+    let output = try LassoRenderer().render(
+        """
+        <?lasso
+        define botMap => array(
+            'SemRush',
+            'DotBot'
+        )
+        ?>
+        [botMap->get(1)]/[botMap->get(2)]/[botMap->size]
+        """,
+        context: &context
+    ).trimmingCharacters(in: .whitespacesAndNewlines)
+    #expect(output == "SemRush/DotBot/2")
+}
+
+@Test func bareIdentifierCallsZeroArgCustomTag() throws {
+    var context = LassoContext()
+    let output = try LassoRenderer().render(
+        """
+        <?lassoscript
+        define greeting => { return('hello') }
+        ?>
+        [greeting]
+        """,
+        context: &context
+    ).trimmingCharacters(in: .whitespacesAndNewlines)
+    #expect(output == "hello")
+}
+
+@Test func typeDataMemberDefaultValueResolvesBareZeroArgTagCall() throws {
+    // Mirrors the real pp_express type exactly: `data public returnURL =
+    // pp_return`, where `pp_return` is itself an expression-bodied
+    // zero-arg define, referenced with no parens.
+    var context = LassoContext()
+    let output = try LassoRenderer().render(
+        """
+        <?lassoscript
+        define pp_return => 'https://example.com/return'
+        define pp_express => type {
+            data public returnURL = pp_return
+        }
+        local(checkout::pp_express = pp_express())
+        ?>
+        [#checkout->returnURL]
+        """,
+        context: &context
+    ).trimmingCharacters(in: .whitespacesAndNewlines)
+    #expect(output == "https://example.com/return")
+}
+
+@Test func withInDoIteratesArrayBindingNamedVariable() throws {
+    var context = LassoContext()
+    let output = try LassoRenderer().render(
+        """
+        <?lasso
+        $collected = ''
+        with x in array('a', 'b', 'c') do {
+            $collected = $collected + #x
+        }
+        ?>
+        [$collected]
+        """,
+        context: &context
+    ).trimmingCharacters(in: .whitespacesAndNewlines)
+    #expect(output == "abc")
+}
+
+@Test func withInDoIteratesOverBareZeroArgTagCallResult() throws {
+    // End-to-end composition of all three fixes in this pass, mirroring
+    // the real excludeBots/botMap shape exactly: a with...do body iterates
+    // a bare-referenced expression-bodied array constant.
+    var context = LassoContext()
+    let output = try LassoRenderer().render(
+        """
+        <?lasso
+        define botMap => array('SemRush', 'DotBot', 'AhrefsBot')
+        define excludeBots(request::String) => {
+            with bot in botMap do {
+                if(#request->contains(#bot)) => {
+                    return true
+                }
+            }
+            return false
+        }
+        ?>
+        [excludeBots(-request='Mozilla/5.0 SemRush Crawler')]/[excludeBots(-request='Mozilla/5.0 real browser')]
+        """,
+        context: &context
+    ).trimmingCharacters(in: .whitespacesAndNewlines)
+    #expect(output == "true/false")
+}
+
+@Test func malformedWithFallsBackToOrdinaryCodeWithoutSwallowingNextStatement() throws {
+    // Regression guard, same class as slashStyleBlockBodyIsNotSwallowedWhenNoArrowFollows:
+    // a bare 'with' not actually followed by 'name in expr do {' must not
+    // crash or eat the statement after it.
+    var context = LassoContext()
+    let output = try LassoRenderer().render(
+        """
+        <?lasso
+        with = 5
+        $after = 'reached'
+        ?>
+        [$after]
+        """,
+        context: &context
+    ).trimmingCharacters(in: .whitespacesAndNewlines)
+    #expect(output == "reached")
+}
+
 private func corpusFixtureContext(
     loader: any LassoIncludeLoader,
     includePath: String
