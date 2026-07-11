@@ -102,6 +102,21 @@ public struct LassoInlineCriterion: Equatable, Sendable {
     }
 }
 
+/// A single column value to write, distinct from `LassoInlineCriterion`
+/// (a search predicate) even though both are name/value-argument-shaped in
+/// real Lasso source — see `Documentation/inline-write-raw-sql-plan.md`'s
+/// "Why split assignments from criteria." In `-Add`/`-Update`, unlabeled
+/// name/value arguments are values to write, not predicates to match.
+public struct LassoInlineAssignment: Equatable, Sendable {
+    public let field: String
+    public let value: LassoValue
+
+    public init(field: String, value: LassoValue) {
+        self.field = field
+        self.value = value
+    }
+}
+
 public struct LassoInlineRequest: Equatable, Sendable {
     public let action: LassoInlineAction
     public let database: String?
@@ -115,6 +130,22 @@ public struct LassoInlineRequest: Equatable, Sendable {
     public let keyField: String?
     public let keyValue: LassoValue?
     public let criteria: [LassoInlineCriterion]
+    /// `-StatementOnly` — generate the statement/predicates but don't
+    /// execute the action. See `PerfectCRUDLassoExecutor`.
+    public let statementOnly: Bool
+    /// Populated only for `.add`/`.update` — non-reserved name/value
+    /// arguments as values to write, not search criteria. Empty for every
+    /// other action, including `.search`/`.find`/`.findAll` (where
+    /// `criteria` above is still what those same arguments mean).
+    public let fieldAssignments: [LassoInlineAssignment]
+    /// The predicate identifying which record(s) `.update`/`.delete`
+    /// target — built from `-KeyField`/`-KeyValue` (a single equality
+    /// criterion), not from the field/value arguments (those are
+    /// `fieldAssignments` for `.update`, ignored entirely for `.delete`).
+    /// `-Key` array-based targeting is deliberately not implemented yet —
+    /// deferred pending stronger pair/staticarray support in `LassoValue`,
+    /// per the plan's own "Recommended first-pass mapping."
+    public let writeCriteria: [LassoInlineCriterion]
     public let rawArguments: [EvaluatedArgument]
 
     public init(arguments: [EvaluatedArgument]) {
@@ -129,7 +160,9 @@ public struct LassoInlineRequest: Equatable, Sendable {
         skipRecords = arguments.lastInt(named: "skiprecords")
         keyField = arguments.lastString(named: "keyfield")
         keyValue = arguments.lastValue(named: "keyvalue")
+        statementOnly = arguments.hasTruthyFlag("statementonly")
 
+        let action: LassoInlineAction
         if sql != nil {
             action = .rawSQL
         } else if arguments.hasTruthyFlag("search") {
@@ -153,6 +186,7 @@ public struct LassoInlineRequest: Equatable, Sendable {
         } else {
             action = .unknown
         }
+        self.action = action
 
         let operations = arguments.strings(named: "op")
         let reserved = Self.reservedNames
@@ -167,12 +201,39 @@ public struct LassoInlineRequest: Equatable, Sendable {
                 value: argument.value
             )
         }
+
+        switch action {
+        case .add:
+            fieldAssignments = fieldArguments.map {
+                LassoInlineAssignment(field: $0.label ?? "", value: $0.value)
+            }
+            writeCriteria = []
+        case .update:
+            fieldAssignments = fieldArguments.map {
+                LassoInlineAssignment(field: $0.label ?? "", value: $0.value)
+            }
+            if let keyField, let keyValue {
+                writeCriteria = [LassoInlineCriterion(field: keyField, operation: "eq", value: keyValue)]
+            } else {
+                writeCriteria = []
+            }
+        case .delete:
+            fieldAssignments = []
+            if let keyField, let keyValue {
+                writeCriteria = [LassoInlineCriterion(field: keyField, operation: "eq", value: keyValue)]
+            } else {
+                writeCriteria = []
+            }
+        default:
+            fieldAssignments = []
+            writeCriteria = []
+        }
     }
 
     private static let reservedNames: Set<String> = [
         "search", "find", "findall", "add", "update", "delete", "show", "prepare", "nothing",
         "database", "table", "sql", "returnfield", "sortfield", "sortorder", "maxrecords",
-        "skiprecords", "keyfield", "keyvalue", "op", "username", "password",
+        "skiprecords", "keyfield", "keyvalue", "op", "username", "password", "statementonly",
     ]
 }
 

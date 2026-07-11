@@ -642,6 +642,64 @@ just filling in stub values. `[File_ProcessUploads]` (moving files)
 deliberately deferred — this pass is metadata only. Corpus sweep unchanged
 at 13/17. 57/57 tests pass.
 
+**Implemented `inline-write-raw-sql-plan`** (all milestones), completing the
+implementation order the architect review confirmed:
+`error-protect-model-plan` → `post-body-support-plan` Phase 1 →
+`session-upload-support-plan` Milestone 1 → `inline-write-raw-sql-plan`.
+Widened PerfectCRUD's existing connector-agnostic dynamic-SQL layer
+(`Dynamic.swift`: new `DynamicMutation`/`DynamicSQL`, `Database.mutate(_:)`/
+`execute(_:)`) rather than adding MySQL-specific code — the `Database:
+DynamicDatabaseProtocol` extension already generalizes over any
+`SQLGenDelegate`/`SQLExeDelegate` connector, so this covers every connector
+at once. Added `SQLExeDelegate.affectedRowCount()`/`lastInsertedID()`
+(default-implemented `0`/`nil`, so existing conformers keep compiling;
+MySQL's `MySQLStmtExeDelegate` implements them for real via `MySQLStmt`'s
+own `affectedRows()`/`insertId()`). `LassoInlineRequest` (`Providers.swift`)
+gained a `fieldAssignments: [LassoInlineAssignment]`/`writeCriteria:
+[LassoInlineCriterion]` split from the pre-existing `criteria` field — in
+`-Add`/`-Update`, unlabeled name/value args are values to write, not search
+predicates, even though they parse identically to `-Search` criteria.
+`PerfectCRUDLassoExecutor` (`PerfectCRUDLassoExecutor.swift`) rewritten with
+three handler closures (`queryHandler`/`mutationHandler`/`rawSQLHandler` —
+`DynamicDatabaseProtocol` isn't existential-safe due to its associated type,
+which ruled out a single "hand back a database" resolver) and a new
+`LassoDatasourceCapabilities` per-datasource policy struct
+(`allowsSelect`/`allowsInsert`/`allowsUpdate`/`allowsDelete`/
+`allowsRawSQL`/`allowsMultipleStatements`/table allowlist/max rows;
+defaults read-only). Capability denial returns a `LassoInlineFrame` with
+non-default `LassoErrorState` (adapter-local `InlineErrorCode`s, 1001-1006)
+rather than throwing — the first real (non-synthetic) producer of frame
+error state since `error-protect-model-plan`'s Milestone 1-3 work, and
+observable via `error_currentError` without needing `protect` at all, since
+`pushInlineFrame` already surfaces it unconditionally. `-Add` best-effort
+follows up with a SELECT-by-insert-id for the inserted row; `-Delete`
+returns an empty found set (both matching documented Lasso behavior).
+`lasso-perfect-server`'s MySQL executor wiring (`main.swift`) gained
+`LASSO_MYSQL_ALLOW_WRITES`/`LASSO_MYSQL_ALLOW_RAW_SQL` env toggles, both
+default off. Deferred, matching the plan's own stated allowances:
+`-StatementOnly`'s true non-execution semantic (parsed, not yet acted on —
+`Dynamic.swift` has no compile-without-executing capability),
+`-Key`-array-based multi-record targeting (only `-KeyField`/`-KeyValue`
+single-predicate targeting is implemented), and real Lasso 8.5 numeric
+error codes (isolated behind `InlineErrorCode` pending PDF extraction).
+Real database/connector-level failures (e.g. a constraint violation) still
+propagate as thrown Swift errors rather than being converted to recoverable
+frames — only capability *denial* produces a frame so far. Verified at the
+unit-test level only (61/61 tests pass, four new: field-assignment/criteria
+splitting, add/update/delete routing to the mutation handler, raw-SQL
+routing, and default-deny capability behavior) — live verification against
+a real MySQL datasource was intentionally skipped this pass rather than
+pass live credentials through the session; see
+`Documentation/inline-write-raw-sql-plan.md`'s Implementation Status note.
+Real-corpus GET-request regression sweep re-run against all top-level
+`.lasso` pages: no new failures — every failing page traces to a
+pre-existing, already-documented gap (missing includes, missing builtins,
+or the expected `inlineNotConfigured` with no live datasource wired into
+the sweep); two pages previously failing on unrelated bugs now get further
+and stop only at the expected `inlineNotConfigured`, and one page still hits
+its previously-catalogued `unsupportedExpression("")` gap, unrelated to this
+change.
+
 ## Next Compatibility Work
 
 1. Implement `[File_ProcessUploads]` (Lasso 8) and any equivalent move/copy
@@ -674,9 +732,14 @@ at 13/17. 57/57 tests pass.
    exercises those constructs.
 5. Add a crawl/report mode that requests many site paths and records the first
    unsupported construct per page.
-6. Real corpus pages still hitting distinct gaps after this pass: one page
-   hits `unknownFunction("if")` (a different legacy dialect than the
-   arrow-brace one already supported), another hits
-   `unsupportedExpression("")`, and a third hits `pathOutsideRoot` on a
-   relative include path (may be a real site-structure quirk, not
-   necessarily an interpreter bug). Not yet investigated.
+6. Real corpus pages still hitting distinct gaps as of the
+   `inline-write-raw-sql-plan` sweep: one page hits
+   `unsupportedExpression("")`. Two pages that previously hit
+   `unknownFunction("if")` and `pathOutsideRoot` respectively now get
+   further and stop only at `inlineNotConfigured` (expected — no live
+   datasource wired into the quick sweep), so those two original gaps
+   appear to already be resolved by other work in this session; not
+   independently re-verified with a live datasource yet. Two more pages hit
+   distinct missing built-ins (`unknownFunction`), and three pages hit
+   `fileNotFound` on missing include files on this local checkout (not
+   interpreter bugs).

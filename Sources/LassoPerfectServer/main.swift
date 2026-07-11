@@ -17,6 +17,11 @@ struct ServerConfig: Sendable {
     let mysqlDatabase: String
     let mysqlUser: String?
     let mysqlPassword: String?
+    /// Both default false — see Documentation/inline-write-raw-sql-plan.md's
+    /// "Capability Policy": reads enabled by default, writes and raw SQL
+    /// disabled until a deployment explicitly opts in.
+    let mysqlAllowWrites: Bool
+    let mysqlAllowRawSQL: Bool
 
     static func load() throws -> ServerConfig {
         let env = ProcessInfo.processInfo.environment
@@ -49,8 +54,15 @@ struct ServerConfig: Sendable {
             mysqlPort: env["LASSO_MYSQL_PORT"].flatMap(Int.init),
             mysqlDatabase: env["LASSO_MYSQL_DATABASE"] ?? "",
             mysqlUser: env["LASSO_MYSQL_USER"],
-            mysqlPassword: env["LASSO_MYSQL_PASSWORD"]
+            mysqlPassword: env["LASSO_MYSQL_PASSWORD"],
+            mysqlAllowWrites: Self.isTruthyEnv(env["LASSO_MYSQL_ALLOW_WRITES"]),
+            mysqlAllowRawSQL: Self.isTruthyEnv(env["LASSO_MYSQL_ALLOW_RAW_SQL"])
         )
+    }
+
+    private static func isTruthyEnv(_ value: String?) -> Bool {
+        guard let value else { return false }
+        return ["1", "true", "yes"].contains(value.lowercased())
     }
 }
 
@@ -80,19 +92,44 @@ struct LassoSiteServer: Sendable {
         includeLoader = try LassoFileSystemIncludeLoader(root: config.siteRoot)
 
         if let alias = config.datasourceAlias, config.mysqlDatabase.isEmpty == false {
-            let executor = PerfectCRUDLassoExecutor { datasource, query in
-                guard datasource == config.mysqlDatabase else {
-                    throw LassoSiteServerError.unknownDatasource(datasource)
-                }
-                let database = try Database(configuration: MySQLDatabaseConfiguration(
+            @Sendable func makeDatabase() throws -> Database<MySQLDatabaseConfiguration> {
+                try Database(configuration: MySQLDatabaseConfiguration(
                     database: config.mysqlDatabase,
                     host: config.mysqlHost,
                     port: config.mysqlPort,
                     username: config.mysqlUser,
                     password: config.mysqlPassword
                 ))
-                return try database.select(query)
             }
+            let executor = PerfectCRUDLassoExecutor(
+                capabilities: { datasource in
+                    guard datasource == config.mysqlDatabase else { return .readOnly }
+                    return LassoDatasourceCapabilities(
+                        allowsInsert: config.mysqlAllowWrites,
+                        allowsUpdate: config.mysqlAllowWrites,
+                        allowsDelete: config.mysqlAllowWrites,
+                        allowsRawSQL: config.mysqlAllowRawSQL
+                    )
+                },
+                queryHandler: { datasource, query in
+                    guard datasource == config.mysqlDatabase else {
+                        throw LassoSiteServerError.unknownDatasource(datasource)
+                    }
+                    return try makeDatabase().select(query)
+                },
+                mutationHandler: { datasource, mutation in
+                    guard datasource == config.mysqlDatabase else {
+                        throw LassoSiteServerError.unknownDatasource(datasource)
+                    }
+                    return try makeDatabase().mutate(mutation)
+                },
+                rawSQLHandler: { datasource, sql in
+                    guard datasource == config.mysqlDatabase else {
+                        throw LassoSiteServerError.unknownDatasource(datasource)
+                    }
+                    return try makeDatabase().execute(sql)
+                }
+            )
             inlineProvider = LassoDynamicInlineProvider(
                 executor: executor,
                 datasourceAliases: [alias: config.mysqlDatabase]

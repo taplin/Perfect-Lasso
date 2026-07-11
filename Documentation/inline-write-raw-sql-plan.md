@@ -2,6 +2,56 @@
 
 Last reviewed: July 10, 2026
 
+## Implementation Status (2026-07-10)
+
+All milestones implemented and unit-tested (61/61 tests pass). Real
+end-to-end verification against a live MySQL datasource was intentionally
+skipped this pass (Tim's call, to avoid needing to pass live credentials
+through the session) — this is unit-test-verified only, not live-verified,
+matching how MySQL-dependent tests are gated elsewhere in this ecosystem
+(`MYSQL_FIXTURE_TESTS=1`, see `Documentation/mysql-fixture-testing.md`).
+A real-corpus regression sweep confirmed no parse/render regressions: every
+one of 9 failing pages traces to a pre-existing, already-documented gap
+(missing includes, missing builtins, or `inlineNotConfigured` — expected
+without a live datasource configured for the sweep), not anything new from
+this change. Notably two pages previously failing on unrelated bugs
+investigated separately in earlier sessions now get further and stop only
+at the expected `inlineNotConfigured`.
+
+Key implementation decisions that turned out differently than the plan's own
+"Implementation Milestones" section suggested:
+- No separate "connector support in Perfect-MySQL" milestone was needed.
+  PerfectCRUD's `Database: DynamicDatabaseProtocol` extension already
+  generically implements dynamic SQL via `SQLGenDelegate`/`SQLExeDelegate`,
+  so widening `Dynamic.swift` once (`DynamicMutation`, `DynamicSQL`,
+  `mutate(_:)`, `execute(_:)`) covers every connector, MySQL included, with
+  no per-connector code. Only the new `affectedRowCount()`/
+  `lastInsertedID()` protocol methods needed a MySQL-specific
+  implementation (`MySQLStmtExeDelegate`, backed by `MySQLStmt`'s existing
+  `affectedRows()`/`insertId()`).
+- `PerfectCRUDLassoExecutor` took three separate handler closures
+  (`queryHandler`/`mutationHandler`/`rawSQLHandler`) rather than a single
+  "hand back a database" resolver — `DynamicDatabaseProtocol` has an
+  associated type via `DatabaseProtocol`, so it isn't existential-safe
+  (`any DynamicDatabaseProtocol` doesn't compile).
+- Capability denial (write/raw-SQL disabled for a datasource) returns a
+  `LassoInlineFrame` with non-default `LassoErrorState` rather than
+  throwing — `pushInlineFrame` already surfaces frame error state through
+  `error_currentError` unconditionally, so `protect` isn't even required to
+  observe a denial.
+
+Deferred, same as the plan's own stated allowances:
+- `-StatementOnly`'s true "compile but don't execute" semantic — parsed
+  (`LassoInlineRequest.statementOnly`) but not yet acted on; `Dynamic.swift`
+  has no compile-without-executing capability yet.
+- `-Key` array-based multi-record update/delete targeting (only
+  `-KeyField`/`-KeyValue` single-predicate targeting is implemented).
+- Real Lasso 8.5 numeric error codes — denial messages use adapter-local
+  codes (`LassoErrorState.InlineErrorCode`, 1001-1006), isolated behind an
+  enum so swapping in the real codes later (pending PDF extraction, per
+  `error-protect-model-plan`'s still-open Milestone 1) won't touch call
+  sites.
+
 ## Goal
 
 Complete the `inline` execution model beyond structured reads:

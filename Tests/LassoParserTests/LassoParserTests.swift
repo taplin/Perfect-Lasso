@@ -496,6 +496,155 @@ import PerfectCRUD
     #expect(output == "247:Black;701:Navy;")
 }
 
+@Test func inlineRequestSplitsFieldAssignmentsFromSearchCriteria() throws {
+    // Documentation/inline-write-raw-sql-plan.md's core design point: in
+    // -Add/-Update, unlabeled name/value arguments are values to write, not
+    // search predicates -- reusing `criteria` for those actions would
+    // misinterpret assignment values as WHERE-clause filters.
+    let add = LassoInlineRequest(arguments: [
+        EvaluatedArgument(label: "database", value: .string("catalog")),
+        EvaluatedArgument(label: "table", value: .string("skus")),
+        EvaluatedArgument(label: "add", value: .boolean(true)),
+        EvaluatedArgument(label: "color", value: .string("red")),
+        EvaluatedArgument(label: "size", value: .string("M")),
+    ])
+    #expect(add.action == .add)
+    #expect(add.fieldAssignments == [
+        LassoInlineAssignment(field: "color", value: .string("red")),
+        LassoInlineAssignment(field: "size", value: .string("M")),
+    ])
+    #expect(add.writeCriteria == [])
+
+    let update = LassoInlineRequest(arguments: [
+        EvaluatedArgument(label: "database", value: .string("catalog")),
+        EvaluatedArgument(label: "table", value: .string("skus")),
+        EvaluatedArgument(label: "update", value: .boolean(true)),
+        EvaluatedArgument(label: "keyfield", value: .string("id")),
+        EvaluatedArgument(label: "keyvalue", value: .integer(42)),
+        EvaluatedArgument(label: "color", value: .string("blue")),
+    ])
+    #expect(update.action == .update)
+    #expect(update.fieldAssignments == [LassoInlineAssignment(field: "color", value: .string("blue"))])
+    #expect(update.writeCriteria == [LassoInlineCriterion(field: "id", operation: "eq", value: .integer(42))])
+
+    let delete = LassoInlineRequest(arguments: [
+        EvaluatedArgument(label: "database", value: .string("catalog")),
+        EvaluatedArgument(label: "table", value: .string("skus")),
+        EvaluatedArgument(label: "delete", value: .boolean(true)),
+        EvaluatedArgument(label: "keyfield", value: .string("id")),
+        EvaluatedArgument(label: "keyvalue", value: .integer(42)),
+        // A stray field/value argument on a delete is not an assignment --
+        // real Lasso 8.5 documents -Delete's target as coming from
+        // -KeyField/-KeyValue only.
+        EvaluatedArgument(label: "color", value: .string("ignored")),
+    ])
+    #expect(delete.action == .delete)
+    #expect(delete.fieldAssignments == [])
+    #expect(delete.writeCriteria == [LassoInlineCriterion(field: "id", operation: "eq", value: .integer(42))])
+}
+
+@Test func perfectCRUDExecutorRoutesAddUpdateDeleteToTheMutationHandler() throws {
+    final class MutationRecorder: @unchecked Sendable {
+        private(set) var mutations: [DynamicMutation] = []
+        func record(_ mutation: DynamicMutation) { mutations.append(mutation) }
+    }
+    let recorder = MutationRecorder()
+    let executor = PerfectCRUDLassoExecutor(
+        capabilities: { _ in .full },
+        queryHandler: { _, _ in DynamicResult(rows: [], statement: "SELECT ...") },
+        mutationHandler: { datasource, mutation in
+            #expect(datasource == "catalog")
+            recorder.record(mutation)
+            return DynamicResult(rows: [], affectedRows: 1, statement: "...", insertedID: mutation.action == .insert ? 99 : nil)
+        }
+    )
+    let provider = LassoDynamicInlineProvider(executor: executor, datasourceAliases: ["catalog_mysql": "catalog"])
+    var context = LassoContext(inlineProvider: provider)
+
+    _ = try LassoRenderer().render(
+        "[inline(-database='catalog_mysql',-table='skus',-add,'color'='red')][/inline]",
+        context: &context
+    )
+    _ = try LassoRenderer().render(
+        "[inline(-database='catalog_mysql',-table='skus',-update,-keyfield='id',-keyvalue=7,'color'='blue')][/inline]",
+        context: &context
+    )
+    _ = try LassoRenderer().render(
+        "[inline(-database='catalog_mysql',-table='skus',-delete,-keyfield='id',-keyvalue=7)][/inline]",
+        context: &context
+    )
+
+    let seenMutations = recorder.mutations
+    #expect(seenMutations.count == 3)
+    #expect(seenMutations[0].action == .insert)
+    #expect(seenMutations[0].table == "skus")
+    #expect(seenMutations[0].values == ["color": .string("red")])
+    #expect(seenMutations[0].predicates == [])
+
+    #expect(seenMutations[1].action == .update)
+    #expect(seenMutations[1].values == ["color": .string("blue")])
+    #expect(seenMutations[1].predicates == [DynamicPredicate(field: "id", comparison: .equal, value: .int(7))])
+
+    #expect(seenMutations[2].action == .delete)
+    #expect(seenMutations[2].values == [:])
+    #expect(seenMutations[2].predicates == [DynamicPredicate(field: "id", comparison: .equal, value: .int(7))])
+}
+
+@Test func perfectCRUDExecutorRoutesRawSQLToTheRawSQLHandler() throws {
+    final class SQLRecorder: @unchecked Sendable {
+        private(set) var sql: DynamicSQL?
+        func record(_ sql: DynamicSQL) { self.sql = sql }
+    }
+    let recorder = SQLRecorder()
+    let executor = PerfectCRUDLassoExecutor(
+        capabilities: { _ in .full },
+        queryHandler: { _, _ in DynamicResult(rows: [], statement: "") },
+        rawSQLHandler: { datasource, sql in
+            #expect(datasource == "catalog")
+            recorder.record(sql)
+            return DynamicResult(rows: [DynamicRow(["n": .int(3)])], affectedRows: 0, statement: sql.sql)
+        }
+    )
+    var context = LassoContext(inlineProvider: LassoDynamicInlineProvider(
+        executor: executor,
+        datasourceAliases: ["catalog_mysql": "catalog"]
+    ))
+    let output = try LassoRenderer().render(
+        "[inline(-database='catalog_mysql',-sql='SELECT COUNT(*) AS n FROM skus')][records][field('n')][/records][/inline]",
+        context: &context
+    )
+    #expect(output == "3")
+    #expect(recorder.sql?.sql == "SELECT COUNT(*) AS n FROM skus")
+}
+
+@Test func writeAndRawSQLCapabilitiesDenyByDefaultAsRecoverableErrors() throws {
+    // Documentation/inline-write-raw-sql-plan.md's Capability Policy:
+    // reads enabled by default, writes/raw SQL disabled until a datasource
+    // explicitly opts in. Denial surfaces as an inline frame carrying
+    // LassoErrorState -- the SAME mechanism a real database permission
+    // error would use (pushInlineFrame sets context.currentError from the
+    // frame automatically) -- not a thrown error, so this doesn't even
+    // need a protect wrapper to observe: error_currentError just reflects
+    // it once the inline block runs.
+    let executor = PerfectCRUDLassoExecutor(
+        queryHandler: { _, _ in DynamicResult(rows: [], statement: "") },
+        mutationHandler: { _, mutation in DynamicResult(rows: [], affectedRows: 1, statement: "") },
+        rawSQLHandler: { _, sql in DynamicResult(rows: [], statement: sql.sql) }
+    )
+    var context = LassoContext(inlineProvider: LassoDynamicInlineProvider(
+        executor: executor,
+        datasourceAliases: ["catalog_mysql": "catalog"]
+    ))
+    let output = try LassoRenderer().render(
+        """
+        [inline(-database='catalog_mysql',-table='skus',-add,'color'='red')][/inline]\
+        error=[error_currenterror]
+        """,
+        context: &context
+    )
+    #expect(output == "error=-Add is not enabled for datasource 'catalog'.")
+}
+
 @Test func customTagDefinesCallsAndIsolatesLocals() throws {
     var context = LassoContext()
     let source = """
