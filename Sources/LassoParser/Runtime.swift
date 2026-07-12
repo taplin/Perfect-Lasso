@@ -127,6 +127,40 @@ public struct LassoNativeRegistry: Sendable {
             let value = arguments.first?.value.outputString ?? ""
             return .string(value.htmlEncoded)
         }
+        register("encode_smart") { arguments, _ in
+            .string(LassoEncoding.smart(arguments.first?.value.outputString ?? ""))
+        }
+        register("encode_break") { arguments, _ in
+            .string(LassoEncoding.breakEncoded(arguments.first?.value.outputString ?? ""))
+        }
+        register("encode_xml") { arguments, _ in
+            .string(LassoEncoding.xml(arguments.first?.value.outputString ?? ""))
+        }
+        register("encode_url") { arguments, _ in
+            .string(LassoEncoding.url(arguments.first?.value.outputString ?? ""))
+        }
+        register("encode_stricturl") { arguments, _ in
+            .string(LassoEncoding.strictURL(arguments.first?.value.outputString ?? ""))
+        }
+        register("encode_sql") { arguments, _ in
+            .string(LassoEncoding.sql(arguments.first?.value.outputString ?? ""))
+        }
+        register("encode_base64") { arguments, _ in
+            .string(LassoEncoding.base64(arguments.first?.value.outputString ?? ""))
+        }
+        // [Output]/Output(...) — Lasso 8.5 Language Guide Chapter 14
+        // "Table 1: Output Tags": applies an encoding to any expression,
+        // member tag, or sub-tag result. Default -EncodeHTML, matching
+        // Chapter 17 "Encoding Rules" ("Substitution Tags which output a
+        // value to the site visitor have a default encoding of
+        // -EncodeHTML"), overridable by an explicit -Encode* keyword or by
+        // an enclosing [Encode_Set] scope. See
+        // Documentation/output-tags-plan.md.
+        register("output") { arguments, context in
+            let value = arguments.first?.value.outputString ?? ""
+            let keyword = LassoEncoding.keyword(in: arguments) ?? context.currentEncodingOverride ?? "html"
+            return .string(LassoEncoding.apply(keyword, to: value))
+        }
         register("map") { arguments, _ in
             var values: [String: LassoValue] = [:]
             for argument in arguments {
@@ -439,6 +473,11 @@ public struct LassoContext: Sendable {
     /// The most recent `session_start` result per session name, so
     /// `session_result` can report it without re-consulting the provider.
     var sessionStartResults: [String: LassoSessionStartResult]
+    /// `[Encode_Set: -EncodeXxx] ... [/Encode_Set]` pushes here; `Output`
+    /// (with no explicit encoding keyword of its own) consults the top of
+    /// this stack instead of the -EncodeHTML default. See
+    /// `Documentation/output-tags-plan.md`.
+    var encodingOverrideStack: [String]
 
     public init(
         globals: [String: LassoValue] = [:],
@@ -475,6 +514,7 @@ public struct LassoContext: Sendable {
         trackedSessionVariables = []
         suppressedSessionSaves = []
         sessionStartResults = [:]
+        encodingOverrideStack = []
     }
 
     public mutating func setError(_ error: LassoErrorState) {
@@ -523,6 +563,10 @@ public struct LassoContext: Sendable {
 
     public var currentInlineFrame: LassoInlineFrame? {
         inlineFrames.last?.frame
+    }
+
+    var currentEncodingOverride: String? {
+        encodingOverrideStack.last
     }
 
     public var currentRow: LassoDataRow? {

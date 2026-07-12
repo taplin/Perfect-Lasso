@@ -844,6 +844,53 @@ from that run, not silently absorbed:
   the main sweep tool going forward, but not done this pass since it
   wasn't the ask.
 
+**Implemented `output-tags-plan`** (`[Output]`/`Output(...)`, `Output_None`,
+`HTML_Comment`, `Encode_Set`, and the full `Encode_*`/Lasso-9-string-method
+encoding family). Grounded in both generations per direct request: the
+local `References/Lasso/Lasso 8.5 Language Guide.pdf` (Chapters 14 and 17)
+for the tag-style contract, and the online Lasso 9 reference
+(lassoguide.com, fetched directly) confirming Lasso 9 exposes the
+identical encoding keyword set through string instance methods
+(`->encodeHtml`, etc.) rather than free tags. All transforms live once in
+new `Sources/LassoParser/Encoding.swift`, reused by both the tag-style
+natives and the existing `.string` member-dispatch cases — not two
+implementations of the same thing. Real corpus usage was `grep`-counted
+before implementing, not assumed: `-EncodeHTML` (35 sites), `-EncodeNone`
+(28), `Encode_Smart` (22), several more with lower but real counts — every
+keyword this pass implements has at least one real call site.
+`Output_None` turned out far more load-bearing than `Output` itself:
+dozens of real pages open with a bare `Output_None; ... /Output_None;`
+wrapper around top-level variable setup, meaning those pages were failing
+before ever reaching their real content.
+
+Two real, separate bugs found and fixed along the way, not just missing
+tags: the `[...]` square-bracket boundary scanner didn't account for
+backslash-escaped quotes inside a string when hunting for the bracket's
+closing `]` (`[Encode_SQL: 'it\'s']` — the scanner ended the string one
+character early at the escaped quote, then misread the string's real
+closing quote as *opening* a new one, losing track of the actual `]`;
+`ExpressionParser.readString` already handled this correctly, the outer
+bracket scanner had separate, more naive quote-tracking); and the
+"route a multi-statement `[...]` body through `ScriptBodyParser`"
+mechanism added for `legacy-define-tag-type-plan`'s `define_tag`/
+`define_type` needed extending to the three new container keywords, plus
+one more real shape it didn't yet cover: a keyword used completely bare
+with no colon or parens, directly followed by `;` (`Output_None;` — the
+"valid next character" check only allowed whitespace/`(`/`:`, not `;`).
+
+Verified via 8 new tests (76/76 total, no regressions) and a live
+real-corpus crawl (`LASSO_CRAWL_REPORT=1`): clean pages rose from 1,666 to
+1,690 of 1,989, and `unknownFunction("Output")` no longer appears anywhere
+in the failure report. The `inlineNotConfigured` bucket grew rather than
+shrank — not a regression; several pages that previously failed on the
+`Output` gap now progress further and correctly stop at the same
+already-documented, expected "no live datasource wired into the sweep"
+blocker. New gaps the deeper crawl surfaced once `Output` stopped masking
+them: `unknownFunction("Date_Format")` (20 pages), `unknownFunction("Decode_Base64")`
+(20 pages), `unknownFunction("inline")` (15 pages, a differently-shaped
+usage from the already-supported `[Inline: ...]` block form) — added to
+the backlog below, not fixed this pass.
+
 ## Next Compatibility Work
 
 1. Implement `[File_ProcessUploads]` (Lasso 8) and any equivalent move/copy
@@ -887,10 +934,12 @@ from that run, not silently absorbed:
    distinct missing built-ins (`unknownFunction`), and three pages hit
    `fileNotFound` on missing include files on this local checkout (not
    interpreter bugs).
-7. Implement `[Output]`/`Output(...)` (Chapter 14's "Table 1: Output
-   Tags" — applies default encoding to any expression/sub-tag/member-tag
-   result). Found by the new crawl/report mode: the single largest
-   genuine gap in a full recursive site sweep (44 of 1,989 pages,
-   `unknownFunction("Output")`), distinct from the vendor-asset noise the
-   same sweep also surfaced (see the crawl/report implementation note
-   above).
+7. ~~Implement `[Output]`/`Output(...)`~~ Done — see the `output-tags-plan`
+   implementation note above.
+8. `unknownFunction("Date_Format")` (20 pages) and `unknownFunction("Decode_Base64")`
+   (20 pages) — real, common Lasso 8 tags, surfaced once `Output` stopped
+   masking them in the crawl/report sweep. Not yet implemented.
+9. `unknownFunction("inline")` (15 pages) — a differently-shaped `Inline`
+   usage from the already-supported `[Inline: ...]` block form (likely a
+   bare-call/value-returning context, e.g. `Inline(...)` used as an
+   expression rather than a container tag). Not yet investigated.

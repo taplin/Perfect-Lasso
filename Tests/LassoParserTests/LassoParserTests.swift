@@ -160,6 +160,92 @@ import PerfectSessionCore
     #expect(output == "before-middle-after")
 }
 
+@Test func outputAppliesDefaultHTMLEncodingUnlessEncodeNoneIsGiven() throws {
+    var context = LassoContext()
+    let output = try LassoRenderer().render(
+        "[Output: '<b>Bold</b>']|[Output: '<b>Bold</b>', -EncodeNone]",
+        context: &context
+    )
+    #expect(output == "&lt;b&gt;Bold&lt;/b&gt;|<b>Bold</b>")
+}
+
+@Test func outputSupportsEveryDocumentedEncodingKeyword() throws {
+    // One render call per keyword — kept separate rather than one combined
+    // literal, since several of these transforms are quote/backslash-heavy
+    // and hard to read correctly when concatenated.
+    func rendered(_ source: String) throws -> String {
+        var context = LassoContext()
+        return try LassoRenderer().render(source, context: &context)
+    }
+
+    #expect(try rendered("[Output: 'é', -EncodeSmart]") == "&#233;")
+    #expect(try rendered("[Output: 'line1\nline2', -EncodeBreak]") == "line1<br>line2")
+    #expect(try rendered("[Output: '<a>', -EncodeXML]") == "&lt;a&gt;")
+    #expect(try rendered("[Output: 'a b', -EncodeURL]") == "a%20b")
+    #expect(try rendered("[Output: 'a&b', -EncodeStrictURL]") == "a%26b")
+    #expect(try rendered("[Output: 'hi', -EncodeBase64]") == "aGk=")
+}
+
+@Test func standaloneEncodeTagsMatchOutputsKeywordTransforms() throws {
+    var context = LassoContext()
+    let output = try LassoRenderer().render(
+        "[Encode_Smart: 'é']|[Encode_Break: 'a\nb']|[Encode_XML: '<x>']|[Encode_URL: 'a b']|" +
+            "[Encode_StrictURL: 'a&b']|[Encode_SQL: 'it\\'s']|[Encode_Base64: 'hi']",
+        context: &context
+    )
+    #expect(output == "&#233;|a<br>b|&lt;x&gt;|a%20b|a%26b|it\\'s|aGk=")
+}
+
+@Test func stringMembersExposeTheSameEncodingsAsLasso9Methods() throws {
+    var context = LassoContext()
+    let output = try LassoRenderer().render(
+        "[('é')->encodeSmart]|[('a\nb')->encodeBreak]|[('<x>')->encodeXML]|" +
+            "[('a&b')->encodeStrictURL]|[('it\\'s')->encodeSQL]|[('hi')->encodeBase64]",
+        context: &context
+    )
+    #expect(output == "&#233;|a<br>b|&lt;x&gt;|a%26b|it\\'s|aGk=")
+}
+
+@Test func outputNoneSuppressesRenderedTextButStillRunsItsBody() throws {
+    // Real corpus shape: a bare colon-call statement with no parens at
+    // all, common at the top of startup/page files
+    // (`Output_None; var(...); /Output_None;`). Side effects (the
+    // variable assignment) must still happen even though no text reaches
+    // the page.
+    var context = LassoContext()
+    let output = try LassoRenderer().render(
+        """
+        before-[
+        Output_None;
+            Var: 'hidden' = 'set';
+        /Output_None;
+        ]-after-[Var: 'hidden']
+        """,
+        context: &context
+    )
+    #expect(output == "before--after-set")
+}
+
+@Test func htmlCommentWrapsRenderedOutput() throws {
+    var context = LassoContext()
+    let output = try LassoRenderer().render(
+        "before-[HTML_Comment]middle[/HTML_Comment]-after",
+        context: &context
+    )
+    #expect(output == "before-<!--middle-->-after")
+}
+
+@Test func encodeSetChangesTheDefaultForNestedOutputCallsWithNoExplicitKeyword() throws {
+    var context = LassoContext()
+    let output = try LassoRenderer().render(
+        "[Encode_Set: -EncodeNone][Output: '<b>Bold</b>'][/Encode_Set]|[Output: '<b>Bold</b>']",
+        context: &context
+    )
+    // Inside Encode_Set(-EncodeNone), Output with no keyword of its own
+    // uses the scope's default; outside it, Output falls back to HTML.
+    #expect(output == "<b>Bold</b>|&lt;b&gt;Bold&lt;/b&gt;")
+}
+
 @Test func rendersIncludesRequestSessionAndInlineFrames() throws {
     struct IncludeLoader: LassoIncludeLoader {
         func loadInclude(path: String, from includingPath: String?) throws -> String {

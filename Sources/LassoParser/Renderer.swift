@@ -228,6 +228,34 @@ private struct RendererEngine {
                 withOutput += try render(body)
             }
             return withOutput
+        case "output_none":
+            // Processes the tags within (side effects like var()/local()
+            // assignments still happen — `render(body)` evaluates
+            // everything normally) but hides the rendered text from the
+            // page, per Lasso 8.5 Language Guide Chapter 14's "Table 1:
+            // Output Tags". See Documentation/output-tags-plan.md.
+            _ = try render(body)
+            return ""
+        case "html_comment":
+            // Wraps the body's rendered output in an HTML comment — the
+            // contents still reach the client (visible via "View Source")
+            // but aren't part of the visible page.
+            return "<!--\(try render(body))-->"
+        case "encode_set":
+            // Changes the default encoding for nested `Output` calls
+            // (those with no -Encode* keyword of their own) for the
+            // duration of the body — see LassoEncoding.keyword(in:) and
+            // the `output` native. An unrecognized/missing keyword falls
+            // through to rendering the body with no override, matching
+            // this interpreter's existing "unknown flag ignored, not
+            // fatal" convention elsewhere.
+            let evaluatedArguments = try evaluator.evaluateArguments(arguments)
+            if let keyword = LassoEncoding.keyword(in: evaluatedArguments) {
+                evaluator.context.encodingOverrideStack.append(keyword)
+                defer { evaluator.context.encodingOverrideStack.removeLast() }
+                return try render(body)
+            }
+            return try render(body)
         default:
             if let function = evaluator.context.natives.function(named: name) {
                 _ = try function(try evaluator.evaluateArguments(arguments), &evaluator.context)

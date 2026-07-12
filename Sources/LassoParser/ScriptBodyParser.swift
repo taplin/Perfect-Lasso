@@ -323,26 +323,32 @@ struct ScriptBodyParser {
             }
             return
         }
-        // Legacy `define_tag`/`define_type` openers commonly use Lasso 8's
-        // bare colon-call convention with no enclosing parens at all
-        // (`Define_Tag: 'name', -Required='x';`), unlike `parseBlockOpening`'s
-        // `if:(...)`/`loop:(...)` handling, which still requires parens
-        // after the colon. That shape parses fine as an ordinary call
-        // expression here — it just needs to become a `.tag(...)` node
-        // (matching `parseBlockOpening`'s output) instead of `.code(...)`
-        // so BlockBuilder can pair it with its `/define_tag;` closer. See
-        // Documentation/legacy-define-tag-type-plan.md.
+        // Several block-shaped keywords commonly use Lasso 8's bare
+        // colon-call convention with no enclosing parens at all
+        // (`Define_Tag: 'name', -Required='x';`, or even zero arguments —
+        // `Output_None;` ... `/Output_None;` — appears constantly in real
+        // startup/page code with no parens whatsoever), unlike
+        // `parseBlockOpening`'s `if:(...)`/`loop:(...)` handling, which
+        // still requires parens after the colon. That shape parses fine as
+        // an ordinary call/bare-identifier expression here — it just needs
+        // to become a `.tag(...)` node (matching `parseBlockOpening`'s
+        // output) instead of `.code(...)` so `BlockBuilder` can pair it
+        // with its `/name;` closer. See
+        // Documentation/legacy-define-tag-type-plan.md and
+        // Documentation/output-tags-plan.md.
         switch expressions[0] {
-        case let .call(.identifier(name), arguments) where Self.legacyDefinitionNames.contains(name.lowercased()):
+        case let .call(.identifier(name), arguments) where Self.bareBlockNames.contains(name.lowercased()):
             nodes.append(.tag(name: name, arguments: arguments, closing: false, dialect: .lasso8, range: range))
-        case let .identifier(name) where Self.legacyDefinitionNames.contains(name.lowercased()):
+        case let .identifier(name) where Self.bareBlockNames.contains(name.lowercased()):
             nodes.append(.tag(name: name, arguments: [], closing: false, dialect: .lasso8, range: range))
         default:
             nodes.append(.code(expressions, .lasso9, delimiter, range))
         }
     }
 
-    private static let legacyDefinitionNames: Set<String> = ["define_tag", "define_type"]
+    private static let bareBlockNames: Set<String> = [
+        "define_tag", "define_type", "output_none", "html_comment", "encode_set",
+    ]
 
     private func normalizeReturn(_ statement: String) -> String {
         guard statement.lowercased().hasPrefix("return ") else { return statement }
@@ -593,5 +599,6 @@ struct ScriptBodyParser {
 
     private static let blockNames: Set<String> = [
         "if", "inline", "records", "rows", "loop", "iterate", "while", "protect",
+        "output_none", "html_comment", "encode_set",
     ]
 }

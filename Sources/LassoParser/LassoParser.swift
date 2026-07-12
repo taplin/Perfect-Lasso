@@ -200,6 +200,17 @@ private struct TemplateScanner {
         while index < characters.count {
             let character = characters[index]
             if let activeQuote = quote {
+                // A backslash-escaped quote (`'it\'s'`) must not be
+                // mistaken for the string's real closing quote — found
+                // testing `[Encode_SQL: 'it\'s']`, where this scanner
+                // (unlike `ExpressionParser.readString`, which already
+                // handles this correctly) ended the string one character
+                // early, then misread the real closing quote as opening a
+                // new one, losing track of the bracket's true `]`.
+                if character == "\\", index + 1 < characters.count {
+                    index += 2
+                    continue
+                }
                 if character == activeQuote { quote = nil }
                 index += 1
                 continue
@@ -299,7 +310,8 @@ private struct TemplateScanner {
         // modern `define`, not the single-expression fallback.
         if delimiter == .square, Self.bodyOpensWithLegacyDefinition(body) {
             var parser = ScriptBodyParser(source: body, range: range, delimiter: .square)
-            nodes.append(contentsOf: parser.parse())
+            let parsed = parser.parse()
+            nodes.append(contentsOf: parsed)
             diagnostics.append(contentsOf: parser.diagnostics)
             return
         }
@@ -422,10 +434,12 @@ private struct TemplateScanner {
     }
 
     /// Same leading-comment-tolerant scan as `bodyOpensWithDefine`, but for
-    /// the legacy `define_tag`/`define_type` keywords instead of modern
-    /// `define`. Both the parenthesized-call (`define_tag(...)`) and
-    /// colon-call (`define_tag:`) openers need to match — the character
-    /// immediately after the keyword is `(`, `:`, whitespace, or end.
+    /// legacy block keywords (`define_tag`/`define_type`, and the
+    /// `output_none`/`html_comment`/`encode_set` container tags — see
+    /// Documentation/output-tags-plan.md) instead of modern `define`. Both
+    /// the parenthesized-call (`define_tag(...)`) and colon-call
+    /// (`define_tag:`) openers need to match — the character immediately
+    /// after the keyword is `(`, `:`, whitespace, or end.
     private static func bodyOpensWithLegacyDefinition(_ body: String) -> Bool {
         let characters = Array(body)
         var index = 0
@@ -445,12 +459,16 @@ private struct TemplateScanner {
             }
         }
         let remainder = String(characters[index...])
-        for keyword in ["define_tag", "define_type"] {
+        for keyword in ["define_tag", "define_type", "output_none", "html_comment", "encode_set"] {
             guard remainder.lowercased().hasPrefix(keyword) else { continue }
             let afterKeyword = remainder.index(remainder.startIndex, offsetBy: keyword.count)
             if afterKeyword == remainder.endIndex { return true }
             let next = remainder[afterKeyword]
-            if next.isWhitespace || next == "(" || next == ":" { return true }
+            // `;` matters for keywords real corpus uses with zero
+            // arguments and no colon (`Output_None;` directly, not
+            // `Output_None:` or `Output_None (`) — found testing exactly
+            // this shape.
+            if next.isWhitespace || next == "(" || next == ":" || next == ";" { return true }
         }
         return false
     }
@@ -490,5 +508,6 @@ private struct TemplateScanner {
 
     private static let blockTagNames: Set<String> = [
         "if", "else", "inline", "records", "rows", "loop", "iterate", "while", "define", "protect",
+        "output_none", "html_comment", "encode_set",
     ]
 }
