@@ -901,9 +901,9 @@ Lasso 9's completely different `GivenBlock`/capture-based mechanism (not
 online search, not assumed to be the same thing under a new name). Then
 `grep`-counted real corpus usage before committing to either dialect:
 **zero** matches for `-Container`/`-Looping`/`Run_Children` anywhere in the
-real site; the only `GivenBlock` usage (158 occurrences) is confined to
-`lassoBackup/scrubs/LassoApps/ds/` — a vendored, dated (2013), third-party
-"DS Suite for Lasso 9" library, not live application content. Surfaced this
+real site; the only `GivenBlock` usage (158 occurrences) is confined to a
+vendored, dated (2013), third-party "DS Suite for Lasso 9" library folder,
+not live application content. Surfaced this
 finding rather than silently deciding either way; skipped in favor of a
 corpus-validated item (`Date_Format`, below) — not implemented this pass.
 
