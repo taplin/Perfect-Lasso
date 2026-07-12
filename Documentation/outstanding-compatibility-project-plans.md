@@ -695,6 +695,45 @@ redirect is set.
 
 ## 9. Crawl/Report Filtering And Triage Quality
 
+### Implementation Status (2026-07-12)
+
+Implemented — see `Documentation/crawl-report-filtering-plan.md` for full
+detail. Grounded scope in real evidence pulled from JSONs already on disk
+from the `inline` fix verification: 53% of all discovered pages (1,053 of
+1,989) live under a `*/vendor/*` path; 32% of then-failing pages (95 of
+299) were vendor pages hitting `unsupportedExpression`-family errors on
+third-party JS/HTML demo syntax, not real gaps. Reused
+`LassoSubsetCrawler.Scanner`'s existing marker list/exclude mechanism
+rather than inventing new signals.
+
+Implemented path excludes (`LASSO_CRAWL_EXCLUDE_PATHS`), a content
+heuristic for `.htm`/`.html` only, two focused-rerun mechanisms
+(`LASSO_CRAWL_PATH_LIST`; `LASSO_CRAWL_BASELINE` +
+`LASSO_CRAWL_ONLY_FAILURE`), an offline diff mode
+(`LASSO_CRAWL_DIFF_BASELINE`/`LASSO_CRAWL_DIFF_CURRENT`), and per-page
+elapsed time + an excluded-page count in JSON output. Extracted the
+crawler's logic into a new `LassoCrawlReport` library target so a test
+target could exercise it without risking execution of
+`LassoPerfectServer`'s genuine top-level-executing `main.swift`.
+
+Found and fixed one real, latent bug while writing the first unit test for
+path discovery: a symlink-resolution mismatch (macOS's `/var` →
+`/private/var` firmlink) in the relative-path computation, present in the
+pre-existing code too but never triggered because the real caller always
+pre-resolves the site root. Fixed by switching to the path-relative
+`FileManager.enumerator(atPath:)` overload.
+
+Verified via 10 new unit tests and three live-verification passes:
+`LASSO_CRAWL_EXCLUDE_PATHS=vendor` dropped the failing-page count from 299
+to 204 (exactly the evidenced 95-page reduction); the diff mode reproduced
+byte-for-byte the `inline`-fix's 14-page bucket change already found by
+hand; the focused-rerun mechanism correctly narrowed a full-site crawl
+down to just the pages matching one failure substring.
+
+Deferred, with reason: separating parser diagnostics from runtime errors
+in JSON output — no evidenced need, every real failure bucket found this
+session has been a runtime error.
+
 ### Goal
 
 Make `LASSO_CRAWL_REPORT=1` a sharper production-readiness tool by filtering
@@ -769,11 +808,12 @@ JSON to `LASSO_CRAWL_REPORT_PATH`. Redirects count as clean.
 
 ## Recommended Execution Order
 
-1. Live MySQL verification and DB error framing.
-2. `Date_Format` plus minimal date helpers.
-3. `Decode_Base64`.
-4. Expression-form `inline(...)`.
-5. Crawl/report filtering, so later sweeps are less noisy.
+1. ~~Live MySQL verification and DB error framing.~~ Done.
+2. ~~`Date_Format` plus minimal date helpers.~~ Done.
+3. ~~`Decode_Base64`.~~ Done.
+4. ~~Expression-form `inline(...)`.~~ Done (real root cause was a bare
+   colon-call parser gap, not an expression-form gap).
+5. ~~Crawl/report filtering, so later sweeps are less noisy.~~ Done.
 6. `[File_ProcessUploads]`.
 7. Session edge cases.
 8. `web_response->include*` and file serving.

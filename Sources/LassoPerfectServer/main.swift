@@ -1,4 +1,5 @@
 import Foundation
+import LassoCrawlReport
 import LassoParser
 import LassoPerfectCRUD
 import LassoPerfectSession
@@ -43,6 +44,20 @@ struct ServerConfig: Sendable {
     /// Optional path to also write the full per-page JSON results to,
     /// for diffing between runs. `LASSO_CRAWL_REPORT_PATH`.
     let crawlReportOutputPath: String?
+    /// Comma-separated, case-insensitive path substrings to skip during
+    /// discovery — `LASSO_CRAWL_EXCLUDE_PATHS` (e.g. "vendor"). Default
+    /// empty: no behavior change unless a deployment opts in. See
+    /// `Documentation/crawl-report-filtering-plan.md`.
+    let crawlExcludePaths: [String]
+    /// `LASSO_CRAWL_PATH_LIST` — a file of newline-delimited site-root-
+    /// relative paths to crawl instead of the filesystem walk.
+    let crawlPathListPath: String?
+    /// `LASSO_CRAWL_BASELINE` — a previous run's own JSON output, used with
+    /// `crawlOnlyFailure` to re-crawl just one failure bucket.
+    let crawlBaselinePath: String?
+    /// `LASSO_CRAWL_ONLY_FAILURE` — a substring matched against
+    /// `crawlBaselinePath`'s `errorDescription` values.
+    let crawlOnlyFailure: String?
 
     static func load() throws -> ServerConfig {
         let env = ProcessInfo.processInfo.environment
@@ -80,7 +95,14 @@ struct ServerConfig: Sendable {
             mysqlAllowRawSQL: Self.isTruthyEnv(env["LASSO_MYSQL_ALLOW_RAW_SQL"]),
             sessionDriver: (env["LASSO_SESSION_DRIVER"] ?? "memory").lowercased(),
             crawlReportMode: Self.isTruthyEnv(env["LASSO_CRAWL_REPORT"]),
-            crawlReportOutputPath: env["LASSO_CRAWL_REPORT_PATH"]
+            crawlReportOutputPath: env["LASSO_CRAWL_REPORT_PATH"],
+            crawlExcludePaths: (env["LASSO_CRAWL_EXCLUDE_PATHS"] ?? "")
+                .split(separator: ",")
+                .map { $0.trimmingCharacters(in: .whitespacesAndNewlines) }
+                .filter { $0.isEmpty == false },
+            crawlPathListPath: env["LASSO_CRAWL_PATH_LIST"],
+            crawlBaselinePath: env["LASSO_CRAWL_BASELINE"],
+            crawlOnlyFailure: env["LASSO_CRAWL_ONLY_FAILURE"]
         )
     }
 
@@ -798,6 +820,25 @@ private extension String {
     }
 }
 
+// Offline diff mode (LASSO_CRAWL_DIFF_BASELINE + LASSO_CRAWL_DIFF_CURRENT)
+// needs neither a site root nor a running server — check for it before
+// ServerConfig.load() so it stays a lightweight, standalone operation
+// rather than printing site/server setup output for what's really just
+// comparing two JSON files.
+if let baselinePath = ProcessInfo.processInfo.environment["LASSO_CRAWL_DIFF_BASELINE"],
+   let currentPath = ProcessInfo.processInfo.environment["LASSO_CRAWL_DIFF_CURRENT"] {
+    guard let baseline = CrawlReport.loadBaseline(baselinePath) else {
+        fputs("Could not read LASSO_CRAWL_DIFF_BASELINE: \(baselinePath)\n", stderr)
+        exit(1)
+    }
+    guard let current = CrawlReport.loadBaseline(currentPath) else {
+        fputs("Could not read LASSO_CRAWL_DIFF_CURRENT: \(currentPath)\n", stderr)
+        exit(1)
+    }
+    CrawlReport.printDiff(CrawlReport.diff(baseline: baseline, current: current))
+    exit(0)
+}
+
 let config = try ServerConfig.load()
 let siteServer = try LassoSiteServer(config: config)
 print("Lasso Perfect test server")
@@ -830,12 +871,34 @@ if config.crawlReportMode {
         // Give the NIO server a moment to actually bind before hitting it —
         // there's no separate "ready" signal to await here.
         try? await Task.sleep(for: .seconds(1))
-        let results = await CrawlReport.run(
+
+        // Focused rerun: an explicit path list wins outright; otherwise a
+        // baseline + failure substring derives one. Neither set -> the
+        // usual full filesystem walk (CrawlReport.run's default).
+        var pathList: [String]?
+        if let pathListPath = config.crawlPathListPath {
+            guard let loaded = CrawlReport.loadPathList(pathListPath) else {
+                fputs("Could not read LASSO_CRAWL_PATH_LIST: \(pathListPath)\n", stderr)
+                exit(1)
+            }
+            pathList = loaded
+        } else if let baselinePath = config.crawlBaselinePath, let onlyFailure = config.crawlOnlyFailure {
+            guard let baseline = CrawlReport.loadBaseline(baselinePath) else {
+                fputs("Could not read LASSO_CRAWL_BASELINE: \(baselinePath)\n", stderr)
+                exit(1)
+            }
+            pathList = CrawlReport.pathsMatchingFailure(baseline, substring: onlyFailure)
+            print("Focused rerun: \(pathList?.count ?? 0) page(s) previously matching '\(onlyFailure)'.")
+        }
+
+        let (results, excludedCount) = await CrawlReport.run(
             baseURL: "http://localhost:\(config.port)",
             siteRoot: config.siteRoot,
-            extensions: config.lassoExtensions
+            extensions: config.lassoExtensions,
+            excludePaths: config.crawlExcludePaths,
+            pathList: pathList
         )
-        CrawlReport.printAndWrite(results, outputPath: config.crawlReportOutputPath)
+        CrawlReport.printAndWrite(results, outputPath: config.crawlReportOutputPath, excludedCount: excludedCount)
         exit(0)
     }
 }

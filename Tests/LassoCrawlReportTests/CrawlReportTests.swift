@@ -1,0 +1,160 @@
+import Foundation
+import Testing
+@testable import LassoCrawlReport
+
+private func makeTempSiteRoot() throws -> URL {
+    let root = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString, isDirectory: true)
+    try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
+    return root
+}
+
+private func write(_ text: String, to root: URL, relativePath: String) throws {
+    let url = root.appendingPathComponent(relativePath)
+    try FileManager.default.createDirectory(at: url.deletingLastPathComponent(), withIntermediateDirectories: true)
+    try text.write(to: url, atomically: true, encoding: .utf8)
+}
+
+@Test func looksLikeLassoSourceRecognizesEveryPortedMarker() throws {
+    #expect(CrawlReport.looksLikeLassoSource("<html><?lasso 'x' ?></html>"))
+    #expect(CrawlReport.looksLikeLassoSource("[inline(-search)]"))
+    #expect(CrawlReport.looksLikeLassoSource("[Records][/Records]"))
+    #expect(CrawlReport.looksLikeLassoSource("<html><body>Static page, no Lasso here.</body></html>") == false)
+}
+
+@Test func discoverPathsSkipsUnderscorePrefixedAndHiddenFiles() throws {
+    let root = try makeTempSiteRoot()
+    defer { try? FileManager.default.removeItem(at: root) }
+    try write("hello", to: root, relativePath: "page.lasso")
+    try write("include-only", to: root, relativePath: "_header.lasso")
+    try write("hidden", to: root, relativePath: ".hidden/page.lasso")
+
+    let (paths, excludedCount) = CrawlReport.discoverPaths(
+        siteRoot: root,
+        extensions: ["lasso"],
+        excludePaths: []
+    )
+    #expect(paths == ["page.lasso"])
+    #expect(excludedCount == 0)
+}
+
+@Test func discoverPathsAppliesCaseInsensitivePathExcludes() throws {
+    let root = try makeTempSiteRoot()
+    defer { try? FileManager.default.removeItem(at: root) }
+    try write("real page", to: root, relativePath: "pages/home.lasso")
+    try write("vendor demo", to: root, relativePath: "assets/Vendor/gmaps/demo.lasso")
+
+    let (paths, excludedCount) = CrawlReport.discoverPaths(
+        siteRoot: root,
+        extensions: ["lasso"],
+        excludePaths: ["vendor"]
+    )
+    #expect(paths == ["pages/home.lasso"])
+    #expect(excludedCount == 1)
+}
+
+@Test func discoverPathsSkipsStaticHTMLButKeepsLassoBearingHTML() throws {
+    let root = try makeTempSiteRoot()
+    defer { try? FileManager.default.removeItem(at: root) }
+    try write("<html><?lasso 'x' ?></html>", to: root, relativePath: "layout.html")
+    try write("<html><body>Static demo page</body></html>", to: root, relativePath: "vendor-ish/demo.html")
+    try write("[inline(-search)][/inline]", to: root, relativePath: "search.htm")
+
+    let (paths, excludedCount) = CrawlReport.discoverPaths(
+        siteRoot: root,
+        extensions: ["html", "htm"],
+        excludePaths: []
+    )
+    #expect(Set(paths) == ["layout.html", "search.htm"])
+    #expect(excludedCount == 1)
+}
+
+@Test func discoverPathsNeverContentSniffsLassoOrIncExtensions() throws {
+    // .lasso/.inc must behave exactly as before this pass regardless of
+    // content — the content heuristic only applies to .htm/.html.
+    let root = try makeTempSiteRoot()
+    defer { try? FileManager.default.removeItem(at: root) }
+    try write("plain text, no Lasso markers at all", to: root, relativePath: "odd.lasso")
+
+    let (paths, excludedCount) = CrawlReport.discoverPaths(
+        siteRoot: root,
+        extensions: ["lasso"],
+        excludePaths: []
+    )
+    #expect(paths == ["odd.lasso"])
+    #expect(excludedCount == 0)
+}
+
+@Test func loadPathListSkipsBlankLinesAndComments() throws {
+    let file = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+    defer { try? FileManager.default.removeItem(at: file) }
+    try """
+    pages/a.lasso
+
+    # a comment
+    pages/b.lasso
+    """.write(to: file, atomically: true, encoding: .utf8)
+
+    let list = CrawlReport.loadPathList(file.path)
+    #expect(list == ["pages/a.lasso", "pages/b.lasso"])
+}
+
+@Test func loadPathListReturnsNilForMissingFile() throws {
+    #expect(CrawlReport.loadPathList("/nonexistent/\(UUID().uuidString)") == nil)
+}
+
+private func writeBaseline(_ records: [[String: String]]) throws -> URL {
+    let file = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString + ".json")
+    let data = try JSONSerialization.data(withJSONObject: records)
+    try data.write(to: file)
+    return file
+}
+
+@Test func loadBaselineRoundTripsPrintAndWritesOwnFormat() throws {
+    let file = try writeBaseline([
+        ["path": "a.lasso", "statusCode": "200", "errorType": "", "errorDescription": "", "elapsedMS": "12"],
+        ["path": "b.lasso", "statusCode": "500", "errorType": "LassoRuntimeError", "errorDescription": "unknownFunction(\"X\")", "elapsedMS": "5"],
+    ])
+    defer { try? FileManager.default.removeItem(at: file) }
+
+    let loaded = try #require(CrawlReport.loadBaseline(file.path))
+    #expect(loaded.count == 2)
+    #expect(loaded[0] == CrawlPageResult(path: "a.lasso", statusCode: 200, errorType: nil, errorDescription: nil, elapsedMS: 12))
+    #expect(loaded[1].errorDescription == "unknownFunction(\"X\")")
+    #expect(loaded[1].isClean == false)
+}
+
+@Test func pathsMatchingFailureFiltersCaseInsensitivelyAndOnlyFailingPages() throws {
+    let baseline = [
+        CrawlPageResult(path: "a.lasso", statusCode: 200, errorType: nil, errorDescription: nil, elapsedMS: 0),
+        CrawlPageResult(path: "b.lasso", statusCode: 500, errorType: "x", errorDescription: "unknownFunction(\"Date_Format\")", elapsedMS: 0),
+        CrawlPageResult(path: "c.lasso", statusCode: 500, errorType: "x", errorDescription: "unknownFunction(\"Select\")", elapsedMS: 0),
+    ]
+    #expect(CrawlReport.pathsMatchingFailure(baseline, substring: "date_format") == ["b.lasso"])
+    #expect(CrawlReport.pathsMatchingFailure(baseline, substring: "nope").isEmpty)
+}
+
+@Test func diffReportsNewlyCleanNewlyFailingAndChangedBucketsOnly() throws {
+    let baseline = [
+        CrawlPageResult(path: "fixed.lasso", statusCode: 500, errorType: "x", errorDescription: "unknownFunction(\"inline\")", elapsedMS: 0),
+        CrawlPageResult(path: "broke.lasso", statusCode: 200, errorType: nil, errorDescription: nil, elapsedMS: 0),
+        CrawlPageResult(path: "movedBucket.lasso", statusCode: 500, errorType: "x", errorDescription: "unknownFunction(\"inline\")", elapsedMS: 0),
+        CrawlPageResult(path: "unchanged.lasso", statusCode: 200, errorType: nil, errorDescription: nil, elapsedMS: 0),
+        CrawlPageResult(path: "removedPage.lasso", statusCode: 200, errorType: nil, errorDescription: nil, elapsedMS: 0),
+    ]
+    let current = [
+        CrawlPageResult(path: "fixed.lasso", statusCode: 500, errorType: "x", errorDescription: "inlineNotConfigured", elapsedMS: 0),
+        CrawlPageResult(path: "broke.lasso", statusCode: 500, errorType: "x", errorDescription: "unknownFunction(\"newGap\")", elapsedMS: 0),
+        CrawlPageResult(path: "movedBucket.lasso", statusCode: 500, errorType: "x", errorDescription: "inlineNotConfigured", elapsedMS: 0),
+        CrawlPageResult(path: "unchanged.lasso", statusCode: 200, errorType: nil, errorDescription: nil, elapsedMS: 0),
+        CrawlPageResult(path: "newPage.lasso", statusCode: 200, errorType: nil, errorDescription: nil, elapsedMS: 0),
+    ]
+
+    let summary = CrawlReport.diff(baseline: baseline, current: current)
+    #expect(summary.newlyFailing == ["broke.lasso"])
+    #expect(summary.newlyClean.isEmpty)
+    #expect(summary.changedBucket.map(\.path) == ["fixed.lasso", "movedBucket.lasso"])
+    #expect(summary.changedBucket.first { $0.path == "fixed.lasso" }?.from == "unknownFunction(\"inline\")")
+    #expect(summary.changedBucket.first { $0.path == "fixed.lasso" }?.to == "inlineNotConfigured")
+    #expect(summary.onlyInBaseline == ["removedPage.lasso"])
+    #expect(summary.onlyInCurrent == ["newPage.lasso"])
+}

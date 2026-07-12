@@ -24,6 +24,7 @@ let package = Package(
     ],
     targets: [
         .target(name: "LassoParser"),
+        .target(name: "LassoCrawlReport"),
         .target(
             name: "LassoPerfectCRUD",
             dependencies: [
@@ -54,6 +55,7 @@ let package = Package(
         .executableTarget(
             name: "LassoPerfectServer",
             dependencies: [
+                "LassoCrawlReport",
                 "LassoParser",
                 "LassoPerfectCRUD",
                 "LassoPerfectSession",
@@ -78,6 +80,10 @@ let package = Package(
             swiftSettings: [
                 .enableUpcomingFeature("ApproachableConcurrency"),
             ],
+        ),
+        .testTarget(
+            name: "LassoCrawlReportTests",
+            dependencies: ["LassoCrawlReport"]
         ),
         .testTarget(
             name: "LassoParserTests",

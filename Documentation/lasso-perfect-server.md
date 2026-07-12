@@ -1016,6 +1016,61 @@ behavior rather than leaving it a silent gap.
 Verified via 5 new tests (98/98 total, no regressions) and the live
 real-corpus crawl described above.
 
+**Implemented `crawl-report-filtering-plan`** — item 9, next in the
+outstanding-compatibility backlog's execution order. Quantified the
+crawl's own noise directly from JSONs already on disk from the `inline`
+fix verification, rather than assuming: 53% of all discovered pages (1,053
+of 1,989) live under a `*/vendor/*` path, and 32% of then-failing pages
+(95 of 299) were vendor pages hitting `unsupportedExpression`-family
+errors on third-party JS/HTML demo syntax, not real interpreter gaps.
+Found and reused a directly applicable precedent already in this repo:
+`LassoSubsetCrawler.Scanner` (a separate, older, static-analysis tool)
+already had both a path-exclude list and a marker-based
+"does this .htm/.html file actually contain Lasso" check for its own
+purposes — ported the same marker list rather than inventing new signals.
+
+Added `LASSO_CRAWL_EXCLUDE_PATHS` (comma-separated path substrings,
+e.g. `vendor`), a content heuristic for `.htm`/`.html` only
+(`.lasso`/`.inc` behavior unchanged), two focused-rerun mechanisms
+(`LASSO_CRAWL_PATH_LIST`; `LASSO_CRAWL_BASELINE` + `LASSO_CRAWL_ONLY_FAILURE`,
+reusing the crawler's own JSON output as the baseline format), an offline
+diff mode (`LASSO_CRAWL_DIFF_BASELINE`/`LASSO_CRAWL_DIFF_CURRENT`, needs
+neither a site root nor a running server), and per-page `elapsedMS` plus
+an excluded-page count in the report output.
+
+Extracted the crawler's logic into its own new library target,
+`LassoCrawlReport` (`Sources/LassoCrawlReport/CrawlReport.swift`), rather
+than adding a test target that depends directly on the `LassoPerfectServer`
+executable — that target's `main.swift` is genuine top-level-executing
+code (not `@main`-based like `LassoSubsetCrawler`), so a test target
+`@testable import`ing it risked executing real server-startup code
+(port binding, env-driven config) as a side effect. Splitting the pure,
+testable logic into its own library sidesteps the ambiguity rather than
+relying on unverified assumptions about module-import semantics.
+
+**One real, latent bug found and fixed while writing the first-ever unit
+test for `discoverPaths`**: its relative-path computation
+(`dropFirst(siteRoot.path.count)`) silently mis-sized whenever
+`FileManager`'s enumerator resolved a symlink in the paths it returned
+that the caller's `siteRoot` hadn't already been resolved through —
+concretely, macOS's `/var` → `/private/var` firmlink, which
+`resolvingSymlinksInPath()` doesn't reliably normalize either. This bug
+already existed in the pre-existing code, just never triggered because
+`main.swift` always pre-resolves the real site root before calling in;
+a temp-directory unit test (which doesn't) exposed it immediately. Fixed
+by switching to the path-relative `FileManager.enumerator(atPath:)`
+overload, which returns already-relative paths and sidesteps the
+absolute-path arithmetic entirely.
+
+Verified via 10 new unit tests (no live server needed) and three live
+passes against the real corpus: `LASSO_CRAWL_EXCLUDE_PATHS=vendor` dropped
+the failing-page count from 299 to 204 — exactly the evidenced 95-page
+reduction, with 1,114 pages correctly reported as excluded; the diff mode,
+run against this session's own real before/after JSONs from the `inline`
+fix, reproduced byte-for-byte the 14-page bucket change already found by
+hand; the focused-rerun mechanism correctly crawled only the 14 pages
+matching `Encrypt_HMAC` instead of the full site.
+
 ## Next Compatibility Work
 
 1. Implement `[File_ProcessUploads]` (Lasso 8) and any equivalent move/copy
