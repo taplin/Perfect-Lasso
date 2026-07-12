@@ -47,6 +47,55 @@ public struct LassoDatasourceCapabilities: Sendable {
     )
 }
 
+public enum LassoDatabaseActionFailureKind: String, Sendable {
+    case search
+    case add
+    case update
+    case delete
+    case sql
+
+    var code: LassoErrorState.InlineErrorCode {
+        switch self {
+        case .search: .selectFailed
+        case .add: .addFailed
+        case .update: .updateFailed
+        case .delete: .deleteFailed
+        case .sql: .rawSQLFailed
+        }
+    }
+
+    var displayName: String {
+        switch self {
+        case .search: "Search"
+        case .add: "Add"
+        case .update: "Update"
+        case .delete: "Delete"
+        case .sql: "SQL"
+        }
+    }
+}
+
+/// Explicit marker for expected datasource/action failures. Generic Swift
+/// throws remain fatal to the adapter; connector boundaries should wrap only
+/// real database-operation failures in this type before they reach the
+/// executor.
+public struct LassoDatabaseActionError: Error, Sendable {
+    public let state: LassoErrorState
+
+    public init(kind: LassoDatabaseActionFailureKind, datasource: String, underlying: Error) {
+        self.state = LassoErrorState(
+            code: kind.code.rawValue,
+            message: "\(kind.displayName) failed for datasource '\(datasource)'.",
+            kind: kind.rawValue,
+            detail: String(describing: underlying)
+        )
+    }
+
+    public init(code: Int, message: String, kind: String, detail: String? = nil) {
+        self.state = LassoErrorState(code: code, message: message, kind: kind, detail: detail)
+    }
+}
+
 public struct PerfectCRUDLassoExecutor: LassoDynamicQueryExecutor {
     public typealias QueryHandler = @Sendable (
         _ datasource: String,
@@ -136,7 +185,14 @@ public struct PerfectCRUDLassoExecutor: LassoDynamicQueryExecutor {
             limit: cappedLimit(request.maxRecords, capabilities: capabilities),
             offset: request.skipRecords
         )
-        let result = try queryHandler(datasource, query)
+        let result: DynamicResult
+        do {
+            result = try queryHandler(datasource, query)
+        } catch let error as LassoRecoverableError {
+            return LassoInlineFrame(rows: [], error: error.state)
+        } catch let error as LassoDatabaseActionError {
+            return LassoInlineFrame(rows: [], error: error.state)
+        }
         return LassoInlineFrame(
             rows: result.rows.map(lassoRow),
             affectedRows: result.affectedRows,
@@ -172,7 +228,14 @@ public struct PerfectCRUDLassoExecutor: LassoDynamicQueryExecutor {
                 ($0.field, dynamicValue($0.value))
             })
         )
-        let result = try mutationHandler(datasource, mutation)
+        let result: DynamicResult
+        do {
+            result = try mutationHandler(datasource, mutation)
+        } catch let error as LassoRecoverableError {
+            return LassoInlineFrame(rows: [], error: error.state)
+        } catch let error as LassoDatabaseActionError {
+            return LassoInlineFrame(rows: [], error: error.state)
+        }
 
         // Best-effort, not guaranteed: return the inserted record only when
         // the connector reported an insert id AND a key field is known to
@@ -224,7 +287,14 @@ public struct PerfectCRUDLassoExecutor: LassoDynamicQueryExecutor {
                 DynamicPredicate(field: $0.field, comparison: try comparison($0.operation), value: dynamicValue($0.value))
             }
         )
-        let result = try mutationHandler(datasource, mutation)
+        let result: DynamicResult
+        do {
+            result = try mutationHandler(datasource, mutation)
+        } catch let error as LassoRecoverableError {
+            return LassoInlineFrame(rows: [], error: error.state)
+        } catch let error as LassoDatabaseActionError {
+            return LassoInlineFrame(rows: [], error: error.state)
+        }
 
         var rows: [LassoDataRow] = []
         if request.maxRecords != 0 {
@@ -261,7 +331,14 @@ public struct PerfectCRUDLassoExecutor: LassoDynamicQueryExecutor {
                 DynamicPredicate(field: $0.field, comparison: try comparison($0.operation), value: dynamicValue($0.value))
             }
         )
-        let result = try mutationHandler(datasource, mutation)
+        let result: DynamicResult
+        do {
+            result = try mutationHandler(datasource, mutation)
+        } catch let error as LassoRecoverableError {
+            return LassoInlineFrame(rows: [], error: error.state)
+        } catch let error as LassoDatabaseActionError {
+            return LassoInlineFrame(rows: [], error: error.state)
+        }
         // Real Lasso 8.5 documents -Delete as returning an empty found set.
         return LassoInlineFrame(rows: [], affectedRows: result.affectedRows, actionStatement: result.statement)
     }
@@ -282,7 +359,14 @@ public struct PerfectCRUDLassoExecutor: LassoDynamicQueryExecutor {
         }
 
         let dynamicSQL = DynamicSQL(sql: sqlText, allowsMultipleStatements: capabilities.allowsMultipleStatements)
-        let result = try rawSQLHandler(datasource, dynamicSQL)
+        let result: DynamicResult
+        do {
+            result = try rawSQLHandler(datasource, dynamicSQL)
+        } catch let error as LassoRecoverableError {
+            return LassoInlineFrame(rows: [], error: error.state)
+        } catch let error as LassoDatabaseActionError {
+            return LassoInlineFrame(rows: [], error: error.state)
+        }
         return LassoInlineFrame(rows: result.rows.map(lassoRow), affectedRows: result.affectedRows, actionStatement: result.statement)
     }
 
@@ -371,12 +455,16 @@ extension LassoErrorState {
         case rawSQLNotAllowed = 1004
         case permissionDenied = 1005
         case tableNotAllowed = 1006
+        case selectFailed = 1007
+        case rawSQLFailed = 1008
 
         var kind: String {
             switch self {
+            case .selectFailed: "search"
             case .addFailed: "add"
             case .updateFailed: "update"
             case .deleteFailed: "delete"
+            case .rawSQLFailed: "sql"
             case .rawSQLNotAllowed, .permissionDenied, .tableNotAllowed: "permission"
             }
         }

@@ -159,19 +159,42 @@ struct LassoSiteServer: Sendable {
                     guard datasource == config.mysqlDatabase else {
                         throw LassoSiteServerError.unknownDatasource(datasource)
                     }
-                    return try makeDatabase().select(query)
+                    do {
+                        return try makeDatabase().select(query)
+                    } catch let error as LassoDatabaseActionError {
+                        throw error
+                    } catch {
+                        throw LassoDatabaseActionError(kind: .search, datasource: datasource, underlying: error)
+                    }
                 },
                 mutationHandler: { datasource, mutation in
                     guard datasource == config.mysqlDatabase else {
                         throw LassoSiteServerError.unknownDatasource(datasource)
                     }
-                    return try makeDatabase().mutate(mutation)
+                    do {
+                        return try makeDatabase().mutate(mutation)
+                    } catch let error as LassoDatabaseActionError {
+                        throw error
+                    } catch {
+                        let kind: LassoDatabaseActionFailureKind = switch mutation.action {
+                        case .insert: .add
+                        case .update: .update
+                        case .delete: .delete
+                        }
+                        throw LassoDatabaseActionError(kind: kind, datasource: datasource, underlying: error)
+                    }
                 },
                 rawSQLHandler: { datasource, sql in
                     guard datasource == config.mysqlDatabase else {
                         throw LassoSiteServerError.unknownDatasource(datasource)
                     }
-                    return try makeDatabase().execute(sql)
+                    do {
+                        return try makeDatabase().execute(sql)
+                    } catch let error as LassoDatabaseActionError {
+                        throw error
+                    } catch {
+                        throw LassoDatabaseActionError(kind: .sql, datasource: datasource, underlying: error)
+                    }
                 }
             )
             inlineProvider = LassoDynamicInlineProvider(

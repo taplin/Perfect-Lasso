@@ -976,6 +976,46 @@ further and stop at other, already-documented gaps (`Decode_Base64`,
 `Select`, `Encrypt_HMAC`, `currency`), none of them newly introduced by
 this pass.
 
+**Implemented the `unknownFunction("inline")` fix** — item 4 of
+`Documentation/outstanding-compatibility-project-plans.md`. That doc's own
+plan speculated the gap was `inline(...)` used as a value-returning
+expression; live corpus investigation (all 15 failing pages, pulled via
+`LASSO_CRAWL_REPORT_PATH` JSON and grepped directly) showed a different,
+more specific root cause: every failing page used Lasso 8's bare colon-call
+block form (`inline: -database=..., -sql=...; ... /inline;`, no wrapping
+parens at all), formatted one flag per line.
+
+Two real, distinct bugs, both in `Sources/LassoParser/ScriptBodyParser.swift`:
+`"inline"` was missing from `emitStatement`'s `bareBlockNames` set (the same
+promotion mechanism `Output_None`/`define_tag` already use to turn a bare
+colon-call into a real block-open node instead of an ordinary, unregistered
+function call) — a one-line fix; and, once that was in place, a second,
+deeper bug surfaced: `readStatement()` breaks a statement at the first bare
+(unparenthesized) newline, which is correct for ordinary one-statement-
+per-line code but truncated these real multi-line colon-calls down to just
+`inline:` before ever reaching their arguments. `grep`-counting every line
+ending inside the real `inline:`...`/inline;` blocks across all 15 files
+found exactly three trailing characters that mark "more follows on the
+next line" — a trailing `,` (comma-separated flags), a trailing `+`
+(string concatenation spanning lines), and the block-opener's own trailing
+`:` — and nothing else; fixed by continuing past a bare newline in exactly
+those three cases.
+
+14 of the 15 pages now clear `unknownFunction("inline")` entirely — 11 of
+those land on the pre-existing, already-documented `inlineNotConfigured`
+bucket (no live datasource wired into the sweep), which is why the overall
+clean-page count held steady at 1,690/1,989 rather than rising. One file,
+`components/inSite/filtered_links.inc`, still fails — for a third,
+distinct, deliberately deferred reason: Lasso 8's operator-less
+string/variable juxtaposition concatenation (`'text' #localVar 'more
+text'`, no `+` between the pieces) inside an argument value, which
+`ExpressionParser` doesn't fold into one expression. Flagged as a new,
+separate backlog item — a test documents the current (still-unsupported)
+behavior rather than leaving it a silent gap.
+
+Verified via 5 new tests (98/98 total, no regressions) and the live
+real-corpus crawl described above.
+
 ## Next Compatibility Work
 
 1. Implement `[File_ProcessUploads]` (Lasso 8) and any equivalent move/copy
@@ -1030,7 +1070,14 @@ this pass.
    `date-format-plan` implementation note above. `unknownFunction("Decode_Base64")`
    (20 pages) — real, common Lasso 8 tag, surfaced once `Output` stopped
    masking it in the crawl/report sweep. Not yet implemented.
-9. `unknownFunction("inline")` (15 pages) — a differently-shaped `Inline`
-   usage from the already-supported `[Inline: ...]` block form (likely a
-   bare-call/value-returning context, e.g. `Inline(...)` used as an
-   expression rather than a container tag). Not yet investigated.
+9. ~~`unknownFunction("inline")` (15 pages)~~ Done — see the implementation
+   note above. Real root cause was Lasso 8's bare colon-call block form
+   (`inline: -database=..., -sql=...; ... /inline;`, no parens), not a
+   value-returning expression as originally guessed; 14 of 15 pages fixed.
+10. Lasso 8's operator-less string/variable juxtaposition concatenation
+    (`'text' #localVar 'more text'`, no `+` between the pieces) inside an
+    argument value — the one real remaining gap the `inline` fix surfaced
+    (`components/inSite/filtered_links.inc`). `ExpressionParser`'s
+    argument-value parser stops at the first complete sub-expression
+    instead of folding the rest into the same argument. Scope/frequency
+    elsewhere in the corpus not yet surveyed. Not yet implemented.

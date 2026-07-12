@@ -335,7 +335,10 @@ struct ScriptBodyParser {
         // output) instead of `.code(...)` so `BlockBuilder` can pair it
         // with its `/name;` closer. See
         // Documentation/legacy-define-tag-type-plan.md and
-        // Documentation/output-tags-plan.md.
+        // Documentation/output-tags-plan.md. `inline` joined this set
+        // after real corpus evidence (`inline: -database=..., -sql=...;
+        // ... /inline;`, no parens at all) showed it hitting the exact
+        // same gap — see Documentation/outstanding-compatibility-project-plans.md.
         switch expressions[0] {
         case let .call(.identifier(name), arguments) where Self.bareBlockNames.contains(name.lowercased()):
             nodes.append(.tag(name: name, arguments: arguments, closing: false, dialect: .lasso8, range: range))
@@ -347,7 +350,7 @@ struct ScriptBodyParser {
     }
 
     private static let bareBlockNames: Set<String> = [
-        "define_tag", "define_type", "output_none", "html_comment", "encode_set",
+        "define_tag", "define_type", "output_none", "html_comment", "encode_set", "inline",
     ]
 
     private func normalizeReturn(_ statement: String) -> String {
@@ -420,7 +423,29 @@ struct ScriptBodyParser {
             } else if character == "}" {
                 if parenDepth == 0 { break }
             } else if character == "\n", parenDepth == 0 {
-                break
+                // A bare (unparenthesized) newline normally ends a
+                // statement here — most script-mode code relies on that as
+                // an implicit terminator, since trailing `;` is often
+                // omitted. But real corpus bare colon-calls (`inline:
+                // -database=...,\n -table=...,\n -sql='...' + \n '...';`,
+                // one flag per line, no wrapping parens at all — see
+                // Documentation/outstanding-compatibility-project-plans.md
+                // item 4) span many physical lines with no paren depth to
+                // keep them together. `grep`-counting every line ending
+                // inside these real inline blocks confirmed exactly three
+                // trailing characters mark "more follows on the next
+                // line": the block-opener's own colon (`inline:`), a
+                // trailing comma between arguments, and a trailing `+`
+                // (string concatenation spanning lines) — every other
+                // line ending was either a real statement end (`;`) or
+                // inside an still-open quote (already handled above,
+                // never reaches here). Continuing past the newline in
+                // exactly these three cases (and no others) fixes the
+                // multi-line shape without weakening the newline
+                // terminator for ordinary one-statement-per-line code.
+                if !Self.lineContinuesPastNewline(characters, start: start, upTo: index) {
+                    break
+                }
             }
             index += 1
         }
@@ -430,6 +455,18 @@ struct ScriptBodyParser {
             index += 1
         }
         return statement
+    }
+
+    /// True when the statement text accumulated so far (`characters[start..<upTo]`)
+    /// ends, ignoring trailing horizontal whitespace, in `,`, `+`, or `:` —
+    /// see the real-corpus-grounded explanation at `readStatement`'s call site.
+    private static func lineContinuesPastNewline(_ characters: [Character], start: Int, upTo: Int) -> Bool {
+        var i = upTo - 1
+        while i >= start, characters[i] == " " || characters[i] == "\t" || characters[i] == "\r" {
+            i -= 1
+        }
+        guard i >= start else { return false }
+        return characters[i] == "," || characters[i] == "+" || characters[i] == ":"
     }
 
     /// Reads up to (not including) a case-insensitive, word-boundary match

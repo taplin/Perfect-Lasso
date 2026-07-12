@@ -52,6 +52,36 @@ Deferred, same as the plan's own stated allowances:
   `error-protect-model-plan`'s still-open Milestone 1) won't touch call
   sites.
 
+## DB Error Framing Update (2026-07-12)
+
+Live connector failures now have an explicit recoverable boundary:
+`LassoDatabaseActionError`. `PerfectCRUDLassoExecutor` converts only
+`LassoDatabaseActionError` and existing `LassoRecoverableError` values into
+`LassoInlineFrame.error`; generic Swift errors still throw so adapter bugs,
+missing tables in the inline request, missing handlers, unsupported actions,
+and other fatal configuration/programmer failures remain visible.
+
+`lasso-perfect-server` wraps failures thrown by the actual PerfectCRUD MySQL
+operation calls (`select`, `mutate`, and `execute`) in
+`LassoDatabaseActionError` after datasource-configuration guards pass. This
+keeps the policy line crisp: validation/configuration failures are fatal to
+the request, while real database action failures become inspectable through
+`[error_currentError]` inside the inline body, matching the Lasso error model
+described in `Documentation/error-protect-model-plan.md`.
+
+Verification commands:
+
+```bash
+COPYFILE_DISABLE=1 swift test --filter perfectCRUD
+COPYFILE_DISABLE=1 swift test
+```
+
+The first command exercises the focused search/add/update/delete/raw-SQL
+framing tests plus the guard that unknown handler throws are not framed. The
+full suite is still subject to the macOS codesign metadata issue documented in
+`Documentation/swift-test-codesign-workaround.md`; run the xattr workaround if
+signing fails before the tests launch.
+
 ## Goal
 
 Complete the `inline` execution model beyond structured reads:

@@ -87,6 +87,17 @@ enum LassoEncoding {
         Data(value.utf8).base64EncodedString()
     }
 
+    /// Base 64 Decoding. Lasso has a richer byte model than this adapter
+    /// does today, so the first compatibility pass returns UTF-8 strings
+    /// and lets callers fall back to `void` for malformed or non-text data.
+    static func decodeBase64(_ value: String) -> String? {
+        guard let data = Data(base64Encoded: value),
+              let decoded = String(data: data, encoding: .utf8) else {
+            return nil
+        }
+        return decoded
+    }
+
     /// Every documented encoding keyword (`-EncodeNone`, `-EncodeHTML`,
     /// etc.), matched case-insensitively against an argument's label, in
     /// the order the Lasso 8.5 Language Guide lists them. `nil` for

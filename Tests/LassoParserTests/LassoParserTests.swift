@@ -196,6 +196,48 @@ import PerfectSessionCore
     #expect(output == "&#233;|a<br>b|&lt;x&gt;|a%20b|a%26b|it\\'s|aGk=")
 }
 
+@Test func decodeBase64InvertsEncodeBase64ForUtf8Text() throws {
+    var context = LassoContext()
+    let output = try LassoRenderer().render(
+        "[Decode_Base64(Encode_Base64('cart-42'))]|[Decode_Base64(Encode_Base64('café'))]",
+        context: &context
+    )
+    #expect(output == "cart-42|café")
+}
+
+@Test func decodeBase64ReturnsVoidForMalformedInput() throws {
+    var context = LassoContext()
+    let output = try LassoRenderer().render(
+        "before-[Decode_Base64('not base64')]-after",
+        context: &context
+    )
+    #expect(output == "before--after")
+}
+
+@Test func decodeBase64StringMemberMatchesTheFreeFunction() throws {
+    var context = LassoContext()
+    let output = try LassoRenderer().render(
+        "[Decode_Base64('Y2FydC00Mg==')]|[('Y2FydC00Mg==')->decodeBase64]",
+        context: &context
+    )
+    #expect(output == "cart-42|cart-42")
+}
+
+@Test func decodeBase64CanFeedInlineSearchCriteria() throws {
+    var context = LassoContext(inlineProvider: LassoInMemoryInlineProvider(tables: [
+        "carts": [
+            LassoDataRow(["cart_id": .string("cart-42"), "status": .string("hit")]),
+            LassoDataRow(["cart_id": .string("cart-99"), "status": .string("miss")]),
+        ],
+    ]))
+
+    let output = try LassoRenderer().render(
+        "[inline(-database='catalog',-table='carts',-search,'cart_id'=Decode_Base64('Y2FydC00Mg=='))][records][field('status')][/records][/inline]",
+        context: &context
+    )
+    #expect(output == "hit")
+}
+
 @Test func stringMembersExposeTheSameEncodingsAsLasso9Methods() throws {
     var context = LassoContext()
     let output = try LassoRenderer().render(
@@ -488,6 +530,142 @@ import PerfectSessionCore
         output == "[{\"preview\":\"one.jpg\",\"catalog_sku\":\"SKU-1\"}]" ||
             output == "[{\"catalog_sku\":\"SKU-1\",\"preview\":\"one.jpg\"}]"
     )
+}
+
+@Test func inlineBareColonCallWithNoParensParsesAndExecutesInsideLassoScript() throws {
+    // Real corpus shape (Documentation/outstanding-compatibility-project-plans.md
+    // item 4, e.g. importscripts/ca_web.lasso): Lasso 8's bare colon-call
+    // convention with NO enclosing parens at all — `inline: -database=...,
+    // -sql=...; ... /inline;` — distinct from the already-working
+    // parenthesized `inline(...)` form covered by
+    // parsesAndRendersLassoScriptInlineJSON above. Before adding "inline"
+    // to ScriptBodyParser.bareBlockNames, this fell through to an ordinary
+    // colon-call expression statement and threw unknownFunction("inline")
+    // at evaluation time, never reaching the block/frame machinery at all.
+    let scriptInline = """
+    <?LassoScript
+    inline:
+        -database='catalog_mysql',
+        -table='skus',
+        -sql='TRUNCATE TABLE skus;';
+        action_statement;
+    /inline;
+    ?>
+    """
+
+    let document = LassoParser().parse(scriptInline)
+    #expect(document.diagnostics.isEmpty)
+    guard case let .block(name, arguments, _, _, _, _) = document.nodes.first else {
+        Issue.record("Expected the bare colon-call to parse as a real block, not fall through to an ordinary call expression")
+        return
+    }
+    #expect(name.lowercased() == "inline")
+    #expect(arguments.count == 3)
+
+    struct InlineProvider: LassoInlineProvider {
+        func executeInline(arguments: [EvaluatedArgument], context: LassoContext) throws -> LassoInlineFrame {
+            let request = LassoInlineRequest(arguments: arguments)
+            #expect(request.database == "catalog_mysql")
+            #expect(request.table == "skus")
+            #expect(request.sql == "TRUNCATE TABLE skus;")
+            return LassoInlineFrame(rows: [], actionStatement: "SQL")
+        }
+    }
+
+    var context = LassoContext(inlineProvider: InlineProvider())
+    let output = try LassoRenderer().render(scriptInline, context: &context)
+    #expect(output.trimmingCharacters(in: .whitespacesAndNewlines) == "SQL")
+}
+
+@Test func inlineBareColonCallSqlArgumentConcatenatedAcrossLinesWithTrailingPlus() throws {
+    // Real corpus shape (importscripts/ca_web.lasso and siblings): a -SQL
+    // argument built from several single-quoted fragments joined by `+`,
+    // each fragment on its own line with a trailing `+` — a third
+    // real trailing-character continuation case (alongside `,` and the
+    // block-opener's own `:`) found `grep`-counting every line ending
+    // inside the real inline blocks. Confirms ScriptBodyParser.readStatement's
+    // line-continuation fix isn't limited to comma-separated arguments.
+    let scriptInline = """
+    <?LassoScript
+    inline:
+        -database='catalog_mysql',
+        -table='skus',
+        -sql='TRUNCATE TABLE ' +
+            'skus;';
+        action_statement;
+    /inline;
+    ?>
+    """
+
+    struct InlineProvider: LassoInlineProvider {
+        func executeInline(arguments: [EvaluatedArgument], context: LassoContext) throws -> LassoInlineFrame {
+            let request = LassoInlineRequest(arguments: arguments)
+            #expect(request.sql == "TRUNCATE TABLE skus;")
+            return LassoInlineFrame(rows: [], actionStatement: "SQL")
+        }
+    }
+
+    var context = LassoContext(inlineProvider: InlineProvider())
+    let output = try LassoRenderer().render(scriptInline, context: &context)
+    #expect(output.trimmingCharacters(in: .whitespacesAndNewlines) == "SQL")
+}
+
+@Test func inlineColonWithParensStillWorksAlongsideTheBareColonCallFix() throws {
+    // Regression guard: `inline:(...)` (colon immediately followed by
+    // parens, matching the already-fixed `if:(condition)` shape) is a
+    // different branch (ScriptBodyParser.parseBlockOpening, not
+    // emitStatement's bareBlockNames) and must keep working unchanged.
+    let scriptInline = """
+    <?LassoScript
+    inline:(-database='catalog_mysql', -table='skus', -sql='SELECT 1;');
+        action_statement;
+    /inline;
+    ?>
+    """
+
+    struct InlineProvider: LassoInlineProvider {
+        func executeInline(arguments: [EvaluatedArgument], context: LassoContext) throws -> LassoInlineFrame {
+            LassoInlineFrame(rows: [], actionStatement: "SQL")
+        }
+    }
+
+    var context = LassoContext(inlineProvider: InlineProvider())
+    let output = try LassoRenderer().render(scriptInline, context: &context)
+    #expect(output.trimmingCharacters(in: .whitespacesAndNewlines) == "SQL")
+}
+
+@Test func inlineBareColonCallWithJuxtaposedStringConcatenationIsADeferredGap() throws {
+    // Documents a real, deliberately-deferred gap found live-verifying the
+    // bareBlockNames/line-continuation fixes above against the real corpus
+    // (components/inSite/filtered_links.inc — the one file, of 15
+    // originally failing on unknownFunction("inline"), that still fails
+    // after those fixes). Root cause is distinct from both fixes above:
+    // Lasso 8's operator-less string/variable juxtaposition concatenation
+    // (`'text' #localVar 'more text'`, no `+` between them) inside an
+    // argument's value. `ExpressionParser`'s argument-value parser stops
+    // at the first complete sub-expression (the leading string), so the
+    // rest (`#cat_master`, the trailing string) become separate top-level
+    // expressions rather than being folded into the same -SQL argument —
+    // which makes ScriptBodyParser.emitStatement see more than one
+    // expression for the whole statement and fall back to `.code(...)`
+    // instead of ever reaching the bareBlockNames `.tag(...)` promotion,
+    // so `inline` gets evaluated as an ordinary (unregistered) function
+    // call. Out of scope for the inline block-opening fix — flagged as a
+    // new backlog item, not silently absorbed.
+    let source = """
+    <?LassoScript
+    inline: -database='catalog_mysql',
+        -sql='SELECT * FROM categories WHERE cat = "' #cat_master '"';
+        action_statement;
+    /inline;
+    ?>
+    """
+    let document = LassoParser().parse(source)
+    guard case let .code(expressions, _, _, _) = document.nodes.first else {
+        Issue.record("Expected this still-unsupported shape to fall back to .code, not .block — update this test if it's since been fixed")
+        return
+    }
+    #expect(expressions.count > 1, "juxtaposed concatenation splits into multiple top-level expressions instead of one inline(...) call")
 }
 
 @Test func rendersCorpusFixtures() throws {

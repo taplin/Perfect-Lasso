@@ -357,6 +357,9 @@ struct Evaluator {
         case let (.string(value), "encodestricturl"): return .string(LassoEncoding.strictURL(value))
         case let (.string(value), "encodesql"): return .string(LassoEncoding.sql(value))
         case let (.string(value), "encodebase64"): return .string(LassoEncoding.base64(value))
+        case let (.string(value), "decodebase64"):
+            guard let decoded = LassoEncoding.decodeBase64(value) else { return .void }
+            return .string(decoded)
         case let (.string(value), "contains"):
             let needle = try arguments.first.map { try evaluate($0.value).outputString } ?? ""
             return .boolean(value.contains(needle))

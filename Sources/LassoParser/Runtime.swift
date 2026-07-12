@@ -148,6 +148,12 @@ public struct LassoNativeRegistry: Sendable {
         register("encode_base64") { arguments, _ in
             .string(LassoEncoding.base64(arguments.first?.value.outputString ?? ""))
         }
+        register("decode_base64") { arguments, _ in
+            guard let decoded = LassoEncoding.decodeBase64(arguments.first?.value.outputString ?? "") else {
+                return .void
+            }
+            return .string(decoded)
+        }
         // Date and time — Lasso 8.5 Language Guide Chapter 29 "Date and
         // Time Operations". See Documentation/date-format-plan.md for the
         // native "date" object representation and the DateFormatter/ICU
