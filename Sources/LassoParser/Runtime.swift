@@ -333,6 +333,43 @@ public struct LassoNativeRegistry: Sendable {
                 ])
             })
         }
+        register("file_processuploads") { arguments, context in
+            guard let destination = arguments.lastString(named: "destination"), destination.isEmpty == false else {
+                throw LassoRecoverableError(LassoErrorState(
+                    code: 2001,
+                    message: "File_ProcessUploads requires -Destination.",
+                    kind: "file"
+                ))
+            }
+            guard let uploadProcessor = context.uploadProcessor else {
+                throw LassoRecoverableError(LassoErrorState(
+                    code: 2002,
+                    message: "File_ProcessUploads is not configured.",
+                    kind: "file"
+                ))
+            }
+
+            let options = LassoUploadProcessingOptions(
+                destination: destination,
+                useTempNames: arguments.hasTruthyFlag("usetempnames"),
+                allowOverwrite: arguments.hasTruthyFlag("fileoverwrite"),
+                maxSize: arguments.lastInt(named: "size"),
+                allowedExtensions: lassoUploadExtensions(from: arguments.lastValue(named: "extensions"))
+            )
+            do {
+                _ = try uploadProcessor.processUploads(context.requestProvider?.uploadedFiles ?? [], options: options)
+                return .void
+            } catch let error as LassoRecoverableError {
+                throw error
+            } catch {
+                throw LassoRecoverableError(LassoErrorState(
+                    code: 2003,
+                    message: "File_ProcessUploads failed.",
+                    kind: "file",
+                    detail: String(describing: error)
+                ))
+            }
+        }
         register("cookie") { arguments, context in
             let name = arguments.firstValue(named: "name")?.outputString ??
                 arguments.first?.value.outputString ?? ""
@@ -496,6 +533,7 @@ public struct LassoContext: Sendable {
     public var includePath: String?
     public var includeStack: [String]
     public var requestProvider: (any LassoRequestProvider)?
+    public var uploadProcessor: (any LassoUploadProcessor)?
     public var sessionProvider: (any LassoSessionProvider)?
     public var responseSink: (any LassoResponseSink)?
     public var inlineProvider: (any LassoInlineProvider)?
@@ -542,6 +580,7 @@ public struct LassoContext: Sendable {
         includeLoader: (any LassoIncludeLoader)? = nil,
         includePath: String? = nil,
         requestProvider: (any LassoRequestProvider)? = nil,
+        uploadProcessor: (any LassoUploadProcessor)? = nil,
         sessionProvider: (any LassoSessionProvider)? = nil,
         responseSink: (any LassoResponseSink)? = nil,
         inlineProvider: (any LassoInlineProvider)? = nil,
@@ -556,6 +595,7 @@ public struct LassoContext: Sendable {
         self.includePath = includePath
         includeStack = []
         self.requestProvider = requestProvider
+        self.uploadProcessor = uploadProcessor
         self.sessionProvider = sessionProvider
         self.responseSink = responseSink
         self.inlineProvider = inlineProvider
@@ -739,6 +779,23 @@ public extension Array where Element == EvaluatedArgument {
         guard unlabeled.indices.contains(index) else { return nil }
         return unlabeled[index].value
     }
+}
+
+private func lassoUploadExtensions(from value: LassoValue?) -> Set<String>? {
+    guard let value else { return nil }
+    let rawValues: [String]
+    switch value {
+    case .array(let values):
+        rawValues = values.map(\.outputString)
+    default:
+        rawValues = value.outputString.components(separatedBy: ",")
+    }
+    let extensions = rawValues
+        .map { $0.trimmingCharacters(in: .whitespacesAndNewlines) }
+        .map { $0.hasPrefix(".") ? String($0.dropFirst()) : $0 }
+        .filter { $0.isEmpty == false }
+        .map { $0.lowercased() }
+    return extensions.isEmpty ? nil : Set(extensions)
 }
 
 public enum LassoRuntimeError: Error, Equatable {

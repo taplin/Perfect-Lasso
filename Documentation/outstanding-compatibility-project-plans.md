@@ -384,6 +384,19 @@ function, so expression-form calls currently fall through to
 
 ## 5. File_ProcessUploads
 
+### Implementation Status (2026-07-12)
+
+Runtime support is implemented and focused-test verified. `LassoParser` now
+has a separate upload-processing service boundary (`LassoUploadProcessor`) and
+a root-confined filesystem implementation (`LassoFileSystemUploadProcessor`).
+`[File_ProcessUploads]` is registered and handles `-Destination`,
+`-UseTempNames`, `-FileOverwrite`, `-Size`, and `-Extensions`. Operational
+failures are recoverable through `[protect]`.
+
+`lasso-perfect-server` now injects `LassoFileSystemUploadProcessor` into each
+request context, rooted at `LASSO_SITE_ROOT`, so live request destinations are
+site-root-confined.
+
 ### Goal
 
 Implement Lasso 8 `[File_ProcessUploads]` so uploaded temp files can be moved

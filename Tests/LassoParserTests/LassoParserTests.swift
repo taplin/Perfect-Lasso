@@ -2038,6 +2038,177 @@ func perfectCRUDConnectorFailuresBecomeInlineErrorFrames(source: String, expecte
     #expect(output == "1|avatar|image/png|photo.png|/tmp/upload-abc123|4096|avatar|photo.png|image/png|4096|png")
 }
 
+@Test func fileProcessUploadsMovesUploadedFilesIntoTheDestination() throws {
+    let root = FileManager.default.temporaryDirectory.appendingPathComponent("lasso-upload-root-\(UUID().uuidString)", isDirectory: true)
+    let temp = FileManager.default.temporaryDirectory.appendingPathComponent("lasso-upload-temp-\(UUID().uuidString)")
+    defer {
+        try? FileManager.default.removeItem(at: root)
+        try? FileManager.default.removeItem(at: temp)
+    }
+    try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
+    try "image-bytes".write(to: temp, atomically: true, encoding: .utf8)
+
+    struct UploadRequestProvider: LassoRequestProvider {
+        let uploadedFiles: [LassoUploadedFile]
+        func parameter(named name: String) -> LassoValue { .void }
+        func header(named name: String) -> LassoValue { .void }
+        func cookie(named name: String) -> LassoValue { .void }
+        var parameters: [String: LassoValue] { [:] }
+    }
+
+    let upload = LassoUploadedFile(
+        fieldName: "avatar",
+        contentType: "image/png",
+        originalFilename: "photo.png",
+        temporaryFilename: temp.path,
+        size: 11
+    )
+    var context = LassoContext(
+        requestProvider: UploadRequestProvider(uploadedFiles: [upload]),
+        uploadProcessor: try LassoFileSystemUploadProcessor(root: root)
+    )
+
+    let output = try LassoRenderer().render(
+        "before-[File_ProcessUploads(-Destination='uploads')]-after",
+        context: &context
+    )
+
+    let moved = root.appendingPathComponent("uploads/photo.png")
+    #expect(output == "before--after")
+    #expect(FileManager.default.fileExists(atPath: moved.path))
+    #expect(FileManager.default.fileExists(atPath: temp.path) == false)
+    #expect(try String(contentsOf: moved, encoding: .utf8) == "image-bytes")
+}
+
+@Test func fileProcessUploadsHonorsSizeAndExtensionFilters() throws {
+    let root = FileManager.default.temporaryDirectory.appendingPathComponent("lasso-upload-root-\(UUID().uuidString)", isDirectory: true)
+    let small = FileManager.default.temporaryDirectory.appendingPathComponent("lasso-upload-small-\(UUID().uuidString)")
+    let large = FileManager.default.temporaryDirectory.appendingPathComponent("lasso-upload-large-\(UUID().uuidString)")
+    let wrongExtension = FileManager.default.temporaryDirectory.appendingPathComponent("lasso-upload-text-\(UUID().uuidString)")
+    defer {
+        try? FileManager.default.removeItem(at: root)
+        try? FileManager.default.removeItem(at: small)
+        try? FileManager.default.removeItem(at: large)
+        try? FileManager.default.removeItem(at: wrongExtension)
+    }
+    try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
+    try "small".write(to: small, atomically: true, encoding: .utf8)
+    try "large".write(to: large, atomically: true, encoding: .utf8)
+    try "text".write(to: wrongExtension, atomically: true, encoding: .utf8)
+
+    struct UploadRequestProvider: LassoRequestProvider {
+        let uploadedFiles: [LassoUploadedFile]
+        func parameter(named name: String) -> LassoValue { .void }
+        func header(named name: String) -> LassoValue { .void }
+        func cookie(named name: String) -> LassoValue { .void }
+        var parameters: [String: LassoValue] { [:] }
+    }
+
+    var context = LassoContext(
+        requestProvider: UploadRequestProvider(uploadedFiles: [
+            LassoUploadedFile(fieldName: "a", contentType: "image/png", originalFilename: "small.png", temporaryFilename: small.path, size: 5),
+            LassoUploadedFile(fieldName: "b", contentType: "image/png", originalFilename: "large.png", temporaryFilename: large.path, size: 50),
+            LassoUploadedFile(fieldName: "c", contentType: "text/plain", originalFilename: "note.txt", temporaryFilename: wrongExtension.path, size: 4),
+        ]),
+        uploadProcessor: try LassoFileSystemUploadProcessor(root: root)
+    )
+
+    _ = try LassoRenderer().render(
+        "[File_ProcessUploads(-Destination='uploads', -Size=10, -Extensions='png')]",
+        context: &context
+    )
+
+    #expect(FileManager.default.fileExists(atPath: root.appendingPathComponent("uploads/small.png").path))
+    #expect(FileManager.default.fileExists(atPath: root.appendingPathComponent("uploads/large.png").path) == false)
+    #expect(FileManager.default.fileExists(atPath: root.appendingPathComponent("uploads/note.txt").path) == false)
+    #expect(FileManager.default.fileExists(atPath: large.path))
+    #expect(FileManager.default.fileExists(atPath: wrongExtension.path))
+}
+
+@Test func fileProcessUploadsUsesTempNamesWhenRequested() throws {
+    let root = FileManager.default.temporaryDirectory.appendingPathComponent("lasso-upload-root-\(UUID().uuidString)", isDirectory: true)
+    let temp = FileManager.default.temporaryDirectory.appendingPathComponent("upload-token-\(UUID().uuidString).tmp")
+    defer {
+        try? FileManager.default.removeItem(at: root)
+        try? FileManager.default.removeItem(at: temp)
+    }
+    try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
+    try "payload".write(to: temp, atomically: true, encoding: .utf8)
+
+    struct UploadRequestProvider: LassoRequestProvider {
+        let uploadedFiles: [LassoUploadedFile]
+        func parameter(named name: String) -> LassoValue { .void }
+        func header(named name: String) -> LassoValue { .void }
+        func cookie(named name: String) -> LassoValue { .void }
+        var parameters: [String: LassoValue] { [:] }
+    }
+
+    let upload = LassoUploadedFile(
+        fieldName: "avatar",
+        contentType: "image/png",
+        originalFilename: "photo.png",
+        temporaryFilename: temp.path,
+        size: 7
+    )
+    var context = LassoContext(
+        requestProvider: UploadRequestProvider(uploadedFiles: [upload]),
+        uploadProcessor: try LassoFileSystemUploadProcessor(root: root)
+    )
+
+    _ = try LassoRenderer().render(
+        "[File_ProcessUploads(-Destination='uploads', -UseTempNames)]",
+        context: &context
+    )
+
+    #expect(FileManager.default.fileExists(atPath: root.appendingPathComponent("uploads/\(temp.lastPathComponent)").path))
+    #expect(FileManager.default.fileExists(atPath: root.appendingPathComponent("uploads/photo.png").path) == false)
+}
+
+@Test func fileProcessUploadsOverwritePolicyAndPathConfinementAreRecoverable() throws {
+    let root = FileManager.default.temporaryDirectory.appendingPathComponent("lasso-upload-root-\(UUID().uuidString)", isDirectory: true)
+    let temp = FileManager.default.temporaryDirectory.appendingPathComponent("lasso-upload-temp-\(UUID().uuidString)")
+    defer {
+        try? FileManager.default.removeItem(at: root)
+        try? FileManager.default.removeItem(at: temp)
+    }
+    try FileManager.default.createDirectory(at: root.appendingPathComponent("uploads"), withIntermediateDirectories: true)
+    try "old".write(to: root.appendingPathComponent("uploads/photo.png"), atomically: true, encoding: .utf8)
+    try "new".write(to: temp, atomically: true, encoding: .utf8)
+
+    struct UploadRequestProvider: LassoRequestProvider {
+        let uploadedFiles: [LassoUploadedFile]
+        func parameter(named name: String) -> LassoValue { .void }
+        func header(named name: String) -> LassoValue { .void }
+        func cookie(named name: String) -> LassoValue { .void }
+        var parameters: [String: LassoValue] { [:] }
+    }
+
+    let upload = LassoUploadedFile(
+        fieldName: "avatar",
+        contentType: "image/png",
+        originalFilename: "photo.png",
+        temporaryFilename: temp.path,
+        size: 3
+    )
+    var context = LassoContext(
+        requestProvider: UploadRequestProvider(uploadedFiles: [upload]),
+        uploadProcessor: try LassoFileSystemUploadProcessor(root: root)
+    )
+
+    let overwriteDenied = try LassoRenderer().render(
+        "[protect][File_ProcessUploads(-Destination='uploads')][/protect][error_currenterror]",
+        context: &context
+    )
+    #expect(overwriteDenied == "File_ProcessUploads failed.")
+    #expect(try String(contentsOf: root.appendingPathComponent("uploads/photo.png"), encoding: .utf8) == "old")
+
+    let outsideRoot = try LassoRenderer().render(
+        "[protect][File_ProcessUploads(-Destination='../escape', -FileOverwrite)][/protect][error_currenterror]",
+        context: &context
+    )
+    #expect(outsideRoot == "File_ProcessUploads failed.")
+}
+
 @Test func voidLookupMissBehavesLikeEmptyStringButNullStaysStrict() throws {
     // Real Lasso 9 returns `void` (not `null`) when web_request->param /
     // action_param / header / cookie lookups miss, and keeps `null` itself

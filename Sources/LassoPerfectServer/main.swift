@@ -125,6 +125,7 @@ enum ServerConfigError: Error, CustomStringConvertible {
 struct LassoSiteServer: Sendable {
     let config: ServerConfig
     let includeLoader: LassoFileSystemIncludeLoader
+    let uploadProcessor: LassoFileSystemUploadProcessor
     let inlineProvider: LassoDynamicInlineProvider?
     /// One registry for the life of this server process. Every request
     /// gets a `LassoContext` wired with this same instance, so `library()`
@@ -141,6 +142,7 @@ struct LassoSiteServer: Sendable {
     init(config: ServerConfig) throws {
         self.config = config
         includeLoader = try LassoFileSystemIncludeLoader(root: config.siteRoot)
+        uploadProcessor = try LassoFileSystemUploadProcessor(root: config.siteRoot)
 
         switch config.sessionDriver {
         case "mysql":
@@ -418,6 +420,7 @@ struct LassoSiteServer: Sendable {
             includeLoader: includeLoader,
             includePath: includePath,
             requestProvider: ServerRequestProvider(request: request, postBody: postBody),
+            uploadProcessor: uploadProcessor,
             sessionProvider: sessionBridge,
             responseSink: sink,
             inlineProvider: inlineProvider,

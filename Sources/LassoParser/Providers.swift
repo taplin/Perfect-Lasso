@@ -365,6 +365,145 @@ public struct LassoUploadedFile: Equatable, Sendable {
     }
 }
 
+public struct LassoUploadProcessingOptions: Equatable, Sendable {
+    public var destination: String
+    public var useTempNames: Bool
+    public var allowOverwrite: Bool
+    public var maxSize: Int?
+    public var allowedExtensions: Set<String>?
+
+    public init(
+        destination: String,
+        useTempNames: Bool = false,
+        allowOverwrite: Bool = false,
+        maxSize: Int? = nil,
+        allowedExtensions: Set<String>? = nil
+    ) {
+        self.destination = destination
+        self.useTempNames = useTempNames
+        self.allowOverwrite = allowOverwrite
+        self.maxSize = maxSize
+        self.allowedExtensions = allowedExtensions.map { Set($0.map { $0.lowercased() }) }
+    }
+}
+
+public struct LassoProcessedUpload: Equatable, Sendable {
+    public var source: LassoUploadedFile
+    public var destinationPath: String
+
+    public init(source: LassoUploadedFile, destinationPath: String) {
+        self.source = source
+        self.destinationPath = destinationPath
+    }
+}
+
+public protocol LassoUploadProcessor: Sendable {
+    func processUploads(_ uploads: [LassoUploadedFile], options: LassoUploadProcessingOptions) throws -> [LassoProcessedUpload]
+}
+
+public enum LassoUploadProcessingError: Error, Equatable, Sendable {
+    case missingDestination
+    case destinationOutsideRoot(String)
+    case destinationUnavailable(String)
+    case invalidOriginalFilename(String)
+    case sourceMissing(String)
+    case destinationExists(String)
+    case moveFailed(String)
+}
+
+public struct LassoFileSystemUploadProcessor: LassoUploadProcessor {
+    public let root: URL
+
+    public init(root: URL) throws {
+        let resolvedRoot = root.standardizedFileURL.resolvingSymlinksInPath()
+        var isDirectory: ObjCBool = false
+        guard FileManager.default.fileExists(atPath: resolvedRoot.path, isDirectory: &isDirectory),
+              isDirectory.boolValue else {
+            throw LassoUploadProcessingError.destinationUnavailable(resolvedRoot.path)
+        }
+        self.root = resolvedRoot
+    }
+
+    public func processUploads(
+        _ uploads: [LassoUploadedFile],
+        options: LassoUploadProcessingOptions
+    ) throws -> [LassoProcessedUpload] {
+        guard options.destination.isEmpty == false else {
+            throw LassoUploadProcessingError.missingDestination
+        }
+        let destinationDirectory = try resolveDestination(options.destination)
+        try FileManager.default.createDirectory(at: destinationDirectory, withIntermediateDirectories: true)
+
+        var processed: [LassoProcessedUpload] = []
+        for upload in uploads where shouldProcess(upload, options: options) {
+            let filename = try destinationFilename(for: upload, useTempNames: options.useTempNames)
+            let destination = destinationDirectory.appendingPathComponent(filename)
+                .standardizedFileURL
+                .resolvingSymlinksInPath()
+            guard isWithinRoot(destination) else {
+                throw LassoUploadProcessingError.destinationOutsideRoot(destination.path)
+            }
+            guard FileManager.default.fileExists(atPath: upload.temporaryFilename) else {
+                throw LassoUploadProcessingError.sourceMissing(upload.temporaryFilename)
+            }
+            if FileManager.default.fileExists(atPath: destination.path) {
+                guard options.allowOverwrite else {
+                    throw LassoUploadProcessingError.destinationExists(destination.path)
+                }
+                try FileManager.default.removeItem(at: destination)
+            }
+            do {
+                try FileManager.default.moveItem(at: URL(fileURLWithPath: upload.temporaryFilename), to: destination)
+            } catch {
+                do {
+                    try FileManager.default.copyItem(at: URL(fileURLWithPath: upload.temporaryFilename), to: destination)
+                    try? FileManager.default.removeItem(atPath: upload.temporaryFilename)
+                } catch {
+                    throw LassoUploadProcessingError.moveFailed(destination.path)
+                }
+            }
+            processed.append(LassoProcessedUpload(source: upload, destinationPath: destination.path))
+        }
+        return processed
+    }
+
+    private func resolveDestination(_ destination: String) throws -> URL {
+        let normalized = destination.hasPrefix("/") ? String(destination.dropFirst()) : destination
+        let candidate = root.appendingPathComponent(normalized)
+            .standardizedFileURL
+            .resolvingSymlinksInPath()
+        guard isWithinRoot(candidate) else {
+            throw LassoUploadProcessingError.destinationOutsideRoot(destination)
+        }
+        return candidate
+    }
+
+    private func shouldProcess(_ upload: LassoUploadedFile, options: LassoUploadProcessingOptions) -> Bool {
+        if let maxSize = options.maxSize, upload.size > maxSize { return false }
+        if let allowedExtensions = options.allowedExtensions {
+            let ext = (upload.originalFilename as NSString).pathExtension.lowercased()
+            return allowedExtensions.contains(ext)
+        }
+        return true
+    }
+
+    private func destinationFilename(for upload: LassoUploadedFile, useTempNames: Bool) throws -> String {
+        let raw = useTempNames
+            ? URL(fileURLWithPath: upload.temporaryFilename).lastPathComponent
+            : upload.originalFilename
+        let sanitized = URL(fileURLWithPath: raw).lastPathComponent
+        guard sanitized.isEmpty == false, sanitized != ".", sanitized != ".." else {
+            throw LassoUploadProcessingError.invalidOriginalFilename(raw)
+        }
+        return sanitized
+    }
+
+    private func isWithinRoot(_ candidate: URL) -> Bool {
+        let rootPath = root.path.hasSuffix("/") ? root.path : root.path + "/"
+        return candidate.path == root.path || candidate.path.hasPrefix(rootPath)
+    }
+}
+
 /// Real Lasso's `web_request` exposes ~35 documented members (see
 /// `Documentation/compatibility-matrix.md`); this protocol only requires
 /// the handful every conformer must supply, with default (empty/zero/false)

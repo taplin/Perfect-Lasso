@@ -15,6 +15,19 @@ all live, tested, and live-verified against a real `curl -F` multipart
 upload. `[File_ProcessUploads]` (moving files) deliberately not
 implemented — this pass is metadata only.
 
+**File_ProcessUploads runtime support (2026-07-12):** the parser/runtime now
+has a dedicated upload-processing boundary (`LassoUploadProcessor`) plus a
+root-confined filesystem implementation (`LassoFileSystemUploadProcessor`).
+`[File_ProcessUploads]` is registered, accepts `-Destination`,
+`-UseTempNames`, `-FileOverwrite`, `-Size`, and `-Extensions`, moves matching
+temporary upload files into the destination, and reports operational failures
+as `LassoRecoverableError` so existing `[protect]` handling can catch them.
+Focused tests cover moving, size/extension filtering, temp-name destination
+selection, overwrite denial, and root confinement. `lasso-perfect-server`
+now injects a process-lifetime `LassoFileSystemUploadProcessor` rooted at
+`LASSO_SITE_ROOT`, so `-Destination` remains site-root-confined in live
+requests.
+
 **Milestones 2-4 (2026-07-12): the `PerfectSessionCore` session bridge is
 implemented.** New target `LassoPerfectSession` (`Package.swift`) bridges
 `LassoParser`'s synchronous evaluator to `PerfectSessionCore.SessionDriver`
