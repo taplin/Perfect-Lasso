@@ -64,6 +64,7 @@ public struct LassoNativeTypeRegistry: Sendable {
     private mutating func registerDefaultTypes() {
         register(Self.makeWebRequestType())
         register(Self.makeWebResponseType())
+        register(Self.makeDateType())
     }
 }
 
@@ -280,6 +281,34 @@ extension LassoNativeTypeRegistry {
             // into page output — no new control-flow mechanism needed.
             context.setReturnSignal(.void)
             return .void
+        }
+
+        return type
+    }
+
+    // MARK: - date
+    //
+    // See Documentation/date-format-plan.md. A date value is
+    // `.object(LassoObjectInstance(typeName: "date"))` storing its six
+    // wall-clock components as plain `.integer` fields (see
+    // `LassoDateParsing.makeObject`) — `date->format(...)` here calls the
+    // exact same `LassoDateFormatting.format` the free-function
+    // `Date_Format` native uses, matching the confirmed Lasso 9
+    // method-style contract with no separate implementation.
+    fileprivate static func makeDateType() -> LassoNativeType {
+        var type = LassoNativeType(name: "date")
+
+        type.register("format") { receiver, arguments, _ in
+            // A bare `Date` identifier with no call parens (e.g.
+            // `Date->format(...)`) resolves to an empty "date" object
+            // (nativeTypes.containsType wins before the zero-arg native
+            // function call, matching the pre-existing `session` bare-
+            // identifier precedent) — falling back to "now" here matches
+            // the free-function `date_format` native's identical fallback
+            // and Lasso's own bare-`Date` = "now" semantics.
+            let components = LassoDateParsing.dateComponents(from: receiver) ?? .now()
+            let format = arguments.firstValue(named: "format")?.outputString ?? firstArgumentString(arguments)
+            return .string(LassoDateFormatting.format(components, using: format))
         }
 
         return type

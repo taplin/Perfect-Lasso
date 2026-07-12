@@ -891,6 +891,91 @@ them: `unknownFunction("Date_Format")` (20 pages), `unknownFunction("Decode_Base
 usage from the already-supported `[Inline: ...]` block form) — added to
 the backlog below, not fixed this pass.
 
+**Investigated `-Container`/`-Looping` custom container tags** (Lasso 8) and
+Lasso 9's `GivenBlock`/capture mechanism before planning any implementation,
+per direct request to review documentation first. Reviewed both
+generations: Lasso 8.5 Language Guide Chapter 57 "Custom Tags" (`[Tag]...
+[/Tag]` container tags, `[Run_Children]`) and Chapter 22's upgrade notes;
+Lasso 9's completely different `GivenBlock`/capture-based mechanism (not
+`-Container`/`-Looping` at all — a genuinely different feature, found via
+online search, not assumed to be the same thing under a new name). Then
+`grep`-counted real corpus usage before committing to either dialect:
+**zero** matches for `-Container`/`-Looping`/`Run_Children` anywhere in the
+real site; the only `GivenBlock` usage (158 occurrences) is confined to
+`lassoBackup/scrubs/LassoApps/ds/` — a vendored, dated (2013), third-party
+"DS Suite for Lasso 9" library, not live application content. Surfaced this
+finding rather than silently deciding either way; skipped in favor of a
+corpus-validated item (`Date_Format`, below) — not implemented this pass.
+
+**Implemented `date-format-plan`** (`Date`/`Date_Format`/
+`Date_LocalToGMT`/`Date_GMTToLocal`/`Server_Date`, plus the Lasso 9
+`date->format(...)` method) — the largest remaining real-corpus gap the
+`Output`-tags crawl surfaced (`unknownFunction("Date_Format")`, 20 pages).
+Grounded in both generations: the local Language Guide's Chapter 29 (Table
+1 "Date Substitution Tags," Table 2 "Date Format Symbols") for the Lasso 8
+tag-style contract, and the online Lasso 9 reference
+(lassoguide.com/operations/date-duration.html, fetched directly) confirming
+the identical `%`-symbol table is exposed via a `date->format(-format=...)`
+method instead — same dual-dialect shape as the Output/Encoding pass.
+Real corpus usage `grep`-counted before implementing: 13 of the ~20
+documented `-Format` symbols actually appear (`%B %Y %Q %D %T %a %m %H %M
+%S %r %w %d`); `Date_LocalToGMT`/`Server_Date` chain with `Date_Format` in
+one real file.
+
+**Design revised mid-plan per direct feedback.** The first `ExitPlanMode`
+proposal hand-computed every `%`-symbol via raw `Calendar`/`DateComponents`
+logic, deliberately avoiding both system `strftime` and `DateFormatter`.
+Asked directly whether the renderer could instead be "based on the
+standard DateFormatter with its extended and more detailed representation
+without breaking normal lasso behavior" — revised to translate each
+Lasso `%`-symbol into an ICU pattern letter (`%Y`→`"yyyy"`, `%B`→`"MMMM"`,
+`%H`→`"HH"`, ...) and render every symbol through one reusable
+`DateFormatter`. This is safe specifically because ICU's letter-repetition
+pattern syntax shares no spelling with Lasso's own `%`-prefixed mini-
+language — unlike reusing raw C `strftime` directly, which *would*
+collide on spelling with different meaning (`%h` is 12-hour-hour in Lasso
+but abbreviated-month in C `strftime`; `%w` is 1-7/Sunday-first in Lasso
+vs. 0-6/Sunday-first in C; `%Q`/`%q`/`%G` aren't C `strftime` symbols at
+all). Three symbols have no ICU equivalent and stay direct `Calendar`
+computation: `%w` (Foundation's `.weekday` component already returns
+exactly Lasso's own Sunday=1...Saturday=7 numbering, no translation
+needed), `%W` (week of year), `%G` (GMT indicator, rendered as a fixed
+`"GMT"` literal — lowest-confidence symbol in the table, no precise
+corpus/doc example for either).
+
+Represented as a native `"date"` object (`Sources/LassoParser/NativeTypes.swift`
+— the same `LassoNativeType`/`LassoObjectInstance` mechanism `web_request`/
+`web_response` already use), storing six wall-clock `.integer` fields
+(year/month/day/hour/minute/second) rather than a `Foundation.Date` — a
+raw `Date` conflates "an absolute instant" with "a time zone" in a way
+that doesn't match Lasso's own wall-clock-oriented model (the actual
+reason `Date_LocalToGMT`/`Date_GMTToLocal` exist as separate fixed-offset
+shifts, not a real timezone reinterpretation). New
+`Sources/LassoParser/DateFormatting.swift` (`LassoDateComponents`,
+`LassoDateParsing`, `LassoDateFormatting`) holds the parsing/formatting
+engine; `date`/`date_format`/`date_localtogmt`/`date_gmttolocal`/
+`server_date` natives added to `Runtime.swift`; `date->format(...)` method
+added to `NativeTypes.swift`, calling the exact same formatter the free
+function uses — proven byte-for-byte identical in tests.
+
+One real, non-obvious consequence of the native-object representation:
+a bare `Date` identifier used with no call parens (`Date_Format(Date,
+-Format='%D')`, the single most common real corpus shape) resolves
+through the pre-existing "bare-identifier checks native types before
+native functions" precedent (already established for `session`) to an
+*empty* `"date"` object with no fields set. Rather than adding a special
+case in the evaluator, both `LassoDateParsing.dateComponents(from:)` and
+the `date->format` native method treat a missing/incomplete field set as
+"now" — matching Lasso's own bare-`Date`-means-now semantics for free.
+
+Verified via 10 new tests (86/86 total, no regressions) and a live
+real-corpus crawl (`LASSO_CRAWL_REPORT=1`): `unknownFunction("Date_Format")`
+no longer appears anywhere in the failure report; clean pages held steady
+at 1,690 of 1,989 — not a regression, the same 20 pages now progress
+further and stop at other, already-documented gaps (`Decode_Base64`,
+`Select`, `Encrypt_HMAC`, `currency`), none of them newly introduced by
+this pass.
+
 ## Next Compatibility Work
 
 1. Implement `[File_ProcessUploads]` (Lasso 8) and any equivalent move/copy
@@ -909,6 +994,11 @@ the backlog below, not fixed this pass.
    registration happens at render time). Also: `-Priority`/`-Criteria`
    overload-chain dispatch, and `Define_Type`'s parent/base type name and
    `-Prototype` (parsed, not acted on — no inheritance execution yet).
+   **Investigated and deliberately skipped**: zero real corpus usage of
+   `-Container`/`-Looping`/`Run_Children` (Lasso 8) or `GivenBlock`
+   (Lasso 9, and the only 158 real hits are confined to a vendored,
+   dated, third-party library, not live content) — see the investigation
+   note above. Revisit only if real corpus evidence appears.
 3. Bridge `web_response->include*`/`sendFile` with the existing
    `include()`/`library()` machinery (currently in `Renderer.swift`'s
    `renderExpression`, not reachable from the Evaluator-level native-type
@@ -936,9 +1026,10 @@ the backlog below, not fixed this pass.
    interpreter bugs).
 7. ~~Implement `[Output]`/`Output(...)`~~ Done — see the `output-tags-plan`
    implementation note above.
-8. `unknownFunction("Date_Format")` (20 pages) and `unknownFunction("Decode_Base64")`
-   (20 pages) — real, common Lasso 8 tags, surfaced once `Output` stopped
-   masking them in the crawl/report sweep. Not yet implemented.
+8. ~~`unknownFunction("Date_Format")` (20 pages)~~ Done — see the
+   `date-format-plan` implementation note above. `unknownFunction("Decode_Base64")`
+   (20 pages) — real, common Lasso 8 tag, surfaced once `Output` stopped
+   masking it in the crawl/report sweep. Not yet implemented.
 9. `unknownFunction("inline")` (15 pages) — a differently-shaped `Inline`
    usage from the already-supported `[Inline: ...]` block form (likely a
    bare-call/value-returning context, e.g. `Inline(...)` used as an

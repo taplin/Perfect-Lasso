@@ -246,6 +246,126 @@ import PerfectSessionCore
     #expect(output == "<b>Bold</b>|&lt;b&gt;Bold&lt;/b&gt;")
 }
 
+@Test func dateParsesRecognizedStringFormats() throws {
+    func rendered(_ source: String) throws -> String {
+        var context = LassoContext()
+        return try LassoRenderer().render(source, context: &context)
+    }
+
+    // US M/d/yyyy, US with time, ISO, ISO with time, compact yyyyMMddHHmmss —
+    // every recognized shape reformatted to the same %Q %T output so a
+    // single assertion per format proves the parse actually worked.
+    #expect(try rendered("[Date_Format('6/14/2001', -Format='%Q %T')]") == "2001-06-14 00:00:00")
+    #expect(try rendered("[Date_Format('6/14/2001 15:05:03', -Format='%Q %T')]") == "2001-06-14 15:05:03")
+    #expect(try rendered("[Date_Format('2001-06-14', -Format='%Q %T')]") == "2001-06-14 00:00:00")
+    #expect(try rendered("[Date_Format('2001-06-14 15:05:03', -Format='%Q %T')]") == "2001-06-14 15:05:03")
+    #expect(try rendered("[Date_Format('20010614150503', -Format='%Q %T')]") == "2001-06-14 15:05:03")
+}
+
+@Test func dateHonorsAnExplicitFormatOverrideWhenParsingAnAmbiguousString() throws {
+    var context = LassoContext()
+    // -Format on Date's own construction forces how the string is read,
+    // rather than falling through the recognized-format list.
+    let output = try LassoRenderer().render(
+        "[Date_Format(Date('14-06-2001', -Format='%d-%m-%Y'), -Format='%Q')]",
+        context: &context
+    )
+    #expect(output == "2001-06-14")
+}
+
+@Test func dateFormatSupportsTheLanguageGuidesOwnWorkedExample() throws {
+    var context = LassoContext()
+    // Lasso 8.5 Language Guide Chapter 29's own worked example:
+    // [Date_Format: '06/14/2001', -Format='%A, %B %d'] -> Thursday, June 14
+    let output = try LassoRenderer().render(
+        "[Date_Format: '06/14/2001', -Format='%A, %B %d']",
+        context: &context
+    )
+    #expect(output == "Thursday, June 14")
+}
+
+@Test func dateFormatSupportsEveryCorpusObservedAndDocumentedSymbol() throws {
+    var context = LassoContext()
+    // 2001-06-14 15:05:03 GMT is a Thursday — one fixed instant covers
+    // every corpus-observed symbol (%B %Y %Q %D %T %a %m %H %M %S %r %w %d)
+    // plus representative coverage of the rest of the documented table
+    // (%A %b %y %h %p %z %Z %G) and the %% literal, in one render call.
+    let output = try LassoRenderer().render(
+        """
+        [Date_Format('2001-06-14 15:05:03', -Format=\
+        '%B|%Y|%Q|%D|%T|%a|%A|%m|%H|%M|%S|%r|%w|%d|%b|%y|%h|%p|%G|%%')]
+        """,
+        context: &context
+    )
+    let fields = output.components(separatedBy: "|")
+    #expect(fields == [
+        "June", "2001", "2001-06-14", "06/14/2001", "15:05:03", "Thu", "Thursday",
+        "06", "15", "05", "03", "03:05:03 PM", "5", "14", "Jun", "01", "03", "PM", "GMT", "%",
+    ])
+}
+
+@Test func dateFormatWeekOfYearRendersAsAZeroPaddedTwoDigitNumber() throws {
+    var context = LassoContext()
+    let output = try LassoRenderer().render(
+        "[Date_Format('2001-06-14', -Format='%W')]",
+        context: &context
+    )
+    #expect(output.count == 2 && output.allSatisfy(\.isNumber), "no precise corpus/doc example for %W's exact value — just its shape")
+}
+
+@Test func dateFormatPaddingModifiersControlLeadingZeroesAndSpaces() throws {
+    var context = LassoContext()
+    // 2001-06-04: a single-digit day, to distinguish the three padding
+    // behaviors (%d zero-padded, %_d space-padded, %-d unpadded).
+    let output = try LassoRenderer().render(
+        "[Date_Format('2001-06-04', -Format='%d|%_d|%-d')]",
+        context: &context
+    )
+    #expect(output == "04| 4|4")
+}
+
+@Test func dateConstructsFromYearMonthDayKeywords() throws {
+    var context = LassoContext()
+    let output = try LassoRenderer().render(
+        "[Date_Format(Date(-Year=2001, -Month=6, -Day=14, -Hour=15, -Minute=5, -Second=3), -Format='%Q %T')]",
+        context: &context
+    )
+    #expect(output == "2001-06-14 15:05:03")
+}
+
+@Test func dateLocalToGMTAndGMTToLocalRoundTrip() throws {
+    var context = LassoContext()
+    let output = try LassoRenderer().render(
+        "[Date_Format(Date_LocalToGMT(Date_GMTToLocal(Date('2001-06-14 15:05:03'))), -Format='%Q %T')]",
+        context: &context
+    )
+    #expect(output == "2001-06-14 15:05:03")
+}
+
+@Test func dateFormatMethodMatchesTheFreeFunctionTagForTheSameInput() throws {
+    var context = LassoContext()
+    let output = try LassoRenderer().render(
+        "[Date_Format(Date('2001-06-14 15:05:03'), -Format='%Q %T')]|" +
+            "[(Date('2001-06-14 15:05:03'))->format('%Q %T')]",
+        context: &context
+    )
+    let parts = output.components(separatedBy: "|")
+    #expect(parts.count == 2 && parts[0] == parts[1], "Lasso 8 tag style and Lasso 9 method style must produce identical output")
+}
+
+@Test func dateFormatAcceptsABareDateArgumentMeaningNow() throws {
+    var context = LassoContext()
+    // The most common real corpus shape: a bare `Date` identifier (no
+    // parens) as the positional argument — resolves to "now", so only the
+    // output shape (not an exact value) can be asserted.
+    let output = try LassoRenderer().render(
+        "[Date_Format(Date, -Format='%D')]",
+        context: &context
+    )
+    let parts = output.components(separatedBy: "/")
+    #expect(parts.count == 3 && parts[0].count == 2 && parts[1].count == 2 && parts[2].count == 4)
+}
+
 @Test func rendersIncludesRequestSessionAndInlineFrames() throws {
     struct IncludeLoader: LassoIncludeLoader {
         func loadInclude(path: String, from includingPath: String?) throws -> String {
@@ -734,6 +854,119 @@ import PerfectSessionCore
         context: &context
     )
     #expect(output == "error=-Add is not enabled for datasource 'catalog'.")
+}
+
+@Test(
+    "PerfectCRUD connector failures become inline error frames",
+    arguments: [
+        (
+            "[inline(-database='catalog_mysql',-table='skus',-search)][error_currenterror]|[error_currenterror(-errorcode)][/inline]",
+            "Search failed for datasource 'catalog'.|1007"
+        ),
+        (
+            "[inline(-database='catalog_mysql',-table='skus',-add,'color'='red')][error_currenterror]|[error_currenterror(-errorcode)][/inline]",
+            "Add failed for datasource 'catalog'.|1001"
+        ),
+        (
+            "[inline(-database='catalog_mysql',-table='skus',-update,-keyfield='id',-keyvalue=7,'color'='blue')][error_currenterror]|[error_currenterror(-errorcode)][/inline]",
+            "Update failed for datasource 'catalog'.|1002"
+        ),
+        (
+            "[inline(-database='catalog_mysql',-table='skus',-delete,-keyfield='id',-keyvalue=7)][error_currenterror]|[error_currenterror(-errorcode)][/inline]",
+            "Delete failed for datasource 'catalog'.|1003"
+        ),
+        (
+            "[inline(-database='catalog_mysql',-sql='SELECT * FROM skus')][error_currenterror]|[error_currenterror(-errorcode)][/inline]",
+            "SQL failed for datasource 'catalog'.|1008"
+        ),
+    ]
+)
+func perfectCRUDConnectorFailuresBecomeInlineErrorFrames(source: String, expected: String) throws {
+    enum ConnectorFailure: Error {
+        case unavailable
+    }
+
+    let executor = PerfectCRUDLassoExecutor(
+        capabilities: { _ in .full },
+        queryHandler: { datasource, _ in
+            throw LassoDatabaseActionError(kind: .search, datasource: datasource, underlying: ConnectorFailure.unavailable)
+        },
+        mutationHandler: { datasource, mutation in
+            let kind: LassoDatabaseActionFailureKind = switch mutation.action {
+            case .insert: .add
+            case .update: .update
+            case .delete: .delete
+            }
+            throw LassoDatabaseActionError(kind: kind, datasource: datasource, underlying: ConnectorFailure.unavailable)
+        },
+        rawSQLHandler: { datasource, _ in
+            throw LassoDatabaseActionError(kind: .sql, datasource: datasource, underlying: ConnectorFailure.unavailable)
+        }
+    )
+    var context = LassoContext(inlineProvider: LassoDynamicInlineProvider(
+        executor: executor,
+        datasourceAliases: ["catalog_mysql": "catalog"]
+    ))
+
+    let output = try LassoRenderer().render(source, context: &context)
+    #expect(output == expected)
+}
+
+@Test func perfectCRUDExecutorPreservesRecoverableErrorsThrownByHandlers() throws {
+    let state = LassoErrorState(code: 4242, message: "Connector-specific failure", kind: "connector")
+    let executor = PerfectCRUDLassoExecutor(
+        capabilities: { _ in .full },
+        queryHandler: { _, _ in throw LassoRecoverableError(state) }
+    )
+    var context = LassoContext(inlineProvider: LassoDynamicInlineProvider(
+        executor: executor,
+        datasourceAliases: ["catalog_mysql": "catalog"]
+    ))
+
+    let output = try LassoRenderer().render(
+        "[inline(-database='catalog_mysql',-table='skus',-search)][error_currenterror]|[error_currenterror(-errorcode)][/inline]",
+        context: &context
+    )
+
+    #expect(output == "Connector-specific failure|4242")
+}
+
+@Test func perfectCRUDExecutorStillThrowsFatalValidationErrorsBeforeConnectorCalls() throws {
+    let executor = PerfectCRUDLassoExecutor(
+        queryHandler: { _, _ in DynamicResult(rows: [], statement: "") }
+    )
+    var context = LassoContext(inlineProvider: LassoDynamicInlineProvider(
+        executor: executor,
+        datasourceAliases: ["catalog_mysql": "catalog"]
+    ))
+
+    #expect(throws: PerfectCRUDLassoError.missingTable) {
+        _ = try LassoRenderer().render(
+            "[inline(-database='catalog_mysql',-search)][error_currenterror][/inline]",
+            context: &context
+        )
+    }
+}
+
+@Test func perfectCRUDExecutorDoesNotFrameUnknownHandlerThrows() throws {
+    enum ProgrammerError: Error, Equatable {
+        case unexpected
+    }
+
+    let executor = PerfectCRUDLassoExecutor(
+        queryHandler: { _, _ in throw ProgrammerError.unexpected }
+    )
+    var context = LassoContext(inlineProvider: LassoDynamicInlineProvider(
+        executor: executor,
+        datasourceAliases: ["catalog_mysql": "catalog"]
+    ))
+
+    #expect(throws: ProgrammerError.unexpected) {
+        _ = try LassoRenderer().render(
+            "[inline(-database='catalog_mysql',-table='skus',-search)][error_currenterror][/inline]",
+            context: &context
+        )
+    }
 }
 
 @Test func customTagDefinesCallsAndIsolatesLocals() throws {

@@ -148,6 +148,55 @@ public struct LassoNativeRegistry: Sendable {
         register("encode_base64") { arguments, _ in
             .string(LassoEncoding.base64(arguments.first?.value.outputString ?? ""))
         }
+        // Date and time — Lasso 8.5 Language Guide Chapter 29 "Date and
+        // Time Operations". See Documentation/date-format-plan.md for the
+        // native "date" object representation and the DateFormatter/ICU
+        // rendering approach.
+        register("date") { arguments, _ in
+            // -Year/-Month/-Day/-Hour/-Minute/-Second construction keywords
+            // (Chapter 29 Table 1) take priority when present — cheap to
+            // support alongside string parsing, same DateComponents
+            // plumbing.
+            if arguments.lastInt(named: "year") != nil || arguments.lastInt(named: "month") != nil || arguments.lastInt(named: "day") != nil {
+                var components = LassoDateComponents.now()
+                if let year = arguments.lastInt(named: "year") { components.year = year }
+                if let month = arguments.lastInt(named: "month") { components.month = month }
+                if let day = arguments.lastInt(named: "day") { components.day = day }
+                if let hour = arguments.lastInt(named: "hour") { components.hour = hour }
+                if let minute = arguments.lastInt(named: "minute") { components.minute = minute }
+                if let second = arguments.lastInt(named: "second") { components.second = second }
+                return .object(LassoDateParsing.makeObject(components))
+            }
+            guard let positional = arguments.positionalValue(at: 0) else {
+                return .object(LassoDateParsing.makeObject(.now()))
+            }
+            let explicitFormat = arguments.lastString(named: "format")
+            let parsed = LassoDateParsing.parse(positional, explicitFormat: explicitFormat) ?? .now()
+            return .object(LassoDateParsing.makeObject(parsed))
+        }
+        register("date_format") { arguments, _ in
+            let positional = arguments.positionalValue(at: 0) ?? .void
+            let format = arguments.lastString(named: "format") ?? ""
+            let components = LassoDateParsing.parse(positional) ?? .now()
+            return .string(LassoDateFormatting.format(components, using: format))
+        }
+        register("date_localtogmt") { arguments, _ in
+            let positional = arguments.positionalValue(at: 0) ?? .void
+            var components = LassoDateParsing.parse(positional) ?? .now()
+            let date = components.asDate.addingTimeInterval(-Double(TimeZone.current.secondsFromGMT()))
+            components = LassoDateComponents(date: date)
+            return .object(LassoDateParsing.makeObject(components))
+        }
+        register("date_gmttolocal") { arguments, _ in
+            let positional = arguments.positionalValue(at: 0) ?? .void
+            var components = LassoDateParsing.parse(positional) ?? .now()
+            let date = components.asDate.addingTimeInterval(Double(TimeZone.current.secondsFromGMT()))
+            components = LassoDateComponents(date: date)
+            return .object(LassoDateParsing.makeObject(components))
+        }
+        register("server_date") { _, _ in
+            .object(LassoDateParsing.makeObject(.now()))
+        }
         // [Output]/Output(...) — Lasso 8.5 Language Guide Chapter 14
         // "Table 1: Output Tags": applies an encoding to any expression,
         // member tag, or sub-tag result. Default -EncodeHTML, matching
