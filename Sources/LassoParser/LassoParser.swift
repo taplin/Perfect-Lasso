@@ -287,6 +287,23 @@ private struct TemplateScanner {
             return
         }
 
+        // Legacy `define_tag`/`define_type` startup libraries commonly wrap
+        // their ENTIRE multi-statement, semicolon-separated body (opener,
+        // nested local()/define_tag() calls, /define_tag;/-style closers) in
+        // one square-bracket span — see Documentation/legacy-define-tag-type-plan.md.
+        // The generic path below only keeps the first parsed expression,
+        // which would silently drop everything after the opening call
+        // (confirmed directly: a real `[Define_Tag(...); ...; /Define_Tag;]`
+        // body collapsed to just the opening call before this fix). Needs
+        // the same statement/block-aware ScriptBodyParser treatment as
+        // modern `define`, not the single-expression fallback.
+        if delimiter == .square, Self.bodyOpensWithLegacyDefinition(body) {
+            var parser = ScriptBodyParser(source: body, range: range, delimiter: .square)
+            nodes.append(contentsOf: parser.parse())
+            diagnostics.append(contentsOf: parser.diagnostics)
+            return
+        }
+
         // <?lasso ?> and <?= ?> content is one continuous span of code
         // between the delimiters — not template text interspersed with
         // tags, the shape bracket dialect has — so it needs the same
@@ -402,6 +419,40 @@ private struct TemplateScanner {
         guard remainder.lowercased().hasPrefix("define") else { return false }
         let afterKeyword = remainder.index(remainder.startIndex, offsetBy: "define".count)
         return afterKeyword == remainder.endIndex || remainder[afterKeyword].isWhitespace
+    }
+
+    /// Same leading-comment-tolerant scan as `bodyOpensWithDefine`, but for
+    /// the legacy `define_tag`/`define_type` keywords instead of modern
+    /// `define`. Both the parenthesized-call (`define_tag(...)`) and
+    /// colon-call (`define_tag:`) openers need to match — the character
+    /// immediately after the keyword is `(`, `:`, whitespace, or end.
+    private static func bodyOpensWithLegacyDefinition(_ body: String) -> Bool {
+        let characters = Array(body)
+        var index = 0
+        while index < characters.count {
+            if characters[index].isWhitespace {
+                index += 1
+            } else if index + 1 < characters.count, characters[index] == "/", characters[index + 1] == "/" {
+                while index < characters.count, characters[index] != "\n" { index += 1 }
+            } else if index + 1 < characters.count, characters[index] == "/", characters[index + 1] == "*" {
+                index += 2
+                while index + 1 < characters.count, !(characters[index] == "*" && characters[index + 1] == "/") {
+                    index += 1
+                }
+                index = min(index + 2, characters.count)
+            } else {
+                break
+            }
+        }
+        let remainder = String(characters[index...])
+        for keyword in ["define_tag", "define_type"] {
+            guard remainder.lowercased().hasPrefix(keyword) else { continue }
+            let afterKeyword = remainder.index(remainder.startIndex, offsetBy: keyword.count)
+            if afterKeyword == remainder.endIndex { return true }
+            let next = remainder[afterKeyword]
+            if next.isWhitespace || next == "(" || next == ":" { return true }
+        }
+        return false
     }
 
     private func inferDialect(_ body: String) -> LassoDialect {

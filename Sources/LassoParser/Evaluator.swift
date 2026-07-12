@@ -165,6 +165,17 @@ struct Evaluator {
         callArguments: [LassoArgument]
     ) throws -> LassoValue {
         let object = LassoObjectInstance(typeName: type.name)
+        // Legacy constructors (e.g. `local('ip' = (params->first ? ...))`)
+        // reference the constructor call's own arguments as `params` while
+        // data member defaults are evaluated — see
+        // Documentation/legacy-define-tag-type-plan.md's "Constructor
+        // params" note. Bound as an ordinary local (not passed through
+        // invokeMemberMethod's own parameter binding) so it's visible here
+        // and restored to whatever it was before once construction ends.
+        let evaluatedCallArguments = try evaluate(callArguments)
+        let savedLocals = context.snapshotLocals()
+        context.set(.array(evaluatedCallArguments.map(\.value)), for: "params", scope: .local)
+        defer { context.replaceLocals(savedLocals) }
         for member in type.dataMembers {
             if let defaultValue = member.defaultValue {
                 object.set(try evaluate(defaultValue), for: member.name)
@@ -217,12 +228,24 @@ struct Evaluator {
 
     private mutating func declare(_ arguments: [LassoArgument], local: Bool) throws -> LassoValue {
         let scope: VariableScope = local ? .local : .global
+        // Assignment-form calls (`local('x' = 1)`) keep returning `.void` —
+        // real corpus code commonly uses this as a bare statement inside a
+        // `[...]` template span and relies on it producing no output.
+        // Only the legacy Lasso 8 READ form — `(Local: 'name')`/`(Var:
+        // 'name')`, a call with no assignment at all — fetches and returns
+        // the variable's current value. Real Lasso 8.5 docs: "The value
+        // for the local variable can be returned with the [Local] tag."
+        // See Documentation/legacy-define-tag-type-plan.md.
+        var readValue: LassoValue?
         for argument in arguments {
-            guard case let .assignment(target, value) = argument.value else { continue }
-            let evaluated = try evaluate(value)
-            try assign(evaluated, to: target, defaultScope: scope)
+            if case let .assignment(target, value) = argument.value {
+                let evaluated = try evaluate(value)
+                try assign(evaluated, to: target, defaultScope: scope)
+            } else if let name = Self.assignmentLabel(argument.value) {
+                readValue = context.value(for: name, scope: scope)
+            }
         }
-        return .void
+        return readValue ?? .void
     }
 
     private mutating func assign(
@@ -335,6 +358,7 @@ struct Evaluator {
             let separator = try arguments.first.map { try evaluate($0.value).outputString } ?? ""
             return .array(value.components(separatedBy: separator).map(LassoValue.string))
         case let (.array(values), "size"): return .integer(values.count)
+        case let (.array(values), "first"): return values.first ?? .null
         case let (.array(values), "get"):
             let requested = try arguments.first.map { try evaluate($0.value).number } ?? 1
             let index = max(Int(requested ?? 1) - 1, 0)

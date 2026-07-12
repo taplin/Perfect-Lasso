@@ -2,6 +2,103 @@
 
 Date: 2026-07-10
 
+## Implementation Status (2026-07-12)
+
+Implemented. Real Lasso 8.5 documentation for `Define_Tag`/`Define_Type`
+was recovered from the local `References/Lasso/Lasso 8.5 Language Guide.pdf`
+(no working CLI text extractor was available in this environment —
+`pdftotext`/`PyPDF2`/`pymupdf` were all missing; installed `poppler` via
+`brew install poppler` to get `pdftotext`, then located the real "Custom
+Tags" (Chapter 57) and "Custom Types" (Chapter 58) chapters — see the
+"Documented Flags And Parameters" section below for what those chapters
+actually say, sourced directly rather than inferred from corpus usage
+alone, per [[lasso-adapter-feedback]]'s "verify against docs" pattern).
+
+**The real root cause was bigger than the syntax of the two openers.**
+Tracing why a real `[Define_Tag(...); ...; /Define_Tag;]` body silently
+lost everything after its first statement found that `LassoParser.swift`'s
+square-bracket (`[...]`) handling only gave full statement/block-aware
+parsing (`ScriptBodyParser`) to bodies opening with modern `define` — any
+other multi-statement `[...]` body (including legacy `define_tag`/
+`define_type`, which real startup files wrap their ENTIRE body in) fell
+through to a single-expression fallback that silently dropped every
+statement after the first. Fixed by adding the same `ScriptBodyParser`
+routing for bodies opening with `define_tag`/`define_type`
+(`bodyOpensWithLegacyDefinition` in `LassoParser.swift`) — confirmed via a
+temporary diagnostic probe (not part of this repo) that a real corpus-shaped
+body collapsed to one node before the fix and parsed correctly after.
+
+Once bodies parsed fully, the actual `define_tag`/`define_type` block
+recognition needed two more additive fixes: `BlockBuilder.blockNames` and
+`ScriptBodyParser`'s own `emitStatement` (for the bare colon-call form with
+no enclosing parens, e.g. `Define_Tag: 'name', -Required='x';` — a
+genuinely different shape from `if:(...)`'s still-parenthesized colon
+form, which `parseBlockOpening` already handled). Legacy definitions lower
+into the *same* runtime models modern `define`/`define ... => type {...}`
+already use (`LassoCustomTagDefinition`, `LassoTypeDefinition`,
+`LassoMethodDefinition`, `LassoDataMemberDefinition`) via new
+`Sources/LassoParser/LegacyDefinitions.swift` — no second runtime path, per
+this plan's own "Step 2" design goal.
+
+**Two real, load-bearing bugs found and fixed along the way, not just
+syntax gaps:**
+- `(Local: 'name')`/`(Var: 'name')` — Lasso 8's documented way to *read* a
+  local/page variable's current value — had never been implemented.
+  `Evaluator.declare` only handled the assignment form
+  (`local('name' = value)`); a bare read silently returned `.void`. This
+  blocks nearly all legacy Lasso 8 tag/type bodies, which read locals this
+  way throughout (confirmed directly against the Lasso 8.5 Language
+  Guide's own Custom Tags chapter examples). Fixed to return the read
+  value for the non-assignment form while keeping the assignment form
+  returning `.void` unchanged (an early attempt at this fix returned the
+  *assigned* value too, which broke three passing corpus fixture tests
+  that rely on `[local('x' = 1)]` producing no output as a bare
+  statement — reverted to keep that path exactly as it was).
+- Constructor `params` (`Local('ip' = (Params->First ? Params->First |
+  ...))`, needed for the real `getGeoIPInfo.inc` shape): `Evaluator.instantiate`
+  now binds a `params` local (an array of the evaluated constructor call
+  arguments) before evaluating data member defaults, matching this plan's
+  own "Constructor params" recommendation. `.array->First` (needed to read
+  it) was also missing and added.
+
+Verified via 4 new tests (standalone parenthesized `Define_Tag`, colon-call
+`Define_Tag` with `-Required`/`-Type` parameter translation, parenthesized
+`Define_Type` with data-member defaults reading constructor `params` and a
+method reading/writing instance data via `self`, and a colon-call
+`Define_Type` matching the real `js_timer.inc` shape) plus the full existing
+69-test suite (65 prior + 4 new; no regressions). **Live-verified against
+the real `LassoStartup` folder: all 10 startup files now load with zero
+failures** (previously 3 failed with `unknownFunction("define_tag")`/
+`unknownFunction("define_type")`) — see `lasso-real-corpus-paths` project
+memory for the path. Real-corpus GET-request sweep unchanged (19 of 28
+top-level pages render cleanly, same 9 pre-existing failures for the same
+reasons — no regression from this pass).
+
+A real, known dispatch nuance found but not fixed (out of scope for this
+pass): `onCreate` (or any nested `define_tag` method) is matched by
+`LassoMethodDispatcher.resolve` using the same arity-aware scoring as
+ordinary method calls — a constructor called with more positional
+arguments than `onCreate` declares parameters for silently skips `onCreate`
+entirely (`missingIsVoid: true`) rather than passing the extra arguments
+through leniently the way real Lasso's docs describe ("called ... with any
+parameters that were passed to the tag that created the type"). Not hit by
+any of the three priority corpus fixtures (their `onCreate`s don't declare
+fixed parameters), so left as a documented gap rather than fixed under
+this pass's scope.
+
+Deferred, matching this plan's own "Recommended Scope Boundaries":
+`-Container`/`-Looping` container-tag calling convention (`Run_Children`) —
+a real, separate feature, since `BlockBuilder` only recognizes a fixed
+keyword set at parse time while custom-tag registration happens at render
+time, a chicken-and-egg ordering problem for treating an arbitrary
+registered tag name as block-shaped; `-Async`/`-Atomic`/`-RPC`/`-SOAP`
+behavior; `-Priority`/`-Criteria` overload-chain dispatch (redefining/
+layering multiple same-named tags); parent/base type name and
+`-Prototype` on `Define_Type` (parsed as positional arguments, not acted
+on — no inheritance execution); `[Private]`/frozen-properties instance
+variable privacy. None of the three priority corpus fixtures need these to
+load cleanly.
+
 ## Purpose
 
 Prepare the next compatibility discussion and implementation pass for the two
@@ -97,11 +194,64 @@ Current doc-acquisition status:
 - The known LassoSoft archive entry
   `https://www.lassosoft.com/LP8_5-Document-Downloads` returned HTTP 500 when
   checked on 2026-07-10.
-- Before implementing the full legacy-definition pass, recover the Lasso 8 /
-  Lasso 8.5 docs from another source if needed: downloaded PDF, Wayback
-  capture, local archive, LassoSoft support copy, or another trustworthy mirror.
-- Once found, add a short sourced summary of `define_tag` and `define_type`
-  parameters/flags to this document before coding the general parser.
+- Resolved 2026-07-12: the Language Guide PDF was already present locally
+  at `References/Lasso/Lasso 8.5 Language Guide.pdf` (849 pages). No CLI
+  text-extraction tool was available in this environment initially
+  (`pdftotext`/`PyPDF2`/`pymupdf` all missing, and `textutil -convert txt`
+  silently copied raw PDF bytes instead of extracting text) —
+  `brew install poppler` provided a working `pdftotext`, used with
+  `-layout` to extract the full document, then `grep`/`sed` to locate
+  Chapter 57 "Custom Tags" and Chapter 58 "Custom Types" (found by
+  listing every `^Chapter [0-9]` heading and its first line, not by
+  guessing page numbers).
+
+## Documented Flags And Parameters
+
+Source: `References/Lasso/Lasso 8.5 Language Guide.pdf`, Chapter 57
+"Custom Tags" (`Table 2: [Define_Tag] Parameters`) and Chapter 58 "Custom
+Types" (`Table 1: Tags for Creating Custom Data Types`, `Table 3: Prototype
+Tag`, `Table 4: Callback Tags`).
+
+### `[Define_Tag]` parameters (Chapter 57, Table 2)
+
+| Flag | Documented meaning | Status |
+| --- | --- | --- |
+| `'Tag Name'` (positional) | Name of the tag being defined. Required. | Implemented |
+| `-Required='name'` | Declares a required parameter, bound as a local. | Implemented (binder doesn't yet error on a missing one — see below) |
+| `-Optional='name'` | Declares an optional parameter. | Implemented (same binder as `-Required`; this interpreter doesn't yet distinguish the two at bind time, for either legacy or modern tags) |
+| `-Type='typeName'` | Type-constrains the immediately preceding `-Required`/`-Optional` parameter. | Implemented — translated to the same `name::type` binary shape modern `define` parameters already use |
+| `-Copy` | The preceding parameter is passed by copy instead of by reference. | Deferred — this interpreter's `LassoValue` is already Swift value-type/copy-on-write, so parameter aliasing (the real problem `-Copy` solves) isn't a hazard here the same way; recognized and discarded, not acted on |
+| `-Namespace` | Places the tag in a namespace. | Deferred — this interpreter has one flat tag registry for every tag, modern or legacy; not a legacy-specific gap |
+| `-Async` | Runs the tag in a separate thread; can't return a value. | Deferred — no background/thread execution model exists |
+| `-Atomic` | Serializes concurrent calls to the same tag. | Deferred — no concurrency-guarding primitive wired to custom tags |
+| `-Container` | Marks the tag as a container tag (`[Tag]...[/Tag]`, body via `[Run_Children]`). | Deferred — real feature gap: `BlockBuilder` recognizes a fixed keyword set at *parse* time, while custom-tag registration happens at *render* time; treating an arbitrary registered tag name as block-shaped needs a different mechanism, not a quick add |
+| `-Looping` | Container tag that also advances `[Loop_Count]`. | Deferred, same reason as `-Container` |
+| `-Priority='High'/'Low'/'Replace'` | Where the tag sits in an overload/redefinition calling chain. | Deferred — no multi-definition calling-chain model; last registration for a name wins |
+| `-Criteria=(expr)` | Guards whether this definition is used for a given call. | Deferred, same reason as `-Priority` |
+| `-Description` | Free-text description, retrievable via `[Tag->Description]`. | Deferred — no tag-reflection member surface for legacy-defined tags yet |
+| `-EncodeNone` | Suppresses default encoding of the tag's return value. | Deferred — this interpreter doesn't auto-HTML-encode substitution tag output the way real Lasso does, so this flag has no analogous behavior to hook into yet |
+| `-Privileged` | Runs with the defining user's permissions, not the caller's. | Deferred — no permission/user model in this interpreter at all |
+| `-ReturnType` | Type-checks the tag's return value. | Deferred — parsed as an ordinary flag and discarded; no return-type enforcement for modern tags either |
+| `-RPC` / `-SOAP` | Exposes the tag as an XML-RPC/SOAP remote procedure call. | Deferred — no RPC/SOAP layer in this adapter |
+
+### `[Define_Type]` (Chapter 58, Table 1) and related tables
+
+| Item | Documented meaning | Status |
+| --- | --- | --- |
+| `'Type Name'` (positional) | Name of the type. Required. | Implemented |
+| Additional positional strings | Parent/base types this type inherits from. | Parsed (kept as ordinary positional arguments, not dropped/erroring) but not acted on — no inheritance execution |
+| `-Namespace` | Namespace for the type. | Deferred, same as `Define_Tag`'s `-Namespace` |
+| `-Prototype` (Table 3) | Compiles the type definition once and copies the pre-built prototype per instance, for performance. | Parsed, not acted on — this interpreter always re-runs data-member-default evaluation per instance already (no prototype-copy optimization exists, for legacy or modern types), so the *behavior* is already correct, just not the *performance characteristic* the flag is about |
+| `-Description` | Free-text description. | Deferred, same as `Define_Tag`'s `-Description` |
+| `[Local]`/`local:` inside the type body | Instance data member declaration with a default-value expression. | Implemented — becomes `LassoDataMemberDefinition`; default expressions can reference a constructor-local `params` (see Implementation Status above) |
+| `[Define_Tag]`/`define_tag:` inside the type body | Member tag (method) declaration. | Implemented — becomes `LassoMethodDefinition`, dispatched through the same `LassoMethodDispatcher` modern type methods use |
+| `[Private]`...`[/Private]` (Table 1) | Marks wrapped instance variables/tags as private to the type. | Deferred — no visibility enforcement distinct from `.public` for legacy-declared members |
+| `[Null->onCreate]` (Table 4 callback) | Called after instance construction, with the constructor's own call arguments. | Implemented, with a known arity-dispatch nuance — see Implementation Status above |
+| `[Null->onConvert]` (Table 4) | Called when the instance is cast to string/integer/decimal. | Works as an ordinary member method already (no special-casing needed — it's just a `Define_Tag('onConvert')` inside the type, dispatched like any other method); automatic invocation on implicit cast (e.g. string interpolation) is not wired up, matching this interpreter's existing (pre-legacy-pass) `onConvert` support level for modern types |
+| `[Null->onDestroy]`/`onSerialize`/`onDeserialize`/`_UnknownTag` (Table 4) | Destruction/serialization/unknown-member callbacks. | Deferred — no object lifecycle/serialization hooks exist in this interpreter for modern types either; not a legacy-specific gap |
+
+No silent gaps: everything documented above is either implemented or named
+with a concrete reason it's deferred.
 
 ## Corpus Shapes To Support
 

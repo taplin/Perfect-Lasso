@@ -109,6 +109,13 @@ public struct LassoNativeRegistry: Sendable {
             default: return .boolean(true)
             }
         }
+        register("local_defined") { arguments, context in
+            let name = arguments.first?.value.outputString ?? ""
+            switch context.value(for: name, scope: .local) {
+            case .void, .null: return .boolean(false)
+            default: return .boolean(true)
+            }
+        }
         let tagExists: LassoNativeFunction = { arguments, context in
             let name = arguments.first?.value.outputString ?? ""
             guard name.isEmpty == false else { return .boolean(false) }
@@ -242,20 +249,63 @@ public struct LassoNativeRegistry: Sendable {
                 arguments.first?.value.outputString ?? ""
             return context.requestProvider?.cookie(named: name) ?? .void
         }
-        register("session") { arguments, context in
-            let name = arguments.firstValue(named: "name")?.outputString ??
-                arguments.first?.value.outputString ?? ""
-            return context.sessionProvider?.value(for: name) ?? .null
-        }
-        register("session_addvar") { arguments, context in
-            let name = arguments.firstValue(named: "name")?.outputString ??
-                arguments.first?.value.outputString ?? ""
-            let value = arguments.firstValue(named: "value") ??
-                arguments.dropFirst().first?.value ?? context.value(for: name)
-            try context.sessionProvider?.set(value, for: name)
+        // Real session semantics: sessions are NAMED (session_start(name,
+        // ...)), and session_addVar(sessionName, varName) registers an
+        // existing thread/local variable for end-of-request persistence —
+        // it does not take a value directly. The actual create/resume/save
+        // work against PerfectSessionCore happens at the server boundary
+        // (see LassoPerfectSession); these natives only read/write the
+        // already-loaded, synchronous state LassoSessionProvider exposes.
+        // See Documentation/session-upload-support-plan.md.
+        register("session_start") { arguments, context in
+            let name = arguments.positionalValue(at: 0)?.outputString ?? ""
+            guard name.isEmpty == false else { return .void }
+            if let result = context.sessionProvider?.start(session: name) {
+                context.sessionStartResults[name.lowercased()] = result
+            }
             return .void
         }
-        register("session_start") { _, _ in .void }
+        register("session_id") { arguments, context in
+            let name = arguments.positionalValue(at: 0)?.outputString ?? ""
+            return context.sessionProvider?.id(session: name).map(LassoValue.string) ?? .void
+        }
+        register("session_result") { arguments, context in
+            let name = arguments.positionalValue(at: 0)?.outputString ?? ""
+            guard let result = context.sessionStartResults[name.lowercased()] else { return .void }
+            return .map([
+                "id": .string(result.sessionID),
+                "new": .boolean(result.isNew),
+            ])
+        }
+        register("session_addvar") { arguments, context in
+            let name = arguments.positionalValue(at: 0)?.outputString ?? ""
+            let varName = arguments.positionalValue(at: 1)?.outputString ?? ""
+            guard name.isEmpty == false, varName.isEmpty == false else { return .void }
+            context.trackedSessionVariables.append((session: name, varName: varName))
+            if let restored = context.sessionProvider?.restoredValue(for: varName, session: name) {
+                context.set(restored, for: varName, scope: .global)
+            }
+            return .void
+        }
+        register("session_removevar") { arguments, context in
+            let name = arguments.positionalValue(at: 0)?.outputString ?? ""
+            let varName = arguments.positionalValue(at: 1)?.outputString ?? ""
+            context.sessionProvider?.removeVar(varName, session: name)
+            context.trackedSessionVariables.removeAll { $0.session == name && $0.varName == varName }
+            return .void
+        }
+        register("session_end") { arguments, context in
+            let name = arguments.positionalValue(at: 0)?.outputString ?? ""
+            context.sessionProvider?.end(session: name)
+            context.suppressedSessionSaves.insert(name)
+            return .void
+        }
+        register("session_abort") { arguments, context in
+            let name = arguments.positionalValue(at: 0)?.outputString ?? ""
+            context.sessionProvider?.abort(session: name)
+            context.suppressedSessionSaves.insert(name)
+            return .void
+        }
         // Real Lasso 8's [Cache(-Name=..., -Expires=...)] ... [/Cache]
         // wraps a body of markup to memoize for a duration — a
         // performance layer, not a correctness one. This interpreter has
@@ -289,7 +339,7 @@ public struct LassoNativeRegistry: Sendable {
 }
 
 extension LassoValue {
-    var jsonObject: Any {
+    public var jsonObject: Any {
         switch self {
         case .void, .null:
             NSNull()
@@ -307,6 +357,32 @@ extension LassoValue {
             Dictionary(uniqueKeysWithValues: values.map { ($0.key, $0.value.jsonObject) })
         case let .object(value):
             value.snapshotData().mapValues(\.jsonObject)
+        }
+    }
+
+    /// Reverses `jsonObject` — used to restore session variables persisted
+    /// as JSON-safe values (see `Documentation/session-upload-support-plan.md`'s
+    /// "Variable strategy": string, integer, decimal, boolean, arrays, maps,
+    /// null/void). Only used for values this adapter itself wrote; a driver
+    /// storing something else is out of scope.
+    public static func from(json value: Any) -> LassoValue {
+        switch value {
+        case is NSNull:
+            .null
+        case let value as Bool:
+            .boolean(value)
+        case let value as Int:
+            .integer(value)
+        case let value as Double:
+            .decimal(value)
+        case let value as String:
+            .string(value)
+        case let value as [Any]:
+            .array(value.map(LassoValue.from(json:)))
+        case let value as [String: Any]:
+            .map(value.mapValues(LassoValue.from(json:)))
+        default:
+            .null
         }
     }
 }
@@ -351,6 +427,18 @@ public struct LassoContext: Sendable {
     /// catch handler has already reset `currentError` for code that follows.
     public var currentError: LassoErrorState
     public var lastError: LassoErrorState?
+    /// `(sessionName, varName)` pairs registered via `session_addVar` this
+    /// request — read back by `finalizeSessions()` at the very end of
+    /// render so the persisted value reflects whatever the page last set
+    /// it to, not just its value at registration time.
+    var trackedSessionVariables: [(session: String, varName: String)]
+    /// Sessions `session_abort`/`session_end` was called on this request —
+    /// `finalizeSessions()` skips persisting tracked variables for these,
+    /// matching the documented "prevents saving" behavior.
+    var suppressedSessionSaves: Set<String>
+    /// The most recent `session_start` result per session name, so
+    /// `session_result` can report it without re-consulting the provider.
+    var sessionStartResults: [String: LassoSessionStartResult]
 
     public init(
         globals: [String: LassoValue] = [:],
@@ -384,6 +472,9 @@ public struct LassoContext: Sendable {
         selfStack = []
         currentError = .noError
         lastError = nil
+        trackedSessionVariables = []
+        suppressedSessionSaves = []
+        sessionStartResults = [:]
     }
 
     public mutating func setError(_ error: LassoErrorState) {
@@ -394,6 +485,20 @@ public struct LassoContext: Sendable {
     public mutating func clearError() {
         lastError = currentError
         currentError = .noError
+    }
+
+    /// Called once, at the very end of a page's render (`LassoRenderer`),
+    /// so tracked session variables persist their final value rather than
+    /// whatever they held at `session_addVar` time.
+    mutating func finalizeSessions() {
+        guard let sessionProvider else {
+            trackedSessionVariables = []
+            return
+        }
+        for tracked in trackedSessionVariables where suppressedSessionSaves.contains(tracked.session) == false {
+            sessionProvider.persist(value(for: tracked.varName), for: tracked.varName, session: tracked.session)
+        }
+        trackedSessionVariables = []
     }
 
     public subscript(_ name: String) -> LassoValue {
@@ -526,6 +631,14 @@ public extension Array where Element == EvaluatedArgument {
         contains { argument in
             argument.label?.caseInsensitiveCompare(name) == .orderedSame && argument.value.isTruthy
         }
+    }
+
+    /// The `index`th unlabeled (positional) argument's value, ignoring any
+    /// `-flag=value` arguments interspersed among them.
+    func positionalValue(at index: Int) -> LassoValue? {
+        let unlabeled = filter { $0.label == nil }
+        guard unlabeled.indices.contains(index) else { return nil }
+        return unlabeled[index].value
     }
 }
 

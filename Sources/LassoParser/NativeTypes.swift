@@ -64,7 +64,6 @@ public struct LassoNativeTypeRegistry: Sendable {
     private mutating func registerDefaultTypes() {
         register(Self.makeWebRequestType())
         register(Self.makeWebResponseType())
-        register(Self.makeSessionType())
     }
 }
 
@@ -286,19 +285,4 @@ extension LassoNativeTypeRegistry {
         return type
     }
 
-    // MARK: - session
-    //
-    // Same two members `nativeMember` already had (`value`/`get`) —
-    // relocated here unchanged, not expanded; session's fuller surface is
-    // out of scope for this pass.
-    fileprivate static func makeSessionType() -> LassoNativeType {
-        var type = LassoNativeType(name: "session")
-        type.register("value") { _, arguments, context in
-            context.sessionProvider?.value(for: firstArgumentString(arguments)) ?? .null
-        }
-        type.register("get") { _, arguments, context in
-            context.sessionProvider?.value(for: firstArgumentString(arguments)) ?? .null
-        }
-        return type
-    }
 }

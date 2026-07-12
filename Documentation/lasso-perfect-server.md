@@ -700,6 +700,101 @@ and stop only at the expected `inlineNotConfigured`, and one page still hits
 its previously-catalogued `unsupportedExpression("")` gap, unrelated to this
 change.
 
+**Implemented `session-upload-support-plan`'s Milestones 2-4** (the
+`PerfectSessionCore` session bridge). New target `LassoPerfectSession`
+bridges the synchronous evaluator to async `SessionDriver` storage:
+`LassoSessionPreflight.scan(document)` walks the parsed AST for literal
+`session_start(...)` calls before render runs; `PerfectBackedLassoSessionProvider`
+does the real async create/resume (`prepare`) and save/destroy (`finalize`)
+work around the still-synchronous `LassoRenderer.render` call, exposing
+only already-loaded state through the (redesigned) `LassoSessionProvider`
+protocol. `render(fileURL:request:includePath:postBody:)` in
+`LassoPerfectServer/main.swift` is now `async` to host this. Real function
+surface: `session_start`, `session_id`, `session_result`, `session_addVar`,
+`session_removeVar`, `session_end`, `session_abort` — `LassoContext` gained
+`trackedSessionVariables`/`suppressedSessionSaves`/`sessionStartResults`
+and a `finalizeSessions()` hook the renderer calls once per render.
+`MemorySessionDriver` by default; `LASSO_SESSION_DRIVER=mysql` wires
+`MySQLSessionDriver` using the existing `LASSO_MYSQL_*` connection vars.
+Tracker cookies (`_LassoSessionTracker_<name>`) are set/cleared through the
+same `ServerResponseSink` that already handles `redirect_url`/`cookie_set`.
+
+**Correction, grounded in real docs before implementing:** the interpreter's
+pre-existing `session(name)` function and `session->value`/`get` native-type
+members modeled an unnamed, single-bucket key/value store that doesn't match
+Lasso's documented named-session contract (`session_start(name, ...)`,
+`session_addVar(sessionName, varName)` registering a variable for
+persistence rather than taking a value directly) — verified against
+`lassoguide.com/operations/sessions.html` per the plan's own "Sources
+Reviewed," not assumed. Removed the old shape and replaced it with the real
+one; the two existing tests and one smoke-script line that exercised the
+old (incorrect) behavior were rewritten to real semantics, not patched to
+keep the old assertions passing. Verified: 65/65 unit tests pass (new
+coverage: preflight-scan literal/dynamic cases, cross-request persistence
+via `MemorySessionDriver`, `session_end`/`session_abort`/`session_removeVar`).
+Real-corpus GET-request regression sweep re-run: identical to the
+pre-session-work baseline (19 of 28 top-level pages render cleanly, same 9
+failures for the same pre-existing, already-documented reasons) — no
+regression from making `render` async or adding the per-request
+`finalizeSessions()` hook. Live verification against a real MySQL session
+driver was not performed this pass (no live datasource credentials
+available in this session). Deferred: `-useLink`/`-useAuto` GET/POST
+`-lassosession` fallback tracking (only `-id` then cookie lookup is wired),
+`session_deleteExpired()`, and dynamically-computed `session_start`
+names/flags (the preflight scanner only recognizes literal arguments —
+documented in `LassoSessionPreflight`'s own doc comment).
+
+**Implemented `legacy-define-tag-type-plan`** (parenthesized-call and
+colon-call `Define_Tag`/`Define_Type`, all previously-blocking startup
+files). Real Lasso 8.5 documentation for the full `[Define_Tag]`/
+`[Define_Type]` parameter/flag surface was recovered from the local
+`References/Lasso/Lasso 8.5 Language Guide.pdf` (Chapters 57-58) —
+`brew install poppler` provided `pdftotext` in this environment, since no
+CLI text extractor was otherwise available. The actual blocker was bigger
+than the two openers' syntax: `LassoParser.swift`'s square-bracket
+handling only gave full statement/block-aware parsing to bodies opening
+with modern `define`, so any other multi-statement `[...]` body —
+including these, which real startup files wrap their entire content in —
+silently kept only its first statement. Fixed generally
+(`bodyOpensWithLegacyDefinition`), then `define_tag`/`define_type` lower
+into the exact same `LassoCustomTagDefinition`/`LassoTypeDefinition`/
+`LassoMethodDefinition`/`LassoDataMemberDefinition` models modern `define`
+already registers with (new `Sources/LassoParser/LegacyDefinitions.swift`)
+— no second runtime path. Colon-call-with-no-parens (`Define_Tag: 'name',
+-Required='x';`, distinct from `if:(...)`'s still-parenthesized colon
+form) needed its own recognition in `ScriptBodyParser.emitStatement`.
+
+Two real, load-bearing bugs surfaced and fixed along the way, not just
+missing syntax: `(Local: 'name')`/`(Var: 'name')` — Lasso 8's documented
+way to *read* a variable's current value — had never been implemented
+(`Evaluator.declare` only handled the assignment call shape, silently
+returning `.void` for a bare read; this blocks nearly every legacy Lasso 8
+tag/type body, which reads locals this way throughout); and constructor
+`params` (`Local('ip' = (Params->First ? Params->First | client_ip))`,
+needed for the real `getGeoIPInfo.inc` shape) — `Evaluator.instantiate` now
+binds a `params` local before evaluating data member defaults, and
+`.array->First` (needed to read it) was added alongside `size`/`get`.
+
+Verified via 4 new tests (69/69 total, no regressions) and full live
+verification: **all 10 real `LassoStartup` files now load with zero
+failures** (previously 3 failed with `unknownFunction("define_tag")`/
+`unknownFunction("define_type")`). Real-corpus GET-request sweep unchanged
+(19 of 28 top-level pages render cleanly, same 9 pre-existing failures for
+the same reasons). Deferred, matching the plan's own scope boundaries:
+`-Container`/`-Looping` (`Run_Children` container-tag calling convention —
+a real chicken-and-egg problem, since `BlockBuilder` recognizes block
+keywords at parse time while custom-tag registration happens at render
+time), `-Async`/`-Atomic`/`-RPC`/`-SOAP`/`-Priority`/`-Criteria` overload
+dispatch, parent/base type name and `-Prototype` on `Define_Type` (parsed,
+not acted on — no inheritance execution). A real dispatch nuance found but
+left alone: a constructor called with more positional arguments than a
+declared-zero-parameter `onCreate` silently skips `onCreate` entirely
+(arity-aware dispatch, same scoring ordinary method calls use) rather than
+passing extras through leniently the way real Lasso's docs describe — not
+hit by any of the three priority corpus fixtures, so left as a documented
+gap. See `Documentation/legacy-define-tag-type-plan.md`'s "Documented
+Flags And Parameters" section for the full classification.
+
 ## Next Compatibility Work
 
 1. Implement `[File_ProcessUploads]` (Lasso 8) and any equivalent move/copy
@@ -711,14 +806,13 @@ change.
    files on `deinit`, so the reader/temp-file handles must be retained
    through render). See `Documentation/session-upload-support-plan.md`
    Milestone 1.
-2. Evaluate whether legacy `define_tag('name', -flags) ... /define_tag`
-   (parenthesized-call style, blocks `_begin_tags.inc`'s `send_email2` and
-   all of `getGeoIPInfo.inc`) and legacy `define_type:`/`define_tag:`
-   colon-call style (blocks all of `js_timer.inc`) are worth real support,
-   given real corpus frequency — both are now precisely characterized (see
-   `Documentation/compatibility-matrix.md`) but neither is implemented;
-   deliberately deferred as a separate, larger follow-up (each is
-   effectively a second, Lasso-8-shaped type-definition sub-parser).
+2. Implement `-Container`/`-Looping` custom container tags
+   (`[Tag]...[/Tag]` with `[Run_Children]`) — deferred out of the legacy
+   `define_tag`/`define_type` pass since it needs a different mechanism
+   than `BlockBuilder`'s fixed parse-time keyword set (custom-tag
+   registration happens at render time). Also: `-Priority`/`-Criteria`
+   overload-chain dispatch, and `Define_Type`'s parent/base type name and
+   `-Prototype` (parsed, not acted on — no inheritance execution yet).
 3. Bridge `web_response->include*`/`sendFile` with the existing
    `include()`/`library()` machinery (currently in `Renderer.swift`'s
    `renderExpression`, not reachable from the Evaluator-level native-type

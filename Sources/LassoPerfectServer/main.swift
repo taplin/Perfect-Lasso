@@ -1,10 +1,13 @@
 import Foundation
 import LassoParser
 import LassoPerfectCRUD
+import LassoPerfectSession
 import PerfectCRUD
 import PerfectMySQL
 import PerfectNIO
 import NIOHTTP1
+import PerfectSessionCore
+import PerfectSessionMySQL
 
 struct ServerConfig: Sendable {
     let siteRoot: URL
@@ -22,6 +25,14 @@ struct ServerConfig: Sendable {
     /// disabled until a deployment explicitly opts in.
     let mysqlAllowWrites: Bool
     let mysqlAllowRawSQL: Bool
+    /// "memory" (default) or "mysql" — see Documentation/
+    /// session-upload-support-plan.md's Milestone 3. PostgreSQL/Redis/
+    /// SQLite session backends already exist in Perfect-Session but aren't
+    /// wired here yet (deferred: this adapter's only actually-configured
+    /// external datasource today is MySQL, via the same LASSO_MYSQL_* vars
+    /// reused below — adding the other three is the same mechanical
+    /// pattern, not a design gap, once a deployment needs one).
+    let sessionDriver: String
 
     static func load() throws -> ServerConfig {
         let env = ProcessInfo.processInfo.environment
@@ -56,7 +67,8 @@ struct ServerConfig: Sendable {
             mysqlUser: env["LASSO_MYSQL_USER"],
             mysqlPassword: env["LASSO_MYSQL_PASSWORD"],
             mysqlAllowWrites: Self.isTruthyEnv(env["LASSO_MYSQL_ALLOW_WRITES"]),
-            mysqlAllowRawSQL: Self.isTruthyEnv(env["LASSO_MYSQL_ALLOW_RAW_SQL"])
+            mysqlAllowRawSQL: Self.isTruthyEnv(env["LASSO_MYSQL_ALLOW_RAW_SQL"]),
+            sessionDriver: (env["LASSO_SESSION_DRIVER"] ?? "memory").lowercased()
         )
     }
 
@@ -86,10 +98,30 @@ struct LassoSiteServer: Sendable {
     /// and every site path this instance serves — not re-parsed or
     /// re-registered per request.
     let tagRegistry = LassoTagRegistry()
+    /// Also one instance for the process lifetime — `SessionDriver`
+    /// conformers (`MemorySessionDriver`, MySQL) are themselves the shared
+    /// storage, matching how a real Lasso instance's session store outlives
+    /// any single request.
+    let sessionDriver: any SessionDriver
 
     init(config: ServerConfig) throws {
         self.config = config
         includeLoader = try LassoFileSystemIncludeLoader(root: config.siteRoot)
+
+        switch config.sessionDriver {
+        case "mysql":
+            // MySQLSessionDriver reads connection info from these process-
+            // global statics (matching PerfectSessionCore's own SessionConfig
+            // pattern) rather than taking them in its initializer.
+            MySQLSessionConnector.host = config.mysqlHost
+            if let port = config.mysqlPort { MySQLSessionConnector.port = port }
+            MySQLSessionConnector.database = config.mysqlDatabase
+            MySQLSessionConnector.username = config.mysqlUser ?? ""
+            MySQLSessionConnector.password = config.mysqlPassword ?? ""
+            sessionDriver = MySQLSessionDriver()
+        default:
+            sessionDriver = MemorySessionDriver()
+        }
 
         if let alias = config.datasourceAlias, config.mysqlDatabase.isEmpty == false {
             @Sendable func makeDatabase() throws -> Database<MySQLDatabaseConfiguration> {
@@ -173,7 +205,7 @@ struct LassoSiteServer: Sendable {
             resolvedFileURL = fileURL
             if shouldRender(fileURL) {
                 let postBody = try await readPostBody(request: request)
-                return try render(fileURL: fileURL, request: request, includePath: path, postBody: postBody)
+                return try await render(fileURL: fileURL, request: request, includePath: path, postBody: postBody)
             }
             return try FileOutput(localPath: fileURL.path)
         } catch let error as ErrorOutput {
@@ -296,7 +328,7 @@ struct LassoSiteServer: Sendable {
         request: any HTTPRequest,
         includePath: String,
         postBody: ParsedPostBody
-    ) throws -> HTTPOutput {
+    ) async throws -> HTTPOutput {
         let source = try String(contentsOf: fileURL, encoding: .utf8)
         let document = LassoParser().parse(source)
         // Kept as a local so its collected status/redirect/headers/cookies
@@ -306,11 +338,30 @@ struct LassoSiteServer: Sendable {
         // cookie_set never actually affected the HTTP response despite
         // correctly mutating this same (reference-type) sink instance.
         let sink = ServerResponseSink()
+
+        // Session preflight: real create/resume against SessionDriver is
+        // async, the renderer/evaluator is not — scan for literal
+        // session_start(...) calls and load them now, before the sync
+        // render runs. See Documentation/session-upload-support-plan.md
+        // and Sources/LassoPerfectSession/PerfectBackedLassoSessionProvider.swift.
+        let sessionCalls = LassoSessionPreflight.scan(document)
+        let sessionBridge: PerfectBackedLassoSessionProvider? = sessionCalls.isEmpty ? nil : PerfectBackedLassoSessionProvider()
+        if let sessionBridge {
+            await sessionBridge.prepare(
+                calls: sessionCalls,
+                driver: sessionDriver,
+                cookies: request.cookies,
+                remoteAddress: request.remoteAddress?.ipAddress ?? "",
+                userAgent: request.headers["user-agent"].first ?? ""
+            )
+        }
+
         var context = LassoContext(
             globals: baseGlobals(for: request),
             includeLoader: includeLoader,
             includePath: includePath,
             requestProvider: ServerRequestProvider(request: request, postBody: postBody),
+            sessionProvider: sessionBridge,
             responseSink: sink,
             inlineProvider: inlineProvider,
             tagRegistry: tagRegistry
@@ -325,6 +376,27 @@ struct LassoSiteServer: Sendable {
                 parserDiagnostics: document.diagnostics.map(\.message)
             )
         }
+
+        if let sessionBridge {
+            let actions = await sessionBridge.finalize(driver: sessionDriver)
+            for action in actions {
+                let cookieName = "_LassoSessionTracker_\(action.call.name)"
+                if action.shouldClearCookie {
+                    try? sink.setCookie(
+                        name: cookieName, value: "",
+                        domain: action.call.domain, expires: "Thu, 01 Jan 1970 00:00:00 GMT",
+                        path: action.call.path ?? "/", secure: action.call.secure, httpOnly: action.call.httpOnly
+                    )
+                } else if let token = action.token {
+                    try? sink.setCookie(
+                        name: cookieName, value: token,
+                        domain: action.call.domain, expires: action.call.cookieExpires,
+                        path: action.call.path ?? "/", secure: action.call.secure, httpOnly: action.call.httpOnly
+                    )
+                }
+            }
+        }
+
         if let redirectURL = sink.redirectURL {
             return RedirectOutput(to: redirectURL, status: .found)
         }
@@ -696,4 +768,6 @@ if let alias = config.datasourceAlias {
 } else {
     print("Datasource alias: none")
 }
+print("Session driver: \(config.sessionDriver)")
+await siteServer.sessionDriver.setup()
 try await Server(routes: try siteServer.routes(), port: config.port).run()

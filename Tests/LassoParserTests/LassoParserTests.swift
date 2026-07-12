@@ -2,7 +2,9 @@ import Foundation
 import Testing
 @testable import LassoParser
 import LassoPerfectCRUD
+import LassoPerfectSession
 import PerfectCRUD
+import PerfectSessionCore
 
 @Test func allFixturesParseWithoutDiagnostics() throws {
     let fixtureURL = try #require(Bundle.module.resourceURL?.appendingPathComponent("Fixtures"))
@@ -183,15 +185,18 @@ import PerfectCRUD
     }
 
     final class SessionProvider: LassoSessionProvider, @unchecked Sendable {
-        private var values: [String: LassoValue] = [:]
-
-        func value(for name: String) -> LassoValue {
-            values[name.lowercased()] ?? .null
+        private var startedNames: Set<String> = []
+        func start(session name: String) -> LassoSessionStartResult? {
+            let isNew = startedNames.contains(name) == false
+            startedNames.insert(name)
+            return LassoSessionStartResult(sessionID: "fake-\(name)", isNew: isNew)
         }
-
-        func set(_ value: LassoValue, for name: String) throws {
-            values[name.lowercased()] = value
-        }
+        func id(session name: String) -> String? { startedNames.contains(name) ? "fake-\(name)" : nil }
+        func restoredValue(for varName: String, session name: String) -> LassoValue? { nil }
+        func persist(_ value: LassoValue, for varName: String, session name: String) {}
+        func removeVar(_ varName: String, session name: String) {}
+        func end(session name: String) { startedNames.remove(name) }
+        func abort(session name: String) {}
     }
 
     var context = LassoContext(
@@ -218,7 +223,7 @@ import PerfectCRUD
     #expect(requestOutput == "clogs|example.test|example.test|abc123")
 
     let sessionOutput = try LassoRenderer().render(
-        "[session_addvar:'cart','open'][session:'cart']",
+        "[session_start('cart')][var(cartvalue = 'open')][session_addvar('cart','cartvalue')][cartvalue]",
         context: &context
     )
     #expect(sessionOutput == "open")
@@ -714,6 +719,102 @@ import PerfectCRUD
     ).trimmingCharacters(in: .whitespacesAndNewlines)
 
     #expect(output == "Ada|Hello, Ada|Hi, Ada|integer|any")
+}
+
+@Test func legacyDefineTagParenthesizedRegistersStandaloneTag() throws {
+    var context = LassoContext()
+    let output = try LassoRenderer().render(
+        """
+        [
+        Define_Tag('Greet', -Required='Name', -Optional='Greeting');
+            Return((Local_Defined: 'Greeting') ? (Local: 'Greeting') + ', ' + (Local: 'Name') | 'Hello, ' + (Local: 'Name'));
+        /Define_Tag;
+        ]
+        [Greet: 'Ada']|[Greet: 'Ada', 'Hi']
+        """,
+        context: &context
+    ).trimmingCharacters(in: .whitespacesAndNewlines)
+
+    #expect(output == "Hello, Ada|Hi, Ada")
+}
+
+@Test func legacyDefineTagColonCallRegistersStandaloneTagWithTypeConstrainedParameters() throws {
+    // Real corpus shape (see Documentation/legacy-define-tag-type-plan.md,
+    // "Parenthesized Legacy Custom Tag" and colon-call variants): no
+    // enclosing parens after the colon, -Required/-Type pairs declaring
+    // typed parameters.
+    var context = LassoContext()
+    let output = try LassoRenderer().render(
+        """
+        [
+        Define_Tag: 'Ex_Sum', -Required='A', -Type='integer', -Required='B', -Type='integer';
+            Return((Local: 'A') + (Local: 'B'));
+        /Define_Tag;
+        ]
+        [Ex_Sum: 3, 4]
+        """,
+        context: &context
+    ).trimmingCharacters(in: .whitespacesAndNewlines)
+
+    #expect(output == "7")
+}
+
+@Test func legacyDefineTypeParenthesizedRegistersDataMembersAndMethodsWithConstructorParams() throws {
+    // Scrubbed version of the real getGeoIPInfo.inc shape: a data member
+    // default that reads the constructor's own `params` (Documentation/
+    // legacy-define-tag-type-plan.md's "Constructor params" note), plus a
+    // nested define_tag method reading/writing instance data via self.
+    var context = LassoContext()
+    let output = try LassoRenderer().render(
+        """
+        [
+        Define_Type('Ex_Info');
+            Local(
+                'label' = (Params->First ? Params->First | 'default'),
+                'country' = 'unknown'
+            );
+            Define_Tag('describe');
+                Self->'country' = 'US';
+                Return((Self->'label') + '/' + (Self->'country'));
+            /Define_Tag;
+        /Define_Type;
+        ]
+        [Local(withArg = Ex_Info('custom'))][Local(withoutArg = Ex_Info())][#withArg->describe]|[#withoutArg->describe]
+        """,
+        context: &context
+    ).trimmingCharacters(in: .whitespacesAndNewlines)
+
+    #expect(output == "custom/US|default/US")
+}
+
+@Test func legacyDefineTypeColonCallRegistersTypeAndMethods() throws {
+    // Scrubbed version of the real js_timer.inc shape: colon-call
+    // define_type with a parent/base type name and -prototype flag
+    // (parsed, not yet acted on — see the plan's deferred inheritance
+    // note), a colon-call local: data member, and colon-call define_tag:
+    // methods using parenthesized self->'member' assignment.
+    var context = LassoContext()
+    let output = try LassoRenderer().render(
+        """
+        [
+        define_type: 'Ex_Timer', 'integer', -prototype;
+            local: 'ticks'=0;
+
+            define_tag: 'bump';
+                (self->'ticks') = (self->'ticks') + 1;
+            /define_tag;
+
+            define_tag: 'value';
+                return: (self->'ticks');
+            /define_tag;
+        /define_type;
+        ]
+        [Local(t = Ex_Timer())][#t->bump][#t->bump][#t->value]
+        """,
+        context: &context
+    ).trimmingCharacters(in: .whitespacesAndNewlines)
+
+    #expect(output == "2")
 }
 
 @Test func customTagRecursionSucceedsAndDeepRecursionThrows() throws {
@@ -1534,21 +1635,114 @@ import PerfectCRUD
     #expect(output == "BEFORE")
 }
 
-@Test func sessionMembersStillWorkAfterMovingOffNativeMember() throws {
-    // Regression guard: session->value/get used to be handled by the
-    // now-deleted nativeMember string switch; confirm identical behavior
-    // now that they're registered on the native session type instead.
+@Test func sessionRemoveVarStopsPersistingAndEndDestroysTheSession() throws {
     final class SessionProvider: LassoSessionProvider, @unchecked Sendable {
-        private var values: [String: LassoValue] = [:]
-        func value(for name: String) -> LassoValue { values[name.lowercased()] ?? .null }
-        func set(_ value: LassoValue, for name: String) throws { values[name.lowercased()] = value }
+        private(set) var persisted: [String: [String: LassoValue]] = [:]
+        private(set) var endedNames: Set<String> = []
+        private var startedNames: Set<String> = []
+        func start(session name: String) -> LassoSessionStartResult? {
+            let isNew = startedNames.contains(name) == false
+            startedNames.insert(name)
+            return LassoSessionStartResult(sessionID: "fake-\(name)", isNew: isNew)
+        }
+        func id(session name: String) -> String? { startedNames.contains(name) ? "fake-\(name)" : nil }
+        func restoredValue(for varName: String, session name: String) -> LassoValue? { nil }
+        func persist(_ value: LassoValue, for varName: String, session name: String) {
+            persisted[name, default: [:]][varName] = value
+        }
+        func removeVar(_ varName: String, session name: String) {
+            persisted[name]?[varName] = nil
+        }
+        func end(session name: String) { endedNames.insert(name) }
+        func abort(session name: String) {}
     }
-    var context = LassoContext(sessionProvider: SessionProvider())
-    let output = try LassoRenderer().render(
-        "[session_addvar:'cart','open'][session->value('cart')]/[session->get('cart')]",
-        context: &context
+
+    // removeVar: registered then removed before render ends — never persisted.
+    let removeProvider = SessionProvider()
+    var removeContext = LassoContext(sessionProvider: removeProvider)
+    _ = try LassoRenderer().render(
+        "[session_start('cart')][var(a = 'x')][session_addvar('cart','a')][session_removevar('cart','a')]",
+        context: &removeContext
     )
-    #expect(output == "open/open")
+    #expect(removeProvider.persisted["cart"] == nil)
+
+    // end: the provider is told the session ended; the real destroy/cookie
+    // clearing happens at the server boundary (PerfectBackedLassoSessionProvider),
+    // not here — this only proves the native reaches the provider.
+    let endProvider = SessionProvider()
+    var endContext = LassoContext(sessionProvider: endProvider)
+    _ = try LassoRenderer().render("[session_start('cart')][session_end('cart')]", context: &endContext)
+    #expect(endProvider.endedNames.contains("cart"))
+}
+
+@Test func sessionPreflightScanFindsLiteralSessionStartCalls() {
+    let document = LassoParser().parse(
+        "<?lassoscript session_start('cart', -expires=3600, -secure=true, -domain='example.test') ?>"
+    )
+    let calls = LassoSessionPreflight.scan(document)
+    #expect(calls.count == 1)
+    #expect(calls.first?.name == "cart")
+    #expect(calls.first?.expiresSeconds == 3600)
+    #expect(calls.first?.secure == true)
+    #expect(calls.first?.domain == "example.test")
+    #expect(calls.first?.useCookie == true)
+}
+
+@Test func sessionPreflightScanIgnoresDynamicSessionNames() {
+    // A documented limitation, not a crash — see LassoSessionPreflight's
+    // doc comment and Documentation/session-upload-support-plan.md.
+    let document = LassoParser().parse("<?lassoscript session_start(var(name)) ?>")
+    #expect(LassoSessionPreflight.scan(document).isEmpty)
+}
+
+@Test func perfectBackedSessionProviderPersistsVariablesAcrossTwoRequestsViaMemoryDriver() async throws {
+    let driver = MemorySessionDriver()
+    let call = LassoSessionStartCall(name: "cart")
+
+    // Request 1: new session, register+set a variable, finalize (saves it).
+    let firstBridge = PerfectBackedLassoSessionProvider()
+    await firstBridge.prepare(calls: [call], driver: driver, cookies: [:], remoteAddress: "", userAgent: "")
+    var firstContext = LassoContext(sessionProvider: firstBridge)
+    let firstOutput = try LassoRenderer().render(
+        "[session_start('cart')][var(total = 3)][session_addvar('cart','total')][total]",
+        context: &firstContext
+    )
+    #expect(firstOutput == "3")
+    let firstActions = await firstBridge.finalize(driver: driver)
+    guard let token = firstActions.first(where: { $0.call.name == "cart" })?.token else {
+        Issue.record("Expected a tracker token from finalize")
+        return
+    }
+
+    // Request 2: resumes via the cookie the first request would have set —
+    // the previously-persisted variable should come back without the page
+    // setting it again.
+    let secondBridge = PerfectBackedLassoSessionProvider()
+    await secondBridge.prepare(
+        calls: [call], driver: driver,
+        cookies: ["_LassoSessionTracker_cart": token],
+        remoteAddress: "", userAgent: ""
+    )
+    var secondContext = LassoContext(sessionProvider: secondBridge)
+    let secondOutput = try LassoRenderer().render(
+        "[session_start('cart')][session_addvar('cart','total')][total]",
+        context: &secondContext
+    )
+    #expect(secondOutput == "3")
+}
+
+@Test func perfectBackedSessionProviderEndDestroysSessionAndClearsCookie() async throws {
+    let driver = MemorySessionDriver()
+    let call = LassoSessionStartCall(name: "cart")
+
+    let bridge = PerfectBackedLassoSessionProvider()
+    await bridge.prepare(calls: [call], driver: driver, cookies: [:], remoteAddress: "", userAgent: "")
+    var context = LassoContext(sessionProvider: bridge)
+    _ = try LassoRenderer().render("[session_start('cart')][session_end('cart')]", context: &context)
+    let actions = await bridge.finalize(driver: driver)
+    let action = actions.first(where: { $0.call.name == "cart" })
+    #expect(action?.shouldClearCookie == true)
+    #expect(action?.token == nil)
 }
 
 @Test func protectCatchesRecoverableErrorAndSetsCurrentError() throws {

@@ -418,9 +418,51 @@ public extension LassoRequestProvider {
     var contentLength: Int { 0 }
 }
 
+public struct LassoSessionStartResult: Equatable, Sendable {
+    public let sessionID: String
+    public let isNew: Bool
+
+    public init(sessionID: String, isNew: Bool) {
+        self.sessionID = sessionID
+        self.isNew = isNew
+    }
+}
+
+/// Real Lasso sessions are named (`session_start(name, ...)`), each backing
+/// a set of persisted thread variables (`session_addVar(name, varName)`) —
+/// see `Documentation/session-upload-support-plan.md`'s "Lasso Session
+/// Semantics". The evaluator is synchronous but real session storage
+/// (`PerfectSessionCore.SessionDriver`) is async, so conformers are expected
+/// to do the actual create/resume/save work at the server boundary (before
+/// and after the synchronous render call) and expose only already-loaded,
+/// synchronous state through this protocol.
+///
+/// Replaces an earlier `value(for:)`/`set(_:for:)` single-unnamed-session
+/// shape that didn't match Lasso's documented `sessionName`/`varName`
+/// contract (it was an unverified placeholder, not a considered design —
+/// see `lasso-adapter-feedback` project memory on verifying real Lasso
+/// semantics against docs before building on top of a guess).
 public protocol LassoSessionProvider: Sendable {
-    func value(for name: String) -> LassoValue
-    func set(_ value: LassoValue, for name: String) throws
+    /// Starts (creates or resumes) a named session. Returns `nil` if `name`
+    /// was never prepared for this request (e.g. missed by preflight
+    /// scanning for `session_start` calls) — callers should treat that as
+    /// "session unavailable," not fabricate one on the spot.
+    func start(session name: String) -> LassoSessionStartResult?
+    func id(session name: String) -> String?
+    /// The value restored from a resumed session for `varName`, or `nil` for
+    /// a new session, an ended/aborted one, or a name never persisted before.
+    func restoredValue(for varName: String, session name: String) -> LassoValue?
+    /// Records the current value of `varName` to persist into `name`'s
+    /// session data when the request ends (skipped if `abort`/`end` was
+    /// called for that session this request).
+    func persist(_ value: LassoValue, for varName: String, session name: String)
+    func removeVar(_ varName: String, session name: String)
+    /// Ends the session: stops future saves and destroys stored state.
+    func end(session name: String)
+    /// Prevents saving for this session (e.g. after a partial failure) but
+    /// does not destroy already-stored state, matching the documented
+    /// difference between `session_abort` and `session_end`.
+    func abort(session name: String)
 }
 
 /// Real Lasso's `web_response` exposes ~20 documented members; same

@@ -17,6 +17,7 @@ public struct LassoRenderer: Sendable {
         if let returned = engine.evaluator.context.consumeReturnSignal() {
             output += returned.outputString
         }
+        engine.evaluator.context.finalizeSessions()
         context = engine.evaluator.context
         return output
     }
@@ -131,6 +132,37 @@ private struct RendererEngine {
                 name: tagName,
                 parameters: Array(arguments.dropFirst()),
                 body: body
+            ))
+            return ""
+        case "define_tag":
+            // A standalone legacy custom tag (`Define_Tag('name', -flags)
+            // ... /Define_Tag`), reusing the exact model modern `define`
+            // already registers with — see LegacyDefinitions.swift and
+            // Documentation/legacy-define-tag-type-plan.md. A `define_tag`
+            // nested inside a `define_type` body never reaches here: the
+            // "define_type" case below walks its own body directly rather
+            // than delegating to this generic block-name switch.
+            guard case let .string(tagName)? = arguments.first?.value else { return "" }
+            evaluator.context.tagRegistry.registerTag(LassoCustomTagDefinition(
+                name: tagName,
+                parameters: LegacyDefinitions.translateParameters(Array(arguments.dropFirst())),
+                body: body
+            ))
+            return ""
+        case "define_type":
+            // `Define_Type('name', ...) ... /Define_Type` — legacy parenthesized
+            // or colon-call type definition. Any positional string arguments
+            // after the name (parent/base type names) and flags like
+            // -Prototype are parsed but not yet acted on (deferred — see
+            // Documentation/legacy-define-tag-type-plan.md's "Recommended
+            // Scope Boundaries"). The body is walked directly (not rendered)
+            // so nested define_tag blocks become methods, not standalone tags.
+            guard case let .string(typeName)? = arguments.first?.value else { return "" }
+            let lowered = LegacyDefinitions.lowerTypeBody(body)
+            evaluator.context.tagRegistry.registerType(LassoTypeDefinition(
+                name: typeName,
+                dataMembers: lowered.dataMembers,
+                methods: lowered.methods
             ))
             return ""
         case "inline":

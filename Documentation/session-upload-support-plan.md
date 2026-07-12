@@ -15,11 +15,65 @@ all live, tested, and live-verified against a real `curl -F` multipart
 upload. `[File_ProcessUploads]` (moving files) deliberately not
 implemented — this pass is metadata only.
 
-Still open: Milestones 2-4 (the `PerfectSessionCore` session bridge),
-sequenced last per the architect's dependency analysis — sessions interact
-with the error/transaction model from `error-protect-model-plan`/
-`inline-write-raw-sql-plan`, better designed against the real thing than
-guessed at in isolation.
+**Milestones 2-4 (2026-07-12): the `PerfectSessionCore` session bridge is
+implemented.** New target `LassoPerfectSession` (`Package.swift`) bridges
+`LassoParser`'s synchronous evaluator to `PerfectSessionCore.SessionDriver`
+(async): `LassoSessionPreflight.scan(document)` (`Sources/LassoParser/
+SessionPreflight.swift`) walks the parsed AST for literal `session_start(...)`
+calls before render; `PerfectBackedLassoSessionProvider` (`Sources/
+LassoPerfectSession/PerfectBackedLassoSessionProvider.swift`) does the real
+async create/resume (`prepare`, before render) and save/destroy (`finalize`,
+after render) work, exposing only synchronous, already-loaded state to the
+evaluator through the (redesigned) `LassoSessionProvider` protocol.
+`lasso-perfect-server`'s `render` is now `async` to host this; it wires the
+bridge in only when a page's preflight scan actually finds a
+`session_start` call (`Sources/LassoPerfectServer/main.swift`).
+
+Real, documented free-function surface implemented: `session_start`,
+`session_id`, `session_result`, `session_addVar` (corrected to its real
+two-argument `(sessionName, varName)` form — see below), `session_removeVar`,
+`session_end`, `session_abort`. `LassoContext` gained `trackedSessionVariables`/
+`suppressedSessionSaves`/`sessionStartResults` and a `finalizeSessions()`
+hook the renderer calls once per render, after the return-signal is consumed.
+`MemorySessionDriver` (default) and `MySQLSessionDriver` (`LASSO_SESSION_DRIVER=mysql`,
+reusing the existing `LASSO_MYSQL_*` connection vars) are wired at the server
+boundary — PostgreSQL/Redis/SQLite backends already exist in Perfect-Session
+but aren't wired here yet (deferred: this adapter has no other configured use
+of those three; adding one is the same mechanical pattern once a deployment
+needs it, not a design gap).
+
+**A real correction, not just an addition:** the interpreter's pre-existing
+`session(name)` free function and `session->value`/`get` native-type members
+did not match Lasso's documented session contract at all — they modeled an
+unnamed, single-bucket key/value store (`session_addvar(varName, value)`
+directly set a value), when real Lasso sessions are named
+(`session_start(name, ...)`) and `session_addVar(sessionName, varName)`
+registers an *existing* variable for end-of-request persistence, it does not
+take a value. That earlier shape was an unverified placeholder (its own code
+comment already flagged it as "out of scope for this pass"), not a
+considered design — verified against `lassoguide.com/operations/sessions.html`
+(cited in this plan's own "Sources Reviewed") before implementing. `session(name)`
+and the native `session` type were removed outright and replaced with the
+real, named-session surface above; the two tests and the one smoke-script
+line that exercised the old (incorrect) contract were rewritten to the real
+one, not just patched to keep passing.
+
+Deferred, with reasons: `-Key`-style multi-session `-useLink`/`-useAuto`
+GET/POST `-lassosession` fallback tracking (only `-id` then cookie lookup is
+implemented; the documented third fallback needs the request's query/post
+pairs threaded into the preflight scan, not yet wired); `session_deleteExpired()`
+(a cross-request maintenance operation, not naturally scoped to one request's
+session bridge); dynamically-computed session names/flag values in
+`session_start(...)` (the preflight scanner only recognizes literal
+arguments — documented directly in `LassoSessionPreflight`'s doc comment,
+not a silent gap). Verified via 65/65 unit tests (new: preflight-scan
+coverage, `PerfectBackedLassoSessionProvider` persistence across two
+simulated requests via `MemorySessionDriver`, end/abort/removeVar) and a
+real-corpus GET-request regression sweep showing no change from the
+pre-session-work baseline (same 19/28 pages render cleanly, same 9 failures
+for the same pre-existing reasons) — live verification against a real MySQL
+session driver was not performed this pass (no live datasource credentials
+in this session, matching the same call made for `inline-write-raw-sql-plan`).
 
 ## Goal
 

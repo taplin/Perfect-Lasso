@@ -89,16 +89,29 @@ struct SmokeRequestProvider: LassoRequestProvider {
     }
 }
 
+/// A minimal, always-available session fixture — unlike
+/// `PerfectBackedLassoSessionProvider` (real create/resume via
+/// `PerfectSessionCore.SessionDriver`), this smoke stub treats any name as
+/// startable and never resumes prior state, which is enough to exercise
+/// the wiring end to end without a real HTTP request/response cycle.
 final class SmokeSessionProvider: LassoSessionProvider, @unchecked Sendable {
-    private var values: [String: LassoValue] = [:]
+    private var startedNames: Set<String> = []
 
-    func value(for name: String) -> LassoValue {
-        values[name.lowercased()] ?? .null
+    func start(session name: String) -> LassoSessionStartResult? {
+        let isNew = startedNames.contains(name) == false
+        startedNames.insert(name)
+        return LassoSessionStartResult(sessionID: "smoke-\(name)", isNew: isNew)
     }
 
-    func set(_ value: LassoValue, for name: String) throws {
-        values[name.lowercased()] = value
+    func id(session name: String) -> String? {
+        startedNames.contains(name) ? "smoke-\(name)" : nil
     }
+
+    func restoredValue(for varName: String, session name: String) -> LassoValue? { nil }
+    func persist(_ value: LassoValue, for varName: String, session name: String) {}
+    func removeVar(_ varName: String, session name: String) {}
+    func end(session name: String) { startedNames.remove(name) }
+    func abort(session name: String) {}
 }
 
 var backendContext = LassoContext(
@@ -124,10 +137,10 @@ let requestOutput = try LassoRenderer().render(
 precondition(requestOutput == "clogs|example.test|abc123", "Request provider rendering failed")
 
 let sessionOutput = try LassoRenderer().render(
-    "[session_addvar:'cart','open'][session:'cart']",
+    "[session_start('cart')][var(cartvalue = 'open')][session_addvar('cart','cartvalue')][cartvalue]/[session_id('cart')]",
     context: &backendContext
 )
-precondition(sessionOutput == "open", "Session provider rendering failed")
+precondition(sessionOutput == "open/smoke-cart", "Session provider rendering failed")
 
 let inlineSource = "[inline:-search,-database='demo',-table='items',-op='eq',-active='yes',-sortfield='name']" +
     "[records][field:'name']:[field:'qty'];[/records]([found_count])[/inline]"
@@ -544,9 +557,13 @@ let secondRequestOutput = try renderAgainstSharedRegistry(
 )
 precondition(firstRequestOutput == "42", "Library-defined tag call failed: \(firstRequestOutput)")
 precondition(secondRequestOutput == "20", "Library-defined tag call failed on second request: \(secondRequestOutput)")
+// loadedLibraries dedup is per-LassoContext (per-request), not on the
+// shared tagRegistry — see Documentation/lasso-perfect-server.md's
+// "library() per-process caching" fix. Two independent contexts each
+// load the library once, even though they share the same tagRegistry.
 precondition(
-    countingLoader.loadCount == 1,
-    "Expected library to load exactly once across two independent contexts sharing one registry, got \(countingLoader.loadCount)"
+    countingLoader.loadCount == 2,
+    "Expected library to load once per independent context, got \(countingLoader.loadCount)"
 )
 
 // MARK: - include(): always re-read and re-rendered (it can produce output

@@ -317,10 +317,32 @@ struct ScriptBodyParser {
         guard !trimmed.isEmpty else { return }
         var parser = ExpressionParser(normalizeReturn(trimmed))
         let expressions = parser.parseList()
-        if !expressions.isEmpty {
+        guard expressions.count == 1 else {
+            if !expressions.isEmpty {
+                nodes.append(.code(expressions, .lasso9, delimiter, range))
+            }
+            return
+        }
+        // Legacy `define_tag`/`define_type` openers commonly use Lasso 8's
+        // bare colon-call convention with no enclosing parens at all
+        // (`Define_Tag: 'name', -Required='x';`), unlike `parseBlockOpening`'s
+        // `if:(...)`/`loop:(...)` handling, which still requires parens
+        // after the colon. That shape parses fine as an ordinary call
+        // expression here — it just needs to become a `.tag(...)` node
+        // (matching `parseBlockOpening`'s output) instead of `.code(...)`
+        // so BlockBuilder can pair it with its `/define_tag;` closer. See
+        // Documentation/legacy-define-tag-type-plan.md.
+        switch expressions[0] {
+        case let .call(.identifier(name), arguments) where Self.legacyDefinitionNames.contains(name.lowercased()):
+            nodes.append(.tag(name: name, arguments: arguments, closing: false, dialect: .lasso8, range: range))
+        case let .identifier(name) where Self.legacyDefinitionNames.contains(name.lowercased()):
+            nodes.append(.tag(name: name, arguments: [], closing: false, dialect: .lasso8, range: range))
+        default:
             nodes.append(.code(expressions, .lasso9, delimiter, range))
         }
     }
+
+    private static let legacyDefinitionNames: Set<String> = ["define_tag", "define_type"]
 
     private func normalizeReturn(_ statement: String) -> String {
         guard statement.lowercased().hasPrefix("return ") else { return statement }
