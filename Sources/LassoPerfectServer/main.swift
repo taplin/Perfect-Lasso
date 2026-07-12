@@ -33,6 +33,16 @@ struct ServerConfig: Sendable {
     /// reused below — adding the other three is the same mechanical
     /// pattern, not a design gap, once a deployment needs one).
     let sessionDriver: String
+    /// `LASSO_CRAWL_REPORT=1` — after the server starts listening, request
+    /// every discovered site page over real HTTP (matching a browser's
+    /// plain GET), group results by first unsupported construct, print a
+    /// report, and exit. Replaces the manual `curl`-in-a-loop sweep used
+    /// throughout this project's development sessions. See
+    /// `Documentation/lasso-perfect-server.md`'s "Next Compatibility Work".
+    let crawlReportMode: Bool
+    /// Optional path to also write the full per-page JSON results to,
+    /// for diffing between runs. `LASSO_CRAWL_REPORT_PATH`.
+    let crawlReportOutputPath: String?
 
     static func load() throws -> ServerConfig {
         let env = ProcessInfo.processInfo.environment
@@ -68,7 +78,9 @@ struct ServerConfig: Sendable {
             mysqlPassword: env["LASSO_MYSQL_PASSWORD"],
             mysqlAllowWrites: Self.isTruthyEnv(env["LASSO_MYSQL_ALLOW_WRITES"]),
             mysqlAllowRawSQL: Self.isTruthyEnv(env["LASSO_MYSQL_ALLOW_RAW_SQL"]),
-            sessionDriver: (env["LASSO_SESSION_DRIVER"] ?? "memory").lowercased()
+            sessionDriver: (env["LASSO_SESSION_DRIVER"] ?? "memory").lowercased(),
+            crawlReportMode: Self.isTruthyEnv(env["LASSO_CRAWL_REPORT"]),
+            crawlReportOutputPath: env["LASSO_CRAWL_REPORT_PATH"]
         )
     }
 
@@ -429,6 +441,24 @@ struct LassoSiteServer: Sendable {
         )
         fputs(details.logLine + "\n", stderr)
 
+        // The crawl/report mode (LASSO_CRAWL_REPORT=1, see CrawlReport.swift)
+        // requests every page with Accept: application/json so it can read
+        // the first unsupported construct structurally instead of scraping
+        // the HTML error page meant for a developer's browser.
+        if request.headers["accept"].contains(where: { $0.contains("application/json") }) {
+            let payload: [String: String] = [
+                "errorType": details.errorType,
+                "errorDescription": details.errorDescription,
+            ]
+            let body = (try? JSONSerialization.data(withJSONObject: payload)) ?? Data("{}".utf8)
+            return BytesOutput(
+                head: HTTPHead(status: .internalServerError, headers: HTTPHeaders([
+                    ("Content-Type", "application/json; charset=utf-8"),
+                ])),
+                body: Array(body)
+            )
+        }
+
         let html = """
         <!doctype html>
         <html>
@@ -770,4 +800,21 @@ if let alias = config.datasourceAlias {
 }
 print("Session driver: \(config.sessionDriver)")
 await siteServer.sessionDriver.setup()
+
+if config.crawlReportMode {
+    print("Crawl report mode: requesting every discovered page once listening...")
+    Task {
+        // Give the NIO server a moment to actually bind before hitting it —
+        // there's no separate "ready" signal to await here.
+        try? await Task.sleep(for: .seconds(1))
+        let results = await CrawlReport.run(
+            baseURL: "http://localhost:\(config.port)",
+            siteRoot: config.siteRoot,
+            extensions: config.lassoExtensions
+        )
+        CrawlReport.printAndWrite(results, outputPath: config.crawlReportOutputPath)
+        exit(0)
+    }
+}
+
 try await Server(routes: try siteServer.routes(), port: config.port).run()

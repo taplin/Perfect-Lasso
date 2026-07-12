@@ -41,6 +41,12 @@ Environment variables:
   `catalog_mysql`.
 - `LASSO_MYSQL_HOST`, `LASSO_MYSQL_PORT`, `LASSO_MYSQL_DATABASE`,
   `LASSO_MYSQL_USER`, `LASSO_MYSQL_PASSWORD`: backend MySQL connection.
+- `LASSO_CRAWL_REPORT=1`: after the server starts listening, request every
+  discovered page (recursively, skipping underscore-prefixed include-only
+  files) over real HTTP, print a report grouped by the first unsupported
+  construct, and exit — see the crawl/report mode implementation note
+  below. `LASSO_CRAWL_REPORT_PATH` optionally writes the full per-page
+  JSON results to a file.
 
 ## Current Behavior
 
@@ -795,6 +801,49 @@ hit by any of the three priority corpus fixtures, so left as a documented
 gap. See `Documentation/legacy-define-tag-type-plan.md`'s "Documented
 Flags And Parameters" section for the full classification.
 
+**Implemented a crawl/report mode** (`LASSO_CRAWL_REPORT=1`), replacing the
+manual `curl`-in-a-loop sweeps used throughout this project's development
+sessions with a repeatable, built-in tool (`Sources/LassoPerfectServer/
+CrawlReport.swift`). Once the server starts listening, it recursively
+discovers every renderable page under `LASSO_SITE_ROOT` (skipping
+underscore-prefixed include-only files, the site's own convention),
+requests each with an ordinary GET plus `Accept: application/json` (so
+`developerErrorOutput` returns the first unsupported construct
+structurally instead of the developer's HTML error page), prints a report
+grouped by the *specific* construct (`unknownFunction("Output")`,
+`unsupportedExpression("{")`, etc. — not the broad Swift error type, which
+would lump dozens of distinct gaps into one `LassoRuntimeError` bucket),
+and exits. `LASSO_CRAWL_REPORT_PATH` optionally writes the full per-page
+JSON results to a file for diffing between runs. Redirects don't follow
+(a dedicated `URLSessionTaskDelegate` returns `nil` from
+`willPerformHTTPRedirection`) and count as clean, not a failure — a page
+redirecting (e.g. the bot-exclusion flow) is a real, intentional Lasso
+outcome, not a bug, and following it would either land on an unrelated
+page's result or loop back into "too many redirects" for anything that
+redirects toward itself.
+
+First real run against the full real site (recursive — 1,989 pages, far
+broader than any manual top-level-only sweep this project has done):
+**1,666 of 1,989 (83.8%) render cleanly.** Two things worth calling out
+from that run, not silently absorbed:
+- `unknownFunction("Output")` is the single largest *genuine* gap (44
+  pages) — `[Output]`/`Output(...)` (Chapter 14's "Table 1: Output Tags":
+  applies default encoding to any expression, sub-tag, or member tag
+  result) isn't implemented as a native at all yet. Not fixed this pass —
+  flagged here as the crawl's actual first finding, exactly what this tool
+  is for.
+- The `unsupportedExpression("{")`/`unsupportedExpression("[")` buckets
+  (45 and 40 pages) are mostly noise, not real Lasso gaps: third-party
+  vendor JS library demo pages (`assets/vendor/.../index.html`) that
+  happen to have a `.html` extension, which `LASSO_RENDER_EXTENSIONS`
+  includes by default, so this interpreter tries to parse their raw
+  JS/JSON as Lasso bracket syntax. The crawler discovers pages purely by
+  file extension under the site root; it doesn't (yet) distinguish real
+  Lasso content from vendored static assets that happen to share an
+  extension. Worth refining (e.g. an exclude-path option) if this becomes
+  the main sweep tool going forward, but not done this pass since it
+  wasn't the ask.
+
 ## Next Compatibility Work
 
 1. Implement `[File_ProcessUploads]` (Lasso 8) and any equivalent move/copy
@@ -824,8 +873,9 @@ Flags And Parameters" section for the full classification.
    researching the void/null fix above, still unimplemented here), rest
    parameters, or richer type/trait dispatch once a page actually
    exercises those constructs.
-5. Add a crawl/report mode that requests many site paths and records the first
-   unsupported construct per page.
+5. ~~Add a crawl/report mode that requests many site paths and records the
+   first unsupported construct per page.~~ Done — `LASSO_CRAWL_REPORT=1`,
+   see the implementation note above.
 6. Real corpus pages still hitting distinct gaps as of the
    `inline-write-raw-sql-plan` sweep: one page hits
    `unsupportedExpression("")`. Two pages that previously hit
@@ -837,3 +887,10 @@ Flags And Parameters" section for the full classification.
    distinct missing built-ins (`unknownFunction`), and three pages hit
    `fileNotFound` on missing include files on this local checkout (not
    interpreter bugs).
+7. Implement `[Output]`/`Output(...)` (Chapter 14's "Table 1: Output
+   Tags" — applies default encoding to any expression/sub-tag/member-tag
+   result). Found by the new crawl/report mode: the single largest
+   genuine gap in a full recursive site sweep (44 of 1,989 pages,
+   `unknownFunction("Output")`), distinct from the vendor-asset noise the
+   same sweep also surfaced (see the crawl/report implementation note
+   above).
