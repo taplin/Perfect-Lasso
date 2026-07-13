@@ -2363,6 +2363,143 @@ func perfectCRUDConnectorFailuresBecomeInlineErrorFrames(source: String, expecte
     #expect(LassoSessionPreflight.scan(document).isEmpty)
 }
 
+@Test func sessionPreflightScanRecognizesTheNameKeywordForm() {
+    // Real corpus shape (Documentation/outstanding-compatibility-project-plans.md
+    // item 7) — session_start's name spelled as -Name=, not positional,
+    // across every real page using it. Before adding the shared
+    // resolveSessionName helper, this returned zero calls (only
+    // positional names were recognized), so every one of these real
+    // pages silently found no preloaded session at render time.
+    let document = LassoParser().parse(
+        "[session_start(-Name='cart', -Expires=30, -UseCookie, -Path='/', -Domain='example.test')]"
+    )
+    let calls = LassoSessionPreflight.scan(document)
+    #expect(calls.count == 1)
+    #expect(calls.first?.name == "cart")
+    #expect(calls.first?.expiresSeconds == 30)
+    #expect(calls.first?.path == "/")
+    #expect(calls.first?.domain == "example.test")
+    #expect(calls.first?.useCookie == true)
+}
+
+@Test func sessionPreflightScanIgnoresANonLiteralNameKeywordValue() {
+    // -Name=var(x) mirrors the existing positional-form limitation
+    // (sessionPreflightScanIgnoresDynamicSessionNames) — only literal
+    // string names are visible to a parse-time scan either way.
+    let document = LassoParser().parse("<?lassoscript session_start(-Name=var(x)) ?>")
+    #expect(LassoSessionPreflight.scan(document).isEmpty)
+}
+
+@Test func sessionAddvarResolvesNameKeywordAndPositionalVarNameCorrectly() throws {
+    // Real corpus shape: Session_Addvar(-Name='cart', 'sort_by') — the
+    // session name is the -Name= keyword, the var name is the (only)
+    // positional argument. Before the fix, positionalValue(at: 0) would
+    // have read the var name ('sort_by') as the session name, and
+    // positionalValue(at: 1) would have found nothing, so varName stayed
+    // empty and the whole call silently no-opped.
+    final class SessionProvider: LassoSessionProvider, @unchecked Sendable {
+        private(set) var persisted: [String: [String: LassoValue]] = [:]
+        private var startedNames: Set<String> = []
+        func start(session name: String) -> LassoSessionStartResult? {
+            let isNew = startedNames.contains(name) == false
+            startedNames.insert(name)
+            return LassoSessionStartResult(sessionID: "fake-\(name)", isNew: isNew)
+        }
+        func id(session name: String) -> String? { startedNames.contains(name) ? "fake-\(name)" : nil }
+        func restoredValue(for varName: String, session name: String) -> LassoValue? { nil }
+        func persist(_ value: LassoValue, for varName: String, session name: String) {
+            persisted[name, default: [:]][varName] = value
+        }
+        func removeVar(_ varName: String, session name: String) {}
+        func end(session name: String) {}
+        func abort(session name: String) {}
+    }
+
+    let provider = SessionProvider()
+    var context = LassoContext(sessionProvider: provider)
+    _ = try LassoRenderer().render(
+        "[session_start(-Name='cart')][var(sort_by = 'newest')][session_addvar(-Name='cart', 'sort_by')]",
+        context: &context
+    )
+    #expect(provider.persisted["cart"]?["sort_by"]?.outputString == "newest")
+    #expect(provider.persisted["sort_by"] == nil, "the var name must not be mistaken for the session name")
+}
+
+@Test func sessionEndAndSessionIdResolveTheNameKeywordFormWithNoVarNameArgument() throws {
+    // Real corpus shapes: Session_ID(-Name='...') (used as an expression,
+    // e.g. embedded in a redirect URL) and Session_End(-Name='...') —
+    // keyword-only, no second (var-name) argument at all.
+    final class SessionProvider: LassoSessionProvider, @unchecked Sendable {
+        private(set) var endedNames: Set<String> = []
+        private var startedNames: Set<String> = []
+        func start(session name: String) -> LassoSessionStartResult? {
+            startedNames.insert(name)
+            return LassoSessionStartResult(sessionID: "fake-\(name)", isNew: true)
+        }
+        func id(session name: String) -> String? { startedNames.contains(name) ? "fake-\(name)" : nil }
+        func restoredValue(for varName: String, session name: String) -> LassoValue? { nil }
+        func persist(_ value: LassoValue, for varName: String, session name: String) {}
+        func removeVar(_ varName: String, session name: String) {}
+        func end(session name: String) { endedNames.insert(name) }
+        func abort(session name: String) {}
+    }
+
+    let provider = SessionProvider()
+    var context = LassoContext(sessionProvider: provider)
+    let output = try LassoRenderer().render(
+        "[session_start(-Name='cart')][Session_ID(-Name='cart')]",
+        context: &context
+    )
+    #expect(output == "fake-cart")
+
+    _ = try LassoRenderer().render("[session_end(-Name='cart')]", context: &context)
+    #expect(provider.endedNames.contains("cart"))
+}
+
+@Test func sessionRemoveVarAbortAndResultResolveTheNameKeywordForm() throws {
+    // No direct real corpus shape found for these three (unlike
+    // session_start/session_addvar/session_id/session_end above) — fixed
+    // anyway via the same shared resolver rather than leaving an
+    // arbitrary split between natives that recognize -Name= and ones that
+    // don't. See Documentation/outstanding-compatibility-project-plans.md
+    // item 7.
+    final class SessionProvider: LassoSessionProvider, @unchecked Sendable {
+        private(set) var persisted: [String: [String: LassoValue]] = [:]
+        private(set) var abortedNames: Set<String> = []
+        func start(session name: String) -> LassoSessionStartResult? {
+            LassoSessionStartResult(sessionID: "fake-\(name)", isNew: true)
+        }
+        func id(session name: String) -> String? { "fake-\(name)" }
+        func restoredValue(for varName: String, session name: String) -> LassoValue? { nil }
+        func persist(_ value: LassoValue, for varName: String, session name: String) {
+            persisted[name, default: [:]][varName] = value
+        }
+        func removeVar(_ varName: String, session name: String) {
+            persisted[name]?[varName] = nil
+        }
+        func end(session name: String) {}
+        func abort(session name: String) { abortedNames.insert(name) }
+    }
+
+    let provider = SessionProvider()
+    var context = LassoContext(sessionProvider: provider)
+    _ = try LassoRenderer().render(
+        "[session_start(-Name='cart')][var(a = 'x')][session_addvar(-Name='cart', 'a')]" +
+            "[session_removevar(-Name='cart', 'a')]",
+        context: &context
+    )
+    #expect(provider.persisted["cart"]?["a"] == nil)
+
+    _ = try LassoRenderer().render("[session_abort(-Name='cart')]", context: &context)
+    #expect(provider.abortedNames.contains("cart"))
+
+    let resultOutput = try LassoRenderer().render(
+        "[session_start(-Name='fresh')][session_result(-Name='fresh')->new]",
+        context: &context
+    )
+    #expect(resultOutput == "true")
+}
+
 @Test func perfectBackedSessionProviderPersistsVariablesAcrossTwoRequestsViaMemoryDriver() async throws {
     let driver = MemorySessionDriver()
     let call = LassoSessionStartCall(name: "cart")

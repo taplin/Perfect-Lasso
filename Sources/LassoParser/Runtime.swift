@@ -384,29 +384,30 @@ public struct LassoNativeRegistry: Sendable {
         // already-loaded, synchronous state LassoSessionProvider exposes.
         // See Documentation/session-upload-support-plan.md.
         register("session_start") { arguments, context in
-            let name = arguments.positionalValue(at: 0)?.outputString ?? ""
-            guard name.isEmpty == false else { return .void }
+            guard let resolved = resolveSessionName(in: arguments, stringValue: { $0.value.outputString }) else { return .void }
+            let name = resolved.name
             if let result = context.sessionProvider?.start(session: name) {
                 context.sessionStartResults[name.lowercased()] = result
             }
             return .void
         }
         register("session_id") { arguments, context in
-            let name = arguments.positionalValue(at: 0)?.outputString ?? ""
-            return context.sessionProvider?.id(session: name).map(LassoValue.string) ?? .void
+            guard let resolved = resolveSessionName(in: arguments, stringValue: { $0.value.outputString }) else { return .void }
+            return context.sessionProvider?.id(session: resolved.name).map(LassoValue.string) ?? .void
         }
         register("session_result") { arguments, context in
-            let name = arguments.positionalValue(at: 0)?.outputString ?? ""
-            guard let result = context.sessionStartResults[name.lowercased()] else { return .void }
+            guard let resolved = resolveSessionName(in: arguments, stringValue: { $0.value.outputString }) else { return .void }
+            guard let result = context.sessionStartResults[resolved.name.lowercased()] else { return .void }
             return .map([
                 "id": .string(result.sessionID),
                 "new": .boolean(result.isNew),
             ])
         }
         register("session_addvar") { arguments, context in
-            let name = arguments.positionalValue(at: 0)?.outputString ?? ""
-            let varName = arguments.positionalValue(at: 1)?.outputString ?? ""
-            guard name.isEmpty == false, varName.isEmpty == false else { return .void }
+            guard let resolved = resolveSessionName(in: arguments, stringValue: { $0.value.outputString }) else { return .void }
+            let name = resolved.name
+            let varName = resolved.remainingPositional.first?.value.outputString ?? ""
+            guard varName.isEmpty == false else { return .void }
             context.trackedSessionVariables.append((session: name, varName: varName))
             if let restored = context.sessionProvider?.restoredValue(for: varName, session: name) {
                 context.set(restored, for: varName, scope: .global)
@@ -414,22 +415,23 @@ public struct LassoNativeRegistry: Sendable {
             return .void
         }
         register("session_removevar") { arguments, context in
-            let name = arguments.positionalValue(at: 0)?.outputString ?? ""
-            let varName = arguments.positionalValue(at: 1)?.outputString ?? ""
+            guard let resolved = resolveSessionName(in: arguments, stringValue: { $0.value.outputString }) else { return .void }
+            let name = resolved.name
+            let varName = resolved.remainingPositional.first?.value.outputString ?? ""
             context.sessionProvider?.removeVar(varName, session: name)
             context.trackedSessionVariables.removeAll { $0.session == name && $0.varName == varName }
             return .void
         }
         register("session_end") { arguments, context in
-            let name = arguments.positionalValue(at: 0)?.outputString ?? ""
-            context.sessionProvider?.end(session: name)
-            context.suppressedSessionSaves.insert(name)
+            guard let resolved = resolveSessionName(in: arguments, stringValue: { $0.value.outputString }) else { return .void }
+            context.sessionProvider?.end(session: resolved.name)
+            context.suppressedSessionSaves.insert(resolved.name)
             return .void
         }
         register("session_abort") { arguments, context in
-            let name = arguments.positionalValue(at: 0)?.outputString ?? ""
-            context.sessionProvider?.abort(session: name)
-            context.suppressedSessionSaves.insert(name)
+            guard let resolved = resolveSessionName(in: arguments, stringValue: { $0.value.outputString }) else { return .void }
+            context.sessionProvider?.abort(session: resolved.name)
+            context.suppressedSessionSaves.insert(resolved.name)
             return .void
         }
         // Real Lasso 8's [Cache(-Name=..., -Expires=...)] ... [/Cache]

@@ -561,6 +561,97 @@ container/looping flag or deferred child body.
 
 ## 7. Session Edge Cases
 
+### Implementation Status (2026-07-12)
+
+Implemented — but the real priority list turned out different from this
+section's original plan below, and the actual fix was a correctness bug,
+not a documented-but-unbuilt edge case. Real corpus verification (direct
+`grep` against the real site, cross-checked by a `feature-dev:code-architect`
+review) corrected every item in the original "Goal" list:
+
+- `-UseLink`: 1 real hit, paired with `-UseCookie` in the same call.
+- `-UseAuto`: 0 real hits.
+- GET/POST `-lassosession` fallback: 0 real hits — a prior grep's "8
+  hits" was a false positive, matching the substring `lassosession`
+  inside literal `_LassoSessionTracker_<name>` cookie-clear calls, not
+  the actual keyword.
+- `session_deleteExpired()`: 0 real hits.
+- Dynamic (computed) `session_start` names: 0 real hits beyond the two
+  literal names already handled.
+
+**The real, previously-undocumented finding**: real corpus
+`session_start`/`session_addvar`/`session_id`/`session_end` calls
+overwhelmingly spell the session name as a **keyword** argument
+(`-Name='...'`), not positional — the dominant shape across every
+site-section template that starts a session, and dozens of
+`Session_Addvar(-Name='...', 'varname')` calls elsewhere. Verified
+directly (parsed the real snippet and ran it): both the preflight
+scanner and every render-time session native only ever looked at
+*positional* arguments for the session name —
+`LassoSessionPreflight.scan()` against the real `-Name=` shape returned
+zero calls, and `session_addvar` would have swapped the session name and
+var name entirely for the real `Session_Addvar(-Name='...', 'sort_by')`
+shape. This failed **silently** (`.void`, no thrown error) — invisible to
+`LASSO_CRAWL_REPORT=1`, so real pages "rendered clean" while quietly
+failing to persist session/cart/login state.
+
+Fixed via one shared resolver (`Sources/LassoParser/SessionArgumentResolution.swift`,
+`resolveSessionName(in:stringValue:)`), matching this session's
+established "one shared implementation, multiple calling conventions"
+pattern (`LassoEncoding`, `LassoDateFormatting`) — checks for `-Name=`
+first, falls back to the first positional argument otherwise, and hands
+back the remaining unconsumed positional arguments so `session_addvar`/
+`session_removevar` find the var name correctly in both shapes. Applied
+to `LassoSessionPreflight.makeCall` (preserving the parse-time scan's
+documented literal-string-only limitation) and all 7 session native
+registrations in `Runtime.swift` — fixed uniformly rather than only the
+4 natives with direct corpus hits, to avoid an arbitrary split.
+
+Deferred, with reasons (matching the corrected evidence above):
+`-UseLink` (the one real call site already sets `-UseCookie`, which is
+fully implemented, so a normal client already gets a working session —
+building HTML link-rewriting for a single call site whose functional
+need is already covered isn't worth the risk the plan's own "Risks"
+section flags); `-UseAuto`, GET/POST `-lassosession` fallback,
+`session_deleteExpired()`, and dynamic session names (zero real evidence
+each). `LassoSessionStartCall.useLink`/`useAuto` stay parsed-but-inert.
+
+Flagged, not fixed: `Runtime.swift`'s `session_start` stores
+`sessionStartResults` keyed by `name.lowercased()`, while
+`PerfectBackedLassoSessionProvider`'s internal dictionaries key by the
+raw, case-sensitive name — a latent inconsistency the architect review
+caught. Real corpus is consistently lowercase, so not a live bug today.
+
+Verified via 5 new tests (107/107 total, no regressions) plus a
+`feature-dev:code-reviewer` pass (no findings) and a live end-to-end
+check: a throwaway page using the exact real `-Name=` shape, hit three
+times over real HTTP with a cookie jar — session created and a tracker
+cookie set on the first request, a value persisted via
+`Session_Addvar(-Name=..., 'sort_by')` on the second, and the persisted
+value correctly read back on the third, proving the fix round-trips
+through a real session driver, not just in-process unit fixtures. A
+real-corpus crawl (`LASSO_CRAWL_EXCLUDE_PATHS=vendor`) showed no
+regression (this bug was invisible to the crawl report both before and
+after, since it always failed silently rather than throwing).
+
+MySQL session driver live-verified too, against the local MySQL instance
+using the `lassouser` account (read-write, matches the
+`perfect_mysql_fixture_%`-prefixed disposable-schema convention already
+established for the CRUD fixture suite): the same 3-request round trip as
+the memory-driver check, this time with `LASSO_SESSION_DRIVER=mysql` —
+fresh request created a real row in a real `sessions` table (confirmed
+directly via `SELECT`, not just inferred from the HTTP response) with
+`sort_by` already present in the persisted JSON `data` column; a second
+request updated it; a third, resuming via the same cookie, read the
+updated value back. No code changes were needed for this — the MySQL
+driver itself is untouched by this fix, only the argument-parsing layer
+above it changed. Found and cleaned up one unrelated environment issue
+along the way: a stray duplicate file in the SwiftPM dependency checkout
+(`.build/checkouts/swift-nio/Sources/_NIOBase64/Base64 2.swift`,
+alongside `Base64.swift`) was causing "invalid redeclaration" build
+failures — a disposable build artifact, not source code, removed with
+explicit confirmation.
+
 ### Goal
 
 Finish the documented session surface beyond the already-working named-session

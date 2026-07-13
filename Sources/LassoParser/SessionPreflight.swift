@@ -119,8 +119,18 @@ public enum LassoSessionPreflight {
     }
 
     private static func makeCall(from arguments: [LassoArgument]) -> LassoSessionStartCall? {
-        let positional = arguments.filter { $0.label == nil }
-        guard let first = positional.first, case .string(let name) = first.value else { return nil }
+        // Real corpus overwhelmingly spells the session name as a -Name=
+        // keyword argument (session_start(-Name='cart', ...)), not the
+        // positional form — see Documentation/outstanding-compatibility-project-plans.md
+        // item 7 and SessionArgumentResolution.swift. `stringValue` stays
+        // restricted to literal `.string` expressions, preserving this
+        // scan's documented "only literal names are visible" limitation
+        // (a `-Name=var(x)` still correctly resolves to nil, same as the
+        // already-tested positional `session_start(var(x))` case).
+        guard let resolved = resolveSessionName(in: arguments, stringValue: { argument in
+            if case .string(let value) = argument.value { value } else { nil }
+        }) else { return nil }
+        let name = resolved.name
 
         func flagString(_ label: String) -> String? {
             guard let argument = arguments.first(where: { $0.label?.caseInsensitiveCompare(label) == .orderedSame }),
