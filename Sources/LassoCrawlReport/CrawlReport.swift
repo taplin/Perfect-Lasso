@@ -1,4 +1,7 @@
 import Foundation
+#if canImport(FoundationNetworking)
+import FoundationNetworking
+#endif
 
 /// One page's crawl result. `errorType`/`errorDescription` come from the
 /// server's own JSON error format (`developerErrorOutput`'s
