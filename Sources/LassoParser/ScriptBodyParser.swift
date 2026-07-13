@@ -27,6 +27,7 @@ struct ScriptBodyParser {
 
             if parseClosingTag() { continue }
             if parseElseTag() { continue }
+            if parseCaseTag() { continue }
             if parseDefineOpening() { continue }
             if parseWithOpening() { continue }
             if parseBlockOpening() { continue }
@@ -77,6 +78,34 @@ struct ScriptBodyParser {
         skipLineRemainder()
         if characters.indices.contains(start) {
             nodes.append(.tag(name: "else", arguments: arguments, closing: false, dialect: .lasso9, range: range))
+        }
+        return true
+    }
+
+    /// Handles `Case(value);`/bare `Case;` inside a free-tag
+    /// `Select(...); ... /Select;` block — a flat branch separator, not a
+    /// paired block, exactly like `else` above. Real corpus's only
+    /// free-tag example (`includes/Calculate_Day.include.lasso`) always
+    /// parenthesizes its value (`Case(1);` ... `Case(7);`); the bare form
+    /// (Lasso 8.5's documented default-case marker) is supported here too
+    /// since it costs nothing extra and matches the bracket-tag dialect's
+    /// `[Case]` default form exactly. An out-of-context `case` (no
+    /// enclosing `Select`) is left for `BlockBuilder` to silently ignore
+    /// as an ordinary flat tag — matching real Select/Case's own zero
+    /// evidence of malformed usage.
+    private mutating func parseCaseTag() -> Bool {
+        let start = index
+        guard readKeyword("case") else { return false }
+        skipHorizontalWhitespace()
+
+        var arguments: [LassoArgument] = []
+        if index < characters.count, characters[index] == "(" {
+            let body = readBalanced(open: "(", close: ")")
+            arguments = parseCallArguments(name: "case", body: body)
+        }
+        skipLineRemainder()
+        if characters.indices.contains(start) {
+            nodes.append(.tag(name: "case", arguments: arguments, closing: false, dialect: .lasso9, range: range))
         }
         return true
     }
@@ -636,6 +665,6 @@ struct ScriptBodyParser {
 
     private static let blockNames: Set<String> = [
         "if", "inline", "records", "rows", "loop", "iterate", "while", "protect",
-        "output_none", "html_comment", "encode_set",
+        "output_none", "html_comment", "encode_set", "select",
     ]
 }

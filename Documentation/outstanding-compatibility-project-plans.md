@@ -994,6 +994,224 @@ JSON to `LASSO_CRAWL_REPORT_PATH`. Redirects count as clean.
 - The crawler is a diagnostic tool, not an implementation oracle. It should
   expose skip reasons so decisions stay auditable.
 
+## 10. Post-item-8 crawl findings: Select/Case, Encrypt_HMAC, Currency/Percent
+
+Not in this doc's original 9-item list — surfaced by a fresh
+`LASSO_CRAWL_REPORT=1` sweep after item 8 (875 pages, 671 clean), same
+"a fix reveals the next gap" pattern `Decode_Base64` surfaced via `Output`.
+Got a `feature-dev:code-architect` review of all three before
+implementing (one combined dispatch); independently verified its two
+riskiest claims (the `(`/`:` postfix-call parser unification, and real
+corpus proof that `$welcome_discount` is a fraction, resolving the
+`percent()` multiplier question) before trusting them. Full design:
+see the architect review synthesis folded into each item below (no
+separate plan doc — these are smaller, self-contained additions than
+item 8, following the same `Date_Format`/`Decode_Base64` "small free
+function in `Runtime.swift`" precedent for two of the three).
+
+### Implementation Status: `Encrypt_HMAC` (2026-07-13)
+
+Implemented. Real signature (LassoGuide 9.3, confirmed live):
+`encrypt_hmac(-password, -token, -digest='MD5', -base64, -hex, -cram)`.
+Real corpus usage (password-reset token generation, 14 pages) is always
+`Encrypt_HMAC(-token=..., -password=..., -Digest='sha1', -Base64)`.
+
+`LassoParser` had zero external dependencies before this — added
+`swift-crypto` (already resolved transitively at 4.5.0 via Perfect-NIO's
+SSL stack, so no new fetch) as a direct product dependency rather than
+`CommonCrypto` (Apple-only, no Linux story, and this monorepo's sibling
+packages have real Linux CI investment). New `Sources/LassoParser/Hashing.swift`
+(`LassoHashing.hmac(password:token:digest:)`) plus a `Runtime.swift`
+registration alongside `decode_base64`/`date_format`.
+
+**Found and fixed during code review, before merge**: `-password`/
+`-token` were silently falling back to `""` when absent, rather than
+throwing — for a tag used in password-reset token generation, an
+empty-string password produces a fully deterministic, publicly-known-key
+"secret" token with zero signal anything was misconfigured. Fixed to
+throw `LassoRecoverableError` (codes 3001/3002), matching
+`File_ProcessUploads`'s existing precedent for missing required
+arguments. Regression test: `encryptHmacRequiresPasswordAndToken`.
+
+**Judgment calls, explicitly flagged**:
+- Unrecognized/missing `-Digest` defaults to MD5 (the tag's own
+  documented default), not a thrown error — reviewed and confirmed as a
+  defensible, low-risk choice given real corpus usage is always a fixed
+  literal `-Digest='sha1'`, but a caller who fat-fingers a digest name
+  would get a silently weaker hash with no signal. Not changed this pass.
+- `-Cram` (a distinct CRAM-hex format) is documented but has zero corpus
+  evidence and its exact byte layout isn't confirmed against the local
+  Lasso 8.5 reference — deferred, matching `Date_Format`'s precedent for
+  its own zero-evidence sibling flags.
+- The no-`-Base64`/`-Hex`/`-Cram` raw-bytes return path lossily decodes as
+  UTF-8 (no `LassoValue` bytes case exists — the same known limitation
+  `Decode_Base64` already lives with) — low-stakes, real usage is always
+  `-Base64`.
+
+**Newly surfaced, out-of-scope, pre-existing gap** (found during
+live-verify, not introduced by this change): this adapter's `field()`
+native (`Runtime.swift`) only reads the current database-row context
+(`context.currentRow`/`currentInlineFrame`) — unlike real Lasso 8's
+`Field()` tag, which also falls back to reading a request parameter of
+the same name outside a row context. Real corpus's
+`pages/lost_password.page.lasso` calls `Encrypt_HMAC(-token=field('password'), ...)`
+expecting exactly that fallback. Previously invisible because
+`Encrypt_HMAC` itself was unimplemented; now that it works, this specific
+page (and similar `field()`-as-parameter-shorthand call sites) will
+correctly throw "`Encrypt_HMAC` requires `-Token`" instead of silently
+producing an insecure empty-token hash — arguably a safer failure mode
+than before, but the underlying `field()` gap is real and unaddressed.
+Not fixed this pass (out of scope for this item); flagging for a future
+pass.
+
+Verified via 5 new tests (`Tests/LassoParserTests/LassoParserTests.swift`,
+search `encryptHmac`) with independently-Python-computed expected
+values (not hand-derived or quoted from memory) — 150/150 total across
+all four test targets, no regressions — plus a `feature-dev:code-reviewer`
+pass and a live end-to-end check over real HTTP: a throwaway page calling
+`Encrypt_HMAC(-token=action_param('password'), -password='sitesecret', -digest='sha1', -base64)`
+against a real query-string-submitted value produced output matching an
+independently-computed Python `hmac`/`hashlib` value exactly. A
+`LASSO_CRAWL_REPORT=1` sweep confirmed `unknownFunction("Encrypt_HMAC")`
+disappeared entirely (0 pages, was 14) — replaced by the `field()`
+gap above (a `LassoRecoverableError`, 14 pages), not a regression: the
+crawl's synthetic GET-only requests have no submitted form data for
+`field('password')` to read, the same class of harness limitation as
+`inlineNotConfigured`.
+
+### Implementation Status: `Currency`/`Percent` (2026-07-13)
+
+Implemented. Real signature (Lasso 8.5 PDF, Ch. 28 "Math Operations",
+Table 13 "Locale Formatting Tags"): `[Currency]`/`[Percent]` each take
+one required number parameter plus optional positional (not `-flag=`)
+language/country codes; default `en`/`US`. Real corpus usage is always
+single-parameter — `[currency($item_price)]` (10 pages) and
+`[percent($welcome_discount)]` (several header includes, previously
+masked by an earlier upstream gap in the same files).
+
+**Scope: `Currency`/`Percent` only**, matching `Date_Format`'s
+evidence-gated-scope precedent — `Scientific`/`Locale_Format` (documented
+siblings in the same table) have zero corpus evidence and are
+deliberately deferred.
+
+New `Sources/LassoParser/NumberFormatting.swift`
+(`LassoNumberFormatting.format`), a fresh `NumberFormatter()` per call
+(never cached — matches `LassoDateFormatting.formatter(pattern:)`'s
+identical thread-safety precedent), plus two `Runtime.swift`
+registrations alongside `date_format`/`decode_base64`/`encrypt_hmac`.
+
+**Percent's multiplier**: `NumberFormatter.percentStyle`'s default
+(multiply by 100) is used as-is — confirmed correct, not guessed, against
+real corpus data before implementing:
+`includes/cart_count.include.lasso`'s
+`Integer(100.00 * decimal($welcome_discount))` proves `$welcome_discount`
+is stored as a fraction (e.g. `0.05` for 5%), exactly matching
+`NumberFormatter`'s default behavior.
+
+Verified via 3 new tests (`Tests/LassoParserTests/LassoParserTests.swift`,
+search `currency`/`percent`) with expected values confirmed by directly
+running `NumberFormatter` before writing assertions (not guessed) —
+153/153 total across all four test targets, no regressions — plus a
+`feature-dev:code-reviewer` pass (no code issues found) and a live
+end-to-end check over real HTTP: a throwaway page rendered
+`[currency(1234.56)]`/`[percent(0.05)]` as `$1,234.56`/`5%`, matching the
+same locally-verified `NumberFormatter` output exactly. A
+`LASSO_CRAWL_REPORT=1` sweep confirmed `unknownFunction("currency")`
+disappeared entirely (0 pages, was 10) and `unknownFunction("percent")`
+never appeared — 672/875 pages now render cleanly (up from 671). Most of
+the 9 real corpus pages that used `currency()` in shared b2b header
+includes now progress past that gap and hit a distinct, unrelated,
+pre-existing site-content issue instead
+(`fileNotFound("includes/b2b//keywords/all_products.lasso")` — a
+malformed double-slash path in the real site's own content, not
+introduced by this change) — flagged, not fixed, out of scope for this
+item.
+
+### Implementation Status: `Select`/`Case` (2026-07-13)
+
+Implemented. Real contract (Lasso 8.5 PDF, Ch. 16 "Conditional Logic"):
+`[Select]` takes one value parameter; a series of `[Case]` tags (each with
+an optional single parameter) follow; the first matching `[Case]`'s body
+(until the next `[Case]` or `[/Select]`) executes; a parameter-less
+`[Case]` is the default, matched only if nothing else matches, and "the
+first" bare `[Case]` wins if there happen to be several. The whole block
+is documented as value-returning, same category as `[if]`.
+
+Real corpus (19 pages: seasonal-banner display logic on several storefront
+home pages, plus a shared day-of-week lookup include) confirmed three
+syntax variants: bracket-tag with parenthesized-call `Case`
+(`[Case('1')]`), bracket-tag with legacy colon-call `Case` (`[Case: 1]`,
+bare unquoted integers compared against a `Field()`-sourced string), and a
+free-tag semicolon-terminated lassoscript-mode form with no brackets at
+all (`Select(x); Case(1); ...; /Select;`).
+
+**Design: lowered into the existing `if`/`else`/`alternate` block
+representation at parse time (`BlockBuilder.swift`) — no new AST node, no
+`Renderer.swift` changes at all.** Directly follows
+`Documentation/legacy-define-tag-type-plan.md`'s stated principle: "do
+not build a second runtime path — lower into the same models already used
+by modern syntax." Case-value matching reuses `Evaluator.binary`'s
+existing coercive `"=="` by emitting literal `.binary(selectValue, "==",
+caseValue)` nodes during lowering — confirmed correct for the real
+corpus's bare-integer-vs-string ambiguity, not an invented comparison
+rule. A new dedicated node type was considered and rejected (would
+duplicate `if`'s already-correct branch-matching/equality logic).
+
+**Independently verified before implementing** (not assumed from the
+architect review alone): `ExpressionParser.parsePostfix` confirmed both
+`(` and `:` postfix calls already produce the identical `.call` node, so
+`[Case('1')]` and `[Case: 1]` parse identically with zero dedicated
+colon-call handling — only `LassoParser.swift`'s `TemplateScanner.blockTagNames`
+needed `"select"`/`"case"` added for the bracket-tag dialect.
+`ScriptBodyParser.swift` gained `"select"` in its own `blockNames` (reusing
+the existing `if`/`loop`/etc. mechanism unchanged) and a new
+`parseCaseTag()` modeled directly on the adjacent, pre-existing
+`parseElseTag()` (a flat branch separator, not a paired block — exactly
+like `else`).
+
+**Judgment call, explicitly implemented not left incidental**: Lasso
+8.5's own doc states "the first Case tag without any value is returned as
+the default" if there happen to be several bare `[Case]` tags — the
+lowering explicitly truncates the branch list at the first bare `Case`,
+making anything after it unreachable by construction, not by accident of
+parser ordering.
+
+**Deferred, flagged (zero corpus evidence)**: arrow-brace
+`Select(...) => { }` bodies and free-tag colon-call `Select: ...` (unlike
+`if`, which has real corpus evidence for both forms); an out-of-context
+`[Case(...)]` with no enclosing `[Select]` degrades silently (falls
+through to `BlockBuilder`'s generic "unrecognized tag, keep flat" path) —
+matches this codebase's established posture for zero-evidence malformed
+input.
+
+**Found during code review, not a bug — a known, pre-existing, inherited
+limitation**: `ScriptBodyParser`'s `skipLineRemainder()` (shared by
+`if`/`else`/`Select`/`Case` alike, not something introduced for this
+item) means multiple free-tag statements on one physical line
+(`Select(x); Case(1); 'A'; Case(2);` all on a single line, rather than one
+per line as every real corpus example already does) would silently drop
+everything after the first tag on that line. Zero corpus evidence of this
+shape — not fixed, flagged for awareness only.
+
+Verified via 8 new tests (`Tests/LassoParserTests/LassoParserTests.swift`,
+search `selectCase`) covering all three syntax variants (including a
+direct proof that colon-call and paren-call `Case` render identically,
+confirming the parser-unification claim end-to-end, not just at the unit
+level), the default-tie-break rule, no-match/no-default fallthrough, and
+two edge cases hand-verified during code review (zero `Case` tags at all;
+a `Select` with only a bare default) — 161/161 total across all four test
+targets, no regressions in this session's riskiest change (a
+parser-level modification touching `BlockBuilder`/`ScriptBodyParser`/
+`LassoParser`). A `feature-dev:code-reviewer` pass traced the lowering
+logic by hand against every edge case above and found no bugs. Live-verified
+over real HTTP: the real `includes/Calculate_Day.include.lasso` file
+(free-tag semicolon form) correctly resolved today's real day-of-week
+name via `Date`; a throwaway page using the real `[Select(Season)][Case: 1]...[/Select]`
+bracket-colon-call shape from `includes/b2b/huguley/top_right.lasso`
+correctly selected its matching branch. A `LASSO_CRAWL_REPORT=1` sweep
+confirmed `unknownFunction("Select")` disappeared entirely (0 pages, was
+19) — 680/875 pages now render cleanly (up from 672).
+
 ## Recommended Execution Order
 
 1. ~~Live MySQL verification and DB error framing.~~ Done.

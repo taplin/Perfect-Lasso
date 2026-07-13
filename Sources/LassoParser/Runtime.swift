@@ -154,6 +154,71 @@ public struct LassoNativeRegistry: Sendable {
             }
             return .string(decoded)
         }
+        // Encrypt_HMAC — LassoGuide 9.3 operations/encryption.html. Real
+        // corpus usage (password-reset token generation) is always
+        // -Digest='sha1' -Base64. -Cram (a distinct CRAM-hex format) has
+        // zero corpus evidence and its exact byte layout isn't confirmed
+        // against the local Lasso 8.5 reference — deferred, same as this
+        // project's other zero-evidence documented siblings (see
+        // Date_Format's deferred flags). With none of -Base64/-Hex/-Cram
+        // given, the real tag returns raw bytes; this adapter's
+        // LassoValue has no bytes case (the same known limitation
+        // Decode_Base64 already lives with), so that path lossily decodes
+        // as UTF-8 rather than crashing — low-stakes since real usage is
+        // always -Base64.
+        register("encrypt_hmac") { arguments, _ in
+            // -Password/-Token are both documented as required, and this
+            // tag is used for password-reset token generation — silently
+            // falling back to an empty string (rather than throwing, like
+            // File_ProcessUploads's missing -Destination does elsewhere in
+            // this codebase) would produce a fully deterministic,
+            // publicly-known-key "secret" token with no signal that
+            // anything was misconfigured. Throw instead.
+            guard let password = arguments.lastString(named: "password"), password.isEmpty == false else {
+                throw LassoRecoverableError(LassoErrorState(
+                    code: 3001,
+                    message: "Encrypt_HMAC requires -Password.",
+                    kind: "encryption"
+                ))
+            }
+            guard let token = arguments.lastString(named: "token"), token.isEmpty == false else {
+                throw LassoRecoverableError(LassoErrorState(
+                    code: 3002,
+                    message: "Encrypt_HMAC requires -Token.",
+                    kind: "encryption"
+                ))
+            }
+            let digest = arguments.lastString(named: "digest") ?? "MD5"
+            let raw = LassoHashing.hmac(password: password, token: token, digest: digest)
+            if arguments.hasTruthyFlag("base64") {
+                return .string(raw.base64EncodedString())
+            }
+            if arguments.hasTruthyFlag("hex") {
+                return .string("0x" + raw.map { String(format: "%02x", $0) }.joined())
+            }
+            return .string(String(decoding: raw, as: UTF8.self))
+        }
+        // [Currency]/[Percent] — Lasso 8.5 Chapter 28 "Math Operations",
+        // Table 13. Positional (not -flag=) language/country parameters,
+        // matching the documented signature exactly. See
+        // Documentation/outstanding-compatibility-project-plans.md and
+        // NumberFormatting.swift.
+        register("currency") { arguments, _ in
+            .string(LassoNumberFormatting.format(
+                arguments.positionalValue(at: 0)?.number ?? 0,
+                style: .currency,
+                language: arguments.positionalValue(at: 1)?.outputString ?? "en",
+                country: arguments.positionalValue(at: 2)?.outputString ?? "US"
+            ))
+        }
+        register("percent") { arguments, _ in
+            .string(LassoNumberFormatting.format(
+                arguments.positionalValue(at: 0)?.number ?? 0,
+                style: .percent,
+                language: arguments.positionalValue(at: 1)?.outputString ?? "en",
+                country: arguments.positionalValue(at: 2)?.outputString ?? "US"
+            ))
+        }
         // Date and time — Lasso 8.5 Language Guide Chapter 29 "Date and
         // Time Operations". See Documentation/date-format-plan.md for the
         // native "date" object representation and the DateFormatter/ICU

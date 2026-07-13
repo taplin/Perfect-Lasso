@@ -21,9 +21,15 @@ let package = Package(
         .package(path: "../../Perfect-Resurrection/Perfect-MySQL"),
         .package(path: "../../Perfect-Resurrection/Perfect-NIO"),
         .package(path: "../../Perfect-Resurrection/Perfect-Session"),
+        .package(url: "https://github.com/apple/swift-crypto.git", from: "4.5.0"),
     ],
     targets: [
-        .target(name: "LassoParser"),
+        .target(
+            name: "LassoParser",
+            dependencies: [
+                .product(name: "Crypto", package: "swift-crypto"),
+            ]
+        ),
         .target(name: "LassoCrawlReport"),
         .target(
             name: "LassoPerfectCRUD",

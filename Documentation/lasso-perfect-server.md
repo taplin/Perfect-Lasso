@@ -1149,3 +1149,15 @@ matching `Encrypt_HMAC` instead of the full site.
     argument-value parser stops at the first complete sub-expression
     instead of folding the rest into the same argument. Scope/frequency
     elsewhere in the corpus not yet surveyed. Not yet implemented.
+11. ~~`unknownFunction("Encrypt_HMAC")` (14 pages, password-reset token
+    generation)~~ Done — 2026-07-13, see `outstanding-compatibility-project-plans.md`
+    item 10. Surfaced a pre-existing, separate gap in `field()`'s
+    request-parameter fallback (flagged there, not fixed this pass).
+    ~~`unknownFunction("currency")` (10 pages) and `unknownFunction("percent")`
+    (masked by an earlier gap)~~ Done — same date, same doc item —
+    672/875 pages now render cleanly (up from 671).
+    ~~`unknownFunction("Select")` (19 pages, a Lasso 8 switch-statement
+    construct)~~ Done — same date, same doc item. Lowered into the
+    existing `if`/`else` block representation at parse time — no new AST
+    node, no `Renderer.swift` changes. 680/875 pages now render cleanly
+    (up from 672).

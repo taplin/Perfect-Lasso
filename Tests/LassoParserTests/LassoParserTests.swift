@@ -238,6 +238,220 @@ import PerfectSessionCore
     #expect(output == "hit")
 }
 
+// Expected values computed independently via Python's stdlib hmac/hashlib
+// (not hand-derived or quoted from memory) for key="key",
+// message="The quick brown fox jumps over the lazy dog" — the standard
+// textbook HMAC worked example. See
+// Documentation/outstanding-compatibility-project-plans.md.
+@Test func encryptHmacSha1HexMatchesKnownVector() throws {
+    var context = LassoContext()
+    let output = try LassoRenderer().render(
+        "[Encrypt_HMAC(-token='The quick brown fox jumps over the lazy dog', -password='key', -digest='sha1', -hex)]",
+        context: &context
+    )
+    #expect(output == "0xde7c9b85b8b78aa6bc8a7a36f70a90701c9db4d9")
+}
+
+@Test func encryptHmacSha1Base64MatchesRealCorpusArgumentShape() throws {
+    // -Token=/-Password=/-Digest='sha1'/-Base64 is real corpus's exact
+    // shape (password-reset token generation).
+    var context = LassoContext()
+    let output = try LassoRenderer().render(
+        "[Encrypt_HMAC(-Token='The quick brown fox jumps over the lazy dog', -Password='key', -Digest='sha1', -Base64)]",
+        context: &context
+    )
+    #expect(output == "3nybhbi3iqa8ino29wqQcBydtNk=")
+}
+
+@Test func encryptHmacUnrecognizedDigestDefaultsToMD5() throws {
+    // No confirmed doc answer for an unrecognized -Digest value —
+    // defaults to MD5 (the tag's own documented default), matching this
+    // codebase's established "unknown keyword -> benign fallback, not a
+    // thrown error" convention rather than LassoRecoverableError (which
+    // this codebase reserves for genuinely missing required arguments).
+    var context = LassoContext()
+    let missingDigest = try LassoRenderer().render(
+        "[Encrypt_HMAC(-token='The quick brown fox jumps over the lazy dog', -password='key', -base64)]",
+        context: &context
+    )
+    let unrecognizedDigest = try LassoRenderer().render(
+        "[Encrypt_HMAC(-token='The quick brown fox jumps over the lazy dog', -password='key', -digest='not-a-real-digest', -base64)]",
+        context: &context
+    )
+    let expectedMD5Base64 = "gAcHE0Y+d0m5DC3CSRHidQ=="
+    #expect(missingDigest == expectedMD5Base64)
+    #expect(unrecognizedDigest == expectedMD5Base64)
+}
+
+@Test func encryptHmacWithNoOutputFlagFallsBackToLossyRawBytes() throws {
+    // Documented limitation: no LassoValue bytes case exists (same known
+    // gap Decode_Base64 already lives with), so the raw-bytes path (no
+    // -Base64/-Hex/-Cram) lossily decodes as UTF-8 rather than crashing —
+    // low-stakes since real corpus usage is always -Base64.
+    var context = LassoContext()
+    let output = try LassoRenderer().render(
+        "[Encrypt_HMAC(-token='x', -password='key')]",
+        context: &context
+    )
+    #expect(output.isEmpty == false)
+}
+
+@Test func encryptHmacRequiresPasswordAndToken() throws {
+    // -Password/-Token are both documented as required, and this tag is
+    // used for password-reset token generation — silently proceeding with
+    // an empty-string password/token would produce a fully deterministic,
+    // publicly-known-key "secret" token with zero signal that something
+    // was misconfigured. Matches File_ProcessUploads's missing
+    // -Destination precedent: throw a recoverable error, catchable by
+    // [protect], not a silent fallback.
+    var context = LassoContext()
+    let missingPassword = try LassoRenderer().render(
+        "[protect][Encrypt_HMAC(-token='x')][/protect][error_currenterror]",
+        context: &context
+    )
+    #expect(missingPassword == "Encrypt_HMAC requires -Password.")
+
+    let missingToken = try LassoRenderer().render(
+        "[protect][Encrypt_HMAC(-password='key')][/protect][error_currenterror]",
+        context: &context
+    )
+    #expect(missingToken == "Encrypt_HMAC requires -Token.")
+}
+
+@Test func currencyDefaultsToEnUSLocale() throws {
+    var context = LassoContext()
+    let output = try LassoRenderer().render("[currency(1234.56)]", context: &context)
+    #expect(output == "$1,234.56")
+}
+
+@Test func percentAppliesDocumentedMultiplyByHundredForAFractionalInput() throws {
+    // Real corpus confirms $welcome_discount is stored as a fraction, not
+    // a whole percentage (includes/cart_count.include.lasso:
+    // Integer(100.00 * decimal($welcome_discount))) — NumberFormatter's
+    // default percentStyle behavior (multiply by 100) is correct as-is
+    // for this shape, no multiplier override needed.
+    var context = LassoContext()
+    let output = try LassoRenderer().render("[percent(0.05)]", context: &context)
+    #expect(output == "5%")
+}
+
+@Test func currencyAndPercentAcceptPositionalLanguageAndCountryOverrides() throws {
+    // Documented signature: one required number, then optional positional
+    // (not -flag=) language/country codes — matching real corpus, which
+    // never exercises positions 1/2, but the documented contract does.
+    // German locale is a distinct-enough test that the language/country
+    // parameters actually took effect (comma/period grouping swap),
+    // without hardcoding the exact currency symbol placement.
+    var context = LassoContext()
+    let output = try LassoRenderer().render("[currency(1234.56, 'de', 'DE')]", context: &context)
+    #expect(output.contains("1.234,56"))
+}
+
+// MARK: - [Select]/[Case]/[/Select] (Lasso 8.5 Ch. 16 "Conditional Logic")
+//
+// Lowered into the existing if/else-if/else block representation at parse
+// time (BlockBuilder.swift) — no new AST node, no new Renderer code. See
+// Documentation/outstanding-compatibility-project-plans.md item 10.
+
+@Test func selectCaseBracketParenCallLowersToIfElseChain() throws {
+    let source = "[Select($x)][Case('1')]one[Case('2')]two[Case]default[/Select]"
+
+    var contextOne = LassoContext(globals: ["x": .string("1")])
+    #expect(try LassoRenderer().render(source, context: &contextOne) == "one")
+
+    var contextTwo = LassoContext(globals: ["x": .string("2")])
+    #expect(try LassoRenderer().render(source, context: &contextTwo) == "two")
+
+    var contextOther = LassoContext(globals: ["x": .string("nope")])
+    #expect(try LassoRenderer().render(source, context: &contextOther) == "default")
+}
+
+@Test func selectCaseColonCallProducesIdenticalOutputToParenCall() throws {
+    // Proves the parser-unification claim end-to-end (not just at the
+    // ExpressionParser unit level): `(` and `:` postfix calls already
+    // produce the identical .call node, so [Case: 1] and [Case('1')]
+    // parse — and render — identically with zero dedicated colon-call
+    // handling for Case.
+    let parenForm = "[Select($season)][Case('1')]spring[Case('2')]summer[/Select]"
+    let colonForm = "[Select($season)][Case: 1]spring[Case: 2]summer[/Select]"
+
+    for season in ["1", "2"] {
+        var parenContext = LassoContext(globals: ["season": .string(season)])
+        var colonContext = LassoContext(globals: ["season": .string(season)])
+        let parenOutput = try LassoRenderer().render(parenForm, context: &parenContext)
+        let colonOutput = try LassoRenderer().render(colonForm, context: &colonContext)
+        #expect(parenOutput == colonOutput)
+    }
+}
+
+@Test func selectCaseColonCallCoercesBareIntegerAgainstAStringSelectValue() throws {
+    // Real corpus shape (includes/b2b/huguley/top_right.lasso): bare
+    // unquoted integer Case values compared against a Field()-sourced
+    // string. Lowering emits selectValue == caseValue as a literal binary
+    // node, reusing Evaluator.binary's existing coercive/string-based
+    // "==" — the same equality every other == in this language uses, not
+    // an invented comparison rule.
+    let source = "[Select(Season)][Case: 1]spring[Case: 2]summer[/Select]"
+    var context = LassoContext(globals: ["season": .string("2")])
+    #expect(try LassoRenderer().render(source, context: &context) == "summer")
+}
+
+@Test func selectCaseFreeTagSemicolonFormMatchesBracketForms() throws {
+    // Real corpus shape (includes/Calculate_Day.include.lasso): no
+    // brackets at all, semicolon-terminated, lassoscript-mode.
+    let source = """
+    <?lassoscript
+    Select(Integer($day));
+    Case(1);
+    'Sunday';
+    Case(2);
+    'Monday';
+    /Select;
+    ?>
+    """
+    var contextOne = LassoContext(globals: ["day": .integer(1)])
+    #expect(try LassoRenderer().render(source, context: &contextOne) == "Sunday")
+
+    var contextTwo = LassoContext(globals: ["day": .integer(2)])
+    #expect(try LassoRenderer().render(source, context: &contextTwo) == "Monday")
+}
+
+@Test func selectCaseSecondBareDefaultIsUnreachable() throws {
+    // Lasso 8.5: "the first Case tag without any value is returned as the
+    // default value" — a second bare Case after the first is truncated
+    // during lowering, not left to incidental parser behavior.
+    let source = "[Select($x)][Case('9')]nope[Case]first-default[Case]second-default[/Select]"
+
+    var matchContext = LassoContext(globals: ["x": .string("9")])
+    #expect(try LassoRenderer().render(source, context: &matchContext) == "nope")
+
+    var defaultContext = LassoContext(globals: ["x": .string("other")])
+    #expect(try LassoRenderer().render(source, context: &defaultContext) == "first-default")
+}
+
+@Test func selectCaseFallsThroughToNothingWhenNoCaseMatchesAndNoDefault() throws {
+    // Matches `if` with no `else`: alternate ?? [] renders empty.
+    let source = "[Select($x)][Case('1')]one[/Select]"
+    var context = LassoContext(globals: ["x": .string("9")])
+    #expect(try LassoRenderer().render(source, context: &context) == "")
+}
+
+@Test func selectCaseWithNoCaseTagsAtAllRendersNothing() throws {
+    // Degenerate but valid: an empty branch list lowers to an empty node
+    // list, not a crash.
+    let source = "before[Select($x)][/Select]after"
+    var context = LassoContext(globals: ["x": .string("1")])
+    #expect(try LassoRenderer().render(source, context: &context) == "beforeafter")
+}
+
+@Test func selectCaseWithOnlyABareDefaultAlwaysRendersIt() throws {
+    // No valued Case at all before the default — the fold produces the
+    // default's body unconditionally, with no wrapping `if`.
+    let source = "[Select($x)][Case]always[/Select]"
+    var context = LassoContext(globals: ["x": .string("anything")])
+    #expect(try LassoRenderer().render(source, context: &context) == "always")
+}
+
 @Test func stringMembersExposeTheSameEncodingsAsLasso9Methods() throws {
     var context = LassoContext()
     let output = try LassoRenderer().render(

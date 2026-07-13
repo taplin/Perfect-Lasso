@@ -508,6 +508,6 @@ private struct TemplateScanner {
 
     private static let blockTagNames: Set<String> = [
         "if", "else", "inline", "records", "rows", "loop", "iterate", "while", "define", "protect",
-        "output_none", "html_comment", "encode_set",
+        "output_none", "html_comment", "encode_set", "select", "case",
     ]
 }
