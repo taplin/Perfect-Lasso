@@ -397,6 +397,18 @@ failures are recoverable through `[protect]`.
 request context, rooted at `LASSO_SITE_ROOT`, so live request destinations are
 site-root-confined.
 
+Live-verified end to end (2026-07-12) against a real running
+`lasso-perfect-server`, closing the one item the plan's own "Tests"
+section hadn't yet crossed off: a real `curl -F` multipart upload against
+a throwaway site root, `[File_ProcessUploads(-Destination='moved')]`
+moved the file out of Perfect-NIO's temp multipart location into a real,
+freshly-created destination directory, with byte-for-byte correct
+content — confirming this survives the real HTTP pipeline, not just
+synthetic in-memory fixtures. A second identical upload (no
+`-FileOverwrite`) was correctly rejected with a real `destinationExists`
+recoverable error, proving the overwrite-protection guard live, not only
+in unit tests.
+
 ### Goal
 
 Implement Lasso 8 `[File_ProcessUploads]` so uploaded temp files can be moved
@@ -458,7 +470,8 @@ files remain readable during render only because `MimeReader` is retained.
 - Size filter skips large file.
 - Extension filter accepts only allowed extensions.
 - Overwrite denied vs allowed.
-- Live multipart smoke that proves the moved file survives after render.
+- ~~Live multipart smoke that proves the moved file survives after render.~~
+  Done — see the Implementation Status note above.
 
 ### Risks
 
