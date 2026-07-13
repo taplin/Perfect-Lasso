@@ -86,6 +86,14 @@ let package = Package(
             dependencies: ["LassoCrawlReport"]
         ),
         .testTarget(
+            name: "LassoPerfectServerTests",
+            dependencies: [
+                "LassoPerfectServer",
+                "LassoParser",
+                .product(name: "PerfectNIO", package: "Perfect-NIO"),
+            ]
+        ),
+        .testTarget(
             name: "LassoParserTests",
             dependencies: [
                 "LassoParser",

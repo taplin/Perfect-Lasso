@@ -206,16 +206,19 @@ extension LassoNativeTypeRegistry {
     //
     // Reference: real Lasso documents ~20 web_response members. Implemented
     // here: status, header get/set/bulk, cookie set (full parameter set)/
-    // get, and abort. `include*`/`includeBytes`/`includes`/`getInclude`
-    // (aliases for the existing include()/library() machinery, which lives
-    // in Renderer.swift's renderExpression, not the Evaluator — bridging
-    // those is a separate integration), `sendFile`/`sendChunk` (no binary
-    // streaming response infrastructure exists), `rawContent`/`rawContent=`
-    // (output is one accumulated string built at the very end of
-    // rendering — reading/overwriting it mid-render doesn't fit today's
-    // architecture), and `addAtEnd`/`define_atBegin`/`define_atEnd`
-    // (server-lifecycle hooks, not a per-request concern) are deliberately
-    // not implemented.
+    // get, abort, include/includeOnce/includeLibrary/includeLibraryOnce/
+    // includeBytes/includes (via `LassoContext.includeRenderService` —
+    // see `Providers.swift`'s `LassoIncludeRenderService` and
+    // `Documentation/web-response-include-plan.md` for the judgment calls
+    // involved), and sendFile (string `data` only, per the real documented
+    // signature — see the same doc for why path-based serving lives on
+    // `file_serve`/`file_stream` instead). `getInclude`, `sendChunk` (no
+    // binary streaming response infrastructure exists), `rawContent`/
+    // `rawContent=` (output is one accumulated string built at the very
+    // end of rendering — reading/overwriting it mid-render doesn't fit
+    // today's architecture), and `addAtEnd`/`define_atBegin`/
+    // `define_atEnd` (server-lifecycle hooks, not a per-request concern)
+    // are deliberately not implemented.
     fileprivate static func makeWebResponseType() -> LassoNativeType {
         var type = LassoNativeType(name: "web_response")
 
@@ -279,6 +282,98 @@ extension LassoNativeTypeRegistry {
             // loop already checks returnSignal after each node and breaks,
             // and LassoRenderer.render already turns an unconsumed signal
             // into page output — no new control-flow mechanism needed.
+            context.setReturnSignal(.void)
+            return .void
+        }
+
+        // Real LP9 convention: one plain positional string, not the
+        // legacy -File/-Path keyword form the free `include()`/`library()`
+        // tags accept. See LassoIncludeRenderService (Providers.swift) and
+        // Documentation/web-response-include-plan.md.
+        type.register("include") { _, arguments, context in
+            guard let service = context.includeRenderService else {
+                throw LassoRuntimeError.includeNotConfigured
+            }
+            let path = arguments.positionalValue(at: 0)?.outputString ?? ""
+            let output = try service.performInclude(path: path, once: false, context: &context)
+            return .string(output ?? "")
+        }
+        type.register("includeonce") { _, arguments, context in
+            guard let service = context.includeRenderService else {
+                throw LassoRuntimeError.includeNotConfigured
+            }
+            let path = arguments.positionalValue(at: 0)?.outputString ?? ""
+            guard let output = try service.performInclude(path: path, once: true, context: &context) else {
+                // A repeat call for an already-included path has no
+                // confirmed documented return value in either reference
+                // source. Defaulting to `.void`, matching
+                // includeLibraryOnce's documented "no value" and this
+                // codebase's void-on-no-op convention — a judgment call,
+                // not a confirmed contract; see the doc above.
+                return .void
+            }
+            return .string(output)
+        }
+        // includeLibrary re-executes every call (no dedup) — genuinely
+        // different from includeLibraryOnce, per the documented contract,
+        // and both are distinct from the free-tag `library(...)`'s
+        // existing always-deduped ("library_once") behavior.
+        type.register("includelibrary") { _, arguments, context in
+            guard let service = context.includeRenderService else {
+                throw LassoRuntimeError.includeNotConfigured
+            }
+            let path = arguments.positionalValue(at: 0)?.outputString ?? ""
+            try service.performLibrary(path: path, once: false, context: &context)
+            return .void
+        }
+        type.register("includelibraryonce") { _, arguments, context in
+            guard let service = context.includeRenderService else {
+                throw LassoRuntimeError.includeNotConfigured
+            }
+            let path = arguments.positionalValue(at: 0)?.outputString ?? ""
+            try service.performLibrary(path: path, once: true, context: &context)
+            return .void
+        }
+        // LassoGuide 9.3: "a stack of currently executing filenames" — the
+        // live nesting stack, needing no new state beyond the existing
+        // includeStack. Scope call, flagged: only include/includeOnce push
+        // onto includeStack today (library calls never did), so this
+        // reflects include-family calls only, not library calls.
+        type.register("includes") { _, _, context in
+            .array(context.includeStack.map { .string($0) })
+        }
+        type.register("includebytes") { _, arguments, context in
+            guard let loader = context.includeLoader else {
+                throw LassoRuntimeError.includeNotConfigured
+            }
+            let path = arguments.positionalValue(at: 0)?.outputString ?? ""
+            let data = try loader.loadIncludeBytes(path: path, from: context.includePath)
+            // Lossy UTF-8 decode, never throws — first-pass fallback since
+            // no LassoValue case models binary data yet (zero corpus
+            // evidence to size one correctly). See
+            // Documentation/web-response-include-plan.md.
+            return .string(String(decoding: data, as: UTF8.self))
+        }
+
+        // `data` is a plain Lasso string value (already-evaluated content,
+        // e.g. from includeBytes or a variable) — matches the real
+        // documented signature's string-accepting case, not an invented
+        // path adaptation; Lasso 8's File_Serve/File_Stream (genuinely
+        // path-based) cover real file-serving instead. `-noAbort` is
+        // unsupported (always aborts) — this adapter's single-
+        // accumulated-response-string architecture has no "serve then
+        // keep composing more output" model.
+        type.register("sendfile") { _, arguments, context in
+            let data = arguments.positionalValue(at: 0)?.outputString ?? ""
+            let name = arguments.positionalValue(at: 1)?.outputString ?? arguments.lastString(named: "name")
+            let contentType = arguments.lastString(named: "type")
+            let disposition = arguments.lastString(named: "disposition") ?? "attachment"
+            try context.responseSink?.serveFile(LassoFileServeRequest(
+                source: .data(Data(data.utf8)),
+                fileName: name,
+                contentType: contentType,
+                disposition: disposition
+            ))
             context.setReturnSignal(.void)
             return .void
         }

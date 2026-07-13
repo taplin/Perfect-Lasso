@@ -1094,11 +1094,24 @@ matching `Encrypt_HMAC` instead of the full site.
    (Lasso 9, and the only 158 real hits are confined to a vendored,
    dated, third-party library, not live content) — see the investigation
    note above. Revisit only if real corpus evidence appears.
-3. Bridge `web_response->include*`/`sendFile` with the existing
+3. ~~Bridge `web_response->include*`/`sendFile` with the existing
    `include()`/`library()` machinery (currently in `Renderer.swift`'s
    `renderExpression`, not reachable from the Evaluator-level native-type
    method tables) — deliberately deferred out of the comprehensive
-   `web_response` pass as a separate integration.
+   `web_response` pass as a separate integration.~~ Done — 2026-07-13, see
+   `Documentation/web-response-include-plan.md`. `include`/`includeOnce`/
+   `includeLibrary`/`includeLibraryOnce`/`includeBytes`/`includes` now
+   live on `web_response`, backed by a new `LassoIncludeRenderService`
+   protocol on `LassoContext` (the free `[include(...)]`/`[library(...)]`
+   tags now delegate to the same service, byte-for-byte unchanged).
+   `sendFile` (string data) and new `file_serve`/`file_stream` (path-based
+   Lasso 8 natives) supersede normal page output via the existing
+   `returnSignal` abort mechanism; the server boundary
+   (`LassoSiteServer.render`) builds the HTTP response from a real
+   `FileOutput` (full ETag/Range support) when no header override is
+   requested, or a hand-assembled `BytesOutput` when one is. Zero real
+   corpus usage of any of this — implemented against the documented
+   contract and live-verified over real HTTP instead.
 4. Continue the object runtime toward the next corpus need: likely
    `_unknowntag` (real Lasso 9's general per-type opt-in mechanism for
    graceful unknown-member dispatch — confirmed real and documented while

@@ -2663,3 +2663,378 @@ private func corpusFixtureContext(
         ])
     )
 }
+
+// MARK: - web_response->include*, includeBytes, sendFile (item 8)
+//
+// See Documentation/web-response-include-plan.md. Grounded in the
+// documented Lasso 8.5/9 contract, not real corpus evidence — a direct
+// grep of the real site found zero usages of any of these members, so
+// there's no observed shape to mirror here (unlike most other test groups
+// in this file). Every judgment call the implementation makes (the void
+// return on a repeat includeOnce call, includes()'s include-family-only
+// scope, file_serve/file_stream's root confinement) has its own test named
+// explicitly as a judgment call, not silently assumed correct.
+
+/// Shared fixture for the tests below: an in-memory, dictionary-backed
+/// `LassoIncludeLoader` that also counts loads per path (for dedup
+/// assertions) and lets a test override the raw bytes returned for a path
+/// independently of its text content (for the includeBytes lossy-decode
+/// test, which needs genuinely invalid UTF-8).
+private final class MapIncludeLoader: LassoIncludeLoader, @unchecked Sendable {
+    private(set) var loadCounts: [String: Int] = [:]
+    var files: [String: String]
+    var byteOverrides: [String: Data] = [:]
+
+    init(files: [String: String]) {
+        self.files = files
+    }
+
+    func loadInclude(path: String, from includingPath: String?) throws -> String {
+        loadCounts[path, default: 0] += 1
+        guard let content = files[path] else {
+            throw LassoFileSystemIncludeError.fileNotFound(path)
+        }
+        return content
+    }
+
+    func loadIncludeBytes(path: String, from includingPath: String?) throws -> Data {
+        if let override = byteOverrides[path] { return override }
+        return Data(try loadInclude(path: path, from: includingPath).utf8)
+    }
+}
+
+@Test func webResponseIncludeRendersFileContentAsExpressionOutput() throws {
+    let loader = MapIncludeLoader(files: ["header.lasso": "<h1>Hi</h1>"])
+    var context = LassoContext(includeLoader: loader)
+    let output = try LassoRenderer().render(
+        "<?lasso web_response->include('header.lasso') ?>",
+        context: &context
+    )
+    #expect(output == "<h1>Hi</h1>")
+}
+
+@Test func includeOnceSecondCallReturnsVoidPendingDocConfirmation() throws {
+    // No confirmed documented return value exists in either reference
+    // source for a repeat includeOnce call — defaulting to `.void`,
+    // matching includeLibraryOnce's documented "no value" and this
+    // codebase's void-on-no-op convention elsewhere. A judgment call, not
+    // a confirmed contract.
+    let loader = MapIncludeLoader(files: ["header.lasso": "HI"])
+    var context = LassoContext(includeLoader: loader)
+    let output = try LassoRenderer().render(
+        "[web_response->includeOnce('header.lasso')]|[web_response->includeOnce('header.lasso')]",
+        context: &context
+    )
+    #expect(output == "HI|")
+    #expect(loader.loadCounts["header.lasso"] == 1)
+}
+
+@Test func includeLibraryReexecutesEveryCallWithNoDedup() throws {
+    let loader = MapIncludeLoader(files: ["lib.lasso": "x"])
+    var context = LassoContext(includeLoader: loader)
+    _ = try LassoRenderer().render(
+        "<?lasso web_response->includeLibrary('lib.lasso') web_response->includeLibrary('lib.lasso') ?>",
+        context: &context
+    )
+    #expect(loader.loadCounts["lib.lasso"] == 2)
+}
+
+@Test func includeLibraryOnceDedupesWithinOneRenderLikeTheFreeLibraryTag() throws {
+    let loader = MapIncludeLoader(files: ["lib.lasso": "x"])
+    var context = LassoContext(includeLoader: loader)
+    _ = try LassoRenderer().render(
+        "<?lasso web_response->includeLibraryOnce('lib.lasso') web_response->includeLibraryOnce('lib.lasso') ?>",
+        context: &context
+    )
+    #expect(loader.loadCounts["lib.lasso"] == 1)
+}
+
+@Test func includeLibraryDetectsSelfReferentialCycleInsteadOfCrashing() throws {
+    // Regression for a stack-overflow found in code review: unlike the
+    // free `library(...)` tag (always once:true, protected by
+    // loadedLibraries dedup even on self-reference), includeLibrary's
+    // once:false call has no dedup to fall back on — without its own
+    // independent libraryStack guard, a self-referential includeLibrary
+    // chain would recurse through native Swift calls unboundedly and trap
+    // the whole process, not just fail this one request.
+    let loader = MapIncludeLoader(files: ["lib.lasso": "<?lasso web_response->includeLibrary('lib.lasso') ?>"])
+    var context = LassoContext(includeLoader: loader)
+    #expect(throws: LassoRuntimeError.includeCycle("lib.lasso")) {
+        _ = try LassoRenderer().render("<?lasso web_response->includeLibrary('lib.lasso') ?>", context: &context)
+    }
+}
+
+@Test func includeLibraryEnforcesDepthLimitOnChainedRecursion() throws {
+    var files: [String: String] = [:]
+    for i in 0..<40 {
+        files["g\(i).lasso"] = "<?lasso web_response->includeLibrary('g\(i + 1).lasso') ?>"
+    }
+    let loader = MapIncludeLoader(files: files)
+    var context = LassoContext(includeLoader: loader)
+    #expect(throws: LassoRuntimeError.includeDepthExceeded) {
+        _ = try LassoRenderer().render("<?lasso web_response->includeLibrary('g0.lasso') ?>", context: &context)
+    }
+}
+
+@Test func webResponseIncludeDetectsSelfReferentialCycle() throws {
+    let loader = MapIncludeLoader(files: ["a.lasso": "<?lasso web_response->include('a.lasso') ?>"])
+    var context = LassoContext(includeLoader: loader)
+    #expect(throws: LassoRuntimeError.includeCycle("a.lasso")) {
+        _ = try LassoRenderer().render("<?lasso web_response->include('a.lasso') ?>", context: &context)
+    }
+}
+
+@Test func webResponseIncludeEnforcesDepthLimit() throws {
+    var files: [String: String] = [:]
+    for i in 0..<40 {
+        files["f\(i).lasso"] = i < 39 ? "<?lasso web_response->include('f\(i + 1).lasso') ?>" : "leaf"
+    }
+    let loader = MapIncludeLoader(files: files)
+    var context = LassoContext(includeLoader: loader)
+    #expect(throws: LassoRuntimeError.includeDepthExceeded) {
+        _ = try LassoRenderer().render("<?lasso web_response->include('f0.lasso') ?>", context: &context)
+    }
+}
+
+@Test func includesMethodReflectsLiveNestingStackDuringNestedInclude() throws {
+    let loader = MapIncludeLoader(files: [
+        "outer.lasso": "[web_response->includes()]|[web_response->include('inner.lasso')]",
+        "inner.lasso": "[web_response->includes()]",
+    ])
+    var context = LassoContext(includeLoader: loader)
+    let output = try LassoRenderer().render(
+        "before:[web_response->includes()]|[web_response->include('outer.lasso')]|after:[web_response->includes()]",
+        context: &context
+    )
+    // Empty before/after the include (top-level, nothing executing);
+    // "outer.lasso" while outer runs; "outer.lassoinner.lasso" (a
+    // one-element-per-frame array, .outputString joins with no
+    // separator) while inner runs nested inside it.
+    #expect(output == "before:|outer.lasso|outer.lassoinner.lasso|after:")
+}
+
+@Test func includesMethodDoesNotReflectLibraryCallsPerDocumentedScope() throws {
+    // includes() is scoped to the live include-family nesting stack only:
+    // only include/includeOnce push onto includeStack today (library calls
+    // never did, matching the free library(...) tag's pre-existing
+    // behavior). A deliberate, flagged judgment call — no confirmed doc
+    // answer either way in LassoGuide 9.3.
+    let loader = MapIncludeLoader(files: ["lib.lasso": "[web_response->includes()]"])
+    var context = LassoContext(includeLoader: loader)
+    let output = try LassoRenderer().render(
+        "[web_response->includeLibrary('lib.lasso')]",
+        context: &context
+    )
+    #expect(output == "")
+}
+
+@Test func includeBytesRoundTripsTextContent() throws {
+    let loader = MapIncludeLoader(files: ["data.txt": "hello bytes"])
+    var context = LassoContext(includeLoader: loader)
+    let output = try LassoRenderer().render(
+        "[web_response->includeBytes('data.txt')]",
+        context: &context
+    )
+    #expect(output == "hello bytes")
+}
+
+@Test func includeBytesLossyDecodesInvalidUTF8InsteadOfThrowing() throws {
+    // Documented limitation, not a crash: no LassoValue case models binary
+    // data yet (zero corpus evidence to size one correctly), so a byte
+    // sequence that isn't valid UTF-8 decodes lossily (U+FFFD replacement
+    // characters) rather than failing the render.
+    let loader = MapIncludeLoader(files: ["blob.bin": ""])
+    loader.byteOverrides["blob.bin"] = Data([0xFF, 0xFE, 0x41, 0x42])
+    var context = LassoContext(includeLoader: loader)
+    let output = try LassoRenderer().render(
+        "[web_response->includeBytes('blob.bin')]",
+        context: &context
+    )
+    #expect(output.contains("AB"))
+    #expect(output.contains("\u{FFFD}"))
+}
+
+@Test func loadIncludeBytesDefaultExtensionThrowsForLegacyLoaders() throws {
+    // Proves the default protocol-extension claim: a loader written before
+    // includeBytes existed (only implementing loadInclude) doesn't need to
+    // change, and correctly surfaces includeNotConfigured rather than a
+    // missing-witness compile error or a silent wrong answer.
+    struct LegacyLoader: LassoIncludeLoader {
+        func loadInclude(path: String, from includingPath: String?) throws -> String { "ok" }
+    }
+    var context = LassoContext(includeLoader: LegacyLoader())
+    #expect(throws: LassoRuntimeError.includeNotConfigured) {
+        _ = try LassoRenderer().render("[web_response->includeBytes('x.lasso')]", context: &context)
+    }
+}
+
+@Test func webResponseIncludeRejectsPathEscapingRootLikeTheFreeTag() throws {
+    let root = FileManager.default.temporaryDirectory
+        .appendingPathComponent("lasso-webresponse-include-\(UUID().uuidString)")
+    try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
+    defer { try? FileManager.default.removeItem(at: root) }
+
+    let loader = try LassoFileSystemIncludeLoader(root: root)
+    var context = LassoContext(includeLoader: loader)
+    #expect(throws: LassoFileSystemIncludeError.pathOutsideRoot("../../outside.lasso")) {
+        _ = try LassoRenderer().render(
+            "<?lasso web_response->include('../../outside.lasso') ?>",
+            context: &context
+        )
+    }
+}
+
+@Test func webResponseIncludeLibraryRejectsPathEscapingRoot() throws {
+    let root = FileManager.default.temporaryDirectory
+        .appendingPathComponent("lasso-webresponse-library-\(UUID().uuidString)")
+    try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
+    defer { try? FileManager.default.removeItem(at: root) }
+
+    let loader = try LassoFileSystemIncludeLoader(root: root)
+    var context = LassoContext(includeLoader: loader)
+    #expect(throws: LassoFileSystemIncludeError.pathOutsideRoot("../../outside.lasso")) {
+        _ = try LassoRenderer().render(
+            "<?lasso web_response->includeLibrary('../../outside.lasso') ?>",
+            context: &context
+        )
+    }
+}
+
+@Test func includeBytesRejectsPathEscapingRootUsingTheSameConfinementAsLoadInclude() throws {
+    let root = FileManager.default.temporaryDirectory
+        .appendingPathComponent("lasso-webresponse-bytes-\(UUID().uuidString)")
+    try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
+    defer { try? FileManager.default.removeItem(at: root) }
+
+    let loader = try LassoFileSystemIncludeLoader(root: root)
+    var context = LassoContext(includeLoader: loader)
+    #expect(throws: LassoFileSystemIncludeError.pathOutsideRoot("../../outside.lasso")) {
+        _ = try LassoRenderer().render(
+            "[web_response->includeBytes('../../outside.lasso')]",
+            context: &context
+        )
+    }
+}
+
+@Test func sendFileRecordsDataPayloadHeadersAndAbortsRendering() throws {
+    final class RecordingFileServeSink: LassoResponseSink, @unchecked Sendable {
+        private(set) var fileServeRequest: LassoFileServeRequest?
+        func setStatus(_ status: Int) throws {}
+        func redirect(to url: String) throws {}
+        func setCookie(name: String, value: String) throws {}
+        func serveFile(_ request: LassoFileServeRequest) throws { fileServeRequest = request }
+    }
+
+    let sink = RecordingFileServeSink()
+    var context = LassoContext(responseSink: sink)
+    let output = try LassoRenderer().render(
+        "BEFORE<?lasso web_response->sendFile('file contents', 'report.csv', -type='text/csv', -disposition='inline') ?>AFTER",
+        context: &context
+    )
+    // Rides the same return-signal short-circuit as abort() — AFTER never
+    // runs.
+    #expect(output == "BEFORE")
+
+    guard case let .data(data)? = sink.fileServeRequest?.source else {
+        Issue.record("Expected a .data source")
+        return
+    }
+    #expect(String(decoding: data, as: UTF8.self) == "file contents")
+    #expect(sink.fileServeRequest?.fileName == "report.csv")
+    #expect(sink.fileServeRequest?.contentType == "text/csv")
+    #expect(sink.fileServeRequest?.disposition == "inline")
+}
+
+@Test func sendFileDefaultsDispositionToAttachmentWithNoNameOrType() throws {
+    // Matches sendFile's real documented -disposition default
+    // ('attachment') even when no name/type override is given.
+    final class RecordingFileServeSink: LassoResponseSink, @unchecked Sendable {
+        private(set) var fileServeRequest: LassoFileServeRequest?
+        func setStatus(_ status: Int) throws {}
+        func redirect(to url: String) throws {}
+        func setCookie(name: String, value: String) throws {}
+        func serveFile(_ request: LassoFileServeRequest) throws { fileServeRequest = request }
+    }
+
+    let sink = RecordingFileServeSink()
+    var context = LassoContext(responseSink: sink)
+    _ = try LassoRenderer().render("<?lasso web_response->sendFile('abc') ?>", context: &context)
+
+    #expect(sink.fileServeRequest?.disposition == "attachment")
+    #expect(sink.fileServeRequest?.fileName == nil)
+    #expect(sink.fileServeRequest?.contentType == nil)
+}
+
+@Test func sendFileDefaultExtensionIsANoOpForLegacySinksButStillAborts() throws {
+    // Proves the default protocol-extension claim for serveFile: a sink
+    // written before file serving existed (never overriding serveFile)
+    // doesn't need to change, and sendFile still aborts rendering even
+    // though there's nowhere for the payload to land.
+    struct LegacySink: LassoResponseSink {
+        func setStatus(_ status: Int) throws {}
+        func redirect(to url: String) throws {}
+        func setCookie(name: String, value: String) throws {}
+    }
+    var context = LassoContext(responseSink: LegacySink())
+    let output = try LassoRenderer().render(
+        "BEFORE<?lasso web_response->sendFile('x') ?>AFTER",
+        context: &context
+    )
+    #expect(output == "BEFORE")
+}
+
+@Test func fileServeAndFileStreamRecordPathSourceAbortAndOmitDispositionByDefault() throws {
+    // file_serve/file_stream are implemented as aliases of one identical
+    // registration (no confirmed documented behavioral distinction found
+    // between them for this adapter's purposes) — both must behave
+    // identically here. Unlike sendFile, neither has a documented
+    // disposition concept, so disposition/fileName stay nil by default
+    // (checked in main.swift's response-building: nil means "don't emit
+    // Content-Disposition at all").
+    final class RecordingFileServeSink: LassoResponseSink, @unchecked Sendable {
+        private(set) var fileServeRequest: LassoFileServeRequest?
+        func setStatus(_ status: Int) throws {}
+        func redirect(to url: String) throws {}
+        func setCookie(name: String, value: String) throws {}
+        func serveFile(_ request: LassoFileServeRequest) throws { fileServeRequest = request }
+    }
+
+    for tag in ["file_serve", "file_stream"] {
+        let sink = RecordingFileServeSink()
+        var context = LassoContext(responseSink: sink)
+        let output = try LassoRenderer().render(
+            "BEFORE<?lasso \(tag)(-File='downloads/report.pdf', -Type='application/pdf') ?>AFTER",
+            context: &context
+        )
+        #expect(output == "BEFORE", "\(tag) should abort rendering like sendFile/abort")
+
+        guard case let .path(path)? = sink.fileServeRequest?.source else {
+            Issue.record("Expected a .path source for \(tag)")
+            continue
+        }
+        #expect(path == "downloads/report.pdf")
+        #expect(sink.fileServeRequest?.contentType == "application/pdf")
+        #expect(sink.fileServeRequest?.disposition == nil, "\(tag) should not force a Content-Disposition by default")
+        #expect(sink.fileServeRequest?.fileName == nil)
+    }
+}
+
+@Test func fileServeAcceptsAPositionalPathArgument() throws {
+    final class RecordingFileServeSink: LassoResponseSink, @unchecked Sendable {
+        private(set) var fileServeRequest: LassoFileServeRequest?
+        func setStatus(_ status: Int) throws {}
+        func redirect(to url: String) throws {}
+        func setCookie(name: String, value: String) throws {}
+        func serveFile(_ request: LassoFileServeRequest) throws { fileServeRequest = request }
+    }
+
+    let sink = RecordingFileServeSink()
+    var context = LassoContext(responseSink: sink)
+    _ = try LassoRenderer().render("<?lasso file_serve('downloads/report.pdf') ?>", context: &context)
+
+    guard case let .path(path)? = sink.fileServeRequest?.source else {
+        Issue.record("Expected a .path source")
+        return
+    }
+    #expect(path == "downloads/report.pdf")
+}

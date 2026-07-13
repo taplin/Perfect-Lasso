@@ -457,6 +457,15 @@ struct LassoSiteServer: Sendable {
             }
         }
 
+        // web_response->sendFile / file_serve / file_stream supersede
+        // normal page output — checked before the redirect check, matching
+        // the same "whichever short-circuit fired wins" precedent redirect
+        // already established. All three set returnSignal to abort the
+        // page script, so `html` at this point is whatever the page
+        // produced before the abort, which is intentionally discarded.
+        if let fileServeRequest = sink.fileServeRequest {
+            return try fileServeOutput(for: fileServeRequest)
+        }
         if let redirectURL = sink.redirectURL {
             return RedirectOutput(to: redirectURL, status: .found)
         }
@@ -471,6 +480,34 @@ struct LassoSiteServer: Sendable {
             head: HTTPHead(status: HTTPResponseStatus(statusCode: sink.status), headers: headers),
             body: Array(html.utf8)
         )
+    }
+
+    /// Builds the HTTP response for a `sendFile`/`file_serve`/`file_stream`
+    /// request. A `.path` source is resolved through the same
+    /// root-confining `fileURL(for:)` every other filesystem-touching
+    /// route already uses — a missing/escaping path throws `ErrorOutput`
+    /// here exactly like a normal static-asset 404/403 would, not a
+    /// `[protect]`-catchable recoverable error (the page has already
+    /// aborted via `returnSignal` by the time this runs). No header
+    /// override requested → real `FileOutput(localPath:)`, full ETag/Range
+    /// support for free. An override (`-Type`, or `sendFile`'s `name`/
+    /// `-disposition`) → `Perfect-NIO`'s `FileOutput` can't be subclassed
+    /// to inject extra headers (confirmed `public`, not `open`), so this
+    /// branch reads the file directly and hand-assembles headers —
+    /// deliberately no Range/ETag support here, a narrow documented
+    /// trade-off. See Documentation/web-response-include-plan.md.
+    private func fileServeOutput(for request: LassoFileServeRequest) throws -> HTTPOutput {
+        switch request.source {
+        case .path(let path):
+            let resolved = try fileURL(for: path)
+            guard request.contentType != nil || request.disposition != nil || request.fileName != nil else {
+                return try FileOutput(localPath: resolved.path)
+            }
+            let data = try Data(contentsOf: resolved)
+            return bytesFileOutput(data: data, request: request)
+        case .data(let data):
+            return bytesFileOutput(data: data, request: request)
+        }
     }
 
     private func developerErrorOutput(
@@ -768,11 +805,56 @@ struct ServerRequestProvider: LassoRequestProvider {
     }
 }
 
+/// Builds the header-carrying HTTP response for a `sendFile`/`file_serve`/
+/// `file_stream` request whose source is already in memory (a `sendFile`
+/// string payload, or a `.path` source that needed a header override and
+/// so was read into memory by `LassoSiteServer.fileServeOutput` instead of
+/// streamed via `FileOutput`). A free function (not a `LassoSiteServer`
+/// method) so it's independently unit-testable — it touches no server
+/// state, only the request's own fields.
+func bytesFileOutput(data: Data, request: LassoFileServeRequest) -> HTTPOutput {
+    var headers = HTTPHeaders([
+        ("Content-Type", headerSafe(request.contentType ?? "application/octet-stream")),
+    ])
+    if let disposition = request.disposition {
+        if let fileName = request.fileName {
+            headers.add(name: "Content-Disposition", value: "\(headerSafe(disposition)); filename=\"\(quotedStringSafe(fileName))\"")
+        } else {
+            headers.add(name: "Content-Disposition", value: headerSafe(disposition))
+        }
+    }
+    return BytesOutput(
+        head: HTTPHead(status: .ok, headers: headers),
+        body: Array(data)
+    )
+}
+
+/// Strips CR/LF from Lasso-script-controlled values before they land in a
+/// raw header — `-Type`/`-Disposition`/`name` all originate from evaluated
+/// Lasso expressions, and an unsanitized newline there would be HTTP
+/// header/response-splitting.
+func headerSafe(_ value: String) -> String {
+    value.replacingOccurrences(of: "\r", with: "").replacingOccurrences(of: "\n", with: "")
+}
+
+/// Escapes a value for use inside an RFC 6266 `quoted-string` (the
+/// `filename="..."` part of `Content-Disposition`) — `headerSafe` alone
+/// strips CR/LF (preventing response-splitting) but doesn't escape `"`/
+/// `\`, so a script-controlled filename containing a quote could otherwise
+/// terminate the quoted string early and inject trailing header
+/// parameters.
+func quotedStringSafe(_ value: String) -> String {
+    headerSafe(value)
+        .replacingOccurrences(of: "\\", with: "\\\\")
+        .replacingOccurrences(of: "\"", with: "\\\"")
+}
+
 final class ServerResponseSink: LassoResponseSink, @unchecked Sendable {
     private(set) var status: Int = 200
     private(set) var redirectURL: String?
     private(set) var headerPairs: [(name: String, value: String)] = []
     private(set) var cookieHeaderValues: [String] = []
+    private(set) var fileServeRequest: LassoFileServeRequest?
 
     func setStatus(_ status: Int) throws {
         self.status = status
@@ -810,6 +892,10 @@ final class ServerResponseSink: LassoResponseSink, @unchecked Sendable {
         if secure { parts.append("Secure") }
         if httpOnly { parts.append("HttpOnly") }
         cookieHeaderValues.append(parts.joined(separator: "; "))
+    }
+
+    func serveFile(_ request: LassoFileServeRequest) throws {
+        fileServeRequest = request
     }
 }
 

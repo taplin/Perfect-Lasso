@@ -34,6 +34,9 @@ private struct RendererEngine {
             context = engine.evaluator.context
             return output
         }
+        if evaluator.context.includeRenderService == nil {
+            evaluator.context.includeRenderService = RendererIncludeService()
+        }
     }
 
     mutating func render(_ nodes: [LassoNode]) throws -> String {
@@ -291,40 +294,56 @@ private struct RendererEngine {
     /// since `loadedLibraries` starts empty on every fresh `LassoContext`.
     /// The library's own text output, if any, is intentionally discarded.
     private mutating func renderLibrary(_ arguments: [LassoArgument]) throws {
-        guard let loader = evaluator.context.includeLoader else {
-            throw LassoRuntimeError.includeNotConfigured
-        }
         let evaluated = try evaluator.evaluateArguments(arguments)
         let path = evaluated.firstValue(named: "file")?.outputString ??
             evaluated.firstValue(named: "path")?.outputString ??
             evaluated.first?.value.outputString ?? ""
-        guard evaluator.context.loadedLibraries.insert(path).inserted else { return }
-
-        let source = try loader.loadInclude(path: path, from: evaluator.context.includePath)
-        _ = try render(LassoParser().parse(source).nodes)
+        guard let service = evaluator.context.includeRenderService else {
+            throw LassoRuntimeError.includeNotConfigured
+        }
+        try service.performLibrary(path: path, once: true, context: &evaluator.context)
     }
 
     private mutating func renderInclude(_ arguments: [LassoArgument]) throws -> String {
-        guard let loader = evaluator.context.includeLoader else {
-            throw LassoRuntimeError.includeNotConfigured
-        }
         let evaluated = try evaluator.evaluateArguments(arguments)
         let path = evaluated.firstValue(named: "file")?.outputString ??
             evaluated.firstValue(named: "path")?.outputString ??
             evaluated.first?.value.outputString ?? ""
-        guard !evaluator.context.includeStack.contains(path) else {
+        guard let service = evaluator.context.includeRenderService else {
+            throw LassoRuntimeError.includeNotConfigured
+        }
+        return try service.performInclude(path: path, once: false, context: &evaluator.context) ?? ""
+    }
+}
+
+/// Concrete `LassoIncludeRenderService` conformer — the only place that
+/// can reconstruct a `RendererEngine` to actually render loaded nodes.
+/// Wired onto every context by `RendererEngine.init`, the same
+/// underlying trick as `evaluator.renderNodes` (`Renderer.swift:29-37`),
+/// exposed as a protocol conformer instead of a bare closure so
+/// evaluator-level native type methods (`web_response->include*`, which
+/// only see `LassoContext`, not an `Evaluator`) can reach it too.
+struct RendererIncludeService: LassoIncludeRenderService {
+    func performInclude(path: String, once: Bool, context: inout LassoContext) throws -> String? {
+        guard let loader = context.includeLoader else {
+            throw LassoRuntimeError.includeNotConfigured
+        }
+        if once {
+            guard context.includedOncePaths.insert(path).inserted else { return nil }
+        }
+        guard !context.includeStack.contains(path) else {
             throw LassoRuntimeError.includeCycle(path)
         }
-        guard evaluator.context.includeStack.count < 32 else {
+        guard context.includeStack.count < 32 else {
             throw LassoRuntimeError.includeDepthExceeded
         }
 
-        let previousPath = evaluator.context.includePath
-        evaluator.context.includeStack.append(path)
-        evaluator.context.includePath = path
+        let previousPath = context.includePath
+        context.includeStack.append(path)
+        context.includePath = path
         defer {
-            evaluator.context.includePath = previousPath
-            _ = evaluator.context.includeStack.popLast()
+            context.includePath = previousPath
+            _ = context.includeStack.popLast()
         }
 
         // Always read the source — it's the only way to detect a change,
@@ -336,12 +355,58 @@ private struct RendererEngine {
         let source = try loader.loadInclude(path: path, from: previousPath)
         let cacheKey = "\(previousPath ?? "")\u{0}\(path)"
         let document: LassoDocument
-        if let cached = evaluator.context.tagRegistry.cachedInclude(forKey: cacheKey, matchingSource: source) {
+        if let cached = context.tagRegistry.cachedInclude(forKey: cacheKey, matchingSource: source) {
             document = cached
         } else {
             document = LassoParser().parse(source)
-            evaluator.context.tagRegistry.cacheInclude(forKey: cacheKey, source: source, document: document)
+            context.tagRegistry.cacheInclude(forKey: cacheKey, source: source, document: document)
         }
-        return try render(document.nodes)
+        var engine = RendererEngine(context: context)
+        let output = try engine.render(document.nodes)
+        context = engine.evaluator.context
+        return output
+    }
+
+    /// Loads and runs a library. `once`, when true, applies LassoSoft's
+    /// documented `library_once` dedup ("if used multiple times
+    /// referencing the same Lasso page then only the first will actually
+    /// perform the include") against `loadedLibraries` — deliberately
+    /// per-`LassoContext`, not the shared `tagRegistry`, since the dedup
+    /// scopes to a single page's own render, not the server process's
+    /// lifetime. Tag/type definitions the library registers land on the
+    /// shared `tagRegistry` and so persist process-wide as normal, but any
+    /// other top-level executable code in the file genuinely re-runs on
+    /// every new request, since `loadedLibraries` starts empty on every
+    /// fresh `LassoContext`. The library's own text output, if any, is
+    /// intentionally discarded — library bodies run for side effects only.
+    func performLibrary(path: String, once: Bool, context: inout LassoContext) throws {
+        guard let loader = context.includeLoader else {
+            throw LassoRuntimeError.includeNotConfigured
+        }
+        if once {
+            guard context.loadedLibraries.insert(path).inserted else { return }
+        }
+        // Independent of the `once` dedup above: `includeLibrary`'s
+        // `once: false` call has no dedup to fall back on, so a self- or
+        // mutually-recursive library chain needs its own cycle/depth
+        // guard — otherwise it recurses through native Swift calls
+        // unboundedly and crashes the process (a Swift stack overflow
+        // traps, it isn't a catchable Lasso error). Mirrors
+        // `performInclude`'s `includeStack` guard exactly, on a separate
+        // stack so `includes()` keeps reflecting include-family calls
+        // only, per its documented scope.
+        guard !context.libraryStack.contains(path) else {
+            throw LassoRuntimeError.includeCycle(path)
+        }
+        guard context.libraryStack.count < 32 else {
+            throw LassoRuntimeError.includeDepthExceeded
+        }
+        context.libraryStack.append(path)
+        defer { _ = context.libraryStack.popLast() }
+
+        let source = try loader.loadInclude(path: path, from: context.includePath)
+        var engine = RendererEngine(context: context)
+        _ = try engine.render(LassoParser().parse(source).nodes)
+        context = engine.evaluator.context
     }
 }

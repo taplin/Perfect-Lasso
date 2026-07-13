@@ -239,6 +239,20 @@ public struct LassoInlineRequest: Equatable, Sendable {
 
 public protocol LassoIncludeLoader: Sendable {
     func loadInclude(path: String, from includingPath: String?) throws -> String
+    /// Raw bytes for `web_response->includeBytes` — a sibling of
+    /// `loadInclude` sharing the exact same path-resolution/root-
+    /// confinement/extension-allowlist policy, just reading the file as
+    /// data instead of decoding it as UTF-8 text. Defaulted so existing
+    /// conformers (test/smoke loaders predating `includeBytes`) don't
+    /// need to change; only `LassoFileSystemIncludeLoader` implements it
+    /// for real. See Documentation/web-response-include-plan.md.
+    func loadIncludeBytes(path: String, from includingPath: String?) throws -> Data
+}
+
+public extension LassoIncludeLoader {
+    func loadIncludeBytes(path: String, from includingPath: String?) throws -> Data {
+        throw LassoRuntimeError.includeNotConfigured
+    }
 }
 
 public struct LassoFileSystemIncludeLoader: LassoIncludeLoader {
@@ -260,6 +274,27 @@ public struct LassoFileSystemIncludeLoader: LassoIncludeLoader {
     }
 
     public func loadInclude(path: String, from includingPath: String?) throws -> String {
+        let candidate = try resolvedCandidateURL(for: path, from: includingPath)
+        do {
+            return try String(contentsOf: candidate, encoding: .utf8)
+        } catch {
+            throw LassoFileSystemIncludeError.unreadableFile(path)
+        }
+    }
+
+    public func loadIncludeBytes(path: String, from includingPath: String?) throws -> Data {
+        let candidate = try resolvedCandidateURL(for: path, from: includingPath)
+        do {
+            return try Data(contentsOf: candidate)
+        } catch {
+            throw LassoFileSystemIncludeError.unreadableFile(path)
+        }
+    }
+
+    /// Path resolution/root-confinement/extension-allowlist policy shared
+    /// by `loadInclude` and `loadIncludeBytes` — only the final read call
+    /// (text vs. raw data) differs between them.
+    private func resolvedCandidateURL(for path: String, from includingPath: String?) throws -> URL {
         let normalizedPath = path.hasPrefix("/") ? String(path.dropFirst()) : path
         var bases: [URL] = [root]
         if !path.hasPrefix("/"), let includingPath {
@@ -293,11 +328,7 @@ public struct LassoFileSystemIncludeLoader: LassoIncludeLoader {
                 throw LassoFileSystemIncludeError.extensionNotAllowed(fileExtension)
             }
             guard FileManager.default.fileExists(atPath: candidate.path) else { continue }
-            do {
-                return try String(contentsOf: candidate, encoding: .utf8)
-            } catch {
-                throw LassoFileSystemIncludeError.unreadableFile(path)
-            }
+            return candidate
         }
         throw LassoFileSystemIncludeError.fileNotFound(path)
     }
@@ -314,6 +345,43 @@ public enum LassoFileSystemIncludeError: Error, Equatable, Sendable {
     case extensionNotAllowed(String)
     case fileNotFound(String)
     case unreadableFile(String)
+}
+
+/// Lets evaluator-level code (native type methods, which only receive a
+/// `LassoContext`, not an `Evaluator`) trigger a full include/library
+/// render without rendering arbitrary nodes itself — the exact gap
+/// `NativeTypes.swift`'s `makeWebResponseType()` used to flag as the
+/// reason `web_response->include*` was deferred. Follows this codebase's
+/// established provider-protocol convention (`includeLoader`,
+/// `sessionProvider`, `responseSink`, `inlineProvider`, `uploadProcessor`
+/// are all `(any SomeProtocol)?` on `LassoContext`, wired imperatively at
+/// whichever call site constructs both a renderer and a context) rather
+/// than a bare closure. The concrete conformer, `RendererIncludeService`,
+/// lives in `Renderer.swift` — only that file can reconstruct a
+/// `RendererEngine` to actually render loaded nodes.
+///
+/// Every call site MUST extract `context.includeRenderService` to a local
+/// `let` before calling into it with `&context` — invoking a
+/// closure/protocol witness stored on `context` as
+/// `context.includeRenderService?.performInclude(..., context: &context)`
+/// is overlapping access to the same storage and is rejected by Swift's
+/// exclusivity checking.
+public protocol LassoIncludeRenderService: Sendable {
+    /// Renders `path` and returns its output, or `nil` when `once` is true
+    /// and this path was already included earlier in the same render (the
+    /// dedup hit itself, distinct from an include that legitimately
+    /// produced empty output) — callers map `nil` to whatever "no-op"
+    /// value fits their call site (e.g. `web_response->includeOnce`'s
+    /// second call returns `.void`). `once`, when true, applies `include`'s
+    /// own dedup (backed by `LassoContext.includedOncePaths`, separate
+    /// from `loadedLibraries` so an `include` path and a `library` path
+    /// sharing a string don't cross-suppress each other).
+    func performInclude(path: String, once: Bool, context: inout LassoContext) throws -> String?
+    /// Executes `path` as a library for its side effects only (library
+    /// bodies don't contribute to page output). `once`, when true, applies
+    /// `loadedLibraries` dedup — the same dedup the bare `library(...)`
+    /// free tag already applies unconditionally.
+    func performLibrary(path: String, once: Bool, context: inout LassoContext) throws
 }
 
 /// A single ordered name/value pair from a request's query string or POST
@@ -622,6 +690,12 @@ public protocol LassoResponseSink: Sendable {
         httpOnly: Bool
     ) throws
     func getStatus() -> Int
+    /// Records a `sendFile`/`file_serve`/`file_stream` request for the
+    /// server boundary to act on after render — same "collect now, act
+    /// after render" convention as `redirect(to:)`/`setCookie`. Defaulted
+    /// to a no-op so existing conformers (test/smoke sinks predating file
+    /// serving) don't need to change.
+    func serveFile(_ request: LassoFileServeRequest) throws
 }
 
 public extension LassoResponseSink {
@@ -638,6 +712,43 @@ public extension LassoResponseSink {
         try setCookie(name: name, value: value)
     }
     func getStatus() -> Int { 200 }
+    func serveFile(_ request: LassoFileServeRequest) throws {}
+}
+
+/// A file-serve request produced by `web_response->sendFile` (already-
+/// evaluated string `data`) or `file_serve`/`file_stream` (a site-relative
+/// `path`, resolved by the server boundary via the same root-confining
+/// `fileURL(for:)` every other filesystem-touching feature already uses).
+/// Exactly one of `data`/`path` is set, matching the two distinct real
+/// Lasso constructs this models — see
+/// `Documentation/web-response-include-plan.md` for why they're kept
+/// separate rather than forced into one path-based mechanism.
+public struct LassoFileServeRequest: Equatable, Sendable {
+    public enum Source: Equatable, Sendable {
+        case data(Data)
+        case path(String)
+    }
+
+    public var source: Source
+    public var fileName: String?
+    public var contentType: String?
+    /// `nil` means "don't emit Content-Disposition at all" — the right
+    /// default for `file_serve`/`file_stream` (no documented disposition
+    /// concept). `sendFile` passes `"attachment"` explicitly, matching its
+    /// real documented `-disposition` default.
+    public var disposition: String?
+
+    public init(
+        source: Source,
+        fileName: String? = nil,
+        contentType: String? = nil,
+        disposition: String? = nil
+    ) {
+        self.source = source
+        self.fileName = fileName
+        self.contentType = contentType
+        self.disposition = disposition
+    }
 }
 
 public protocol LassoInlineProvider: Sendable {

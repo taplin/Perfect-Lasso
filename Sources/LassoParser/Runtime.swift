@@ -370,6 +370,37 @@ public struct LassoNativeRegistry: Sendable {
                 ))
             }
         }
+        // Lasso 8, genuinely path-based (unlike web_response->sendFile,
+        // which takes already-evaluated string data). Implemented as
+        // aliases of one identical registration — no confirmed documented
+        // behavioral distinction found between File_Serve and File_Stream
+        // for this adapter's purposes. Deliberately root-confined, for
+        // consistency with every other filesystem-touching feature in this
+        // adapter (uploads, includes) — a considered divergence from real
+        // Lasso 8's very likely unconfined posture; no escape hatch this
+        // pass. The path is handed to the response sink unresolved; actual
+        // existence/root-confinement/ETag/Range handling happens at the
+        // server boundary via the same fileURL(for:)/FileOutput every
+        // other static-asset request already uses (LassoPerfectServer's
+        // LassoSiteServer.render) — a missing file surfaces there as a
+        // genuine HTTP 404, not a [protect]-catchable recoverable error,
+        // since by the time that check runs the page has already aborted
+        // via returnSignal and there's no page left for [protect] to catch
+        // anything on. See Documentation/web-response-include-plan.md.
+        let fileServeHandler: LassoNativeFunction = { arguments, context in
+            let path = arguments.lastString(named: "file") ??
+                arguments.lastString(named: "path") ??
+                arguments.first?.value.outputString ?? ""
+            try context.responseSink?.serveFile(LassoFileServeRequest(
+                source: .path(path),
+                contentType: arguments.lastString(named: "type")
+            ))
+            context.setReturnSignal(.void)
+            return .void
+        }
+        register("file_serve", function: fileServeHandler)
+        register("file_stream", function: fileServeHandler)
+
         register("cookie") { arguments, context in
             let name = arguments.firstValue(named: "name")?.outputString ??
                 arguments.first?.value.outputString ?? ""
@@ -534,6 +565,19 @@ public struct LassoContext: Sendable {
     public var includeLoader: (any LassoIncludeLoader)?
     public var includePath: String?
     public var includeStack: [String]
+    /// Wired imperatively by whichever call site constructs both a
+    /// `RendererEngine`/`Evaluator` and a `LassoContext` together — same
+    /// convention as `Evaluator.renderNodes`, not a public initializer
+    /// parameter. Lets `web_response->include`/`includeLibrary` (evaluator-
+    /// level native methods, which only see this context, not an
+    /// `Evaluator`) trigger a full node render. See
+    /// `LassoIncludeRenderService` in `Providers.swift`.
+    public var includeRenderService: (any LassoIncludeRenderService)?
+    /// Paths already processed by `web_response->includeOnce` this
+    /// request's render. Deliberately separate from `loadedLibraries` so
+    /// an `include` path and a `library` path sharing a string don't
+    /// cross-suppress each other.
+    var includedOncePaths: Set<String>
     public var requestProvider: (any LassoRequestProvider)?
     public var uploadProcessor: (any LassoUploadProcessor)?
     public var sessionProvider: (any LassoSessionProvider)?
@@ -546,6 +590,16 @@ public struct LassoContext: Sendable {
     /// anything" dedup to a single page's own render, not the server
     /// process's lifetime.
     var loadedLibraries: Set<String>
+    /// Cycle/depth guard for `performLibrary`, independent of
+    /// `includeStack` (which stays include-family-only, matching
+    /// `includes()`'s documented scope) and independent of
+    /// `loadedLibraries` (which only guards the `once: true` path).
+    /// `includeLibrary`'s `once: false` call has no dedup to fall back on,
+    /// so without this a self- or mutually-recursive `includeLibrary`
+    /// chain would recurse through native Swift calls unboundedly and
+    /// crash the process — this bounds it the same way `includeStack`
+    /// already bounds `include`.
+    var libraryStack: [String]
     var returnSignal: LassoValue?
     var tagCallStack: [String]
     var selfStack: [LassoObjectInstance]
@@ -596,6 +650,8 @@ public struct LassoContext: Sendable {
         self.includeLoader = includeLoader
         self.includePath = includePath
         includeStack = []
+        includeRenderService = nil
+        includedOncePaths = []
         self.requestProvider = requestProvider
         self.uploadProcessor = uploadProcessor
         self.sessionProvider = sessionProvider
@@ -603,6 +659,7 @@ public struct LassoContext: Sendable {
         self.inlineProvider = inlineProvider
         self.tagRegistry = tagRegistry
         loadedLibraries = []
+        libraryStack = []
         returnSignal = nil
         tagCallStack = []
         selfStack = []

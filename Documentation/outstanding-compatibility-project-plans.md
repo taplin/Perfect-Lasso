@@ -729,6 +729,77 @@ live MySQL session verification.
 
 ## 8. web_response->include*, includeBytes, sendFile
 
+### Implementation Status (2026-07-13)
+
+Implemented per the original plan's shape, with one correction and several
+explicitly-flagged judgment calls. See
+[web-response-include-plan.md](web-response-include-plan.md) for the full
+design and every deferred/assumed item. Summary:
+
+**Correction to this section's own "Reference Findings"**: `sendFile`'s
+real LassoGuide 9.3 signature takes `data` (a string/bytes/file value —
+already-evaluated content), not a path, unlike this section's original
+framing which conflated it with the genuinely path-based Lasso 8
+`File_Serve`/`File_Stream`. Implemented faithfully: `sendFile` accepts a
+plain Lasso string, and `file_serve`/`file_stream` (new Lasso 8 free-tag
+natives, not part of the original plan's Step 6/7 scope but added to
+actually cover path-based serving) take the path instead.
+
+**Zero real corpus evidence for anything in this section** — a direct
+`grep` against the real site found no usages of `web_response->include*`,
+`sendFile`, `File_Serve`, or `File_Stream`. Implemented against the
+documented Lasso 8.5/9 contract, live-verified via a throwaway page over
+real HTTP (see the doc above) rather than corpus signal, since there's no
+corpus signal to check against.
+
+**Architecture** (per the plan's own Step 1/3): a new
+`LassoIncludeRenderService` protocol on `LassoContext`, matching this
+codebase's established provider-protocol convention rather than a bare
+closure. Its concrete conformer, `RendererIncludeService`
+(`Sources/LassoParser/Renderer.swift`), holds the exact pre-existing
+`renderInclude`/`renderLibrary` cycle-detection/depth-limit/caching logic
+moved verbatim — the free-tag `[include(...)]`/`[library(...)]` path is
+provably unchanged (all pre-existing include/library tests, including the
+real-corpus fixture regression test, still pass byte-for-byte).
+
+**Judgment calls, explicitly flagged** (no confirmed documented answer
+found in either LassoGuide 9.3 or the local Lasso 8.5 reference):
+- `includeOnce`'s return value on a repeat call for an already-included
+  path defaults to `.void`.
+- `includes()` reflects the live include-family nesting stack only —
+  `library`/`includeLibrary` calls never push onto it, matching the
+  pre-existing free-tag `library(...)`'s own scope.
+- `file_serve` and `file_stream` are implemented as aliases of one
+  identical registration (no documented behavioral distinction found).
+- `file_serve`/`file_stream` are root-confined for consistency with every
+  other filesystem-touching feature in this adapter, a deliberate
+  divergence from real Lasso 8's likely-unconfined posture.
+- `sendFile`'s `-noAbort` is unsupported (always aborts) — this adapter's
+  single-accumulated-response-string architecture has no "serve then keep
+  composing more output" model.
+
+**Found and fixed during a code-reviewer pass, before merge**: the new
+`includeLibrary` (no-dedup) native had no cycle/depth guard — unlike
+`include`/`includeOnce` (protected by the pre-existing `includeStack`
+guard) and `includeLibraryOnce`/the free `library(...)` tag (protected by
+`loadedLibraries` dedup even on self-reference), a self- or
+mutually-recursive `includeLibrary` chain would have recursed through
+native Swift calls unboundedly and crashed the whole server process, not
+just failed one request. Fixed with an independent `LassoContext.libraryStack`
+guard mirroring `includeStack`'s, kept on a separate stack so it doesn't
+affect `includes()`'s documented scope. A second, unrelated finding
+(`Content-Disposition`'s `filename="..."` not escaping embedded `"`/`\`)
+was fixed the same pass. Both fixes have dedicated regression tests.
+
+Verified via 32 new tests (23 in `LassoParserTests`, 6 in a new
+`LassoPerfectServerTests` target covering the header-building/escaping
+logic that lives in the `LassoPerfectServer` executable target and so
+couldn't be reached from `LassoParserTests`) — 145/145 total across all
+four test targets, no regressions — plus two `feature-dev:code-reviewer`
+passes (the second finding nothing beyond the first pass's two fixes) and
+a live end-to-end check over real HTTP (see
+[web-response-include-plan.md](web-response-include-plan.md)).
+
 ### Goal
 
 Bridge Lasso 9 `web_response` include/file-serving methods to the adapter's
