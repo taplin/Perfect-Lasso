@@ -54,7 +54,7 @@ for input in renderInputs {
         "name": .string("Ada"),
         "unsafe": .string("<strong>unsafe & raw</strong>"),
     ])
-    let actual = try LassoRenderer().render(source, context: &context)
+    let actual = try await LassoRenderer().render(source, context: &context)
     precondition(actual == expected, "Golden mismatch in \(input.lastPathComponent)")
 }
 
@@ -62,8 +62,8 @@ var natives = LassoNativeRegistry()
 natives.register("greet") { arguments, _ in
     .string("Hello, \(arguments.first?.value.outputString ?? "friend")")
 }
-var nativeContext = LassoContext(natives: natives)
-let nativeOutput = try LassoRenderer().render("[greet('Ada')]", context: &nativeContext)
+nonisolated(unsafe) var nativeContext = LassoContext(natives: natives)
+let nativeOutput = try await LassoRenderer().render("[greet('Ada')]", context: &nativeContext)
 precondition(nativeOutput == "Hello, Ada", "Native function registration failed")
 
 struct SmokeIncludeLoader: LassoIncludeLoader {
@@ -114,7 +114,7 @@ final class SmokeSessionProvider: LassoSessionProvider, @unchecked Sendable {
     func abort(session name: String) {}
 }
 
-var backendContext = LassoContext(
+nonisolated(unsafe) var backendContext = LassoContext(
     globals: ["title": .string("Catalog")],
     includeLoader: SmokeIncludeLoader(),
     requestProvider: SmokeRequestProvider(),
@@ -127,16 +127,16 @@ var backendContext = LassoContext(
         ],
     ])
 )
-let includeOutput = try LassoRenderer().render("[include:'partials/header.lasso']", context: &backendContext)
+let includeOutput = try await LassoRenderer().render("[include:'partials/header.lasso']", context: &backendContext)
 precondition(includeOutput == "<h1>Catalog</h1>", "Include rendering failed")
 
-let requestOutput = try LassoRenderer().render(
+let requestOutput = try await LassoRenderer().render(
     "[web_request->param('term')]|[web_request->header('host')]|[cookie:'sid']",
     context: &backendContext
 )
 precondition(requestOutput == "clogs|example.test|abc123", "Request provider rendering failed")
 
-let sessionOutput = try LassoRenderer().render(
+let sessionOutput = try await LassoRenderer().render(
     "[session_start('cart')][var(cartvalue = 'open')][session_addvar('cart','cartvalue')][cartvalue]/[session_id('cart')]",
     context: &backendContext
 )
@@ -144,7 +144,7 @@ precondition(sessionOutput == "open/smoke-cart", "Session provider rendering fai
 
 let inlineSource = "[inline:-search,-database='demo',-table='items',-op='eq',-active='yes',-sortfield='name']" +
     "[records][field:'name']:[field:'qty'];[/records]([found_count])[/inline]"
-let inlineOutput = try LassoRenderer().render(inlineSource, context: &backendContext)
+let inlineOutput = try await LassoRenderer().render(inlineSource, context: &backendContext)
 precondition(inlineOutput == "Alpha:2;Beta:3;(2)", "Inline records rendering failed")
 
 struct CorpusIncludeLoader: LassoIncludeLoader {
@@ -165,7 +165,7 @@ struct CorpusIncludeLoader: LassoIncludeLoader {
     }
 }
 
-var corpusContext = LassoContext(
+nonisolated(unsafe) var corpusContext = LassoContext(
     globals: [
         "http": .string("https://demo.example"),
         "url_prefix": .string(""),
@@ -190,12 +190,12 @@ var corpusContext = LassoContext(
         ],
     ])
 )
-let corpusBillboard = try LassoRenderer().render("[include('billboard.txt')]", context: &corpusContext)
+let corpusBillboard = try await LassoRenderer().render("[include('billboard.txt')]", context: &corpusContext)
 precondition(
     corpusBillboard == "<a href=\"https://demo.example/store.lasso?pid=247\">Billboard</a>",
     "Corpus billboard include failed"
 )
-let corpusCategory = try LassoRenderer().render(
+let corpusCategory = try await LassoRenderer().render(
     "<a href=\"[$URL_Prefix][response_filepath]?cid=tops&keywords=[include('keywords/tops.lasso')]\">Tops</a>",
     context: &corpusContext
 )
@@ -208,7 +208,7 @@ let corpusCloseout = """
     -op='cn','featured'='seasonal_sale',-ReturnField='mfr_style_no',-ReturnField='color',-search)]
 [records][field('mfr_style_no')]:[field('color')];[/records][/inline]
 """
-let corpusCloseoutOutput = try LassoRenderer().render(corpusCloseout, context: &corpusContext)
+let corpusCloseoutOutput = try await LassoRenderer().render(corpusCloseout, context: &corpusContext)
 precondition(
     corpusCloseoutOutput.replacingOccurrences(of: "\n", with: "") == "247:Black;701:Navy;",
     "Corpus closeout carousel query failed: \(corpusCloseoutOutput)"
@@ -226,14 +226,14 @@ let perfectCRUDExecutor = PerfectCRUDLassoExecutor { datasource, query in
         statement: "SELECT ..."
     )
 }
-var perfectCRUDContext = LassoContext(
+nonisolated(unsafe) var perfectCRUDContext = LassoContext(
     globals: ["product_subset": .string("DEMO")],
     inlineProvider: LassoDynamicInlineProvider(
         executor: perfectCRUDExecutor,
         datasourceAliases: ["catalog_mysql": "catalog"]
     )
 )
-let perfectCRUDOutput = try LassoRenderer().render(corpusCloseout, context: &perfectCRUDContext)
+let perfectCRUDOutput = try await LassoRenderer().render(corpusCloseout, context: &perfectCRUDContext)
 precondition(
     perfectCRUDOutput.replacingOccurrences(of: "\n", with: "") == "247:Black;701:Navy;",
     "PerfectCRUD Lasso executor parity failed"
@@ -275,7 +275,7 @@ for input in corpusFixtureInputs {
             ],
         ])
     )
-    let output = try LassoRenderer().render(source, context: &context)
+    let output = try await LassoRenderer().render(source, context: &context)
     precondition(
         output.trimmingCharacters(in: .newlines) == expected.trimmingCharacters(in: .newlines),
         "Corpus fixture mismatch in \(input.lastPathComponent): \(output)"
@@ -307,7 +307,7 @@ if let realPageRelativePath = environment["LASSO_SMOKE_REAL_PAGE_PATH"],
             includePath: realPageRelativePath,
             inlineProvider: LassoInMemoryInlineProvider(tables: [:])
         )
-        let realPageOutput = try LassoRenderer().render(realPageSource, context: &realPageContext)
+        let realPageOutput = try await LassoRenderer().render(realPageSource, context: &realPageContext)
         precondition(!realPageOutput.isEmpty, "Real page smoke render produced no output")
         print("Rendered real-page smoke check against \(realPageRelativePath) (\(realPageOutput.count) bytes).")
     }
@@ -336,7 +336,7 @@ precondition(scriptArguments.count == 6, "Expected script inline arguments")
 precondition(scriptBody.count == 1, "Expected return statement inside script inline")
 
 struct ScriptInlineProvider: LassoInlineProvider {
-    func executeInline(arguments: [EvaluatedArgument], context: LassoContext) throws -> LassoInlineFrame {
+    func executeInline(arguments: [EvaluatedArgument], context: LassoContext) async throws -> LassoInlineFrame {
         let request = LassoInlineRequest(arguments: arguments)
         precondition(request.database == "catalog_mysql", "Script inline database did not normalize")
         precondition(request.table == "skus", "Script inline table did not normalize")
@@ -346,7 +346,7 @@ struct ScriptInlineProvider: LassoInlineProvider {
         ])
     }
 }
-var scriptContext = LassoContext(
+nonisolated(unsafe) var scriptContext = LassoContext(
     globals: ["product_subset": .string("demo-product-line")],
     inlineProvider: ScriptInlineProvider()
 )
@@ -362,7 +362,7 @@ inline(
 /inline
 ?>
 """
-_ = try LassoRenderer().render(scriptRenderSource, context: &scriptContext)
+_ = try await LassoRenderer().render(scriptRenderSource, context: &scriptContext)
 
 let scriptJSONSource = """
 <?lassoscript
@@ -379,7 +379,7 @@ inline(
 /inline
 ?>
 """
-let scriptJSONOutput = try LassoRenderer().render(scriptJSONSource, context: &scriptContext)
+let scriptJSONOutput = try await LassoRenderer().render(scriptJSONSource, context: &scriptContext)
 precondition(
     scriptJSONOutput == "[{\"preview\":\"one.jpg\",\"catalog_sku\":\"SKU-1\"}]" ||
         scriptJSONOutput == "[{\"catalog_sku\":\"SKU-1\",\"preview\":\"one.jpg\"}]",
@@ -399,7 +399,7 @@ if let apiPath = environment["LASSO_SMOKE_REAL_API_PAGE_PATH"],
 
 // MARK: - Custom tags: definition, parameter defaults, return, recursion depth
 
-var tagContext = LassoContext()
+nonisolated(unsafe) var tagContext = LassoContext()
 let greetSource = """
 <?lassoscript
 define greet_tag(#name, #greeting='Hello') => {
@@ -408,10 +408,10 @@ define greet_tag(#name, #greeting='Hello') => {
 ?>
 [greet_tag('Ada')] / [greet_tag('Bo', 'Hi')]
 """
-let greetOutput = try LassoRenderer().render(greetSource, context: &tagContext)
+let greetOutput = try await LassoRenderer().render(greetSource, context: &tagContext)
 precondition(greetOutput.trimmingCharacters(in: .whitespacesAndNewlines) == "Hello, Ada! / Hi, Bo!", "Custom tag define/call failed: \(greetOutput)")
 
-let tagExistsOutput = try LassoRenderer().render(
+let tagExistsOutput = try await LassoRenderer().render(
     "[lasso_tagexists('string')]|[tag_exists('greet_tag')]|[tag_exists('missing_tag')]",
     context: &tagContext
 )
@@ -420,8 +420,8 @@ precondition(
     "tag_exists/lasso_tagexists failed: \(tagExistsOutput)"
 )
 
-var typeContext = LassoContext()
-let typeOutput = try LassoRenderer().render(
+nonisolated(unsafe) var typeContext = LassoContext()
+let typeOutput = try await LassoRenderer().render(
     """
     <?lassoscript
     define Widget => type {
@@ -459,7 +459,7 @@ define increment_tag(#value) => {
 ?>
 [local(result = 100)][increment_tag(5)] / [#result]
 """
-let isolationOutput = try LassoRenderer().render(isolationSource, context: &tagContext)
+let isolationOutput = try await LassoRenderer().render(isolationSource, context: &tagContext)
 precondition(
     isolationOutput.trimmingCharacters(in: .whitespacesAndNewlines) == "6 / 100",
     "Custom tag local-scope isolation failed: \(isolationOutput)"
@@ -476,7 +476,7 @@ define short_circuit_tag(#flag) => {
 ?>
 [short_circuit_tag(true)] / [short_circuit_tag(false)]
 """
-let shortCircuitOutput = try LassoRenderer().render(shortCircuitSource, context: &tagContext)
+let shortCircuitOutput = try await LassoRenderer().render(shortCircuitSource, context: &tagContext)
 precondition(
     shortCircuitOutput.trimmingCharacters(in: .whitespacesAndNewlines) == "early / late",
     "Custom tag return short-circuiting failed: \(shortCircuitOutput)"
@@ -493,12 +493,12 @@ define recurse_tag(#n) => {
 ?>
 [recurse_tag(3)]
 """
-let recursionOutput = try LassoRenderer().render(recursionSource, context: &tagContext)
+let recursionOutput = try await LassoRenderer().render(recursionSource, context: &tagContext)
 precondition(recursionOutput.trimmingCharacters(in: .whitespacesAndNewlines) == "3", "Custom tag recursion failed: \(recursionOutput)")
 
 do {
     var deepContext = LassoContext()
-    _ = try LassoRenderer().render(
+    _ = try await LassoRenderer().render(
         """
         <?lassoscript
         define deep_recurse_tag(#n) => {
@@ -544,15 +544,15 @@ define shared_tag(#x) => {
 """)
 let sharedTagRegistry = LassoTagRegistry()
 
-func renderAgainstSharedRegistry(_ source: String) throws -> String {
+func renderAgainstSharedRegistry(_ source: String) async throws -> String {
     var requestContext = LassoContext(includeLoader: countingLoader, tagRegistry: sharedTagRegistry)
-    return try LassoRenderer().render(source, context: &requestContext)
+    return try await LassoRenderer().render(source, context: &requestContext)
 }
 
-let firstRequestOutput = try renderAgainstSharedRegistry(
+let firstRequestOutput = try await renderAgainstSharedRegistry(
     "<?lassoscript library('/shared.lasso') ?>[shared_tag(21)]"
 )
-let secondRequestOutput = try renderAgainstSharedRegistry(
+let secondRequestOutput = try await renderAgainstSharedRegistry(
     "<?lassoscript library('/shared.lasso') ?>[shared_tag(10)]"
 )
 precondition(firstRequestOutput == "42", "Library-defined tag call failed: \(firstRequestOutput)")
@@ -587,13 +587,13 @@ final class MutableIncludeLoader: LassoIncludeLoader, @unchecked Sendable {
 let includeRegistry = LassoTagRegistry()
 let mutableLoader = MutableIncludeLoader(content: "v1: [local(x = 1)][#x]")
 
-func renderAgainstIncludeRegistry(_ source: String) throws -> String {
+func renderAgainstIncludeRegistry(_ source: String) async throws -> String {
     var requestContext = LassoContext(includeLoader: mutableLoader, tagRegistry: includeRegistry)
-    return try LassoRenderer().render(source, context: &requestContext)
+    return try await LassoRenderer().render(source, context: &requestContext)
 }
 
-let includeFirstOutput = try renderAgainstIncludeRegistry("[include('shared.lasso')]")
-let includeSecondOutput = try renderAgainstIncludeRegistry("[include('shared.lasso')]")
+let includeFirstOutput = try await renderAgainstIncludeRegistry("[include('shared.lasso')]")
+let includeSecondOutput = try await renderAgainstIncludeRegistry("[include('shared.lasso')]")
 precondition(includeFirstOutput == "v1: 1", "Include rendering failed: \(includeFirstOutput)")
 precondition(includeSecondOutput == "v1: 1", "Include rendering failed on second use: \(includeSecondOutput)")
 precondition(
@@ -623,7 +623,7 @@ precondition(
 // Changing the included file's content between uses must not serve stale
 // output — caching is content-based, not "first result wins forever".
 mutableLoader.content = "v2: [local(x = 2)][#x]"
-let includeThirdOutput = try renderAgainstIncludeRegistry("[include('shared.lasso')]")
+let includeThirdOutput = try await renderAgainstIncludeRegistry("[include('shared.lasso')]")
 precondition(
     includeThirdOutput == "v2: 2",
     "Stale include content served after a real change: \(includeThirdOutput)"
@@ -631,7 +631,7 @@ precondition(
 
 // MARK: - <?lasso ?> / <?= ?> block support (arrow-brace and slash-closed)
 
-var lassoBlockContext = LassoContext()
+nonisolated(unsafe) var lassoBlockContext = LassoContext()
 let braceIfSource = """
 <?lasso
 var(triggered::boolean = false)
@@ -643,7 +643,7 @@ var(after::string = 'done')
 ?>
 [$triggered]/[$inside]/[$after]
 """
-let braceIfOutput = try LassoRenderer().render(braceIfSource, context: &lassoBlockContext)
+let braceIfOutput = try await LassoRenderer().render(braceIfSource, context: &lassoBlockContext)
 precondition(
     braceIfOutput.trimmingCharacters(in: .whitespacesAndNewlines) == "true/yes/done",
     "Brace-style <?lasso ?> if failed, or content after '}' was swallowed into its body: \(braceIfOutput)"
@@ -659,7 +659,7 @@ if(true) => {
 ?>
 [$branch]
 """
-let braceIfElseTrueOutput = try LassoRenderer().render(braceIfElseTrueSource, context: &lassoBlockContext)
+let braceIfElseTrueOutput = try await LassoRenderer().render(braceIfElseTrueSource, context: &lassoBlockContext)
 precondition(
     braceIfElseTrueOutput.trimmingCharacters(in: .whitespacesAndNewlines) == "if",
     "Brace-style if/else (true branch) failed: \(braceIfElseTrueOutput)"
@@ -675,7 +675,7 @@ if(false) => {
 ?>
 [$branch]
 """
-let braceIfElseFalseOutput = try LassoRenderer().render(braceIfElseFalseSource, context: &lassoBlockContext)
+let braceIfElseFalseOutput = try await LassoRenderer().render(braceIfElseFalseSource, context: &lassoBlockContext)
 precondition(
     braceIfElseFalseOutput.trimmingCharacters(in: .whitespacesAndNewlines) == "else",
     "Brace-style if/else (false branch) failed: \(braceIfElseFalseOutput)"
@@ -691,7 +691,7 @@ if(true)
 ?>
 [$nested]
 """
-let mixedNestingOutput = try LassoRenderer().render(mixedNestingSource, context: &lassoBlockContext)
+let mixedNestingOutput = try await LassoRenderer().render(mixedNestingSource, context: &lassoBlockContext)
 precondition(
     mixedNestingOutput.trimmingCharacters(in: .whitespacesAndNewlines) == "yes",
     "Brace-style if nested inside a slash-style if failed: \(mixedNestingOutput)"
@@ -708,7 +708,7 @@ if(!$demo_setup_done) => {
 ?>
 [$demo_setup_done]
 """
-let realWorldShapeOutput = try LassoRenderer().render(realWorldShapeSource, context: &lassoBlockContext)
+let realWorldShapeOutput = try await LassoRenderer().render(realWorldShapeSource, context: &lassoBlockContext)
 precondition(
     realWorldShapeOutput.trimmingCharacters(in: .whitespacesAndNewlines) == "true",
     "Real-corpus if(...) => {...} shape under <?lasso ?> failed: \(realWorldShapeOutput)"

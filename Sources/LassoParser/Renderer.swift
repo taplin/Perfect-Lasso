@@ -1,14 +1,14 @@
 public struct LassoRenderer: Sendable {
     public init() {}
 
-    public func render(_ source: String, context: inout LassoContext) throws -> String {
+    public func render(_ source: String, context: inout LassoContext) async throws -> String {
         let document = LassoParser().parse(source)
-        return try render(document, context: &context)
+        return try await render(document, context: &context)
     }
 
-    public func render(_ document: LassoDocument, context: inout LassoContext) throws -> String {
+    public func render(_ document: LassoDocument, context: inout LassoContext) async throws -> String {
         var engine = RendererEngine(context: context)
-        var output = try engine.render(document.nodes)
+        var output = try await engine.render(document.nodes)
         // A `return` at page/include level (not inside a called custom tag,
         // which already consumes its own signal) contributes its value to
         // the page's output — the same behavior `<?lassoscript ... return
@@ -30,7 +30,7 @@ private struct RendererEngine {
         evaluator = Evaluator(context: context)
         evaluator.renderNodes = { nodes, context in
             var engine = RendererEngine(context: context)
-            let output = try engine.render(nodes)
+            let output = try await engine.render(nodes)
             context = engine.evaluator.context
             return output
         }
@@ -39,7 +39,7 @@ private struct RendererEngine {
         }
     }
 
-    mutating func render(_ nodes: [LassoNode]) throws -> String {
+    mutating func render(_ nodes: [LassoNode]) async throws -> String {
         var output = ""
         for node in nodes {
             switch node {
@@ -49,14 +49,14 @@ private struct RendererEngine {
                 if case let .identifier(name) = expression, name.lowercased() == "no_square_brackets" {
                     continue
                 }
-                output += try renderExpression(expression)
+                output += try await renderExpression(expression)
             case let .code(expressions, _, _, _):
                 for expression in expressions {
-                    output += try renderExpression(expression)
+                    output += try await renderExpression(expression)
                     if evaluator.context.returnSignal != nil { break }
                 }
             case let .block(name, arguments, body, alternate, _, _):
-                output += try renderBlock(
+                output += try await renderBlock(
                     name: name,
                     arguments: arguments,
                     body: body,
@@ -77,15 +77,20 @@ private struct RendererEngine {
         arguments: [LassoArgument],
         body: [LassoNode],
         alternate: [LassoNode]?
-    ) throws -> String {
+    ) async throws -> String {
         switch name.lowercased() {
         case "if":
-            let condition = try arguments.first.map { try evaluator.evaluate($0.value) } ?? .boolean(false)
-            return condition.isTruthy ? try render(body) : try render(alternate ?? [])
+            let condition: LassoValue
+            if let argument = arguments.first {
+                condition = try await evaluator.evaluate(argument.value)
+            } else {
+                condition = .boolean(false)
+            }
+            return condition.isTruthy ? try await render(body) : try await render(alternate ?? [])
         case "loop":
             let count: Int
             if let argument = arguments.first {
-                count = Int(try evaluator.evaluate(argument.value).number ?? 0)
+                count = Int(try await evaluator.evaluate(argument.value).number ?? 0)
             } else {
                 count = 0
             }
@@ -93,7 +98,7 @@ private struct RendererEngine {
             if count > 0 {
                 for iteration in 1...count {
                     evaluator.context.set(.integer(iteration), for: "loop_count", scope: .local)
-                    output += try render(body)
+                    output += try await render(body)
                 }
             }
             return output
@@ -101,9 +106,14 @@ private struct RendererEngine {
             var output = ""
             var iterations = 0
             while iterations < 10_000 {
-                let condition = try arguments.first.map { try evaluator.evaluate($0.value) } ?? .boolean(false)
+                let condition: LassoValue
+                if let argument = arguments.first {
+                    condition = try await evaluator.evaluate(argument.value)
+                } else {
+                    condition = .boolean(false)
+                }
                 if !condition.isTruthy { break }
-                output += try render(body)
+                output += try await render(body)
                 iterations += 1
             }
             return output
@@ -122,7 +132,7 @@ private struct RendererEngine {
             // preserves partial protected-block output (see the plan's open
             // question) — safer to under-output than to guess and be wrong.
             do {
-                let output = try render(body)
+                let output = try await render(body)
                 evaluator.context.clearError()
                 return output
             } catch let recoverable as LassoRecoverableError {
@@ -172,14 +182,14 @@ private struct RendererEngine {
             guard let inlineProvider = evaluator.context.inlineProvider else {
                 throw LassoRuntimeError.inlineNotConfigured
             }
-            let frame = try inlineProvider.executeInline(
-                arguments: try evaluator.evaluateArguments(arguments),
+            let frame = try await inlineProvider.executeInline(
+                arguments: try await evaluator.evaluateArguments(arguments),
                 context: evaluator.context
             )
             evaluator.context.pushInlineFrame(frame)
             evaluator.context.set(.array(frame.rows.map { .map($0.mapValue) }), for: "records_map", scope: .local)
             defer { evaluator.context.popInlineFrame() }
-            return try render(body)
+            return try await render(body)
         case "records", "rows":
             guard let frame = evaluator.context.currentInlineFrame else { return "" }
             var output = ""
@@ -187,14 +197,14 @@ private struct RendererEngine {
                 evaluator.context.setCurrentRow(row)
                 evaluator.context.set(.integer(index + 1), for: "record_count", scope: .local)
                 evaluator.context.set(.integer(index + 1), for: "row_count", scope: .local)
-                output += try render(body)
+                output += try await render(body)
             }
             evaluator.context.setCurrentRow(nil)
             return output
         case "iterate":
             let values: [LassoValue]
             if let argument = arguments.first {
-                switch try evaluator.evaluate(argument.value) {
+                switch try await evaluator.evaluate(argument.value) {
                 case let .array(items): values = items
                 case let .map(items): values = items.values.map { $0 }
                 case .void, .null: values = []
@@ -207,7 +217,7 @@ private struct RendererEngine {
             for (index, value) in values.enumerated() {
                 evaluator.context.set(value, for: "loop_value", scope: .local)
                 evaluator.context.set(.integer(index + 1), for: "loop_count", scope: .local)
-                output += try render(body)
+                output += try await render(body)
             }
             return output
         case "with":
@@ -219,7 +229,7 @@ private struct RendererEngine {
                 return ""
             }
             let withValues: [LassoValue]
-            switch try evaluator.evaluate(arguments[1].value) {
+            switch try await evaluator.evaluate(arguments[1].value) {
             case let .array(items): withValues = items
             case let .map(items): withValues = items.values.map { $0 }
             case .void, .null: withValues = []
@@ -228,7 +238,7 @@ private struct RendererEngine {
             var withOutput = ""
             for value in withValues {
                 evaluator.context.set(value, for: variableName, scope: .local)
-                withOutput += try render(body)
+                withOutput += try await render(body)
             }
             return withOutput
         case "output_none":
@@ -237,13 +247,13 @@ private struct RendererEngine {
             // everything normally) but hides the rendered text from the
             // page, per Lasso 8.5 Language Guide Chapter 14's "Table 1:
             // Output Tags". See Documentation/output-tags-plan.md.
-            _ = try render(body)
+            _ = try await render(body)
             return ""
         case "html_comment":
             // Wraps the body's rendered output in an HTML comment — the
             // contents still reach the client (visible via "View Source")
             // but aren't part of the visible page.
-            return "<!--\(try render(body))-->"
+            return "<!--\(try await render(body))-->"
         case "encode_set":
             // Changes the default encoding for nested `Output` calls
             // (those with no -Encode* keyword of their own) for the
@@ -252,33 +262,33 @@ private struct RendererEngine {
             // through to rendering the body with no override, matching
             // this interpreter's existing "unknown flag ignored, not
             // fatal" convention elsewhere.
-            let evaluatedArguments = try evaluator.evaluateArguments(arguments)
+            let evaluatedArguments = try await evaluator.evaluateArguments(arguments)
             if let keyword = LassoEncoding.keyword(in: evaluatedArguments) {
                 evaluator.context.encodingOverrideStack.append(keyword)
                 defer { evaluator.context.encodingOverrideStack.removeLast() }
-                return try render(body)
+                return try await render(body)
             }
-            return try render(body)
+            return try await render(body)
         default:
             if let function = evaluator.context.natives.function(named: name) {
-                _ = try function(try evaluator.evaluateArguments(arguments), &evaluator.context)
+                _ = try await function(try await evaluator.evaluateArguments(arguments), &evaluator.context)
             }
-            return try render(body)
+            return try await render(body)
         }
     }
 
-    private mutating func renderExpression(_ expression: LassoExpression) throws -> String {
+    private mutating func renderExpression(_ expression: LassoExpression) async throws -> String {
         if case let .call(callee, arguments) = expression,
            case let .identifier(name) = callee {
             if name.caseInsensitiveCompare("include") == .orderedSame {
-                return try renderInclude(arguments)
+                return try await renderInclude(arguments)
             }
             if name.caseInsensitiveCompare("library") == .orderedSame {
-                try renderLibrary(arguments)
+                try await renderLibrary(arguments)
                 return ""
             }
         }
-        return try evaluator.evaluate(expression).outputString
+        return try await evaluator.evaluate(expression).outputString
     }
 
     /// Loads and runs a library exactly once per path *for this request's
@@ -293,26 +303,26 @@ private struct RendererEngine {
     /// a bot-exclusion redirect) genuinely re-runs on every new request,
     /// since `loadedLibraries` starts empty on every fresh `LassoContext`.
     /// The library's own text output, if any, is intentionally discarded.
-    private mutating func renderLibrary(_ arguments: [LassoArgument]) throws {
-        let evaluated = try evaluator.evaluateArguments(arguments)
+    private mutating func renderLibrary(_ arguments: [LassoArgument]) async throws {
+        let evaluated = try await evaluator.evaluateArguments(arguments)
         let path = evaluated.firstValue(named: "file")?.outputString ??
             evaluated.firstValue(named: "path")?.outputString ??
             evaluated.first?.value.outputString ?? ""
         guard let service = evaluator.context.includeRenderService else {
             throw LassoRuntimeError.includeNotConfigured
         }
-        try service.performLibrary(path: path, once: true, context: &evaluator.context)
+        try await service.performLibrary(path: path, once: true, context: &evaluator.context)
     }
 
-    private mutating func renderInclude(_ arguments: [LassoArgument]) throws -> String {
-        let evaluated = try evaluator.evaluateArguments(arguments)
+    private mutating func renderInclude(_ arguments: [LassoArgument]) async throws -> String {
+        let evaluated = try await evaluator.evaluateArguments(arguments)
         let path = evaluated.firstValue(named: "file")?.outputString ??
             evaluated.firstValue(named: "path")?.outputString ??
             evaluated.first?.value.outputString ?? ""
         guard let service = evaluator.context.includeRenderService else {
             throw LassoRuntimeError.includeNotConfigured
         }
-        return try service.performInclude(path: path, once: false, context: &evaluator.context) ?? ""
+        return try await service.performInclude(path: path, once: false, context: &evaluator.context) ?? ""
     }
 }
 
@@ -324,7 +334,7 @@ private struct RendererEngine {
 /// evaluator-level native type methods (`web_response->include*`, which
 /// only see `LassoContext`, not an `Evaluator`) can reach it too.
 struct RendererIncludeService: LassoIncludeRenderService {
-    func performInclude(path: String, once: Bool, context: inout LassoContext) throws -> String? {
+    func performInclude(path: String, once: Bool, context: inout LassoContext) async throws -> String? {
         guard let loader = context.includeLoader else {
             throw LassoRuntimeError.includeNotConfigured
         }
@@ -362,7 +372,7 @@ struct RendererIncludeService: LassoIncludeRenderService {
             context.tagRegistry.cacheInclude(forKey: cacheKey, source: source, document: document)
         }
         var engine = RendererEngine(context: context)
-        let output = try engine.render(document.nodes)
+        let output = try await engine.render(document.nodes)
         context = engine.evaluator.context
         return output
     }
@@ -379,7 +389,7 @@ struct RendererIncludeService: LassoIncludeRenderService {
     /// every new request, since `loadedLibraries` starts empty on every
     /// fresh `LassoContext`. The library's own text output, if any, is
     /// intentionally discarded — library bodies run for side effects only.
-    func performLibrary(path: String, once: Bool, context: inout LassoContext) throws {
+    func performLibrary(path: String, once: Bool, context: inout LassoContext) async throws {
         guard let loader = context.includeLoader else {
             throw LassoRuntimeError.includeNotConfigured
         }
@@ -406,7 +416,7 @@ struct RendererIncludeService: LassoIncludeRenderService {
 
         let source = try loader.loadInclude(path: path, from: context.includePath)
         var engine = RendererEngine(context: context)
-        _ = try engine.render(LassoParser().parse(source).nodes)
+        _ = try await engine.render(LassoParser().parse(source).nodes)
         context = engine.evaluator.context
     }
 }

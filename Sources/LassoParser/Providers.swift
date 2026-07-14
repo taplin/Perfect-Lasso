@@ -453,12 +453,12 @@ public protocol LassoIncludeRenderService: Sendable {
     /// own dedup (backed by `LassoContext.includedOncePaths`, separate
     /// from `loadedLibraries` so an `include` path and a `library` path
     /// sharing a string don't cross-suppress each other).
-    func performInclude(path: String, once: Bool, context: inout LassoContext) throws -> String?
+    func performInclude(path: String, once: Bool, context: inout LassoContext) async throws -> String?
     /// Executes `path` as a library for its side effects only (library
     /// bodies don't contribute to page output). `once`, when true, applies
     /// `loadedLibraries` dedup — the same dedup the bare `library(...)`
     /// free tag already applies unconditionally.
-    func performLibrary(path: String, once: Bool, context: inout LassoContext) throws
+    func performLibrary(path: String, once: Bool, context: inout LassoContext) async throws
 }
 
 /// A single ordered name/value pair from a request's query string or POST
@@ -829,11 +829,11 @@ public struct LassoFileServeRequest: Equatable, Sendable {
 }
 
 public protocol LassoInlineProvider: Sendable {
-    func executeInline(arguments: [EvaluatedArgument], context: LassoContext) throws -> LassoInlineFrame
+    func executeInline(arguments: [EvaluatedArgument], context: LassoContext) async throws -> LassoInlineFrame
 }
 
 public protocol LassoDynamicQueryExecutor: Sendable {
-    func execute(_ request: LassoInlineRequest) throws -> LassoInlineFrame
+    func execute(_ request: LassoInlineRequest) async throws -> LassoInlineFrame
 }
 
 public struct LassoDynamicInlineProvider: LassoInlineProvider {
@@ -853,7 +853,7 @@ public struct LassoDynamicInlineProvider: LassoInlineProvider {
     public func executeInline(
         arguments: [EvaluatedArgument],
         context: LassoContext
-    ) throws -> LassoInlineFrame {
+    ) async throws -> LassoInlineFrame {
         let request = LassoInlineRequest(arguments: arguments)
         let mappedRequest: LassoInlineRequest
         if let database = request.database,
@@ -862,7 +862,7 @@ public struct LassoDynamicInlineProvider: LassoInlineProvider {
         } else {
             mappedRequest = request
         }
-        return try executor.execute(mappedRequest)
+        return try await executor.execute(mappedRequest)
     }
 }
 
@@ -873,7 +873,7 @@ public struct LassoInMemoryInlineProvider: LassoInlineProvider {
         self.tables = Dictionary(uniqueKeysWithValues: tables.map { ($0.key.lowercased(), $0.value) })
     }
 
-    public func executeInline(arguments: [EvaluatedArgument], context: LassoContext) throws -> LassoInlineFrame {
+    public func executeInline(arguments: [EvaluatedArgument], context: LassoContext) async throws -> LassoInlineFrame {
         let request = LassoInlineRequest(arguments: arguments)
         guard request.action != .nothing else { return LassoInlineFrame(rows: []) }
         guard let table = request.table?.lowercased(), var rows = tables[table] else {

@@ -74,7 +74,7 @@ public struct EvaluatedArgument: Equatable, Sendable {
 public typealias LassoNativeFunction = @Sendable (
     _ arguments: [EvaluatedArgument],
     _ context: inout LassoContext
-) throws -> LassoValue
+) async throws -> LassoValue
 
 public struct LassoNativeRegistry: Sendable {
     private var functions: [String: LassoNativeFunction] = [:]

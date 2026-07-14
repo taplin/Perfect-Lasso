@@ -479,16 +479,13 @@ struct LassoSiteServer: Sendable {
                     userName: filemakerUser, password: filemakerPassword,
                     useTLS: filemakerUseTLS
                 )
-                // FileMakerServer.query(_:) is now genuine async/await
-                // (the resurrected library replaced its blocking
-                // PerfectCURL/libcurl transport with URLSession), while
-                // this queryHandler must stay synchronous. See
-                // runAsyncAndWait's own doc comment (AsyncBridge.swift)
-                // for why a plain Task+semaphore bridge inline here would
-                // risk deadlocking the whole server under concurrent
-                // load, not just this datasource.
+                // FileMakerServer.query(_:) is genuine async/await (the
+                // resurrected library replaced its blocking PerfectCURL/
+                // libcurl transport with URLSession); the render pipeline
+                // is now natively async throughout, so this queryHandler
+                // can await it directly with no bridge.
                 do {
-                    return try runAsyncAndWait { try await server.query(query) }
+                    return try await server.query(query)
                 } catch let error as LassoFileMakerDatabaseActionError {
                     throw error
                 } catch {
@@ -709,26 +706,24 @@ struct LassoSiteServer: Sendable {
             inlineProvider: inlineProvider,
             tagRegistry: tagRegistry
         )
-        // The synchronous render (including any blocking/bridged
-        // datasource call inside it, e.g. PerfectFileMakerLassoExecutor's
-        // runAsyncAndWait) must never run directly on one of Swift's
-        // cooperative-pool threads — see runBlockingOffCooperativePool's
-        // own doc comment and Documentation/synchronous-render-pipeline.md
-        // for why. `context`/`document` are both `Sendable` value types,
-        // captured by copy; the mutated copy never needs to leave this
-        // closure since nothing downstream reads `context` again (only
-        // `sink`, a separately-captured reference type, does).
-        let html = try await runBlockingOffCooperativePool {
-            var localContext = context
-            do {
-                return try LassoRenderer().render(document, context: &localContext)
-            } catch {
-                throw LassoSiteRenderError(
-                    underlying: error,
-                    includeStack: localContext.includeStack,
-                    parserDiagnostics: document.diagnostics.map(\.message)
-                )
-            }
+        // The render pipeline (`LassoRenderer`, `LassoInlineProvider`,
+        // `LassoDynamicQueryExecutor`) is natively `async throws` now, so
+        // it can be awaited directly here — no bridge/off-pool wrapper
+        // needed (see Documentation/synchronous-render-pipeline.md for the
+        // pre-conversion history this superseded). `context`/`document`
+        // are both `Sendable` value types; the mutated copy never needs to
+        // leave this scope since nothing downstream reads `context` again
+        // (only `sink`, a separately-captured reference type, does).
+        var localContext = context
+        let html: String
+        do {
+            html = try await LassoRenderer().render(document, context: &localContext)
+        } catch {
+            throw LassoSiteRenderError(
+                underlying: error,
+                includeStack: localContext.includeStack,
+                parserDiagnostics: document.diagnostics.map(\.message)
+            )
         }
 
         if let sessionBridge {
@@ -1227,7 +1222,7 @@ let siteServer = try LassoSiteServer(config: config)
 print("Lasso Perfect test server")
 print("Site root: \(config.siteRoot.path)")
 if let startupPath = config.startupPath {
-    let result = loadLassoStartupDirectory(
+    let result = await loadLassoStartupDirectory(
         at: startupPath,
         allowedExtensions: config.lassoExtensions,
         tagRegistry: siteServer.tagRegistry

@@ -35,15 +35,15 @@ struct LassoMultiBackendInlineProvider: LassoInlineProvider {
         self.fileMakerAliases = Set(fileMakerAliases.map { $0.lowercased() })
     }
 
-    func executeInline(arguments: [EvaluatedArgument], context: LassoContext) throws -> LassoInlineFrame {
+    func executeInline(arguments: [EvaluatedArgument], context: LassoContext) async throws -> LassoInlineFrame {
         let request = LassoInlineRequest(arguments: arguments)
         if let database = request.database, fileMakerAliases.contains(database.lowercased()),
            let fileMakerProvider {
-            return try fileMakerProvider.executeInline(arguments: arguments, context: context)
+            return try await fileMakerProvider.executeInline(arguments: arguments, context: context)
         }
         guard let mysqlProvider else {
             throw LassoRuntimeError.inlineNotConfigured
         }
-        return try mysqlProvider.executeInline(arguments: arguments, context: context)
+        return try await mysqlProvider.executeInline(arguments: arguments, context: context)
     }
 }

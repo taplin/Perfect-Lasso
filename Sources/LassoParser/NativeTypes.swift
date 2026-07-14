@@ -12,7 +12,7 @@ public typealias LassoNativeMethod = @Sendable (
     _ receiver: LassoObjectInstance,
     _ arguments: [EvaluatedArgument],
     _ context: inout LassoContext
-) throws -> LassoValue
+) async throws -> LassoValue
 
 /// One built-in type's method table — `web_request`, `web_response`,
 /// `session`. Mirrors `LassoNativeRegistry`'s register/lookup shape
@@ -295,7 +295,7 @@ extension LassoNativeTypeRegistry {
                 throw LassoRuntimeError.includeNotConfigured
             }
             let path = arguments.positionalValue(at: 0)?.outputString ?? ""
-            let output = try service.performInclude(path: path, once: false, context: &context)
+            let output = try await service.performInclude(path: path, once: false, context: &context)
             return .string(output ?? "")
         }
         type.register("includeonce") { _, arguments, context in
@@ -303,7 +303,7 @@ extension LassoNativeTypeRegistry {
                 throw LassoRuntimeError.includeNotConfigured
             }
             let path = arguments.positionalValue(at: 0)?.outputString ?? ""
-            guard let output = try service.performInclude(path: path, once: true, context: &context) else {
+            guard let output = try await service.performInclude(path: path, once: true, context: &context) else {
                 // A repeat call for an already-included path has no
                 // confirmed documented return value in either reference
                 // source. Defaulting to `.void`, matching
@@ -323,7 +323,7 @@ extension LassoNativeTypeRegistry {
                 throw LassoRuntimeError.includeNotConfigured
             }
             let path = arguments.positionalValue(at: 0)?.outputString ?? ""
-            try service.performLibrary(path: path, once: false, context: &context)
+            try await service.performLibrary(path: path, once: false, context: &context)
             return .void
         }
         type.register("includelibraryonce") { _, arguments, context in
@@ -331,7 +331,7 @@ extension LassoNativeTypeRegistry {
                 throw LassoRuntimeError.includeNotConfigured
             }
             let path = arguments.positionalValue(at: 0)?.outputString ?? ""
-            try service.performLibrary(path: path, once: true, context: &context)
+            try await service.performLibrary(path: path, once: true, context: &context)
             return .void
         }
         // LassoGuide 9.3: "a stack of currently executing filenames" — the

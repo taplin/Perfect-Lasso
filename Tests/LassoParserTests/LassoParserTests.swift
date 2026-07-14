@@ -61,7 +61,7 @@ import PerfectSessionCore
     #expect(text.contains("[1, 2, 3]"))
 }
 
-@Test func squareBracketScanningSkipsCommentsWhenFindingTheClosingBracket() throws {
+@Test func squareBracketScanningSkipsCommentsWhenFindingTheClosingBracket() async throws {
     // Real Lasso lets a whole `[ ... ]` span hold a full `define ... =>
     // { ... }` custom tag with a leading `//lasso` comment as a human hint
     // that the bracket contains Lasso code — a real idiom found in
@@ -79,7 +79,7 @@ import PerfectSessionCore
     //     closing tag. The bracket "loaded" with no error, but the tag it
     //     defined was silently never registered.
     var context = LassoContext()
-    let output = try LassoRenderer().render(
+    let output = try await LassoRenderer().render(
         """
         [//lasso
         /* Header comment mentioning someone's tag usage: [example_tag(1)]
@@ -96,7 +96,7 @@ import PerfectSessionCore
     #expect(output == "hi there")
 }
 
-@Test func noProcessPassesThroughRawContentWithoutScanningItAsLasso() throws {
+@Test func noProcessPassesThroughRawContentWithoutScanningItAsLasso() async throws {
     // Real Lasso's documented escape hatch for embedding non-Lasso content
     // (almost always Dreamweaver-era JavaScript) inside a template — used
     // throughout the real corpus. Found live-verifying a real page whose
@@ -108,7 +108,7 @@ import PerfectSessionCore
     // never even attempt to parse its body as Lasso — everything between
     // the open and close tags is emitted completely verbatim.
     var context = LassoContext(globals: ["x": .string("outside-still-works")])
-    let output = try LassoRenderer().render(
+    let output = try await LassoRenderer().render(
         """
         before-[noprocess]<script>var i,j; d.MM_p[j++].src=a[i];</script>[/noprocess]-after-[$x]
         """,
@@ -117,7 +117,7 @@ import PerfectSessionCore
     #expect(output == "before-<script>var i,j; d.MM_p[j++].src=a[i];</script>-after-outside-still-works")
 }
 
-@Test func rendersGoldenFixtures() throws {
+@Test func rendersGoldenFixtures() async throws {
     let fixtureURL = try #require(Bundle.module.resourceURL?.appendingPathComponent("RenderFixtures"))
     let inputs = try FileManager.default.contentsOfDirectory(
         at: fixtureURL,
@@ -133,64 +133,64 @@ import PerfectSessionCore
             "name": .string("Ada"),
             "unsafe": .string("<strong>unsafe & raw</strong>"),
         ])
-        let actual = try LassoRenderer().render(source, context: &context)
+        let actual = try await LassoRenderer().render(source, context: &context)
         #expect(actual == expected, "Golden mismatch for \(input.lastPathComponent)")
     }
 }
 
-@Test func invokesRegisteredNativeFunction() throws {
+@Test func invokesRegisteredNativeFunction() async throws {
     var natives = LassoNativeRegistry()
     natives.register("greet") { arguments, _ in
         .string("Hello, \(arguments.first?.value.outputString ?? "friend")")
     }
     var context = LassoContext(natives: natives)
-    let output = try LassoRenderer().render("[greet('Ada')]", context: &context)
+    let output = try await LassoRenderer().render("[greet('Ada')]", context: &context)
     #expect(output == "Hello, Ada")
 }
 
-@Test func cacheTagIsANoOpButItsBodyStillRenders() throws {
+@Test func cacheTagIsANoOpButItsBodyStillRenders() async throws {
     // Real Lasso 8's [Cache(-Name=..., -Expires=...)] ... [/Cache] wraps a
     // body of markup to memoize for a duration — this interpreter has no
     // output-caching layer, so the opening call is a no-op and the body
     // still renders normally as ordinary template content. Found live
     // -verifying a real corpus page whose template used this exact shape.
     var context = LassoContext()
-    let output = try LassoRenderer().render(
+    let output = try await LassoRenderer().render(
         "before-[Cache(-Name='x', -Expires=10)]middle[/Cache]-after",
         context: &context
     )
     #expect(output == "before-middle-after")
 }
 
-@Test func outputAppliesDefaultHTMLEncodingUnlessEncodeNoneIsGiven() throws {
+@Test func outputAppliesDefaultHTMLEncodingUnlessEncodeNoneIsGiven() async throws {
     var context = LassoContext()
-    let output = try LassoRenderer().render(
+    let output = try await LassoRenderer().render(
         "[Output: '<b>Bold</b>']|[Output: '<b>Bold</b>', -EncodeNone]",
         context: &context
     )
     #expect(output == "&lt;b&gt;Bold&lt;/b&gt;|<b>Bold</b>")
 }
 
-@Test func outputSupportsEveryDocumentedEncodingKeyword() throws {
+@Test func outputSupportsEveryDocumentedEncodingKeyword() async throws {
     // One render call per keyword — kept separate rather than one combined
     // literal, since several of these transforms are quote/backslash-heavy
     // and hard to read correctly when concatenated.
-    func rendered(_ source: String) throws -> String {
+    func rendered(_ source: String) async throws -> String {
         var context = LassoContext()
-        return try LassoRenderer().render(source, context: &context)
+        return try await LassoRenderer().render(source, context: &context)
     }
 
-    #expect(try rendered("[Output: 'é', -EncodeSmart]") == "&#233;")
-    #expect(try rendered("[Output: 'line1\nline2', -EncodeBreak]") == "line1<br>line2")
-    #expect(try rendered("[Output: '<a>', -EncodeXML]") == "&lt;a&gt;")
-    #expect(try rendered("[Output: 'a b', -EncodeURL]") == "a%20b")
-    #expect(try rendered("[Output: 'a&b', -EncodeStrictURL]") == "a%26b")
-    #expect(try rendered("[Output: 'hi', -EncodeBase64]") == "aGk=")
+    #expect(try await rendered("[Output: 'é', -EncodeSmart]") == "&#233;")
+    #expect(try await rendered("[Output: 'line1\nline2', -EncodeBreak]") == "line1<br>line2")
+    #expect(try await rendered("[Output: '<a>', -EncodeXML]") == "&lt;a&gt;")
+    #expect(try await rendered("[Output: 'a b', -EncodeURL]") == "a%20b")
+    #expect(try await rendered("[Output: 'a&b', -EncodeStrictURL]") == "a%26b")
+    #expect(try await rendered("[Output: 'hi', -EncodeBase64]") == "aGk=")
 }
 
-@Test func standaloneEncodeTagsMatchOutputsKeywordTransforms() throws {
+@Test func standaloneEncodeTagsMatchOutputsKeywordTransforms() async throws {
     var context = LassoContext()
-    let output = try LassoRenderer().render(
+    let output = try await LassoRenderer().render(
         "[Encode_Smart: 'é']|[Encode_Break: 'a\nb']|[Encode_XML: '<x>']|[Encode_URL: 'a b']|" +
             "[Encode_StrictURL: 'a&b']|[Encode_SQL: 'it\\'s']|[Encode_Base64: 'hi']",
         context: &context
@@ -198,34 +198,34 @@ import PerfectSessionCore
     #expect(output == "&#233;|a<br>b|&lt;x&gt;|a%20b|a%26b|it\\'s|aGk=")
 }
 
-@Test func decodeBase64InvertsEncodeBase64ForUtf8Text() throws {
+@Test func decodeBase64InvertsEncodeBase64ForUtf8Text() async throws {
     var context = LassoContext()
-    let output = try LassoRenderer().render(
+    let output = try await LassoRenderer().render(
         "[Decode_Base64(Encode_Base64('cart-42'))]|[Decode_Base64(Encode_Base64('café'))]",
         context: &context
     )
     #expect(output == "cart-42|café")
 }
 
-@Test func decodeBase64ReturnsVoidForMalformedInput() throws {
+@Test func decodeBase64ReturnsVoidForMalformedInput() async throws {
     var context = LassoContext()
-    let output = try LassoRenderer().render(
+    let output = try await LassoRenderer().render(
         "before-[Decode_Base64('not base64')]-after",
         context: &context
     )
     #expect(output == "before--after")
 }
 
-@Test func decodeBase64StringMemberMatchesTheFreeFunction() throws {
+@Test func decodeBase64StringMemberMatchesTheFreeFunction() async throws {
     var context = LassoContext()
-    let output = try LassoRenderer().render(
+    let output = try await LassoRenderer().render(
         "[Decode_Base64('Y2FydC00Mg==')]|[('Y2FydC00Mg==')->decodeBase64]",
         context: &context
     )
     #expect(output == "cart-42|cart-42")
 }
 
-@Test func decodeBase64CanFeedInlineSearchCriteria() throws {
+@Test func decodeBase64CanFeedInlineSearchCriteria() async throws {
     var context = LassoContext(inlineProvider: LassoInMemoryInlineProvider(tables: [
         "carts": [
             LassoDataRow(["cart_id": .string("cart-42"), "status": .string("hit")]),
@@ -233,7 +233,7 @@ import PerfectSessionCore
         ],
     ]))
 
-    let output = try LassoRenderer().render(
+    let output = try await LassoRenderer().render(
         "[inline(-database='catalog',-table='carts',-search,'cart_id'=Decode_Base64('Y2FydC00Mg=='))][records][field('status')][/records][/inline]",
         context: &context
     )
@@ -245,38 +245,38 @@ import PerfectSessionCore
 // message="The quick brown fox jumps over the lazy dog" — the standard
 // textbook HMAC worked example. See
 // Documentation/outstanding-compatibility-project-plans.md.
-@Test func encryptHmacSha1HexMatchesKnownVector() throws {
+@Test func encryptHmacSha1HexMatchesKnownVector() async throws {
     var context = LassoContext()
-    let output = try LassoRenderer().render(
+    let output = try await LassoRenderer().render(
         "[Encrypt_HMAC(-token='The quick brown fox jumps over the lazy dog', -password='key', -digest='sha1', -hex)]",
         context: &context
     )
     #expect(output == "0xde7c9b85b8b78aa6bc8a7a36f70a90701c9db4d9")
 }
 
-@Test func encryptHmacSha1Base64MatchesRealCorpusArgumentShape() throws {
+@Test func encryptHmacSha1Base64MatchesRealCorpusArgumentShape() async throws {
     // -Token=/-Password=/-Digest='sha1'/-Base64 is real corpus's exact
     // shape (password-reset token generation).
     var context = LassoContext()
-    let output = try LassoRenderer().render(
+    let output = try await LassoRenderer().render(
         "[Encrypt_HMAC(-Token='The quick brown fox jumps over the lazy dog', -Password='key', -Digest='sha1', -Base64)]",
         context: &context
     )
     #expect(output == "3nybhbi3iqa8ino29wqQcBydtNk=")
 }
 
-@Test func encryptHmacUnrecognizedDigestDefaultsToMD5() throws {
+@Test func encryptHmacUnrecognizedDigestDefaultsToMD5() async throws {
     // No confirmed doc answer for an unrecognized -Digest value —
     // defaults to MD5 (the tag's own documented default), matching this
     // codebase's established "unknown keyword -> benign fallback, not a
     // thrown error" convention rather than LassoRecoverableError (which
     // this codebase reserves for genuinely missing required arguments).
     var context = LassoContext()
-    let missingDigest = try LassoRenderer().render(
+    let missingDigest = try await LassoRenderer().render(
         "[Encrypt_HMAC(-token='The quick brown fox jumps over the lazy dog', -password='key', -base64)]",
         context: &context
     )
-    let unrecognizedDigest = try LassoRenderer().render(
+    let unrecognizedDigest = try await LassoRenderer().render(
         "[Encrypt_HMAC(-token='The quick brown fox jumps over the lazy dog', -password='key', -digest='not-a-real-digest', -base64)]",
         context: &context
     )
@@ -285,20 +285,20 @@ import PerfectSessionCore
     #expect(unrecognizedDigest == expectedMD5Base64)
 }
 
-@Test func encryptHmacWithNoOutputFlagFallsBackToLossyRawBytes() throws {
+@Test func encryptHmacWithNoOutputFlagFallsBackToLossyRawBytes() async throws {
     // Documented limitation: no LassoValue bytes case exists (same known
     // gap Decode_Base64 already lives with), so the raw-bytes path (no
     // -Base64/-Hex/-Cram) lossily decodes as UTF-8 rather than crashing —
     // low-stakes since real corpus usage is always -Base64.
     var context = LassoContext()
-    let output = try LassoRenderer().render(
+    let output = try await LassoRenderer().render(
         "[Encrypt_HMAC(-token='x', -password='key')]",
         context: &context
     )
     #expect(output.isEmpty == false)
 }
 
-@Test func encryptHmacRequiresPasswordAndToken() throws {
+@Test func encryptHmacRequiresPasswordAndToken() async throws {
     // -Password/-Token are both documented as required, and this tag is
     // used for password-reset token generation — silently proceeding with
     // an empty-string password/token would produce a fully deterministic,
@@ -307,37 +307,37 @@ import PerfectSessionCore
     // -Destination precedent: throw a recoverable error, catchable by
     // [protect], not a silent fallback.
     var context = LassoContext()
-    let missingPassword = try LassoRenderer().render(
+    let missingPassword = try await LassoRenderer().render(
         "[protect][Encrypt_HMAC(-token='x')][/protect][error_currenterror]",
         context: &context
     )
     #expect(missingPassword == "Encrypt_HMAC requires -Password.")
 
-    let missingToken = try LassoRenderer().render(
+    let missingToken = try await LassoRenderer().render(
         "[protect][Encrypt_HMAC(-password='key')][/protect][error_currenterror]",
         context: &context
     )
     #expect(missingToken == "Encrypt_HMAC requires -Token.")
 }
 
-@Test func currencyDefaultsToEnUSLocale() throws {
+@Test func currencyDefaultsToEnUSLocale() async throws {
     var context = LassoContext()
-    let output = try LassoRenderer().render("[currency(1234.56)]", context: &context)
+    let output = try await LassoRenderer().render("[currency(1234.56)]", context: &context)
     #expect(output == "$1,234.56")
 }
 
-@Test func percentAppliesDocumentedMultiplyByHundredForAFractionalInput() throws {
+@Test func percentAppliesDocumentedMultiplyByHundredForAFractionalInput() async throws {
     // Real corpus confirms $welcome_discount is stored as a fraction, not
     // a whole percentage (includes/cart_count.include.lasso:
     // Integer(100.00 * decimal($welcome_discount))) — NumberFormatter's
     // default percentStyle behavior (multiply by 100) is correct as-is
     // for this shape, no multiplier override needed.
     var context = LassoContext()
-    let output = try LassoRenderer().render("[percent(0.05)]", context: &context)
+    let output = try await LassoRenderer().render("[percent(0.05)]", context: &context)
     #expect(output == "5%")
 }
 
-@Test func currencyAndPercentAcceptPositionalLanguageAndCountryOverrides() throws {
+@Test func currencyAndPercentAcceptPositionalLanguageAndCountryOverrides() async throws {
     // Documented signature: one required number, then optional positional
     // (not -flag=) language/country codes — matching real corpus, which
     // never exercises positions 1/2, but the documented contract does.
@@ -345,7 +345,7 @@ import PerfectSessionCore
     // parameters actually took effect (comma/period grouping swap),
     // without hardcoding the exact currency symbol placement.
     var context = LassoContext()
-    let output = try LassoRenderer().render("[currency(1234.56, 'de', 'DE')]", context: &context)
+    let output = try await LassoRenderer().render("[currency(1234.56, 'de', 'DE')]", context: &context)
     #expect(output.contains("1.234,56"))
 }
 
@@ -355,20 +355,20 @@ import PerfectSessionCore
 // time (BlockBuilder.swift) — no new AST node, no new Renderer code. See
 // Documentation/outstanding-compatibility-project-plans.md item 10.
 
-@Test func selectCaseBracketParenCallLowersToIfElseChain() throws {
+@Test func selectCaseBracketParenCallLowersToIfElseChain() async throws {
     let source = "[Select($x)][Case('1')]one[Case('2')]two[Case]default[/Select]"
 
     var contextOne = LassoContext(globals: ["x": .string("1")])
-    #expect(try LassoRenderer().render(source, context: &contextOne) == "one")
+    #expect(try await LassoRenderer().render(source, context: &contextOne) == "one")
 
     var contextTwo = LassoContext(globals: ["x": .string("2")])
-    #expect(try LassoRenderer().render(source, context: &contextTwo) == "two")
+    #expect(try await LassoRenderer().render(source, context: &contextTwo) == "two")
 
     var contextOther = LassoContext(globals: ["x": .string("nope")])
-    #expect(try LassoRenderer().render(source, context: &contextOther) == "default")
+    #expect(try await LassoRenderer().render(source, context: &contextOther) == "default")
 }
 
-@Test func selectCaseColonCallProducesIdenticalOutputToParenCall() throws {
+@Test func selectCaseColonCallProducesIdenticalOutputToParenCall() async throws {
     // Proves the parser-unification claim end-to-end (not just at the
     // ExpressionParser unit level): `(` and `:` postfix calls already
     // produce the identical .call node, so [Case: 1] and [Case('1')]
@@ -380,13 +380,13 @@ import PerfectSessionCore
     for season in ["1", "2"] {
         var parenContext = LassoContext(globals: ["season": .string(season)])
         var colonContext = LassoContext(globals: ["season": .string(season)])
-        let parenOutput = try LassoRenderer().render(parenForm, context: &parenContext)
-        let colonOutput = try LassoRenderer().render(colonForm, context: &colonContext)
+        let parenOutput = try await LassoRenderer().render(parenForm, context: &parenContext)
+        let colonOutput = try await LassoRenderer().render(colonForm, context: &colonContext)
         #expect(parenOutput == colonOutput)
     }
 }
 
-@Test func selectCaseColonCallCoercesBareIntegerAgainstAStringSelectValue() throws {
+@Test func selectCaseColonCallCoercesBareIntegerAgainstAStringSelectValue() async throws {
     // Real corpus shape (includes/b2b/huguley/top_right.lasso): bare
     // unquoted integer Case values compared against a Field()-sourced
     // string. Lowering emits selectValue == caseValue as a literal binary
@@ -395,10 +395,10 @@ import PerfectSessionCore
     // an invented comparison rule.
     let source = "[Select(Season)][Case: 1]spring[Case: 2]summer[/Select]"
     var context = LassoContext(globals: ["season": .string("2")])
-    #expect(try LassoRenderer().render(source, context: &context) == "summer")
+    #expect(try await LassoRenderer().render(source, context: &context) == "summer")
 }
 
-@Test func selectCaseFreeTagSemicolonFormMatchesBracketForms() throws {
+@Test func selectCaseFreeTagSemicolonFormMatchesBracketForms() async throws {
     // Real corpus shape (includes/Calculate_Day.include.lasso): no
     // brackets at all, semicolon-terminated, lassoscript-mode.
     let source = """
@@ -412,51 +412,51 @@ import PerfectSessionCore
     ?>
     """
     var contextOne = LassoContext(globals: ["day": .integer(1)])
-    #expect(try LassoRenderer().render(source, context: &contextOne) == "Sunday")
+    #expect(try await LassoRenderer().render(source, context: &contextOne) == "Sunday")
 
     var contextTwo = LassoContext(globals: ["day": .integer(2)])
-    #expect(try LassoRenderer().render(source, context: &contextTwo) == "Monday")
+    #expect(try await LassoRenderer().render(source, context: &contextTwo) == "Monday")
 }
 
-@Test func selectCaseSecondBareDefaultIsUnreachable() throws {
+@Test func selectCaseSecondBareDefaultIsUnreachable() async throws {
     // Lasso 8.5: "the first Case tag without any value is returned as the
     // default value" — a second bare Case after the first is truncated
     // during lowering, not left to incidental parser behavior.
     let source = "[Select($x)][Case('9')]nope[Case]first-default[Case]second-default[/Select]"
 
     var matchContext = LassoContext(globals: ["x": .string("9")])
-    #expect(try LassoRenderer().render(source, context: &matchContext) == "nope")
+    #expect(try await LassoRenderer().render(source, context: &matchContext) == "nope")
 
     var defaultContext = LassoContext(globals: ["x": .string("other")])
-    #expect(try LassoRenderer().render(source, context: &defaultContext) == "first-default")
+    #expect(try await LassoRenderer().render(source, context: &defaultContext) == "first-default")
 }
 
-@Test func selectCaseFallsThroughToNothingWhenNoCaseMatchesAndNoDefault() throws {
+@Test func selectCaseFallsThroughToNothingWhenNoCaseMatchesAndNoDefault() async throws {
     // Matches `if` with no `else`: alternate ?? [] renders empty.
     let source = "[Select($x)][Case('1')]one[/Select]"
     var context = LassoContext(globals: ["x": .string("9")])
-    #expect(try LassoRenderer().render(source, context: &context) == "")
+    #expect(try await LassoRenderer().render(source, context: &context) == "")
 }
 
-@Test func selectCaseWithNoCaseTagsAtAllRendersNothing() throws {
+@Test func selectCaseWithNoCaseTagsAtAllRendersNothing() async throws {
     // Degenerate but valid: an empty branch list lowers to an empty node
     // list, not a crash.
     let source = "before[Select($x)][/Select]after"
     var context = LassoContext(globals: ["x": .string("1")])
-    #expect(try LassoRenderer().render(source, context: &context) == "beforeafter")
+    #expect(try await LassoRenderer().render(source, context: &context) == "beforeafter")
 }
 
-@Test func selectCaseWithOnlyABareDefaultAlwaysRendersIt() throws {
+@Test func selectCaseWithOnlyABareDefaultAlwaysRendersIt() async throws {
     // No valued Case at all before the default — the fold produces the
     // default's body unconditionally, with no wrapping `if`.
     let source = "[Select($x)][Case]always[/Select]"
     var context = LassoContext(globals: ["x": .string("anything")])
-    #expect(try LassoRenderer().render(source, context: &context) == "always")
+    #expect(try await LassoRenderer().render(source, context: &context) == "always")
 }
 
-@Test func stringMembersExposeTheSameEncodingsAsLasso9Methods() throws {
+@Test func stringMembersExposeTheSameEncodingsAsLasso9Methods() async throws {
     var context = LassoContext()
-    let output = try LassoRenderer().render(
+    let output = try await LassoRenderer().render(
         "[('é')->encodeSmart]|[('a\nb')->encodeBreak]|[('<x>')->encodeXML]|" +
             "[('a&b')->encodeStrictURL]|[('it\\'s')->encodeSQL]|[('hi')->encodeBase64]",
         context: &context
@@ -464,14 +464,14 @@ import PerfectSessionCore
     #expect(output == "&#233;|a<br>b|&lt;x&gt;|a%26b|it\\'s|aGk=")
 }
 
-@Test func outputNoneSuppressesRenderedTextButStillRunsItsBody() throws {
+@Test func outputNoneSuppressesRenderedTextButStillRunsItsBody() async throws {
     // Real corpus shape: a bare colon-call statement with no parens at
     // all, common at the top of startup/page files
     // (`Output_None; var(...); /Output_None;`). Side effects (the
     // variable assignment) must still happen even though no text reaches
     // the page.
     var context = LassoContext()
-    let output = try LassoRenderer().render(
+    let output = try await LassoRenderer().render(
         """
         before-[
         Output_None;
@@ -484,18 +484,18 @@ import PerfectSessionCore
     #expect(output == "before--after-set")
 }
 
-@Test func htmlCommentWrapsRenderedOutput() throws {
+@Test func htmlCommentWrapsRenderedOutput() async throws {
     var context = LassoContext()
-    let output = try LassoRenderer().render(
+    let output = try await LassoRenderer().render(
         "before-[HTML_Comment]middle[/HTML_Comment]-after",
         context: &context
     )
     #expect(output == "before-<!--middle-->-after")
 }
 
-@Test func encodeSetChangesTheDefaultForNestedOutputCallsWithNoExplicitKeyword() throws {
+@Test func encodeSetChangesTheDefaultForNestedOutputCallsWithNoExplicitKeyword() async throws {
     var context = LassoContext()
-    let output = try LassoRenderer().render(
+    let output = try await LassoRenderer().render(
         "[Encode_Set: -EncodeNone][Output: '<b>Bold</b>'][/Encode_Set]|[Output: '<b>Bold</b>']",
         context: &context
     )
@@ -504,51 +504,51 @@ import PerfectSessionCore
     #expect(output == "<b>Bold</b>|&lt;b&gt;Bold&lt;/b&gt;")
 }
 
-@Test func dateParsesRecognizedStringFormats() throws {
-    func rendered(_ source: String) throws -> String {
+@Test func dateParsesRecognizedStringFormats() async throws {
+    func rendered(_ source: String) async throws -> String {
         var context = LassoContext()
-        return try LassoRenderer().render(source, context: &context)
+        return try await LassoRenderer().render(source, context: &context)
     }
 
     // US M/d/yyyy, US with time, ISO, ISO with time, compact yyyyMMddHHmmss —
     // every recognized shape reformatted to the same %Q %T output so a
     // single assertion per format proves the parse actually worked.
-    #expect(try rendered("[Date_Format('6/14/2001', -Format='%Q %T')]") == "2001-06-14 00:00:00")
-    #expect(try rendered("[Date_Format('6/14/2001 15:05:03', -Format='%Q %T')]") == "2001-06-14 15:05:03")
-    #expect(try rendered("[Date_Format('2001-06-14', -Format='%Q %T')]") == "2001-06-14 00:00:00")
-    #expect(try rendered("[Date_Format('2001-06-14 15:05:03', -Format='%Q %T')]") == "2001-06-14 15:05:03")
-    #expect(try rendered("[Date_Format('20010614150503', -Format='%Q %T')]") == "2001-06-14 15:05:03")
+    #expect(try await rendered("[Date_Format('6/14/2001', -Format='%Q %T')]") == "2001-06-14 00:00:00")
+    #expect(try await rendered("[Date_Format('6/14/2001 15:05:03', -Format='%Q %T')]") == "2001-06-14 15:05:03")
+    #expect(try await rendered("[Date_Format('2001-06-14', -Format='%Q %T')]") == "2001-06-14 00:00:00")
+    #expect(try await rendered("[Date_Format('2001-06-14 15:05:03', -Format='%Q %T')]") == "2001-06-14 15:05:03")
+    #expect(try await rendered("[Date_Format('20010614150503', -Format='%Q %T')]") == "2001-06-14 15:05:03")
 }
 
-@Test func dateHonorsAnExplicitFormatOverrideWhenParsingAnAmbiguousString() throws {
+@Test func dateHonorsAnExplicitFormatOverrideWhenParsingAnAmbiguousString() async throws {
     var context = LassoContext()
     // -Format on Date's own construction forces how the string is read,
     // rather than falling through the recognized-format list.
-    let output = try LassoRenderer().render(
+    let output = try await LassoRenderer().render(
         "[Date_Format(Date('14-06-2001', -Format='%d-%m-%Y'), -Format='%Q')]",
         context: &context
     )
     #expect(output == "2001-06-14")
 }
 
-@Test func dateFormatSupportsTheLanguageGuidesOwnWorkedExample() throws {
+@Test func dateFormatSupportsTheLanguageGuidesOwnWorkedExample() async throws {
     var context = LassoContext()
     // Lasso 8.5 Language Guide Chapter 29's own worked example:
     // [Date_Format: '06/14/2001', -Format='%A, %B %d'] -> Thursday, June 14
-    let output = try LassoRenderer().render(
+    let output = try await LassoRenderer().render(
         "[Date_Format: '06/14/2001', -Format='%A, %B %d']",
         context: &context
     )
     #expect(output == "Thursday, June 14")
 }
 
-@Test func dateFormatSupportsEveryCorpusObservedAndDocumentedSymbol() throws {
+@Test func dateFormatSupportsEveryCorpusObservedAndDocumentedSymbol() async throws {
     var context = LassoContext()
     // 2001-06-14 15:05:03 GMT is a Thursday — one fixed instant covers
     // every corpus-observed symbol (%B %Y %Q %D %T %a %m %H %M %S %r %w %d)
     // plus representative coverage of the rest of the documented table
     // (%A %b %y %h %p %z %Z %G) and the %% literal, in one render call.
-    let output = try LassoRenderer().render(
+    let output = try await LassoRenderer().render(
         """
         [Date_Format('2001-06-14 15:05:03', -Format=\
         '%B|%Y|%Q|%D|%T|%a|%A|%m|%H|%M|%S|%r|%w|%d|%b|%y|%h|%p|%G|%%')]
@@ -562,47 +562,47 @@ import PerfectSessionCore
     ])
 }
 
-@Test func dateFormatWeekOfYearRendersAsAZeroPaddedTwoDigitNumber() throws {
+@Test func dateFormatWeekOfYearRendersAsAZeroPaddedTwoDigitNumber() async throws {
     var context = LassoContext()
-    let output = try LassoRenderer().render(
+    let output = try await LassoRenderer().render(
         "[Date_Format('2001-06-14', -Format='%W')]",
         context: &context
     )
     #expect(output.count == 2 && output.allSatisfy(\.isNumber), "no precise corpus/doc example for %W's exact value — just its shape")
 }
 
-@Test func dateFormatPaddingModifiersControlLeadingZeroesAndSpaces() throws {
+@Test func dateFormatPaddingModifiersControlLeadingZeroesAndSpaces() async throws {
     var context = LassoContext()
     // 2001-06-04: a single-digit day, to distinguish the three padding
     // behaviors (%d zero-padded, %_d space-padded, %-d unpadded).
-    let output = try LassoRenderer().render(
+    let output = try await LassoRenderer().render(
         "[Date_Format('2001-06-04', -Format='%d|%_d|%-d')]",
         context: &context
     )
     #expect(output == "04| 4|4")
 }
 
-@Test func dateConstructsFromYearMonthDayKeywords() throws {
+@Test func dateConstructsFromYearMonthDayKeywords() async throws {
     var context = LassoContext()
-    let output = try LassoRenderer().render(
+    let output = try await LassoRenderer().render(
         "[Date_Format(Date(-Year=2001, -Month=6, -Day=14, -Hour=15, -Minute=5, -Second=3), -Format='%Q %T')]",
         context: &context
     )
     #expect(output == "2001-06-14 15:05:03")
 }
 
-@Test func dateLocalToGMTAndGMTToLocalRoundTrip() throws {
+@Test func dateLocalToGMTAndGMTToLocalRoundTrip() async throws {
     var context = LassoContext()
-    let output = try LassoRenderer().render(
+    let output = try await LassoRenderer().render(
         "[Date_Format(Date_LocalToGMT(Date_GMTToLocal(Date('2001-06-14 15:05:03'))), -Format='%Q %T')]",
         context: &context
     )
     #expect(output == "2001-06-14 15:05:03")
 }
 
-@Test func dateFormatMethodMatchesTheFreeFunctionTagForTheSameInput() throws {
+@Test func dateFormatMethodMatchesTheFreeFunctionTagForTheSameInput() async throws {
     var context = LassoContext()
-    let output = try LassoRenderer().render(
+    let output = try await LassoRenderer().render(
         "[Date_Format(Date('2001-06-14 15:05:03'), -Format='%Q %T')]|" +
             "[(Date('2001-06-14 15:05:03'))->format('%Q %T')]",
         context: &context
@@ -611,12 +611,12 @@ import PerfectSessionCore
     #expect(parts.count == 2 && parts[0] == parts[1], "Lasso 8 tag style and Lasso 9 method style must produce identical output")
 }
 
-@Test func dateFormatAcceptsABareDateArgumentMeaningNow() throws {
+@Test func dateFormatAcceptsABareDateArgumentMeaningNow() async throws {
     var context = LassoContext()
     // The most common real corpus shape: a bare `Date` identifier (no
     // parens) as the positional argument — resolves to "now", so only the
     // output shape (not an exact value) can be asserted.
-    let output = try LassoRenderer().render(
+    let output = try await LassoRenderer().render(
         "[Date_Format(Date, -Format='%D')]",
         context: &context
     )
@@ -624,7 +624,7 @@ import PerfectSessionCore
     #expect(parts.count == 3 && parts[0].count == 2 && parts[1].count == 2 && parts[2].count == 4)
 }
 
-@Test func rendersIncludesRequestSessionAndInlineFrames() throws {
+@Test func rendersIncludesRequestSessionAndInlineFrames() async throws {
     struct IncludeLoader: LassoIncludeLoader {
         func loadInclude(path: String, from includingPath: String?) throws -> String {
             #expect(path == "partials/header.lasso")
@@ -677,16 +677,16 @@ import PerfectSessionCore
         ])
     )
 
-    let includeOutput = try LassoRenderer().render("[include:'partials/header.lasso']", context: &context)
+    let includeOutput = try await LassoRenderer().render("[include:'partials/header.lasso']", context: &context)
     #expect(includeOutput == "<h1>Catalog</h1>")
 
-    let requestOutput = try LassoRenderer().render(
+    let requestOutput = try await LassoRenderer().render(
         "[web_request->param('term')]|[web_request->header('host')]|[web_request->httpHost]|[cookie:'sid']",
         context: &context
     )
     #expect(requestOutput == "clogs|example.test|example.test|abc123")
 
-    let sessionOutput = try LassoRenderer().render(
+    let sessionOutput = try await LassoRenderer().render(
         "[session_start('cart')][var(cartvalue = 'open')][session_addvar('cart','cartvalue')][cartvalue]",
         context: &context
     )
@@ -694,11 +694,11 @@ import PerfectSessionCore
 
     let inlineSource = "[inline:-search,-database='demo',-table='items',-op='eq',-active='yes',-sortfield='name']" +
         "[records][field:'name']:[field:'qty'];[/records]([found_count])[/inline]"
-    let inlineOutput = try LassoRenderer().render(inlineSource, context: &context)
+    let inlineOutput = try await LassoRenderer().render(inlineSource, context: &context)
     #expect(inlineOutput == "Alpha:2;Beta:3;(2)")
 }
 
-@Test func parsesAndRendersLassoScriptInlineJSON() throws {
+@Test func parsesAndRendersLassoScriptInlineJSON() async throws {
     let scriptInline = """
     <?lassoscript
     inline(
@@ -726,7 +726,7 @@ import PerfectSessionCore
     #expect(body.count == 2)
 
     struct InlineProvider: LassoInlineProvider {
-        func executeInline(arguments: [EvaluatedArgument], context: LassoContext) throws -> LassoInlineFrame {
+        func executeInline(arguments: [EvaluatedArgument], context: LassoContext) async throws -> LassoInlineFrame {
             let request = LassoInlineRequest(arguments: arguments)
             #expect(request.database == "catalog_mysql")
             #expect(request.table == "skus")
@@ -741,14 +741,14 @@ import PerfectSessionCore
         globals: ["product_subset": .string("demo-product-line")],
         inlineProvider: InlineProvider()
     )
-    let output = try LassoRenderer().render(scriptInline, context: &context)
+    let output = try await LassoRenderer().render(scriptInline, context: &context)
     #expect(
         output == "[{\"preview\":\"one.jpg\",\"catalog_sku\":\"SKU-1\"}]" ||
             output == "[{\"catalog_sku\":\"SKU-1\",\"preview\":\"one.jpg\"}]"
     )
 }
 
-@Test func inlineBareColonCallWithNoParensParsesAndExecutesInsideLassoScript() throws {
+@Test func inlineBareColonCallWithNoParensParsesAndExecutesInsideLassoScript() async throws {
     // Real corpus shape (Documentation/outstanding-compatibility-project-plans.md
     // item 4, e.g. importscripts/ca_web.lasso): Lasso 8's bare colon-call
     // convention with NO enclosing parens at all — `inline: -database=...,
@@ -779,7 +779,7 @@ import PerfectSessionCore
     #expect(arguments.count == 3)
 
     struct InlineProvider: LassoInlineProvider {
-        func executeInline(arguments: [EvaluatedArgument], context: LassoContext) throws -> LassoInlineFrame {
+        func executeInline(arguments: [EvaluatedArgument], context: LassoContext) async throws -> LassoInlineFrame {
             let request = LassoInlineRequest(arguments: arguments)
             #expect(request.database == "catalog_mysql")
             #expect(request.table == "skus")
@@ -789,11 +789,11 @@ import PerfectSessionCore
     }
 
     var context = LassoContext(inlineProvider: InlineProvider())
-    let output = try LassoRenderer().render(scriptInline, context: &context)
+    let output = try await LassoRenderer().render(scriptInline, context: &context)
     #expect(output.trimmingCharacters(in: .whitespacesAndNewlines) == "SQL")
 }
 
-@Test func inlineBareColonCallSqlArgumentConcatenatedAcrossLinesWithTrailingPlus() throws {
+@Test func inlineBareColonCallSqlArgumentConcatenatedAcrossLinesWithTrailingPlus() async throws {
     // Real corpus shape (importscripts/ca_web.lasso and siblings): a -SQL
     // argument built from several single-quoted fragments joined by `+`,
     // each fragment on its own line with a trailing `+` — a third
@@ -814,7 +814,7 @@ import PerfectSessionCore
     """
 
     struct InlineProvider: LassoInlineProvider {
-        func executeInline(arguments: [EvaluatedArgument], context: LassoContext) throws -> LassoInlineFrame {
+        func executeInline(arguments: [EvaluatedArgument], context: LassoContext) async throws -> LassoInlineFrame {
             let request = LassoInlineRequest(arguments: arguments)
             #expect(request.sql == "TRUNCATE TABLE skus;")
             return LassoInlineFrame(rows: [], actionStatement: "SQL")
@@ -822,11 +822,11 @@ import PerfectSessionCore
     }
 
     var context = LassoContext(inlineProvider: InlineProvider())
-    let output = try LassoRenderer().render(scriptInline, context: &context)
+    let output = try await LassoRenderer().render(scriptInline, context: &context)
     #expect(output.trimmingCharacters(in: .whitespacesAndNewlines) == "SQL")
 }
 
-@Test func inlineColonWithParensStillWorksAlongsideTheBareColonCallFix() throws {
+@Test func inlineColonWithParensStillWorksAlongsideTheBareColonCallFix() async throws {
     // Regression guard: `inline:(...)` (colon immediately followed by
     // parens, matching the already-fixed `if:(condition)` shape) is a
     // different branch (ScriptBodyParser.parseBlockOpening, not
@@ -840,13 +840,13 @@ import PerfectSessionCore
     """
 
     struct InlineProvider: LassoInlineProvider {
-        func executeInline(arguments: [EvaluatedArgument], context: LassoContext) throws -> LassoInlineFrame {
+        func executeInline(arguments: [EvaluatedArgument], context: LassoContext) async throws -> LassoInlineFrame {
             LassoInlineFrame(rows: [], actionStatement: "SQL")
         }
     }
 
     var context = LassoContext(inlineProvider: InlineProvider())
-    let output = try LassoRenderer().render(scriptInline, context: &context)
+    let output = try await LassoRenderer().render(scriptInline, context: &context)
     #expect(output.trimmingCharacters(in: .whitespacesAndNewlines) == "SQL")
 }
 
@@ -884,7 +884,7 @@ import PerfectSessionCore
     #expect(expressions.count > 1, "juxtaposed concatenation splits into multiple top-level expressions instead of one inline(...) call")
 }
 
-@Test func rendersCorpusFixtures() throws {
+@Test func rendersCorpusFixtures() async throws {
     let root = try #require(Bundle.module.resourceURL?.appendingPathComponent("CorpusFixtures"))
     let loader = try LassoFileSystemIncludeLoader(root: root)
     let inputs = try FileManager.default.contentsOfDirectory(
@@ -900,7 +900,7 @@ import PerfectSessionCore
             encoding: .utf8
         )
         var context = corpusFixtureContext(loader: loader, includePath: input.lastPathComponent)
-        let output = try LassoRenderer().render(source, context: &context)
+        let output = try await LassoRenderer().render(source, context: &context)
         #expect(
             output.trimmingCharacters(in: .newlines) == expected.trimmingCharacters(in: .newlines),
             "Corpus fixture mismatch for \(input.lastPathComponent)"
@@ -947,7 +947,7 @@ import PerfectSessionCore
     #expect(try loader.loadInclude(path: "includes/siteconfig.inc", from: "/includes/b2b/parent.lasso") == "OUTER")
 }
 
-@Test func startupDirectoryLoadsMatchingExtensionsAndSkipsOthers() throws {
+@Test func startupDirectoryLoadsMatchingExtensionsAndSkipsOthers() async throws {
     let root = FileManager.default.temporaryDirectory
         .appendingPathComponent("lasso-startup-\(UUID().uuidString)")
     try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
@@ -964,7 +964,7 @@ import PerfectSessionCore
     )
 
     let registry = LassoTagRegistry()
-    let result = loadLassoStartupDirectory(
+    let result = await loadLassoStartupDirectory(
         at: root,
         allowedExtensions: ["lasso", "inc"],
         tagRegistry: registry
@@ -976,7 +976,7 @@ import PerfectSessionCore
     #expect(registry.containsTag(named: "farewell"))
 }
 
-@Test func startupDirectoryContinuesPastAFailingFileAndReportsIt() throws {
+@Test func startupDirectoryContinuesPastAFailingFileAndReportsIt() async throws {
     let root = FileManager.default.temporaryDirectory
         .appendingPathComponent("lasso-startup-\(UUID().uuidString)")
     try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
@@ -993,7 +993,7 @@ import PerfectSessionCore
     )
 
     let registry = LassoTagRegistry()
-    let result = loadLassoStartupDirectory(
+    let result = await loadLassoStartupDirectory(
         at: root,
         allowedExtensions: ["inc"],
         tagRegistry: registry
@@ -1007,12 +1007,12 @@ import PerfectSessionCore
     #expect(registry.containsTag(named: "alsoGood"))
 }
 
-@Test func startupDirectoryHandlesMissingDirectoryGracefully() {
+@Test func startupDirectoryHandlesMissingDirectoryGracefully() async {
     let missing = FileManager.default.temporaryDirectory
         .appendingPathComponent("lasso-startup-does-not-exist-\(UUID().uuidString)")
     let registry = LassoTagRegistry()
 
-    let result = loadLassoStartupDirectory(
+    let result = await loadLassoStartupDirectory(
         at: missing,
         allowedExtensions: ["lasso", "inc"],
         tagRegistry: registry
@@ -1023,7 +1023,7 @@ import PerfectSessionCore
     #expect(result.failedFiles.first?.error == "not a directory or does not exist")
 }
 
-@Test func startupDirectoryTagsAreVisibleToLaterContextsSharingTheRegistry() throws {
+@Test func startupDirectoryTagsAreVisibleToLaterContextsSharingTheRegistry() async throws {
     let root = FileManager.default.temporaryDirectory
         .appendingPathComponent("lasso-startup-\(UUID().uuidString)")
     try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
@@ -1034,20 +1034,20 @@ import PerfectSessionCore
     )
 
     let registry = LassoTagRegistry()
-    let result = loadLassoStartupDirectory(at: root, allowedExtensions: ["inc"], tagRegistry: registry)
+    let result = await loadLassoStartupDirectory(at: root, allowedExtensions: ["inc"], tagRegistry: registry)
     #expect(result.failedFiles.isEmpty)
 
     var pageContext = LassoContext(tagRegistry: registry)
-    let output = try LassoRenderer().render(
+    let output = try await LassoRenderer().render(
         "[shout(-msg='hello')]",
         context: &pageContext
     )
     #expect(output == "hello!")
 }
 
-@Test func dynamicInlineProviderMapsDatasourceForPerfectCRUDExecutor() throws {
+@Test func dynamicInlineProviderMapsDatasourceForPerfectCRUDExecutor() async throws {
     struct Executor: LassoDynamicQueryExecutor {
-        func execute(_ request: LassoInlineRequest) throws -> LassoInlineFrame {
+        func execute(_ request: LassoInlineRequest) async throws -> LassoInlineFrame {
             #expect(request.database == "primary-mysql")
             #expect(request.table == "skus")
             return LassoInlineFrame(rows: [
@@ -1060,14 +1060,14 @@ import PerfectSessionCore
         executor: Executor(),
         datasourceAliases: ["catalog_mysql": "primary-mysql"]
     ))
-    let output = try LassoRenderer().render(
+    let output = try await LassoRenderer().render(
         "[inline(-database='catalog_mysql',-table='skus',-findall)][records][field('mfr_style_no')][/records][/inline]",
         context: &context
     )
     #expect(output == "247")
 }
 
-@Test func perfectCRUDExecutorMapsSearchWithoutApplicationSpecificAPI() throws {
+@Test func perfectCRUDExecutorMapsSearchWithoutApplicationSpecificAPI() async throws {
     let executor = PerfectCRUDLassoExecutor { datasource, query in
         #expect(datasource == "catalog")
         #expect(query.table == "skus")
@@ -1091,7 +1091,7 @@ import PerfectSessionCore
             datasourceAliases: ["catalog_mysql": "catalog"]
         )
     )
-    let output = try LassoRenderer().render(
+    let output = try await LassoRenderer().render(
         "[inline(-database='catalog_mysql',-table='skus',-op='cn','store_id'=$product_subset," +
             "-op='cn','featured'='seasonal_sale',-ReturnField='mfr_style_no'," +
             "-ReturnField='color',-search)][records][field('mfr_style_no')]:" +
@@ -1198,11 +1198,11 @@ import PerfectSessionCore
     #expect(request.criteriaGroups.first?.criteria == request.criteria)
 }
 
-@Test func keyfieldValueReadsLassoDataRowKeyValueAndIsNullWhenAbsent() throws {
+@Test func keyfieldValueReadsLassoDataRowKeyValueAndIsNullWhenAbsent() async throws {
     var context = LassoContext(inlineProvider: LassoInMemoryInlineProvider(tables: [
         "storefront": [LassoDataRow(["status": .string("unchecked")], keyValue: .integer(101))],
     ]))
-    let output = try LassoRenderer().render(
+    let output = try await LassoRenderer().render(
         "[inline(-database='catalog',-table='storefront',-search)][records][keyfield_value][/records][/inline]",
         context: &context
     )
@@ -1210,7 +1210,7 @@ import PerfectSessionCore
 
     // No current row (outside any inline/records) -- .null, not a crash.
     var emptyContext = LassoContext()
-    let emptyOutput = try LassoRenderer().render("[keyfield_value]", context: &emptyContext)
+    let emptyOutput = try await LassoRenderer().render("[keyfield_value]", context: &emptyContext)
     #expect(emptyOutput == "")
 }
 
@@ -1229,7 +1229,7 @@ private enum TestFileMakerProbeError: Error {
     case stopAfterCapture
 }
 
-@Test func fileMakerExecutorThrowsMissingDatasourceWhenDatabaseAbsent() throws {
+@Test func fileMakerExecutorThrowsMissingDatasourceWhenDatabaseAbsent() async throws {
     let executor = PerfectFileMakerLassoExecutor { _, _, _ in
         Issue.record("queryHandler should not be called before -database is validated")
         throw TestFileMakerProbeError.stopAfterCapture
@@ -1238,12 +1238,12 @@ private enum TestFileMakerProbeError: Error {
         EvaluatedArgument(label: "table", value: .string("storefront")),
         EvaluatedArgument(label: "findall", value: .boolean(true)),
     ])
-    #expect(throws: LassoFileMakerLassoError.missingDatasource) {
-        try executor.execute(request)
+    await #expect(throws: LassoFileMakerLassoError.missingDatasource) {
+        try await executor.execute(request)
     }
 }
 
-@Test func fileMakerExecutorThrowsMissingTableWhenTableAbsent() throws {
+@Test func fileMakerExecutorThrowsMissingTableWhenTableAbsent() async throws {
     let executor = PerfectFileMakerLassoExecutor { _, _, _ in
         Issue.record("queryHandler should not be called before -table is validated")
         throw TestFileMakerProbeError.stopAfterCapture
@@ -1252,12 +1252,12 @@ private enum TestFileMakerProbeError: Error {
         EvaluatedArgument(label: "database", value: .string("fm_catalog")),
         EvaluatedArgument(label: "findall", value: .boolean(true)),
     ])
-    #expect(throws: LassoFileMakerLassoError.missingTable) {
-        try executor.execute(request)
+    await #expect(throws: LassoFileMakerLassoError.missingTable) {
+        try await executor.execute(request)
     }
 }
 
-@Test func fileMakerExecutorThrowsUnsupportedActionForShow() throws {
+@Test func fileMakerExecutorThrowsUnsupportedActionForShow() async throws {
     let executor = PerfectFileMakerLassoExecutor { _, _, _ in
         Issue.record("queryHandler should not be called for an unsupported action")
         throw TestFileMakerProbeError.stopAfterCapture
@@ -1267,12 +1267,12 @@ private enum TestFileMakerProbeError: Error {
         EvaluatedArgument(label: "table", value: .string("storefront")),
         EvaluatedArgument(label: "show", value: .boolean(true)),
     ])
-    #expect(throws: LassoFileMakerLassoError.unsupportedAction(.show)) {
-        try executor.execute(request)
+    await #expect(throws: LassoFileMakerLassoError.unsupportedAction(.show)) {
+        try await executor.execute(request)
     }
 }
 
-@Test func fileMakerExecutorGatesAddUpdateDeleteBehindAllowWrites() throws {
+@Test func fileMakerExecutorGatesAddUpdateDeleteBehindAllowWrites() async throws {
     let executor = PerfectFileMakerLassoExecutor(allowWrites: false) { _, _, _ in
         Issue.record("queryHandler should not be called while writes are disabled")
         throw TestFileMakerProbeError.stopAfterCapture
@@ -1282,14 +1282,14 @@ private enum TestFileMakerProbeError: Error {
         EvaluatedArgument(label: "table", value: .string("storefront")),
     ]
 
-    let addFrame = try executor.execute(LassoInlineRequest(arguments: base + [
+    let addFrame = try await executor.execute(LassoInlineRequest(arguments: base + [
         EvaluatedArgument(label: "add", value: .boolean(true)),
         EvaluatedArgument(label: "status", value: .string("new")),
     ]))
     #expect(addFrame.error != .noError)
     #expect(addFrame.error.kind == "add")
 
-    let updateFrame = try executor.execute(LassoInlineRequest(arguments: base + [
+    let updateFrame = try await executor.execute(LassoInlineRequest(arguments: base + [
         EvaluatedArgument(label: "update", value: .boolean(true)),
         EvaluatedArgument(label: "keyfield", value: .string("")),
         EvaluatedArgument(label: "keyvalue", value: .integer(101)),
@@ -1298,7 +1298,7 @@ private enum TestFileMakerProbeError: Error {
     #expect(updateFrame.error != .noError)
     #expect(updateFrame.error.kind == "update")
 
-    let deleteFrame = try executor.execute(LassoInlineRequest(arguments: base + [
+    let deleteFrame = try await executor.execute(LassoInlineRequest(arguments: base + [
         EvaluatedArgument(label: "delete", value: .boolean(true)),
         EvaluatedArgument(label: "keyfield", value: .string("")),
         EvaluatedArgument(label: "keyvalue", value: .integer(101)),
@@ -1307,7 +1307,7 @@ private enum TestFileMakerProbeError: Error {
     #expect(deleteFrame.error.kind == "delete")
 }
 
-@Test func fileMakerExecutorThrowsMissingAssignmentsForAddAndUpdateWithNoFields() throws {
+@Test func fileMakerExecutorThrowsMissingAssignmentsForAddAndUpdateWithNoFields() async throws {
     let executor = PerfectFileMakerLassoExecutor(allowWrites: true) { _, _, _ in
         Issue.record("queryHandler should not be called with no field assignments")
         throw TestFileMakerProbeError.stopAfterCapture
@@ -1317,13 +1317,13 @@ private enum TestFileMakerProbeError: Error {
         EvaluatedArgument(label: "table", value: .string("storefront")),
     ]
 
-    #expect(throws: LassoFileMakerLassoError.missingAssignments(.add)) {
-        try executor.execute(LassoInlineRequest(arguments: base + [
+    await #expect(throws: LassoFileMakerLassoError.missingAssignments(.add)) {
+        try await executor.execute(LassoInlineRequest(arguments: base + [
             EvaluatedArgument(label: "add", value: .boolean(true)),
         ]))
     }
-    #expect(throws: LassoFileMakerLassoError.missingAssignments(.update)) {
-        try executor.execute(LassoInlineRequest(arguments: base + [
+    await #expect(throws: LassoFileMakerLassoError.missingAssignments(.update)) {
+        try await executor.execute(LassoInlineRequest(arguments: base + [
             EvaluatedArgument(label: "update", value: .boolean(true)),
             EvaluatedArgument(label: "keyfield", value: .string("")),
             EvaluatedArgument(label: "keyvalue", value: .integer(101)),
@@ -1331,7 +1331,7 @@ private enum TestFileMakerProbeError: Error {
     }
 }
 
-@Test func fileMakerExecutorReturnsRecoverableFrameWhenKeyValueMissingOrInvalid() throws {
+@Test func fileMakerExecutorReturnsRecoverableFrameWhenKeyValueMissingOrInvalid() async throws {
     let executor = PerfectFileMakerLassoExecutor(allowWrites: true) { _, _, _ in
         Issue.record("queryHandler should not be called with an invalid record id")
         throw TestFileMakerProbeError.stopAfterCapture
@@ -1342,7 +1342,7 @@ private enum TestFileMakerProbeError: Error {
     ]
 
     // No -KeyValue at all (e.g. a tampered/missing hidden form field).
-    let updateFrame = try executor.execute(LassoInlineRequest(arguments: base + [
+    let updateFrame = try await executor.execute(LassoInlineRequest(arguments: base + [
         EvaluatedArgument(label: "update", value: .boolean(true)),
         EvaluatedArgument(label: "status", value: .string("checked")),
     ]))
@@ -1350,7 +1350,7 @@ private enum TestFileMakerProbeError: Error {
     #expect(updateFrame.error.kind == "update")
 
     // A -KeyValue that isn't a valid record id.
-    let deleteFrame = try executor.execute(LassoInlineRequest(arguments: base + [
+    let deleteFrame = try await executor.execute(LassoInlineRequest(arguments: base + [
         EvaluatedArgument(label: "delete", value: .boolean(true)),
         EvaluatedArgument(label: "keyfield", value: .string("")),
         EvaluatedArgument(label: "keyvalue", value: .string("not-a-number")),
@@ -1359,7 +1359,7 @@ private enum TestFileMakerProbeError: Error {
     #expect(deleteFrame.error.kind == "delete")
 }
 
-@Test func fileMakerExecutorMapsSearchCriteriaAndOperatorsIntoFindQuery() throws {
+@Test func fileMakerExecutorMapsSearchCriteriaAndOperatorsIntoFindQuery() async throws {
     final class Capture: @unchecked Sendable {
         var query: FMPQuery?
     }
@@ -1375,7 +1375,7 @@ private enum TestFileMakerProbeError: Error {
         EvaluatedArgument(label: "op", value: .string("eq")),
         EvaluatedArgument(label: "status", value: .string("unchecked")),
     ])
-    _ = try? executor.execute(request)
+    _ = try? await executor.execute(request)
     let queryString = try #require(capture.query?.queryString)
     #expect(queryString.contains("-db=fm_catalog"))
     #expect(queryString.contains("-lay=storefront"))
@@ -1389,7 +1389,7 @@ private enum TestFileMakerProbeError: Error {
     #expect(queryString.contains("==unchecked*") == false)
 }
 
-@Test func fileMakerExecutorDefaultsMissingOpToBeginsWithNotExactMatch() throws {
+@Test func fileMakerExecutorDefaultsMissingOpToBeginsWithNotExactMatch() async throws {
     // Regression coverage for a real bug this session: a criterion with
     // no -Op at all must NOT silently become an exact-match (-EQ) search.
     // LassoInlineRequest's shared parsing (Providers.swift) represents
@@ -1414,13 +1414,13 @@ private enum TestFileMakerProbeError: Error {
         EvaluatedArgument(label: "search", value: .boolean(true)),
         EvaluatedArgument(label: "status", value: .string("unchecked")),
     ])
-    _ = try? executor.execute(request)
+    _ = try? await executor.execute(request)
     let queryString = try #require(capture.query?.queryString)
     // FMPFieldOp.beginsWith renders "==value*" (trailing "*").
     #expect(queryString.contains("==unchecked*"))
 }
 
-@Test func fileMakerExecutorMapsNotGroupToNegatedCompoundQuerySegment() throws {
+@Test func fileMakerExecutorMapsNotGroupToNegatedCompoundQuerySegment() async throws {
     final class Capture: @unchecked Sendable {
         var query: FMPQuery?
     }
@@ -1439,7 +1439,7 @@ private enum TestFileMakerProbeError: Error {
         EvaluatedArgument(label: "not", value: .boolean(true)),
         EvaluatedArgument(label: "status", value: .string("unchecked")),
     ])
-    _ = try? executor.execute(request)
+    _ = try? await executor.execute(request)
     let queryString = try #require(capture.query?.queryString)
     // compoundQueryString renders a negated group as "!(qN)" -- see
     // FMPQuery.compoundQueryString in the upstream Perfect-FileMaker
@@ -1452,7 +1452,7 @@ private enum TestFileMakerProbeError: Error {
     #expect(queryString.contains("%28q1%29"))
 }
 
-@Test func fileMakerExecutorThrowsUnsupportedComparisonForUnknownOperator() throws {
+@Test func fileMakerExecutorThrowsUnsupportedComparisonForUnknownOperator() async throws {
     let executor = PerfectFileMakerLassoExecutor { _, _, _ in
         Issue.record("queryHandler should not be called for an unsupported operator")
         throw TestFileMakerProbeError.stopAfterCapture
@@ -1467,12 +1467,12 @@ private enum TestFileMakerProbeError: Error {
     // Structural/programmer-facing -- not caught by this executor's
     // LassoFileMakerDatabaseActionError handling, so it propagates as a
     // genuine Swift throw rather than becoming a silently-recoverable frame.
-    #expect(throws: LassoFileMakerLassoError.unsupportedComparison("rx")) {
-        try executor.execute(request)
+    await #expect(throws: LassoFileMakerLassoError.unsupportedComparison("rx")) {
+        try await executor.execute(request)
     }
 }
 
-@Test func fileMakerExecutorMapsFindAllActionWithSortAndPaging() throws {
+@Test func fileMakerExecutorMapsFindAllActionWithSortAndPaging() async throws {
     final class Capture: @unchecked Sendable {
         var query: FMPQuery?
     }
@@ -1490,7 +1490,7 @@ private enum TestFileMakerProbeError: Error {
         EvaluatedArgument(label: "maxrecords", value: .integer(25)),
         EvaluatedArgument(label: "skiprecords", value: .integer(50)),
     ])
-    _ = try? executor.execute(request)
+    _ = try? await executor.execute(request)
     let queryString = try #require(capture.query?.queryString)
     #expect(queryString.contains("-findall"))
     #expect(queryString.contains("-sortfield.1=last_name"))
@@ -1499,7 +1499,7 @@ private enum TestFileMakerProbeError: Error {
     #expect(queryString.contains("-max=25"))
 }
 
-@Test func fileMakerExecutorMapsAddActionWithFieldAssignments() throws {
+@Test func fileMakerExecutorMapsAddActionWithFieldAssignments() async throws {
     final class Capture: @unchecked Sendable {
         var query: FMPQuery?
     }
@@ -1514,13 +1514,13 @@ private enum TestFileMakerProbeError: Error {
         EvaluatedArgument(label: "add", value: .boolean(true)),
         EvaluatedArgument(label: "status", value: .string("new")),
     ])
-    _ = try? executor.execute(request)
+    _ = try? await executor.execute(request)
     let queryString = try #require(capture.query?.queryString)
     #expect(queryString.contains("-new"))
     #expect(queryString.contains("status"))
 }
 
-@Test func fileMakerExecutorMapsUpdateActionWithRecordIdFromKeyValue() throws {
+@Test func fileMakerExecutorMapsUpdateActionWithRecordIdFromKeyValue() async throws {
     final class Capture: @unchecked Sendable {
         var query: FMPQuery?
     }
@@ -1539,13 +1539,13 @@ private enum TestFileMakerProbeError: Error {
         EvaluatedArgument(label: "keyvalue", value: .integer(101)),
         EvaluatedArgument(label: "status", value: .string("checked")),
     ])
-    _ = try? executor.execute(request)
+    _ = try? await executor.execute(request)
     let queryString = try #require(capture.query?.queryString)
     #expect(queryString.contains("-recid=101"))
     #expect(queryString.contains("-edit"))
 }
 
-@Test func fileMakerExecutorMapsDeleteActionWithRecordId() throws {
+@Test func fileMakerExecutorMapsDeleteActionWithRecordId() async throws {
     final class Capture: @unchecked Sendable {
         var query: FMPQuery?
     }
@@ -1561,13 +1561,13 @@ private enum TestFileMakerProbeError: Error {
         EvaluatedArgument(label: "keyfield", value: .string("")),
         EvaluatedArgument(label: "keyvalue", value: .integer(101)),
     ])
-    _ = try? executor.execute(request)
+    _ = try? await executor.execute(request)
     let queryString = try #require(capture.query?.queryString)
     #expect(queryString.contains("-recid=101"))
     #expect(queryString.contains("-delete"))
 }
 
-@Test func fileMakerExecutorTurnsClassifiedHandlerFailureIntoRecoverableFrame() throws {
+@Test func fileMakerExecutorTurnsClassifiedHandlerFailureIntoRecoverableFrame() async throws {
     // Mirrors what the real production `queryHandler` (built in
     // main.swift, wrapping a semaphore-bridged FileMakerServer call) is
     // expected to do: catch its own real backend failure and throw
@@ -1583,14 +1583,14 @@ private enum TestFileMakerProbeError: Error {
         EvaluatedArgument(label: "table", value: .string("storefront")),
         EvaluatedArgument(label: "findall", value: .boolean(true)),
     ])
-    let frame = try executor.execute(request)
+    let frame = try await executor.execute(request)
     #expect(frame.rows == [])
     #expect(frame.error != .noError)
     #expect(frame.error.kind == "search")
     #expect(frame.error.detail?.contains("FakeServerError") == true)
 }
 
-@Test func fileMakerExecutorPropagatesUnclassifiedHandlerFailureFatally() throws {
+@Test func fileMakerExecutorPropagatesUnclassifiedHandlerFailureFatally() async throws {
     // The inverse of the above: an UNclassified error from the handler
     // (a bug in the semaphore bridge, or any failure it forgot to wrap)
     // must NOT be silently downgraded into a routine recoverable frame --
@@ -1608,20 +1608,20 @@ private enum TestFileMakerProbeError: Error {
         EvaluatedArgument(label: "table", value: .string("storefront")),
         EvaluatedArgument(label: "findall", value: .boolean(true)),
     ])
-    #expect {
-        try executor.execute(request)
+    await #expect {
+        try await executor.execute(request)
     } throws: { error in
         error is FakeBugError
     }
 }
 
-@Test func fileMakerExecutorRendersRecoverableErrorThroughInlineWhenWritesDisabled() throws {
+@Test func fileMakerExecutorRendersRecoverableErrorThroughInlineWhenWritesDisabled() async throws {
     let executor = PerfectFileMakerLassoExecutor(allowWrites: false) { _, _, _ in
         throw TestFileMakerProbeError.stopAfterCapture
     }
     let provider = LassoDynamicInlineProvider(executor: executor, datasourceAliases: ["fm_catalog": "fm_catalog"])
     var context = LassoContext(inlineProvider: provider)
-    let output = try LassoRenderer().render(
+    let output = try await LassoRenderer().render(
         "[inline(-database='fm_catalog',-table='storefront',-add,'status'='new')][/inline][error_currenterror]",
         context: &context
     )
@@ -1644,7 +1644,7 @@ private enum TestFileMakerProbeError: Error {
     #expect(executor.lassoValue(.container("http://elsewhere/photo.jpg")) == .string("http://elsewhere/photo.jpg"))
 }
 
-@Test func perfectCRUDExecutorRoutesAddUpdateDeleteToTheMutationHandler() throws {
+@Test func perfectCRUDExecutorRoutesAddUpdateDeleteToTheMutationHandler() async throws {
     final class MutationRecorder: @unchecked Sendable {
         private(set) var mutations: [DynamicMutation] = []
         func record(_ mutation: DynamicMutation) { mutations.append(mutation) }
@@ -1662,15 +1662,15 @@ private enum TestFileMakerProbeError: Error {
     let provider = LassoDynamicInlineProvider(executor: executor, datasourceAliases: ["catalog_mysql": "catalog"])
     var context = LassoContext(inlineProvider: provider)
 
-    _ = try LassoRenderer().render(
+    _ = try await LassoRenderer().render(
         "[inline(-database='catalog_mysql',-table='skus',-add,'color'='red')][/inline]",
         context: &context
     )
-    _ = try LassoRenderer().render(
+    _ = try await LassoRenderer().render(
         "[inline(-database='catalog_mysql',-table='skus',-update,-keyfield='id',-keyvalue=7,'color'='blue')][/inline]",
         context: &context
     )
-    _ = try LassoRenderer().render(
+    _ = try await LassoRenderer().render(
         "[inline(-database='catalog_mysql',-table='skus',-delete,-keyfield='id',-keyvalue=7)][/inline]",
         context: &context
     )
@@ -1691,7 +1691,7 @@ private enum TestFileMakerProbeError: Error {
     #expect(seenMutations[2].predicates == [DynamicPredicate(field: "id", comparison: .equal, value: .int(7))])
 }
 
-@Test func perfectCRUDExecutorRoutesRawSQLToTheRawSQLHandler() throws {
+@Test func perfectCRUDExecutorRoutesRawSQLToTheRawSQLHandler() async throws {
     final class SQLRecorder: @unchecked Sendable {
         private(set) var sql: DynamicSQL?
         func record(_ sql: DynamicSQL) { self.sql = sql }
@@ -1710,7 +1710,7 @@ private enum TestFileMakerProbeError: Error {
         executor: executor,
         datasourceAliases: ["catalog_mysql": "catalog"]
     ))
-    let output = try LassoRenderer().render(
+    let output = try await LassoRenderer().render(
         "[inline(-database='catalog_mysql',-sql='SELECT COUNT(*) AS n FROM skus')][records][field('n')][/records][/inline]",
         context: &context
     )
@@ -1718,7 +1718,7 @@ private enum TestFileMakerProbeError: Error {
     #expect(recorder.sql?.sql == "SELECT COUNT(*) AS n FROM skus")
 }
 
-@Test func writeAndRawSQLCapabilitiesDenyByDefaultAsRecoverableErrors() throws {
+@Test func writeAndRawSQLCapabilitiesDenyByDefaultAsRecoverableErrors() async throws {
     // Documentation/inline-write-raw-sql-plan.md's Capability Policy:
     // reads enabled by default, writes/raw SQL disabled until a datasource
     // explicitly opts in. Denial surfaces as an inline frame carrying
@@ -1736,7 +1736,7 @@ private enum TestFileMakerProbeError: Error {
         executor: executor,
         datasourceAliases: ["catalog_mysql": "catalog"]
     ))
-    let output = try LassoRenderer().render(
+    let output = try await LassoRenderer().render(
         """
         [inline(-database='catalog_mysql',-table='skus',-add,'color'='red')][/inline]\
         error=[error_currenterror]
@@ -1771,7 +1771,7 @@ private enum TestFileMakerProbeError: Error {
         ),
     ]
 )
-func perfectCRUDConnectorFailuresBecomeInlineErrorFrames(source: String, expected: String) throws {
+func perfectCRUDConnectorFailuresBecomeInlineErrorFrames(source: String, expected: String) async throws {
     enum ConnectorFailure: Error {
         case unavailable
     }
@@ -1798,11 +1798,11 @@ func perfectCRUDConnectorFailuresBecomeInlineErrorFrames(source: String, expecte
         datasourceAliases: ["catalog_mysql": "catalog"]
     ))
 
-    let output = try LassoRenderer().render(source, context: &context)
+    let output = try await LassoRenderer().render(source, context: &context)
     #expect(output == expected)
 }
 
-@Test func perfectCRUDExecutorPreservesRecoverableErrorsThrownByHandlers() throws {
+@Test func perfectCRUDExecutorPreservesRecoverableErrorsThrownByHandlers() async throws {
     let state = LassoErrorState(code: 4242, message: "Connector-specific failure", kind: "connector")
     let executor = PerfectCRUDLassoExecutor(
         capabilities: { _ in .full },
@@ -1813,7 +1813,7 @@ func perfectCRUDConnectorFailuresBecomeInlineErrorFrames(source: String, expecte
         datasourceAliases: ["catalog_mysql": "catalog"]
     ))
 
-    let output = try LassoRenderer().render(
+    let output = try await LassoRenderer().render(
         "[inline(-database='catalog_mysql',-table='skus',-search)][error_currenterror]|[error_currenterror(-errorcode)][/inline]",
         context: &context
     )
@@ -1821,7 +1821,7 @@ func perfectCRUDConnectorFailuresBecomeInlineErrorFrames(source: String, expecte
     #expect(output == "Connector-specific failure|4242")
 }
 
-@Test func perfectCRUDExecutorStillThrowsFatalValidationErrorsBeforeConnectorCalls() throws {
+@Test func perfectCRUDExecutorStillThrowsFatalValidationErrorsBeforeConnectorCalls() async throws {
     let executor = PerfectCRUDLassoExecutor(
         queryHandler: { _, _ in DynamicResult(rows: [], statement: "") }
     )
@@ -1830,15 +1830,15 @@ func perfectCRUDConnectorFailuresBecomeInlineErrorFrames(source: String, expecte
         datasourceAliases: ["catalog_mysql": "catalog"]
     ))
 
-    #expect(throws: PerfectCRUDLassoError.missingTable) {
-        _ = try LassoRenderer().render(
+    await #expect(throws: PerfectCRUDLassoError.missingTable) {
+        _ = try await LassoRenderer().render(
             "[inline(-database='catalog_mysql',-search)][error_currenterror][/inline]",
             context: &context
         )
     }
 }
 
-@Test func perfectCRUDExecutorDoesNotFrameUnknownHandlerThrows() throws {
+@Test func perfectCRUDExecutorDoesNotFrameUnknownHandlerThrows() async throws {
     enum ProgrammerError: Error, Equatable {
         case unexpected
     }
@@ -1851,15 +1851,15 @@ func perfectCRUDConnectorFailuresBecomeInlineErrorFrames(source: String, expecte
         datasourceAliases: ["catalog_mysql": "catalog"]
     ))
 
-    #expect(throws: ProgrammerError.unexpected) {
-        _ = try LassoRenderer().render(
+    await #expect(throws: ProgrammerError.unexpected) {
+        _ = try await LassoRenderer().render(
             "[inline(-database='catalog_mysql',-table='skus',-search)][error_currenterror][/inline]",
             context: &context
         )
     }
 }
 
-@Test func customTagDefinesCallsAndIsolatesLocals() throws {
+@Test func customTagDefinesCallsAndIsolatesLocals() async throws {
     var context = LassoContext()
     let source = """
     <?lassoscript
@@ -1879,30 +1879,30 @@ func perfectCRUDConnectorFailuresBecomeInlineErrorFrames(source: String, expecte
     ?>
     [greet_tag('Ada')] / [greet_tag('Bo', 'Hi')] / [local(result = 100)][increment_tag(5)] / [#result] / [short_circuit_tag(true)] / [short_circuit_tag(false)]
     """
-    let output = try LassoRenderer().render(source, context: &context)
+    let output = try await LassoRenderer().render(source, context: &context)
         .trimmingCharacters(in: .whitespacesAndNewlines)
     #expect(output == "Hello, Ada! / Hi, Bo! / 6 / 100 / early / late")
 }
 
-@Test func tagExistsChecksNativeFunctionsAndCustomTags() throws {
+@Test func tagExistsChecksNativeFunctionsAndCustomTags() async throws {
     var nativeContext = LassoContext()
-    let nativeOutput = try LassoRenderer().render(
+    let nativeOutput = try await LassoRenderer().render(
         "[lasso_tagexists('string')]|[tag_exists('lasso_tagexists')]|[tag_exists('missing_tag')]",
         context: &nativeContext
     )
     #expect(nativeOutput == "true|true|false")
 
     var customContext = LassoContext()
-    let customOutput = try LassoRenderer().render(
+    let customOutput = try await LassoRenderer().render(
         "<?lassoscript define sample_tag() => { return 'ok' } ?>[lasso_tagexists('sample_tag')]|[tag_exists('sample_tag')]",
         context: &customContext
     )
     #expect(customOutput == "true|true")
 }
 
-@Test func typeDefinitionsConstructObjectsAndDispatchMethods() throws {
+@Test func typeDefinitionsConstructObjectsAndDispatchMethods() async throws {
     var context = LassoContext()
-    let output = try LassoRenderer().render(
+    let output = try await LassoRenderer().render(
         """
         <?lassoscript
         define Widget => type {
@@ -1930,9 +1930,9 @@ func perfectCRUDConnectorFailuresBecomeInlineErrorFrames(source: String, expecte
     #expect(output == "Ada|Hello, Ada|Hi, Ada|integer|any")
 }
 
-@Test func legacyDefineTagParenthesizedRegistersStandaloneTag() throws {
+@Test func legacyDefineTagParenthesizedRegistersStandaloneTag() async throws {
     var context = LassoContext()
-    let output = try LassoRenderer().render(
+    let output = try await LassoRenderer().render(
         """
         [
         Define_Tag('Greet', -Required='Name', -Optional='Greeting');
@@ -1947,13 +1947,13 @@ func perfectCRUDConnectorFailuresBecomeInlineErrorFrames(source: String, expecte
     #expect(output == "Hello, Ada|Hi, Ada")
 }
 
-@Test func legacyDefineTagColonCallRegistersStandaloneTagWithTypeConstrainedParameters() throws {
+@Test func legacyDefineTagColonCallRegistersStandaloneTagWithTypeConstrainedParameters() async throws {
     // Real corpus shape (see Documentation/legacy-define-tag-type-plan.md,
     // "Parenthesized Legacy Custom Tag" and colon-call variants): no
     // enclosing parens after the colon, -Required/-Type pairs declaring
     // typed parameters.
     var context = LassoContext()
-    let output = try LassoRenderer().render(
+    let output = try await LassoRenderer().render(
         """
         [
         Define_Tag: 'Ex_Sum', -Required='A', -Type='integer', -Required='B', -Type='integer';
@@ -1968,13 +1968,13 @@ func perfectCRUDConnectorFailuresBecomeInlineErrorFrames(source: String, expecte
     #expect(output == "7")
 }
 
-@Test func legacyDefineTypeParenthesizedRegistersDataMembersAndMethodsWithConstructorParams() throws {
+@Test func legacyDefineTypeParenthesizedRegistersDataMembersAndMethodsWithConstructorParams() async throws {
     // Scrubbed version of the real getGeoIPInfo.inc shape: a data member
     // default that reads the constructor's own `params` (Documentation/
     // legacy-define-tag-type-plan.md's "Constructor params" note), plus a
     // nested define_tag method reading/writing instance data via self.
     var context = LassoContext()
-    let output = try LassoRenderer().render(
+    let output = try await LassoRenderer().render(
         """
         [
         Define_Type('Ex_Info');
@@ -1996,14 +1996,14 @@ func perfectCRUDConnectorFailuresBecomeInlineErrorFrames(source: String, expecte
     #expect(output == "custom/US|default/US")
 }
 
-@Test func legacyDefineTypeColonCallRegistersTypeAndMethods() throws {
+@Test func legacyDefineTypeColonCallRegistersTypeAndMethods() async throws {
     // Scrubbed version of the real js_timer.inc shape: colon-call
     // define_type with a parent/base type name and -prototype flag
     // (parsed, not yet acted on — see the plan's deferred inheritance
     // note), a colon-call local: data member, and colon-call define_tag:
     // methods using parenthesized self->'member' assignment.
     var context = LassoContext()
-    let output = try LassoRenderer().render(
+    let output = try await LassoRenderer().render(
         """
         [
         define_type: 'Ex_Timer', 'integer', -prototype;
@@ -2026,9 +2026,9 @@ func perfectCRUDConnectorFailuresBecomeInlineErrorFrames(source: String, expecte
     #expect(output == "2")
 }
 
-@Test func customTagRecursionSucceedsAndDeepRecursionThrows() throws {
+@Test func customTagRecursionSucceedsAndDeepRecursionThrows() async throws {
     var context = LassoContext()
-    let output = try LassoRenderer().render(
+    let output = try await LassoRenderer().render(
         """
         <?lassoscript
         define recurse_tag(#n) => {
@@ -2045,8 +2045,8 @@ func perfectCRUDConnectorFailuresBecomeInlineErrorFrames(source: String, expecte
     #expect(output == "3")
 
     var deepContext = LassoContext()
-    #expect(throws: LassoRuntimeError.tagCallDepthExceeded) {
-        try LassoRenderer().render(
+    await #expect(throws: LassoRuntimeError.tagCallDepthExceeded) {
+        try await LassoRenderer().render(
             """
             <?lassoscript
             define deep_recurse_tag(#n) => {
@@ -2063,7 +2063,7 @@ func perfectCRUDConnectorFailuresBecomeInlineErrorFrames(source: String, expecte
     }
 }
 
-@Test func libraryDedupesWithinOneRenderButReloadsPerIndependentContext() throws {
+@Test func libraryDedupesWithinOneRenderButReloadsPerIndependentContext() async throws {
     // Per LassoSoft's own library_once/[Library_Once] documentation, repeat
     // calls only no-op "if used multiple times referencing the same Lasso
     // page" — i.e. within one page's own render, not across the server
@@ -2093,7 +2093,7 @@ func perfectCRUDConnectorFailuresBecomeInlineErrorFrames(source: String, expecte
     let registry = LassoTagRegistry()
 
     var firstRequestContext = LassoContext(includeLoader: loader, tagRegistry: registry)
-    let firstOutput = try LassoRenderer().render(
+    let firstOutput = try await LassoRenderer().render(
         """
         <?lassoscript
         library('/shared.lasso')
@@ -2108,7 +2108,7 @@ func perfectCRUDConnectorFailuresBecomeInlineErrorFrames(source: String, expecte
     #expect(firstOutput == "42")
 
     var secondRequestContext = LassoContext(includeLoader: loader, tagRegistry: registry)
-    let secondOutput = try LassoRenderer().render(
+    let secondOutput = try await LassoRenderer().render(
         "<?lassoscript library('/shared.lasso') ?>[shared_tag(10)]",
         context: &secondRequestContext
     )
@@ -2120,7 +2120,7 @@ func perfectCRUDConnectorFailuresBecomeInlineErrorFrames(source: String, expecte
     #expect(secondOutput == "20")
 }
 
-@Test func includeAlwaysRereadsButSkipsReparseWhenUnchanged() throws {
+@Test func includeAlwaysRereadsButSkipsReparseWhenUnchanged() async throws {
     final class MutableIncludeLoader: LassoIncludeLoader, @unchecked Sendable {
         private(set) var loadCount = 0
         var content: String
@@ -2138,18 +2138,18 @@ func perfectCRUDConnectorFailuresBecomeInlineErrorFrames(source: String, expecte
     let registry = LassoTagRegistry()
     let loader = MutableIncludeLoader(content: "v1: [local(x = 1)][#x]")
 
-    func render(_ source: String) throws -> String {
+    func render(_ source: String) async throws -> String {
         var context = LassoContext(includeLoader: loader, tagRegistry: registry)
-        return try LassoRenderer().render(source, context: &context)
+        return try await LassoRenderer().render(source, context: &context)
     }
 
-    #expect(try render("[include('shared.lasso')]") == "v1: 1")
-    #expect(try render("[include('shared.lasso')]") == "v1: 1")
+    #expect(try await render("[include('shared.lasso')]") == "v1: 1")
+    #expect(try await render("[include('shared.lasso')]") == "v1: 1")
     #expect(loader.loadCount == 2, "An include is re-read (I/O) on every use, unlike a library")
 
     loader.content = "v2: [local(x = 2)][#x]"
     #expect(
-        try render("[include('shared.lasso')]") == "v2: 2",
+        try await render("[include('shared.lasso')]") == "v2: 2",
         "A real content change must not serve stale cached output"
     )
 }
@@ -2165,7 +2165,7 @@ func perfectCRUDConnectorFailuresBecomeInlineErrorFrames(source: String, expecte
     #expect(registry.cachedInclude(forKey: "probe", matchingSource: "changed") == nil)
 }
 
-@Test func lassoDelimiterSupportsBraceStyleBlocks() throws {
+@Test func lassoDelimiterSupportsBraceStyleBlocks() async throws {
     var context = LassoContext()
     let source = """
     <?lasso
@@ -2178,7 +2178,7 @@ func perfectCRUDConnectorFailuresBecomeInlineErrorFrames(source: String, expecte
     ?>
     [$triggered]/[$inside]/[$after]
     """
-    let output = try LassoRenderer().render(source, context: &context)
+    let output = try await LassoRenderer().render(source, context: &context)
         .trimmingCharacters(in: .whitespacesAndNewlines)
     #expect(
         output == "true/yes/done",
@@ -2186,10 +2186,10 @@ func perfectCRUDConnectorFailuresBecomeInlineErrorFrames(source: String, expecte
     )
 }
 
-@Test func lassoDelimiterBraceStyleIfElseChoosesCorrectBranch() throws {
+@Test func lassoDelimiterBraceStyleIfElseChoosesCorrectBranch() async throws {
     var context = LassoContext()
 
-    let trueOutput = try LassoRenderer().render(
+    let trueOutput = try await LassoRenderer().render(
         """
         <?lasso
         if(true) => {
@@ -2204,7 +2204,7 @@ func perfectCRUDConnectorFailuresBecomeInlineErrorFrames(source: String, expecte
     ).trimmingCharacters(in: .whitespacesAndNewlines)
     #expect(trueOutput == "if")
 
-    let falseOutput = try LassoRenderer().render(
+    let falseOutput = try await LassoRenderer().render(
         """
         <?lasso
         if(false) => {
@@ -2220,7 +2220,7 @@ func perfectCRUDConnectorFailuresBecomeInlineErrorFrames(source: String, expecte
     #expect(falseOutput == "else")
 }
 
-@Test func colonCallIfOpenerIsRecognizedAsRealControlFlow() throws {
+@Test func colonCallIfOpenerIsRecognizedAsRealControlFlow() async throws {
     // Lasso 8's colon-call convention (`if:(condition);` ... `else;` ...
     // `/if;`) is just as valid an opener as the parenthesized-call style —
     // found live-verifying a real corpus page, where `if:(...)` fell
@@ -2229,7 +2229,7 @@ func perfectCRUDConnectorFailuresBecomeInlineErrorFrames(source: String, expecte
     // unknownFunction("if") instead of ever reaching real control flow.
     var context = LassoContext()
 
-    let trueOutput = try LassoRenderer().render(
+    let trueOutput = try await LassoRenderer().render(
         """
         <?lasso
         if:(true);
@@ -2244,7 +2244,7 @@ func perfectCRUDConnectorFailuresBecomeInlineErrorFrames(source: String, expecte
     ).trimmingCharacters(in: .whitespacesAndNewlines)
     #expect(trueOutput == "if")
 
-    let falseOutput = try LassoRenderer().render(
+    let falseOutput = try await LassoRenderer().render(
         """
         <?lasso
         if:(false);
@@ -2260,9 +2260,9 @@ func perfectCRUDConnectorFailuresBecomeInlineErrorFrames(source: String, expecte
     #expect(falseOutput == "else")
 }
 
-@Test func lassoDelimiterMixesBraceAndSlashStyleNesting() throws {
+@Test func lassoDelimiterMixesBraceAndSlashStyleNesting() async throws {
     var context = LassoContext()
-    let output = try LassoRenderer().render(
+    let output = try await LassoRenderer().render(
         """
         <?lasso
         if(true)
@@ -2278,9 +2278,9 @@ func perfectCRUDConnectorFailuresBecomeInlineErrorFrames(source: String, expecte
     #expect(output == "yes")
 }
 
-@Test func lassoDelimiterRealCorpusShapeNoLongerThrowsUnknownFunctionIf() throws {
+@Test func lassoDelimiterRealCorpusShapeNoLongerThrowsUnknownFunctionIf() async throws {
     var context = LassoContext()
-    let output = try LassoRenderer().render(
+    let output = try await LassoRenderer().render(
         """
         <?lasso
         if(!$demo_setup_done) => {
@@ -2305,7 +2305,7 @@ func perfectCRUDConnectorFailuresBecomeInlineErrorFrames(source: String, expecte
     #expect(malformedDefine.diagnostics.contains { $0.message.hasPrefix("Malformed 'define'") })
 }
 
-@Test func arrowBraceBodyOnItsOwnLineIsNotMalformed() throws {
+@Test func arrowBraceBodyOnItsOwnLineIsNotMalformed() async throws {
     // Real startup-folder code commonly puts the opening brace on the line
     // after '=>' rather than immediately following it (found verifying
     // against a real LassoStartup folder — a `define name(...) =>` /
@@ -2313,7 +2313,7 @@ func perfectCRUDConnectorFailuresBecomeInlineErrorFrames(source: String, expecte
     // entirely, silently reinterpreting the define as a plain statement
     // and later throwing unknownFunction for the tag's own name).
     var context = LassoContext()
-    let output = try LassoRenderer().render(
+    let output = try await LassoRenderer().render(
         """
         <?lassoscript
         define greet(name = void) =>
@@ -2328,9 +2328,9 @@ func perfectCRUDConnectorFailuresBecomeInlineErrorFrames(source: String, expecte
     #expect(output == "hi there")
 }
 
-@Test func arrowBraceIfBodyOnItsOwnLineIsRecognized() throws {
+@Test func arrowBraceIfBodyOnItsOwnLineIsRecognized() async throws {
     var context = LassoContext()
-    let output = try LassoRenderer().render(
+    let output = try await LassoRenderer().render(
         """
         <?lasso
         if(true) =>
@@ -2345,7 +2345,7 @@ func perfectCRUDConnectorFailuresBecomeInlineErrorFrames(source: String, expecte
     #expect(output == "taken")
 }
 
-@Test func slashStyleBlockBodyIsNotSwallowedWhenNoArrowFollows() throws {
+@Test func slashStyleBlockBodyIsNotSwallowedWhenNoArrowFollows() async throws {
     // Regression guard for a bug introduced while fixing the arrow-brace
     // newline case above: consumeArrowBlockStartIfPresent() must not
     // cross a newline while merely probing for '=>' — doing so left the
@@ -2353,7 +2353,7 @@ func perfectCRUDConnectorFailuresBecomeInlineErrorFrames(source: String, expecte
     // caller's unconditional skipLineRemainder() then silently swallowed
     // instead of just cleaning up the block-opening line's own trailer.
     var context = LassoContext()
-    let output = try LassoRenderer().render(
+    let output = try await LassoRenderer().render(
         """
         <?lasso
         if(true)
@@ -2367,7 +2367,7 @@ func perfectCRUDConnectorFailuresBecomeInlineErrorFrames(source: String, expecte
     #expect(output == "taken")
 }
 
-@Test func crlfLineEndingsDoNotSwallowArrowBraceBlockBodies() throws {
+@Test func crlfLineEndingsDoNotSwallowArrowBraceBlockBodies() async throws {
     // Real corpus files are commonly CRLF-terminated (Windows-authored
     // Lasso code). Swift's Character type treats "\r\n" as a single
     // extended grapheme cluster that equals neither the standalone "\r"
@@ -2380,18 +2380,18 @@ func perfectCRUDConnectorFailuresBecomeInlineErrorFrames(source: String, expecte
     // brace, silently discarding both.
     var context = LassoContext()
     let source = "<?lasso\r\nif(true) => {\r\n\t$x = 1\r\n}\r\n?>\r\n[$x]"
-    let output = try LassoRenderer().render(source, context: &context)
+    let output = try await LassoRenderer().render(source, context: &context)
         .trimmingCharacters(in: .whitespacesAndNewlines)
     #expect(output == "1")
 }
 
-@Test func expressionBodiedDefineRegistersStringLiteralConstant() throws {
+@Test func expressionBodiedDefineRegistersStringLiteralConstant() async throws {
     // Real startup-folder shape: `define br => '<br />'` — no braces at
     // all, just a bare expression. Before this fix, parseDefineOpening
     // backed out entirely on seeing no '{', so `br` was never registered
     // and got parsed as an ordinary (undefined) function call instead.
     var context = LassoContext()
-    let output = try LassoRenderer().render(
+    let output = try await LassoRenderer().render(
         """
         <?lasso
         define br => '<br />'
@@ -2403,13 +2403,13 @@ func perfectCRUDConnectorFailuresBecomeInlineErrorFrames(source: String, expecte
     #expect(output == "<br />")
 }
 
-@Test func expressionBodiedDefineSupportsMultiLineArrayAndMapLiterals() throws {
+@Test func expressionBodiedDefineSupportsMultiLineArrayAndMapLiterals() async throws {
     // Real shape: `define botMap => array(...)` / `define keywordMap =>
     // map(...)` spanning multiple lines. readStatement()'s paren-depth
     // tracking must treat the whole multi-line call as one statement, not
     // stop at each internal newline.
     var context = LassoContext()
-    let output = try LassoRenderer().render(
+    let output = try await LassoRenderer().render(
         """
         <?lasso
         define botMap => array(
@@ -2424,9 +2424,9 @@ func perfectCRUDConnectorFailuresBecomeInlineErrorFrames(source: String, expecte
     #expect(output == "SemRush/DotBot/2")
 }
 
-@Test func bareIdentifierCallsZeroArgCustomTag() throws {
+@Test func bareIdentifierCallsZeroArgCustomTag() async throws {
     var context = LassoContext()
-    let output = try LassoRenderer().render(
+    let output = try await LassoRenderer().render(
         """
         <?lassoscript
         define greeting => { return('hello') }
@@ -2438,12 +2438,12 @@ func perfectCRUDConnectorFailuresBecomeInlineErrorFrames(source: String, expecte
     #expect(output == "hello")
 }
 
-@Test func typeDataMemberDefaultValueResolvesBareZeroArgTagCall() throws {
+@Test func typeDataMemberDefaultValueResolvesBareZeroArgTagCall() async throws {
     // Mirrors the real pp_express type exactly: `data public returnURL =
     // pp_return`, where `pp_return` is itself an expression-bodied
     // zero-arg define, referenced with no parens.
     var context = LassoContext()
-    let output = try LassoRenderer().render(
+    let output = try await LassoRenderer().render(
         """
         <?lassoscript
         define pp_return => 'https://example.com/return'
@@ -2459,9 +2459,9 @@ func perfectCRUDConnectorFailuresBecomeInlineErrorFrames(source: String, expecte
     #expect(output == "https://example.com/return")
 }
 
-@Test func withInDoIteratesArrayBindingNamedVariable() throws {
+@Test func withInDoIteratesArrayBindingNamedVariable() async throws {
     var context = LassoContext()
-    let output = try LassoRenderer().render(
+    let output = try await LassoRenderer().render(
         """
         <?lasso
         $collected = ''
@@ -2476,12 +2476,12 @@ func perfectCRUDConnectorFailuresBecomeInlineErrorFrames(source: String, expecte
     #expect(output == "abc")
 }
 
-@Test func withInDoIteratesOverBareZeroArgTagCallResult() throws {
+@Test func withInDoIteratesOverBareZeroArgTagCallResult() async throws {
     // End-to-end composition of all three fixes in this pass, mirroring
     // the real excludeBots/botMap shape exactly: a with...do body iterates
     // a bare-referenced expression-bodied array constant.
     var context = LassoContext()
-    let output = try LassoRenderer().render(
+    let output = try await LassoRenderer().render(
         """
         <?lasso
         define botMap => array('SemRush', 'DotBot', 'AhrefsBot')
@@ -2501,7 +2501,7 @@ func perfectCRUDConnectorFailuresBecomeInlineErrorFrames(source: String, expecte
     #expect(output == "true/false")
 }
 
-@Test func excludeBotsFullRealShapeRedirectsUsingWebRequestHttpHost() throws {
+@Test func excludeBotsFullRealShapeRedirectsUsingWebRequestHttpHost() async throws {
     // The exact next gap found live-verifying excludeBots against the real
     // startup folder: excludeBots's with...do loop calls botRedirect,
     // whose body reads web_request->httpHost — reached only once a bot
@@ -2517,7 +2517,7 @@ func perfectCRUDConnectorFailuresBecomeInlineErrorFrames(source: String, expecte
     }
 
     var context = LassoContext(requestProvider: RequestProvider())
-    let output = try LassoRenderer().render(
+    let output = try await LassoRenderer().render(
         """
         <?lasso
         define botMap => array('SemRush', 'DotBot', 'AhrefsBot')
@@ -2540,12 +2540,12 @@ func perfectCRUDConnectorFailuresBecomeInlineErrorFrames(source: String, expecte
     #expect(output == "https://shop.example.test/bot_response.lasso")
 }
 
-@Test func malformedWithFallsBackToOrdinaryCodeWithoutSwallowingNextStatement() throws {
+@Test func malformedWithFallsBackToOrdinaryCodeWithoutSwallowingNextStatement() async throws {
     // Regression guard, same class as slashStyleBlockBodyIsNotSwallowedWhenNoArrowFollows:
     // a bare 'with' not actually followed by 'name in expr do {' must not
     // crash or eat the statement after it.
     var context = LassoContext()
-    let output = try LassoRenderer().render(
+    let output = try await LassoRenderer().render(
         """
         <?lasso
         with = 5
@@ -2558,7 +2558,7 @@ func perfectCRUDConnectorFailuresBecomeInlineErrorFrames(source: String, expecte
     #expect(output == "reached")
 }
 
-@Test func nativeReceiverIsAssignableFirstClassValue() throws {
+@Test func nativeReceiverIsAssignableFirstClassValue() async throws {
     // The specific gap that motivated unifying native types with the
     // object system: before this, `web_request` only "worked" as a
     // receiver by spelling — it was intercepted before ever being
@@ -2572,14 +2572,14 @@ func perfectCRUDConnectorFailuresBecomeInlineErrorFrames(source: String, expecte
         func cookie(named name: String) -> LassoValue { .void }
     }
     var context = LassoContext(requestProvider: RequestProvider())
-    let output = try LassoRenderer().render(
+    let output = try await LassoRenderer().render(
         "<?lasso local(r = web_request) ?>[#r->param('term')]",
         context: &context
     ).trimmingCharacters(in: .whitespacesAndNewlines)
     #expect(output == "clogs")
 }
 
-@Test func webRequestMembersReflectRealRequestData() throws {
+@Test func webRequestMembersReflectRealRequestData() async throws {
     struct RichRequestProvider: LassoRequestProvider {
         let parameters: [String: LassoValue] = ["term": .string("clogs")]
         let headers: [String: LassoValue] = [
@@ -2605,7 +2605,7 @@ func perfectCRUDConnectorFailuresBecomeInlineErrorFrames(source: String, expecte
     }
 
     var context = LassoContext(requestProvider: RichRequestProvider())
-    let output = try LassoRenderer().render(
+    let output = try await LassoRenderer().render(
         """
         [web_request->requestMethod]|\
         [web_request->requestURI]|\
@@ -2635,27 +2635,27 @@ func perfectCRUDConnectorFailuresBecomeInlineErrorFrames(source: String, expecte
     // dispatch does plain key lookup, not method calls like ->find(key),
     // so this checks the same way ordinary Lasso map access already works
     // elsewhere in this test file.
-    let bulkOutput = try LassoRenderer().render(
+    let bulkOutput = try await LassoRenderer().render(
         "[web_request->headers->host]/[web_request->cookies->sid]/[web_request->params->term]",
         context: &context
     )
     #expect(bulkOutput == "shop.example.test/abc123/clogs")
 }
 
-@Test func webRequestPostParamsAreEmptyNotBroken() throws {
+@Test func webRequestPostParamsAreEmptyNotBroken() async throws {
     // Documented limitation, not a silent failure: this interpreter has
     // never parsed POST bodies (tracked separately). postParam/postParams/
     // postString return empty results — the same shape a real request
     // with no matching data would produce — rather than throwing.
     var context = LassoContext()
-    let output = try LassoRenderer().render(
+    let output = try await LassoRenderer().render(
         "[web_request->postParam('x')]|[web_request->postString]",
         context: &context
     )
     #expect(output == "|")
 }
 
-@Test func postBodySupportsRealFormDataWithPostBeforeGetOrdering() throws {
+@Test func postBodySupportsRealFormDataWithPostBeforeGetOrdering() async throws {
     // Documentation/post-body-support-plan.md Phase 1: real POST body data
     // reaches Lasso code now, not just wired-but-empty stubs. Duplicate
     // names, POST-before-GET combined ordering, and the joiner behavior for
@@ -2690,7 +2690,7 @@ func perfectCRUDConnectorFailuresBecomeInlineErrorFrames(source: String, expecte
     }
 
     var context = LassoContext(requestProvider: FormRequestProvider())
-    let output = try LassoRenderer().render(
+    let output = try await LassoRenderer().render(
         """
         [web_request->postParam('term')]|\
         [web_request->postString]|\
@@ -2707,7 +2707,7 @@ func perfectCRUDConnectorFailuresBecomeInlineErrorFrames(source: String, expecte
     #expect(output == "from-post|term=from-post&color=red&color=blue|from-post|from-query|red,blue|2|red|red|red")
 }
 
-@Test func fileUploadsExposeMetadataUnderBothLasso9And8KeyNames() throws {
+@Test func fileUploadsExposeMetadataUnderBothLasso9And8KeyNames() async throws {
     // Documentation/session-upload-support-plan.md Milestone 1:
     // web_request->fileUploads() (Lasso 9 keys) and [file_uploads] (Lasso 8
     // keys) both project the same real upload metadata, just under each
@@ -2731,7 +2731,7 @@ func perfectCRUDConnectorFailuresBecomeInlineErrorFrames(source: String, expecte
     }
 
     var context = LassoContext(requestProvider: UploadRequestProvider())
-    let output = try LassoRenderer().render(
+    let output = try await LassoRenderer().render(
         """
         [web_request->fileUploads->size]|\
         [web_request->fileUploads->get(1)->fieldname]|\
@@ -2750,7 +2750,7 @@ func perfectCRUDConnectorFailuresBecomeInlineErrorFrames(source: String, expecte
     #expect(output == "1|avatar|image/png|photo.png|/tmp/upload-abc123|4096|avatar|photo.png|image/png|4096|png")
 }
 
-@Test func fileProcessUploadsMovesUploadedFilesIntoTheDestination() throws {
+@Test func fileProcessUploadsMovesUploadedFilesIntoTheDestination() async throws {
     let root = FileManager.default.temporaryDirectory.appendingPathComponent("lasso-upload-root-\(UUID().uuidString)", isDirectory: true)
     let temp = FileManager.default.temporaryDirectory.appendingPathComponent("lasso-upload-temp-\(UUID().uuidString)")
     defer {
@@ -2780,7 +2780,7 @@ func perfectCRUDConnectorFailuresBecomeInlineErrorFrames(source: String, expecte
         uploadProcessor: try LassoFileSystemUploadProcessor(root: root)
     )
 
-    let output = try LassoRenderer().render(
+    let output = try await LassoRenderer().render(
         "before-[File_ProcessUploads(-Destination='uploads')]-after",
         context: &context
     )
@@ -2792,7 +2792,7 @@ func perfectCRUDConnectorFailuresBecomeInlineErrorFrames(source: String, expecte
     #expect(try String(contentsOf: moved, encoding: .utf8) == "image-bytes")
 }
 
-@Test func fileProcessUploadsHonorsSizeAndExtensionFilters() throws {
+@Test func fileProcessUploadsHonorsSizeAndExtensionFilters() async throws {
     let root = FileManager.default.temporaryDirectory.appendingPathComponent("lasso-upload-root-\(UUID().uuidString)", isDirectory: true)
     let small = FileManager.default.temporaryDirectory.appendingPathComponent("lasso-upload-small-\(UUID().uuidString)")
     let large = FileManager.default.temporaryDirectory.appendingPathComponent("lasso-upload-large-\(UUID().uuidString)")
@@ -2825,7 +2825,7 @@ func perfectCRUDConnectorFailuresBecomeInlineErrorFrames(source: String, expecte
         uploadProcessor: try LassoFileSystemUploadProcessor(root: root)
     )
 
-    _ = try LassoRenderer().render(
+    _ = try await LassoRenderer().render(
         "[File_ProcessUploads(-Destination='uploads', -Size=10, -Extensions='png')]",
         context: &context
     )
@@ -2837,7 +2837,7 @@ func perfectCRUDConnectorFailuresBecomeInlineErrorFrames(source: String, expecte
     #expect(FileManager.default.fileExists(atPath: wrongExtension.path))
 }
 
-@Test func fileProcessUploadsUsesTempNamesWhenRequested() throws {
+@Test func fileProcessUploadsUsesTempNamesWhenRequested() async throws {
     let root = FileManager.default.temporaryDirectory.appendingPathComponent("lasso-upload-root-\(UUID().uuidString)", isDirectory: true)
     let temp = FileManager.default.temporaryDirectory.appendingPathComponent("upload-token-\(UUID().uuidString).tmp")
     defer {
@@ -2867,7 +2867,7 @@ func perfectCRUDConnectorFailuresBecomeInlineErrorFrames(source: String, expecte
         uploadProcessor: try LassoFileSystemUploadProcessor(root: root)
     )
 
-    _ = try LassoRenderer().render(
+    _ = try await LassoRenderer().render(
         "[File_ProcessUploads(-Destination='uploads', -UseTempNames)]",
         context: &context
     )
@@ -2876,7 +2876,7 @@ func perfectCRUDConnectorFailuresBecomeInlineErrorFrames(source: String, expecte
     #expect(FileManager.default.fileExists(atPath: root.appendingPathComponent("uploads/photo.png").path) == false)
 }
 
-@Test func fileProcessUploadsOverwritePolicyAndPathConfinementAreRecoverable() throws {
+@Test func fileProcessUploadsOverwritePolicyAndPathConfinementAreRecoverable() async throws {
     let root = FileManager.default.temporaryDirectory.appendingPathComponent("lasso-upload-root-\(UUID().uuidString)", isDirectory: true)
     let temp = FileManager.default.temporaryDirectory.appendingPathComponent("lasso-upload-temp-\(UUID().uuidString)")
     defer {
@@ -2907,21 +2907,21 @@ func perfectCRUDConnectorFailuresBecomeInlineErrorFrames(source: String, expecte
         uploadProcessor: try LassoFileSystemUploadProcessor(root: root)
     )
 
-    let overwriteDenied = try LassoRenderer().render(
+    let overwriteDenied = try await LassoRenderer().render(
         "[protect][File_ProcessUploads(-Destination='uploads')][/protect][error_currenterror]",
         context: &context
     )
     #expect(overwriteDenied == "File_ProcessUploads failed.")
     #expect(try String(contentsOf: root.appendingPathComponent("uploads/photo.png"), encoding: .utf8) == "old")
 
-    let outsideRoot = try LassoRenderer().render(
+    let outsideRoot = try await LassoRenderer().render(
         "[protect][File_ProcessUploads(-Destination='../escape', -FileOverwrite)][/protect][error_currenterror]",
         context: &context
     )
     #expect(outsideRoot == "File_ProcessUploads failed.")
 }
 
-@Test func voidLookupMissBehavesLikeEmptyStringButNullStaysStrict() throws {
+@Test func voidLookupMissBehavesLikeEmptyStringButNullStaysStrict() async throws {
     // Real Lasso 9 returns `void` (not `null`) when web_request->param /
     // action_param / header / cookie lookups miss, and keeps `null` itself
     // strict — an unhandled member on a real null throws unless the type
@@ -2931,7 +2931,7 @@ func perfectCRUDConnectorFailuresBecomeInlineErrorFrames(source: String, expecte
     // returned `.null` on a miss, and `.null` had no member-dispatch case
     // at all.
     var context = LassoContext()
-    let output = try LassoRenderer().render(
+    let output = try await LassoRenderer().render(
         "[action_param('missing')->size]|[action_param('missing')->contains('x')]|[action_param('missing')->uppercase]",
         context: &context
     )
@@ -2940,8 +2940,8 @@ func perfectCRUDConnectorFailuresBecomeInlineErrorFrames(source: String, expecte
     // A genuine null (not a lookup-miss void) must still throw on an
     // unhandled member — this fix must not weaken null's real strictness.
     var nullContext = LassoContext()
-    #expect(throws: LassoRuntimeError.unsupportedExpression("Member bogusMember")) {
-        _ = try LassoRenderer().render("[null->bogusMember]", context: &nullContext)
+    await #expect(throws: LassoRuntimeError.unsupportedExpression("Member bogusMember")) {
+        _ = try await LassoRenderer().render("[null->bogusMember]", context: &nullContext)
     }
 
     // The literal `void` keyword must itself parse to a real .void value
@@ -2949,11 +2949,11 @@ func perfectCRUDConnectorFailuresBecomeInlineErrorFrames(source: String, expecte
     // expression node — harmless before this fix, but now `void` needs
     // its own distinct, permissive dispatch).
     var voidContext = LassoContext()
-    let voidOutput = try LassoRenderer().render("[void->size]", context: &voidContext)
+    let voidOutput = try await LassoRenderer().render("[void->size]", context: &voidContext)
     #expect(voidOutput == "0")
 }
 
-@Test func webResponseMembersRecordThroughResponseSink() throws {
+@Test func webResponseMembersRecordThroughResponseSink() async throws {
     final class RecordingResponseSink: LassoResponseSink, @unchecked Sendable {
         private(set) var status = 200
         private(set) var headerPairs: [(name: String, value: String)] = []
@@ -2976,7 +2976,7 @@ func perfectCRUDConnectorFailuresBecomeInlineErrorFrames(source: String, expecte
 
     let sink = RecordingResponseSink()
     var context = LassoContext(responseSink: sink)
-    _ = try LassoRenderer().render(
+    _ = try await LassoRenderer().render(
         """
         <?lasso
         web_response->setStatus(201)
@@ -2998,7 +2998,7 @@ func perfectCRUDConnectorFailuresBecomeInlineErrorFrames(source: String, expecte
     #expect(sink.cookiePairs.first?.httpOnly == true)
 }
 
-@Test func webResponseAbortStopsRenderingLikeReturn() throws {
+@Test func webResponseAbortStopsRenderingLikeReturn() async throws {
     // abort() rides the existing return-signal short-circuit mechanism —
     // no new control-flow needed. Verified the same way return's
     // short-circuit already is: output truncates at the abort point.
@@ -3008,14 +3008,14 @@ func perfectCRUDConnectorFailuresBecomeInlineErrorFrames(source: String, expecte
     // this test was) can't distinguish "stopped early" from "never
     // executed anything in the first place."
     var context = LassoContext()
-    let output = try LassoRenderer().render(
+    let output = try await LassoRenderer().render(
         "BEFORE<?lasso web_response->abort() ?>AFTER",
         context: &context
     )
     #expect(output == "BEFORE")
 }
 
-@Test func sessionRemoveVarStopsPersistingAndEndDestroysTheSession() throws {
+@Test func sessionRemoveVarStopsPersistingAndEndDestroysTheSession() async throws {
     final class SessionProvider: LassoSessionProvider, @unchecked Sendable {
         private(set) var persisted: [String: [String: LassoValue]] = [:]
         private(set) var endedNames: Set<String> = []
@@ -3040,7 +3040,7 @@ func perfectCRUDConnectorFailuresBecomeInlineErrorFrames(source: String, expecte
     // removeVar: registered then removed before render ends — never persisted.
     let removeProvider = SessionProvider()
     var removeContext = LassoContext(sessionProvider: removeProvider)
-    _ = try LassoRenderer().render(
+    _ = try await LassoRenderer().render(
         "[session_start('cart')][var(a = 'x')][session_addvar('cart','a')][session_removevar('cart','a')]",
         context: &removeContext
     )
@@ -3051,7 +3051,7 @@ func perfectCRUDConnectorFailuresBecomeInlineErrorFrames(source: String, expecte
     // not here — this only proves the native reaches the provider.
     let endProvider = SessionProvider()
     var endContext = LassoContext(sessionProvider: endProvider)
-    _ = try LassoRenderer().render("[session_start('cart')][session_end('cart')]", context: &endContext)
+    _ = try await LassoRenderer().render("[session_start('cart')][session_end('cart')]", context: &endContext)
     #expect(endProvider.endedNames.contains("cart"))
 }
 
@@ -3102,7 +3102,7 @@ func perfectCRUDConnectorFailuresBecomeInlineErrorFrames(source: String, expecte
     #expect(LassoSessionPreflight.scan(document).isEmpty)
 }
 
-@Test func sessionAddvarResolvesNameKeywordAndPositionalVarNameCorrectly() throws {
+@Test func sessionAddvarResolvesNameKeywordAndPositionalVarNameCorrectly() async throws {
     // Real corpus shape: Session_Addvar(-Name='cart', 'sort_by') — the
     // session name is the -Name= keyword, the var name is the (only)
     // positional argument. Before the fix, positionalValue(at: 0) would
@@ -3129,7 +3129,7 @@ func perfectCRUDConnectorFailuresBecomeInlineErrorFrames(source: String, expecte
 
     let provider = SessionProvider()
     var context = LassoContext(sessionProvider: provider)
-    _ = try LassoRenderer().render(
+    _ = try await LassoRenderer().render(
         "[session_start(-Name='cart')][var(sort_by = 'newest')][session_addvar(-Name='cart', 'sort_by')]",
         context: &context
     )
@@ -3137,7 +3137,7 @@ func perfectCRUDConnectorFailuresBecomeInlineErrorFrames(source: String, expecte
     #expect(provider.persisted["sort_by"] == nil, "the var name must not be mistaken for the session name")
 }
 
-@Test func sessionEndAndSessionIdResolveTheNameKeywordFormWithNoVarNameArgument() throws {
+@Test func sessionEndAndSessionIdResolveTheNameKeywordFormWithNoVarNameArgument() async throws {
     // Real corpus shapes: Session_ID(-Name='...') (used as an expression,
     // e.g. embedded in a redirect URL) and Session_End(-Name='...') —
     // keyword-only, no second (var-name) argument at all.
@@ -3158,17 +3158,17 @@ func perfectCRUDConnectorFailuresBecomeInlineErrorFrames(source: String, expecte
 
     let provider = SessionProvider()
     var context = LassoContext(sessionProvider: provider)
-    let output = try LassoRenderer().render(
+    let output = try await LassoRenderer().render(
         "[session_start(-Name='cart')][Session_ID(-Name='cart')]",
         context: &context
     )
     #expect(output == "fake-cart")
 
-    _ = try LassoRenderer().render("[session_end(-Name='cart')]", context: &context)
+    _ = try await LassoRenderer().render("[session_end(-Name='cart')]", context: &context)
     #expect(provider.endedNames.contains("cart"))
 }
 
-@Test func sessionRemoveVarAbortAndResultResolveTheNameKeywordForm() throws {
+@Test func sessionRemoveVarAbortAndResultResolveTheNameKeywordForm() async throws {
     // No direct real corpus shape found for these three (unlike
     // session_start/session_addvar/session_id/session_end above) — fixed
     // anyway via the same shared resolver rather than leaving an
@@ -3195,17 +3195,17 @@ func perfectCRUDConnectorFailuresBecomeInlineErrorFrames(source: String, expecte
 
     let provider = SessionProvider()
     var context = LassoContext(sessionProvider: provider)
-    _ = try LassoRenderer().render(
+    _ = try await LassoRenderer().render(
         "[session_start(-Name='cart')][var(a = 'x')][session_addvar(-Name='cart', 'a')]" +
             "[session_removevar(-Name='cart', 'a')]",
         context: &context
     )
     #expect(provider.persisted["cart"]?["a"] == nil)
 
-    _ = try LassoRenderer().render("[session_abort(-Name='cart')]", context: &context)
+    _ = try await LassoRenderer().render("[session_abort(-Name='cart')]", context: &context)
     #expect(provider.abortedNames.contains("cart"))
 
-    let resultOutput = try LassoRenderer().render(
+    let resultOutput = try await LassoRenderer().render(
         "[session_start(-Name='fresh')][session_result(-Name='fresh')->new]",
         context: &context
     )
@@ -3220,7 +3220,7 @@ func perfectCRUDConnectorFailuresBecomeInlineErrorFrames(source: String, expecte
     let firstBridge = PerfectBackedLassoSessionProvider()
     await firstBridge.prepare(calls: [call], driver: driver, cookies: [:], remoteAddress: "", userAgent: "")
     var firstContext = LassoContext(sessionProvider: firstBridge)
-    let firstOutput = try LassoRenderer().render(
+    let firstOutput = try await LassoRenderer().render(
         "[session_start('cart')][var(total = 3)][session_addvar('cart','total')][total]",
         context: &firstContext
     )
@@ -3241,7 +3241,7 @@ func perfectCRUDConnectorFailuresBecomeInlineErrorFrames(source: String, expecte
         remoteAddress: "", userAgent: ""
     )
     var secondContext = LassoContext(sessionProvider: secondBridge)
-    let secondOutput = try LassoRenderer().render(
+    let secondOutput = try await LassoRenderer().render(
         "[session_start('cart')][session_addvar('cart','total')][total]",
         context: &secondContext
     )
@@ -3255,14 +3255,14 @@ func perfectCRUDConnectorFailuresBecomeInlineErrorFrames(source: String, expecte
     let bridge = PerfectBackedLassoSessionProvider()
     await bridge.prepare(calls: [call], driver: driver, cookies: [:], remoteAddress: "", userAgent: "")
     var context = LassoContext(sessionProvider: bridge)
-    _ = try LassoRenderer().render("[session_start('cart')][session_end('cart')]", context: &context)
+    _ = try await LassoRenderer().render("[session_start('cart')][session_end('cart')]", context: &context)
     let actions = await bridge.finalize(driver: driver)
     let action = actions.first(where: { $0.call.name == "cart" })
     #expect(action?.shouldClearCookie == true)
     #expect(action?.token == nil)
 }
 
-@Test func protectCatchesRecoverableErrorAndSetsCurrentError() throws {
+@Test func protectCatchesRecoverableErrorAndSetsCurrentError() async throws {
     // Documentation/error-protect-model-plan.md's core contract: protect
     // catches ONLY LassoRecoverableError, sets context.currentError, and
     // continues rendering after the block. No native tag throws this yet
@@ -3274,21 +3274,21 @@ func perfectCRUDConnectorFailuresBecomeInlineErrorFrames(source: String, expecte
         throw LassoRecoverableError(LassoErrorState(code: 42, message: "Add failed", kind: "add"))
     }
     var context = LassoContext(natives: natives)
-    let output = try LassoRenderer().render(
+    let output = try await LassoRenderer().render(
         "before-[protect]during-[fail_with_db_error]-unreached[/protect]-after-[error_currenterror]-[error_currenterror(-errorcode)]",
         context: &context
     )
     #expect(output == "before--after-Add failed-42")
 }
 
-@Test func protectDoesNotCatchReturnOrFatalErrors() throws {
+@Test func protectDoesNotCatchReturnOrFatalErrors() async throws {
     // return/abort ride the existing returnSignal short-circuit, not a
     // thrown error, so protect's do/catch never even sees them — but this
     // is worth a real regression test rather than trusting the mechanism
     // description. Separately, genuine fatal errors (LassoRuntimeError)
     // must stay fatal — protect only catches LassoRecoverableError.
     var returnContext = LassoContext()
-    let returnOutput = try LassoRenderer().render(
+    let returnOutput = try await LassoRenderer().render(
         "before-[protect]during-[return('early')]-unreached[/protect]-after",
         context: &returnContext
     )
@@ -3301,22 +3301,22 @@ func perfectCRUDConnectorFailuresBecomeInlineErrorFrames(source: String, expecte
     #expect(returnOutput == "before-during-early")
 
     var fatalContext = LassoContext()
-    #expect(throws: LassoRuntimeError.unknownFunction("totally_undefined_native")) {
-        _ = try LassoRenderer().render(
+    await #expect(throws: LassoRuntimeError.unknownFunction("totally_undefined_native")) {
+        _ = try await LassoRenderer().render(
             "[protect]during-[totally_undefined_native()][/protect]-after",
             context: &fatalContext
         )
     }
 }
 
-@Test func errorCurrentErrorDefaultsToNoErrorAndInlineFramesUpdateIt() throws {
+@Test func errorCurrentErrorDefaultsToNoErrorAndInlineFramesUpdateIt() async throws {
     // Milestone 3/4: a fresh context starts at real Lasso's "No Error"
     // state, and pushing an inline frame (the mechanism every inline
     // action already goes through) updates context.currentError from the
     // frame's own error state — the wiring inline-write-raw-sql-plan's
     // executor work will populate with real connector failures later.
     var context = LassoContext()
-    let defaultOutput = try LassoRenderer().render(
+    let defaultOutput = try await LassoRenderer().render(
         "[error_currenterror]/[error_currenterror(-errorcode)]",
         context: &context
     )
@@ -3415,17 +3415,17 @@ private final class MapIncludeLoader: LassoIncludeLoader, @unchecked Sendable {
     }
 }
 
-@Test func webResponseIncludeRendersFileContentAsExpressionOutput() throws {
+@Test func webResponseIncludeRendersFileContentAsExpressionOutput() async throws {
     let loader = MapIncludeLoader(files: ["header.lasso": "<h1>Hi</h1>"])
     var context = LassoContext(includeLoader: loader)
-    let output = try LassoRenderer().render(
+    let output = try await LassoRenderer().render(
         "<?lasso web_response->include('header.lasso') ?>",
         context: &context
     )
     #expect(output == "<h1>Hi</h1>")
 }
 
-@Test func includeOnceSecondCallReturnsVoidPendingDocConfirmation() throws {
+@Test func includeOnceSecondCallReturnsVoidPendingDocConfirmation() async throws {
     // No confirmed documented return value exists in either reference
     // source for a repeat includeOnce call — defaulting to `.void`,
     // matching includeLibraryOnce's documented "no value" and this
@@ -3433,7 +3433,7 @@ private final class MapIncludeLoader: LassoIncludeLoader, @unchecked Sendable {
     // a confirmed contract.
     let loader = MapIncludeLoader(files: ["header.lasso": "HI"])
     var context = LassoContext(includeLoader: loader)
-    let output = try LassoRenderer().render(
+    let output = try await LassoRenderer().render(
         "[web_response->includeOnce('header.lasso')]|[web_response->includeOnce('header.lasso')]",
         context: &context
     )
@@ -3441,27 +3441,27 @@ private final class MapIncludeLoader: LassoIncludeLoader, @unchecked Sendable {
     #expect(loader.loadCounts["header.lasso"] == 1)
 }
 
-@Test func includeLibraryReexecutesEveryCallWithNoDedup() throws {
+@Test func includeLibraryReexecutesEveryCallWithNoDedup() async throws {
     let loader = MapIncludeLoader(files: ["lib.lasso": "x"])
     var context = LassoContext(includeLoader: loader)
-    _ = try LassoRenderer().render(
+    _ = try await LassoRenderer().render(
         "<?lasso web_response->includeLibrary('lib.lasso') web_response->includeLibrary('lib.lasso') ?>",
         context: &context
     )
     #expect(loader.loadCounts["lib.lasso"] == 2)
 }
 
-@Test func includeLibraryOnceDedupesWithinOneRenderLikeTheFreeLibraryTag() throws {
+@Test func includeLibraryOnceDedupesWithinOneRenderLikeTheFreeLibraryTag() async throws {
     let loader = MapIncludeLoader(files: ["lib.lasso": "x"])
     var context = LassoContext(includeLoader: loader)
-    _ = try LassoRenderer().render(
+    _ = try await LassoRenderer().render(
         "<?lasso web_response->includeLibraryOnce('lib.lasso') web_response->includeLibraryOnce('lib.lasso') ?>",
         context: &context
     )
     #expect(loader.loadCounts["lib.lasso"] == 1)
 }
 
-@Test func includeLibraryDetectsSelfReferentialCycleInsteadOfCrashing() throws {
+@Test func includeLibraryDetectsSelfReferentialCycleInsteadOfCrashing() async throws {
     // Regression for a stack-overflow found in code review: unlike the
     // free `library(...)` tag (always once:true, protected by
     // loadedLibraries dedup even on self-reference), includeLibrary's
@@ -3471,50 +3471,50 @@ private final class MapIncludeLoader: LassoIncludeLoader, @unchecked Sendable {
     // the whole process, not just fail this one request.
     let loader = MapIncludeLoader(files: ["lib.lasso": "<?lasso web_response->includeLibrary('lib.lasso') ?>"])
     var context = LassoContext(includeLoader: loader)
-    #expect(throws: LassoRuntimeError.includeCycle("lib.lasso")) {
-        _ = try LassoRenderer().render("<?lasso web_response->includeLibrary('lib.lasso') ?>", context: &context)
+    await #expect(throws: LassoRuntimeError.includeCycle("lib.lasso")) {
+        _ = try await LassoRenderer().render("<?lasso web_response->includeLibrary('lib.lasso') ?>", context: &context)
     }
 }
 
-@Test func includeLibraryEnforcesDepthLimitOnChainedRecursion() throws {
+@Test func includeLibraryEnforcesDepthLimitOnChainedRecursion() async throws {
     var files: [String: String] = [:]
     for i in 0..<40 {
         files["g\(i).lasso"] = "<?lasso web_response->includeLibrary('g\(i + 1).lasso') ?>"
     }
     let loader = MapIncludeLoader(files: files)
     var context = LassoContext(includeLoader: loader)
-    #expect(throws: LassoRuntimeError.includeDepthExceeded) {
-        _ = try LassoRenderer().render("<?lasso web_response->includeLibrary('g0.lasso') ?>", context: &context)
+    await #expect(throws: LassoRuntimeError.includeDepthExceeded) {
+        _ = try await LassoRenderer().render("<?lasso web_response->includeLibrary('g0.lasso') ?>", context: &context)
     }
 }
 
-@Test func webResponseIncludeDetectsSelfReferentialCycle() throws {
+@Test func webResponseIncludeDetectsSelfReferentialCycle() async throws {
     let loader = MapIncludeLoader(files: ["a.lasso": "<?lasso web_response->include('a.lasso') ?>"])
     var context = LassoContext(includeLoader: loader)
-    #expect(throws: LassoRuntimeError.includeCycle("a.lasso")) {
-        _ = try LassoRenderer().render("<?lasso web_response->include('a.lasso') ?>", context: &context)
+    await #expect(throws: LassoRuntimeError.includeCycle("a.lasso")) {
+        _ = try await LassoRenderer().render("<?lasso web_response->include('a.lasso') ?>", context: &context)
     }
 }
 
-@Test func webResponseIncludeEnforcesDepthLimit() throws {
+@Test func webResponseIncludeEnforcesDepthLimit() async throws {
     var files: [String: String] = [:]
     for i in 0..<40 {
         files["f\(i).lasso"] = i < 39 ? "<?lasso web_response->include('f\(i + 1).lasso') ?>" : "leaf"
     }
     let loader = MapIncludeLoader(files: files)
     var context = LassoContext(includeLoader: loader)
-    #expect(throws: LassoRuntimeError.includeDepthExceeded) {
-        _ = try LassoRenderer().render("<?lasso web_response->include('f0.lasso') ?>", context: &context)
+    await #expect(throws: LassoRuntimeError.includeDepthExceeded) {
+        _ = try await LassoRenderer().render("<?lasso web_response->include('f0.lasso') ?>", context: &context)
     }
 }
 
-@Test func includesMethodReflectsLiveNestingStackDuringNestedInclude() throws {
+@Test func includesMethodReflectsLiveNestingStackDuringNestedInclude() async throws {
     let loader = MapIncludeLoader(files: [
         "outer.lasso": "[web_response->includes()]|[web_response->include('inner.lasso')]",
         "inner.lasso": "[web_response->includes()]",
     ])
     var context = LassoContext(includeLoader: loader)
-    let output = try LassoRenderer().render(
+    let output = try await LassoRenderer().render(
         "before:[web_response->includes()]|[web_response->include('outer.lasso')]|after:[web_response->includes()]",
         context: &context
     )
@@ -3525,7 +3525,7 @@ private final class MapIncludeLoader: LassoIncludeLoader, @unchecked Sendable {
     #expect(output == "before:|outer.lasso|outer.lassoinner.lasso|after:")
 }
 
-@Test func includesMethodDoesNotReflectLibraryCallsPerDocumentedScope() throws {
+@Test func includesMethodDoesNotReflectLibraryCallsPerDocumentedScope() async throws {
     // includes() is scoped to the live include-family nesting stack only:
     // only include/includeOnce push onto includeStack today (library calls
     // never did, matching the free library(...) tag's pre-existing
@@ -3533,24 +3533,24 @@ private final class MapIncludeLoader: LassoIncludeLoader, @unchecked Sendable {
     // answer either way in LassoGuide 9.3.
     let loader = MapIncludeLoader(files: ["lib.lasso": "[web_response->includes()]"])
     var context = LassoContext(includeLoader: loader)
-    let output = try LassoRenderer().render(
+    let output = try await LassoRenderer().render(
         "[web_response->includeLibrary('lib.lasso')]",
         context: &context
     )
     #expect(output == "")
 }
 
-@Test func includeBytesRoundTripsTextContent() throws {
+@Test func includeBytesRoundTripsTextContent() async throws {
     let loader = MapIncludeLoader(files: ["data.txt": "hello bytes"])
     var context = LassoContext(includeLoader: loader)
-    let output = try LassoRenderer().render(
+    let output = try await LassoRenderer().render(
         "[web_response->includeBytes('data.txt')]",
         context: &context
     )
     #expect(output == "hello bytes")
 }
 
-@Test func includeBytesLossyDecodesInvalidUTF8InsteadOfThrowing() throws {
+@Test func includeBytesLossyDecodesInvalidUTF8InsteadOfThrowing() async throws {
     // Documented limitation, not a crash: no LassoValue case models binary
     // data yet (zero corpus evidence to size one correctly), so a byte
     // sequence that isn't valid UTF-8 decodes lossily (U+FFFD replacement
@@ -3558,7 +3558,7 @@ private final class MapIncludeLoader: LassoIncludeLoader, @unchecked Sendable {
     let loader = MapIncludeLoader(files: ["blob.bin": ""])
     loader.byteOverrides["blob.bin"] = Data([0xFF, 0xFE, 0x41, 0x42])
     var context = LassoContext(includeLoader: loader)
-    let output = try LassoRenderer().render(
+    let output = try await LassoRenderer().render(
         "[web_response->includeBytes('blob.bin')]",
         context: &context
     )
@@ -3566,7 +3566,7 @@ private final class MapIncludeLoader: LassoIncludeLoader, @unchecked Sendable {
     #expect(output.contains("\u{FFFD}"))
 }
 
-@Test func loadIncludeBytesDefaultExtensionThrowsForLegacyLoaders() throws {
+@Test func loadIncludeBytesDefaultExtensionThrowsForLegacyLoaders() async throws {
     // Proves the default protocol-extension claim: a loader written before
     // includeBytes existed (only implementing loadInclude) doesn't need to
     // change, and correctly surfaces includeNotConfigured rather than a
@@ -3575,12 +3575,12 @@ private final class MapIncludeLoader: LassoIncludeLoader, @unchecked Sendable {
         func loadInclude(path: String, from includingPath: String?) throws -> String { "ok" }
     }
     var context = LassoContext(includeLoader: LegacyLoader())
-    #expect(throws: LassoRuntimeError.includeNotConfigured) {
-        _ = try LassoRenderer().render("[web_response->includeBytes('x.lasso')]", context: &context)
+    await #expect(throws: LassoRuntimeError.includeNotConfigured) {
+        _ = try await LassoRenderer().render("[web_response->includeBytes('x.lasso')]", context: &context)
     }
 }
 
-@Test func webResponseIncludeRejectsPathEscapingRootLikeTheFreeTag() throws {
+@Test func webResponseIncludeRejectsPathEscapingRootLikeTheFreeTag() async throws {
     let root = FileManager.default.temporaryDirectory
         .appendingPathComponent("lasso-webresponse-include-\(UUID().uuidString)")
     try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
@@ -3588,15 +3588,15 @@ private final class MapIncludeLoader: LassoIncludeLoader, @unchecked Sendable {
 
     let loader = try LassoFileSystemIncludeLoader(root: root)
     var context = LassoContext(includeLoader: loader)
-    #expect(throws: LassoFileSystemIncludeError.pathOutsideRoot("../../outside.lasso")) {
-        _ = try LassoRenderer().render(
+    await #expect(throws: LassoFileSystemIncludeError.pathOutsideRoot("../../outside.lasso")) {
+        _ = try await LassoRenderer().render(
             "<?lasso web_response->include('../../outside.lasso') ?>",
             context: &context
         )
     }
 }
 
-@Test func webResponseIncludeLibraryRejectsPathEscapingRoot() throws {
+@Test func webResponseIncludeLibraryRejectsPathEscapingRoot() async throws {
     let root = FileManager.default.temporaryDirectory
         .appendingPathComponent("lasso-webresponse-library-\(UUID().uuidString)")
     try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
@@ -3604,15 +3604,15 @@ private final class MapIncludeLoader: LassoIncludeLoader, @unchecked Sendable {
 
     let loader = try LassoFileSystemIncludeLoader(root: root)
     var context = LassoContext(includeLoader: loader)
-    #expect(throws: LassoFileSystemIncludeError.pathOutsideRoot("../../outside.lasso")) {
-        _ = try LassoRenderer().render(
+    await #expect(throws: LassoFileSystemIncludeError.pathOutsideRoot("../../outside.lasso")) {
+        _ = try await LassoRenderer().render(
             "<?lasso web_response->includeLibrary('../../outside.lasso') ?>",
             context: &context
         )
     }
 }
 
-@Test func includeBytesRejectsPathEscapingRootUsingTheSameConfinementAsLoadInclude() throws {
+@Test func includeBytesRejectsPathEscapingRootUsingTheSameConfinementAsLoadInclude() async throws {
     let root = FileManager.default.temporaryDirectory
         .appendingPathComponent("lasso-webresponse-bytes-\(UUID().uuidString)")
     try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
@@ -3620,15 +3620,15 @@ private final class MapIncludeLoader: LassoIncludeLoader, @unchecked Sendable {
 
     let loader = try LassoFileSystemIncludeLoader(root: root)
     var context = LassoContext(includeLoader: loader)
-    #expect(throws: LassoFileSystemIncludeError.pathOutsideRoot("../../outside.lasso")) {
-        _ = try LassoRenderer().render(
+    await #expect(throws: LassoFileSystemIncludeError.pathOutsideRoot("../../outside.lasso")) {
+        _ = try await LassoRenderer().render(
             "[web_response->includeBytes('../../outside.lasso')]",
             context: &context
         )
     }
 }
 
-@Test func sendFileRecordsDataPayloadHeadersAndAbortsRendering() throws {
+@Test func sendFileRecordsDataPayloadHeadersAndAbortsRendering() async throws {
     final class RecordingFileServeSink: LassoResponseSink, @unchecked Sendable {
         private(set) var fileServeRequest: LassoFileServeRequest?
         func setStatus(_ status: Int) throws {}
@@ -3639,7 +3639,7 @@ private final class MapIncludeLoader: LassoIncludeLoader, @unchecked Sendable {
 
     let sink = RecordingFileServeSink()
     var context = LassoContext(responseSink: sink)
-    let output = try LassoRenderer().render(
+    let output = try await LassoRenderer().render(
         "BEFORE<?lasso web_response->sendFile('file contents', 'report.csv', -type='text/csv', -disposition='inline') ?>AFTER",
         context: &context
     )
@@ -3657,7 +3657,7 @@ private final class MapIncludeLoader: LassoIncludeLoader, @unchecked Sendable {
     #expect(sink.fileServeRequest?.disposition == "inline")
 }
 
-@Test func sendFileDefaultsDispositionToAttachmentWithNoNameOrType() throws {
+@Test func sendFileDefaultsDispositionToAttachmentWithNoNameOrType() async throws {
     // Matches sendFile's real documented -disposition default
     // ('attachment') even when no name/type override is given.
     final class RecordingFileServeSink: LassoResponseSink, @unchecked Sendable {
@@ -3670,14 +3670,14 @@ private final class MapIncludeLoader: LassoIncludeLoader, @unchecked Sendable {
 
     let sink = RecordingFileServeSink()
     var context = LassoContext(responseSink: sink)
-    _ = try LassoRenderer().render("<?lasso web_response->sendFile('abc') ?>", context: &context)
+    _ = try await LassoRenderer().render("<?lasso web_response->sendFile('abc') ?>", context: &context)
 
     #expect(sink.fileServeRequest?.disposition == "attachment")
     #expect(sink.fileServeRequest?.fileName == nil)
     #expect(sink.fileServeRequest?.contentType == nil)
 }
 
-@Test func sendFileDefaultExtensionIsANoOpForLegacySinksButStillAborts() throws {
+@Test func sendFileDefaultExtensionIsANoOpForLegacySinksButStillAborts() async throws {
     // Proves the default protocol-extension claim for serveFile: a sink
     // written before file serving existed (never overriding serveFile)
     // doesn't need to change, and sendFile still aborts rendering even
@@ -3688,14 +3688,14 @@ private final class MapIncludeLoader: LassoIncludeLoader, @unchecked Sendable {
         func setCookie(name: String, value: String) throws {}
     }
     var context = LassoContext(responseSink: LegacySink())
-    let output = try LassoRenderer().render(
+    let output = try await LassoRenderer().render(
         "BEFORE<?lasso web_response->sendFile('x') ?>AFTER",
         context: &context
     )
     #expect(output == "BEFORE")
 }
 
-@Test func fileServeAndFileStreamRecordPathSourceAbortAndOmitDispositionByDefault() throws {
+@Test func fileServeAndFileStreamRecordPathSourceAbortAndOmitDispositionByDefault() async throws {
     // file_serve/file_stream are implemented as aliases of one identical
     // registration (no confirmed documented behavioral distinction found
     // between them for this adapter's purposes) — both must behave
@@ -3714,7 +3714,7 @@ private final class MapIncludeLoader: LassoIncludeLoader, @unchecked Sendable {
     for tag in ["file_serve", "file_stream"] {
         let sink = RecordingFileServeSink()
         var context = LassoContext(responseSink: sink)
-        let output = try LassoRenderer().render(
+        let output = try await LassoRenderer().render(
             "BEFORE<?lasso \(tag)(-File='downloads/report.pdf', -Type='application/pdf') ?>AFTER",
             context: &context
         )
@@ -3731,7 +3731,7 @@ private final class MapIncludeLoader: LassoIncludeLoader, @unchecked Sendable {
     }
 }
 
-@Test func fileServeAcceptsAPositionalPathArgument() throws {
+@Test func fileServeAcceptsAPositionalPathArgument() async throws {
     final class RecordingFileServeSink: LassoResponseSink, @unchecked Sendable {
         private(set) var fileServeRequest: LassoFileServeRequest?
         func setStatus(_ status: Int) throws {}
@@ -3742,7 +3742,7 @@ private final class MapIncludeLoader: LassoIncludeLoader, @unchecked Sendable {
 
     let sink = RecordingFileServeSink()
     var context = LassoContext(responseSink: sink)
-    _ = try LassoRenderer().render("<?lasso file_serve('downloads/report.pdf') ?>", context: &context)
+    _ = try await LassoRenderer().render("<?lasso file_serve('downloads/report.pdf') ?>", context: &context)
 
     guard case let .path(path)? = sink.fileServeRequest?.source else {
         Issue.record("Expected a .path source")

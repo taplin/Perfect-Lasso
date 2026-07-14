@@ -93,10 +93,14 @@ public enum LassoFileMakerLassoError: Error, Equatable, Sendable {
 /// case (`-Duplicate`/`-Random`/`-Show`/`-RX`/portal reads — zero real
 /// corpus evidence).
 public struct PerfectFileMakerLassoExecutor: LassoDynamicQueryExecutor {
-    /// Synchronous by design, matching `PerfectCRUDLassoExecutor.QueryHandler`
-    /// — the production implementation bridges `FileMakerServer`'s async
-    /// completion-callback API to this synchronous shape via a semaphore
-    /// (see `main.swift`); this executor doesn't need to know that.
+    /// `async throws`, matching `FileMakerServer.query(_:)`'s own native
+    /// `async`/`await` shape — the production implementation in `main.swift`
+    /// awaits it directly, with no sync/async bridge; unlike
+    /// `PerfectCRUDLassoExecutor.QueryHandler` (still deliberately
+    /// synchronous, since `PerfectMySQL`'s underlying calls have no async
+    /// API to bridge to — see Phase 2 of
+    /// `Documentation/synchronous-render-pipeline.md`'s successor plan for
+    /// the thread-offload that's meant to address that separately).
     ///
     /// Takes `kind`/`datasource` alongside the query — unlike
     /// `PerfectCRUDLassoExecutor` (which splits `queryHandler`/
@@ -115,7 +119,7 @@ public struct PerfectFileMakerLassoExecutor: LassoDynamicQueryExecutor {
         _ query: FMPQuery,
         _ kind: LassoFileMakerActionFailureKind,
         _ datasource: String
-    ) throws -> FMPResultSet
+    ) async throws -> FMPResultSet
 
     private let queryHandler: QueryHandler
     /// Matches `LassoPerfectCRUD`'s "reads enabled by default, writes
@@ -135,7 +139,7 @@ public struct PerfectFileMakerLassoExecutor: LassoDynamicQueryExecutor {
         self.baseURL = baseURL
     }
 
-    public func execute(_ request: LassoInlineRequest) throws -> LassoInlineFrame {
+    public func execute(_ request: LassoInlineRequest) async throws -> LassoInlineFrame {
         guard let datasource = request.database, datasource.isEmpty == false else {
             throw LassoFileMakerLassoError.missingDatasource
         }
@@ -145,15 +149,15 @@ public struct PerfectFileMakerLassoExecutor: LassoDynamicQueryExecutor {
 
         switch request.action {
         case .search, .find:
-            return try executeFind(request, datasource: datasource, table: table)
+            return try await executeFind(request, datasource: datasource, table: table)
         case .findAll:
-            return try executeFindAll(request, datasource: datasource, table: table)
+            return try await executeFindAll(request, datasource: datasource, table: table)
         case .add:
-            return try executeAdd(request, datasource: datasource, table: table)
+            return try await executeAdd(request, datasource: datasource, table: table)
         case .update:
-            return try executeUpdate(request, datasource: datasource, table: table)
+            return try await executeUpdate(request, datasource: datasource, table: table)
         case .delete:
-            return try executeDelete(request, datasource: datasource, table: table)
+            return try await executeDelete(request, datasource: datasource, table: table)
         default:
             throw LassoFileMakerLassoError.unsupportedAction(request.action)
         }
@@ -161,27 +165,27 @@ public struct PerfectFileMakerLassoExecutor: LassoDynamicQueryExecutor {
 
     // MARK: - Read
 
-    private func executeFind(_ request: LassoInlineRequest, datasource: String, table: String) throws -> LassoInlineFrame {
+    private func executeFind(_ request: LassoInlineRequest, datasource: String, table: String) async throws -> LassoInlineFrame {
         do {
             var query = FMPQuery(database: datasource, layout: table, action: .find)
                 .sortFields(sortFields(request))
                 .queryFields(try queryFieldGroups(request.criteriaGroups))
             if let maxRecords = request.maxRecords { query = query.maxRecords(maxRecords) }
             if let skipRecords = request.skipRecords { query = query.skipRecords(skipRecords) }
-            let result = try performSync(query, kind: .search, datasource: datasource)
+            let result = try await performSync(query, kind: .search, datasource: datasource)
             return LassoInlineFrame(rows: result.records.map(lassoRow), foundCount: result.foundCount, actionStatement: query.queryString)
         } catch let error as LassoFileMakerDatabaseActionError {
             return LassoInlineFrame(rows: [], error: error.state)
         }
     }
 
-    private func executeFindAll(_ request: LassoInlineRequest, datasource: String, table: String) throws -> LassoInlineFrame {
+    private func executeFindAll(_ request: LassoInlineRequest, datasource: String, table: String) async throws -> LassoInlineFrame {
         do {
             var query = FMPQuery(database: datasource, layout: table, action: .findAll)
                 .sortFields(sortFields(request))
             if let maxRecords = request.maxRecords { query = query.maxRecords(maxRecords) }
             if let skipRecords = request.skipRecords { query = query.skipRecords(skipRecords) }
-            let result = try performSync(query, kind: .search, datasource: datasource)
+            let result = try await performSync(query, kind: .search, datasource: datasource)
             return LassoInlineFrame(rows: result.records.map(lassoRow), foundCount: result.foundCount, actionStatement: query.queryString)
         } catch let error as LassoFileMakerDatabaseActionError {
             return LassoInlineFrame(rows: [], error: error.state)
@@ -190,7 +194,7 @@ public struct PerfectFileMakerLassoExecutor: LassoDynamicQueryExecutor {
 
     // MARK: - Write actions
 
-    private func executeAdd(_ request: LassoInlineRequest, datasource: String, table: String) throws -> LassoInlineFrame {
+    private func executeAdd(_ request: LassoInlineRequest, datasource: String, table: String) async throws -> LassoInlineFrame {
         guard allowWrites else {
             return recoverableFrame(kind: .add, datasource: datasource, message: "-Add is not enabled for FileMaker datasource '\(datasource)'.")
         }
@@ -200,14 +204,14 @@ public struct PerfectFileMakerLassoExecutor: LassoDynamicQueryExecutor {
         do {
             let query = FMPQuery(database: datasource, layout: table, action: .new)
                 .queryFields(queryFields(request.fieldAssignments))
-            let result = try performSync(query, kind: .add, datasource: datasource)
+            let result = try await performSync(query, kind: .add, datasource: datasource)
             return LassoInlineFrame(rows: result.records.map(lassoRow), affectedRows: 1, actionStatement: query.queryString)
         } catch let error as LassoFileMakerDatabaseActionError {
             return LassoInlineFrame(rows: [], error: error.state)
         }
     }
 
-    private func executeUpdate(_ request: LassoInlineRequest, datasource: String, table: String) throws -> LassoInlineFrame {
+    private func executeUpdate(_ request: LassoInlineRequest, datasource: String, table: String) async throws -> LassoInlineFrame {
         guard allowWrites else {
             return recoverableFrame(kind: .update, datasource: datasource, message: "-Update is not enabled for FileMaker datasource '\(datasource)'.")
         }
@@ -219,14 +223,14 @@ public struct PerfectFileMakerLassoExecutor: LassoDynamicQueryExecutor {
             let query = FMPQuery(database: datasource, layout: table, action: .edit)
                 .recordId(recordID)
                 .queryFields(queryFields(request.fieldAssignments))
-            let result = try performSync(query, kind: .update, datasource: datasource)
+            let result = try await performSync(query, kind: .update, datasource: datasource)
             return LassoInlineFrame(rows: result.records.map(lassoRow), affectedRows: 1, actionStatement: query.queryString)
         } catch let error as LassoFileMakerDatabaseActionError {
             return LassoInlineFrame(rows: [], error: error.state)
         }
     }
 
-    private func executeDelete(_ request: LassoInlineRequest, datasource: String, table: String) throws -> LassoInlineFrame {
+    private func executeDelete(_ request: LassoInlineRequest, datasource: String, table: String) async throws -> LassoInlineFrame {
         guard allowWrites else {
             return recoverableFrame(kind: .delete, datasource: datasource, message: "-Delete is not enabled for FileMaker datasource '\(datasource)'.")
         }
@@ -234,7 +238,7 @@ public struct PerfectFileMakerLassoExecutor: LassoDynamicQueryExecutor {
             let recordID = try recordID(from: request.keyValue, kind: .delete, datasource: datasource)
             let query = FMPQuery(database: datasource, layout: table, action: .delete)
                 .recordId(recordID)
-            _ = try performSync(query, kind: .delete, datasource: datasource)
+            _ = try await performSync(query, kind: .delete, datasource: datasource)
             // Real Lasso 8.5 documents -Delete as returning an empty found
             // set — matches PerfectCRUDLassoExecutor's identical precedent.
             return LassoInlineFrame(rows: [], affectedRows: 1, actionStatement: query.queryString)
@@ -257,8 +261,8 @@ public struct PerfectFileMakerLassoExecutor: LassoDynamicQueryExecutor {
     /// genuine adapter bug) is deliberately left to propagate fatally
     /// rather than being silently downgraded into a routine "-Search
     /// failed" frame.
-    private func performSync(_ query: FMPQuery, kind: LassoFileMakerActionFailureKind, datasource: String) throws -> FMPResultSet {
-        try queryHandler(query, kind, datasource)
+    private func performSync(_ query: FMPQuery, kind: LassoFileMakerActionFailureKind, datasource: String) async throws -> FMPResultSet {
+        try await queryHandler(query, kind, datasource)
     }
 
     // MARK: - Shared helpers

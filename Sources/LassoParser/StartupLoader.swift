@@ -39,7 +39,7 @@ public func loadLassoStartupDirectory(
     at directory: URL,
     allowedExtensions: Set<String>,
     tagRegistry: LassoTagRegistry
-) -> LassoStartupLoadResult {
+) async -> LassoStartupLoadResult {
     var isDirectory: ObjCBool = false
     guard FileManager.default.fileExists(atPath: directory.path, isDirectory: &isDirectory),
           isDirectory.boolValue else {
@@ -84,7 +84,7 @@ public func loadLassoStartupDirectory(
                 includePath: file.lastPathComponent,
                 tagRegistry: tagRegistry
             )
-            _ = try LassoRenderer().render(source, context: &context)
+            _ = try await LassoRenderer().render(source, context: &context)
             loaded.append(file.lastPathComponent)
         } catch {
             failed.append(LassoStartupLoadFailure(file: file.lastPathComponent, error: String(describing: error)))

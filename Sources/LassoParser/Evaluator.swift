@@ -5,9 +5,9 @@ struct Evaluator {
     /// Lets expression evaluation invoke full node rendering (for custom
     /// tag bodies) without `Evaluator` depending on `Renderer.swift`, which
     /// already wraps `Evaluator` — injected by `RendererEngine.init`.
-    var renderNodes: ((_ nodes: [LassoNode], _ context: inout LassoContext) throws -> String)? = nil
+    var renderNodes: ((_ nodes: [LassoNode], _ context: inout LassoContext) async throws -> String)? = nil
 
-    mutating func evaluate(_ expression: LassoExpression) throws -> LassoValue {
+    mutating func evaluate(_ expression: LassoExpression) async throws -> LassoValue {
         switch expression {
         case let .string(value): return .string(value)
         case let .integer(value): return .integer(value)
@@ -33,68 +33,72 @@ struct Evaluator {
                 return .object(LassoObjectInstance(typeName: name))
             }
             if let function = context.natives.function(named: name) {
-                return try function([], &context)
+                return try await function([], &context)
             }
             if let definition = context.tagRegistry.tag(named: name) {
-                return try invokeCustomTag(definition, callArguments: [])
+                return try await invokeCustomTag(definition, callArguments: [])
             }
             return context.value(for: name)
         case let .assignment(target, value):
-            let evaluated = try evaluate(value)
-            try assign(evaluated, to: target, defaultScope: .unscoped)
+            let evaluated = try await evaluate(value)
+            try await assign(evaluated, to: target, defaultScope: .unscoped)
             return .void
         case let .ternary(condition, whenTrue, whenFalse):
-            return try evaluate(condition).isTruthy ? try evaluate(whenTrue) : try evaluate(whenFalse)
+            return try await evaluate(condition).isTruthy ? try await evaluate(whenTrue) : try await evaluate(whenFalse)
         case let .unary(op, value):
-            return try unary(op, try evaluate(value))
+            return try unary(op, try await evaluate(value))
         case let .binary(left, op, right):
             if op == "&&" {
-                let lhs = try evaluate(left)
-                return lhs.isTruthy ? .boolean(try evaluate(right).isTruthy) : .boolean(false)
+                let lhs = try await evaluate(left)
+                return lhs.isTruthy ? .boolean(try await evaluate(right).isTruthy) : .boolean(false)
             }
             if op == "||" {
-                let lhs = try evaluate(left)
-                return lhs.isTruthy ? .boolean(true) : .boolean(try evaluate(right).isTruthy)
+                let lhs = try await evaluate(left)
+                return lhs.isTruthy ? .boolean(true) : .boolean(try await evaluate(right).isTruthy)
             }
-            return try binary(try evaluate(left), op, try evaluate(right))
+            return try binary(try await evaluate(left), op, try await evaluate(right))
         case let .call(callee, arguments):
             guard case let .identifier(name) = callee else {
                 throw LassoRuntimeError.unsupportedExpression("Dynamic call")
             }
             if name.caseInsensitiveCompare("var") == .orderedSame ||
                 name.caseInsensitiveCompare("local") == .orderedSame {
-                return try declare(arguments, local: name.lowercased() == "local")
+                return try await declare(arguments, local: name.lowercased() == "local")
             }
             if let function = context.natives.function(named: name) {
-                return try function(try evaluate(arguments), &context)
+                return try await function(try await evaluate(arguments), &context)
             }
             if let type = context.tagRegistry.type(named: name) {
-                return try instantiate(type, callArguments: arguments)
+                return try await instantiate(type, callArguments: arguments)
             }
             if let definition = context.tagRegistry.tag(named: name) {
-                return try invokeCustomTag(definition, callArguments: arguments)
+                return try await invokeCustomTag(definition, callArguments: arguments)
             }
             throw LassoRuntimeError.unknownFunction(name)
         case let .member(base, name, arguments):
-            return try member(try evaluate(base), name, arguments ?? [])
+            return try await member(try await evaluate(base), name, arguments ?? [])
         case let .unknown(value):
             throw LassoRuntimeError.unsupportedExpression(value)
         }
     }
 
-    private mutating func evaluate(_ arguments: [LassoArgument]) throws -> [EvaluatedArgument] {
-        try arguments.map { argument in
+    private mutating func evaluate(_ arguments: [LassoArgument]) async throws -> [EvaluatedArgument] {
+        var results: [EvaluatedArgument] = []
+        results.reserveCapacity(arguments.count)
+        for argument in arguments {
             if argument.label == nil,
                case let .assignment(target, value) = argument.value,
                let label = Self.assignmentLabel(target) {
-                return EvaluatedArgument(label: label, value: try evaluate(value))
+                results.append(EvaluatedArgument(label: label, value: try await evaluate(value)))
+            } else {
+                results.append(EvaluatedArgument(label: argument.label, value: try await evaluate(argument.value)))
             }
-            return EvaluatedArgument(label: argument.label, value: try evaluate(argument.value))
         }
+        return results
     }
 
-    mutating func evaluateArguments(_ arguments: [LassoArgument]) throws -> [EvaluatedArgument] {
-        try evaluate(arguments)
+    mutating func evaluateArguments(_ arguments: [LassoArgument]) async throws -> [EvaluatedArgument] {
+        try await evaluate(arguments)
     }
 
     /// Invokes a compiled custom tag: binds call-site arguments to the
@@ -107,9 +111,9 @@ struct Evaluator {
     private mutating func invokeCustomTag(
         _ definition: LassoCustomTagDefinition,
         callArguments: [LassoArgument]
-    ) throws -> LassoValue {
-        let evaluatedCallArguments = try evaluate(callArguments)
-        let boundLocals = try bindParameters(definition.parameters, to: evaluatedCallArguments)
+    ) async throws -> LassoValue {
+        let evaluatedCallArguments = try await evaluate(callArguments)
+        let boundLocals = try await bindParameters(definition.parameters, to: evaluatedCallArguments)
 
         let savedLocals = context.snapshotLocals()
         try context.pushTagCall(definition.name)
@@ -121,14 +125,14 @@ struct Evaluator {
 
         guard let renderNodes else { return .void }
         context.clearReturnSignal()
-        _ = try renderNodes(definition.body, &context)
+        _ = try await renderNodes(definition.body, &context)
         return context.consumeReturnSignal() ?? .void
     }
 
     private mutating func bindParameters(
         _ parameters: [LassoArgument],
         to callArguments: [EvaluatedArgument]
-    ) throws -> [String: LassoValue] {
+    ) async throws -> [String: LassoValue] {
         let positional = callArguments.filter { $0.label == nil }
         var positionalIndex = 0
         var bound: [String: LassoValue] = [:]
@@ -145,7 +149,7 @@ struct Evaluator {
                 bound[name.lowercased()] = positional[positionalIndex].value
                 positionalIndex += 1
             } else if let defaultExpression {
-                bound[name.lowercased()] = try evaluate(defaultExpression)
+                bound[name.lowercased()] = try await evaluate(defaultExpression)
             } else {
                 bound[name.lowercased()] = .null
             }
@@ -163,7 +167,7 @@ struct Evaluator {
     private mutating func instantiate(
         _ type: LassoTypeDefinition,
         callArguments: [LassoArgument]
-    ) throws -> LassoValue {
+    ) async throws -> LassoValue {
         let object = LassoObjectInstance(typeName: type.name)
         // Legacy constructors (e.g. `local('ip' = (params->first ? ...))`)
         // reference the constructor call's own arguments as `params` while
@@ -172,18 +176,18 @@ struct Evaluator {
         // params" note. Bound as an ordinary local (not passed through
         // invokeMemberMethod's own parameter binding) so it's visible here
         // and restored to whatever it was before once construction ends.
-        let evaluatedCallArguments = try evaluate(callArguments)
+        let evaluatedCallArguments = try await evaluate(callArguments)
         let savedLocals = context.snapshotLocals()
         context.set(.array(evaluatedCallArguments.map(\.value)), for: "params", scope: .local)
         defer { context.replaceLocals(savedLocals) }
         for member in type.dataMembers {
             if let defaultValue = member.defaultValue {
-                object.set(try evaluate(defaultValue), for: member.name)
+                object.set(try await evaluate(defaultValue), for: member.name)
             } else {
                 object.set(.null, for: member.name)
             }
         }
-        if let onCreate = try invokeMemberMethod(
+        if let onCreate = try await invokeMemberMethod(
             named: "onCreate",
             on: object,
             type: type,
@@ -201,8 +205,8 @@ struct Evaluator {
         type: LassoTypeDefinition,
         arguments: [LassoArgument],
         missingIsVoid: Bool = false
-    ) throws -> LassoValue? {
-        let evaluatedCallArguments = try evaluate(arguments)
+    ) async throws -> LassoValue? {
+        let evaluatedCallArguments = try await evaluate(arguments)
         guard let resolved = LassoMethodDispatcher.resolve(
             method: name,
             on: type,
@@ -211,7 +215,7 @@ struct Evaluator {
             if missingIsVoid { return .void }
             return nil
         }
-        let boundLocals = try bindParameters(resolved.definition.parameters, to: resolved.evaluatedArguments)
+        let boundLocals = try await bindParameters(resolved.definition.parameters, to: resolved.evaluatedArguments)
         let savedLocals = context.snapshotLocals()
         context.replaceLocals(boundLocals)
         context.pushSelf(object)
@@ -222,11 +226,11 @@ struct Evaluator {
 
         guard let renderNodes else { return .void }
         context.clearReturnSignal()
-        _ = try renderNodes(resolved.definition.body, &context)
+        _ = try await renderNodes(resolved.definition.body, &context)
         return context.consumeReturnSignal() ?? .void
     }
 
-    private mutating func declare(_ arguments: [LassoArgument], local: Bool) throws -> LassoValue {
+    private mutating func declare(_ arguments: [LassoArgument], local: Bool) async throws -> LassoValue {
         let scope: VariableScope = local ? .local : .global
         // Assignment-form calls (`local('x' = 1)`) keep returning `.void` —
         // real corpus code commonly uses this as a bare statement inside a
@@ -239,8 +243,8 @@ struct Evaluator {
         var readValue: LassoValue?
         for argument in arguments {
             if case let .assignment(target, value) = argument.value {
-                let evaluated = try evaluate(value)
-                try assign(evaluated, to: target, defaultScope: scope)
+                let evaluated = try await evaluate(value)
+                try await assign(evaluated, to: target, defaultScope: scope)
             } else if let name = Self.assignmentLabel(argument.value) {
                 readValue = context.value(for: name, scope: scope)
             }
@@ -252,10 +256,10 @@ struct Evaluator {
         _ value: LassoValue,
         to target: LassoExpression,
         defaultScope: VariableScope
-    ) throws {
+    ) async throws {
         switch target {
         case let .binary(left, "::", _):
-            try assign(value, to: left, defaultScope: defaultScope)
+            try await assign(value, to: left, defaultScope: defaultScope)
         case let .variable(name, scope):
             context.set(value, for: name, scope: scope == .unscoped ? defaultScope : scope)
         case let .identifier(name):
@@ -269,7 +273,7 @@ struct Evaluator {
                let object = context.currentSelf {
                 baseValue = .object(object)
             } else {
-                baseValue = try evaluate(base)
+                baseValue = try await evaluate(base)
             }
             guard case let .object(object) = baseValue else {
                 throw LassoRuntimeError.invalidAssignment
@@ -331,7 +335,7 @@ struct Evaluator {
         _ base: LassoValue,
         _ name: String,
         _ arguments: [LassoArgument]
-    ) throws -> LassoValue {
+    ) async throws -> LassoValue {
         let normalized = name.lowercased()
         switch (base, normalized) {
         case (.void, _):
@@ -343,7 +347,7 @@ struct Evaluator {
             // as an empty string for member access, matching how it
             // already behaves for truthiness (`false`) and string output
             // (`""`) elsewhere in this runtime.
-            return try member(.string(""), name, arguments)
+            return try await member(.string(""), name, arguments)
         case let (.string(value), "size"): return .integer(value.count)
         case let (.string(value), "uppercase"): return .string(value.uppercased())
         case let (.string(value), "lowercase"): return .string(value.lowercased())
@@ -361,27 +365,42 @@ struct Evaluator {
             guard let decoded = LassoEncoding.decodeBase64(value) else { return .void }
             return .string(decoded)
         case let (.string(value), "contains"):
-            let needle = try arguments.first.map { try evaluate($0.value).outputString } ?? ""
+            let needle: String
+            if let argument = arguments.first {
+                needle = try await evaluate(argument.value).outputString
+            } else {
+                needle = ""
+            }
             return .boolean(value.contains(needle))
         case let (.string(value), "split"):
-            let separator = try arguments.first.map { try evaluate($0.value).outputString } ?? ""
+            let separator: String
+            if let argument = arguments.first {
+                separator = try await evaluate(argument.value).outputString
+            } else {
+                separator = ""
+            }
             return .array(value.components(separatedBy: separator).map(LassoValue.string))
         case let (.array(values), "size"): return .integer(values.count)
         case let (.array(values), "first"): return values.first ?? .null
         case let (.array(values), "get"):
-            let requested = try arguments.first.map { try evaluate($0.value).number } ?? 1
+            let requested: Double?
+            if let argument = arguments.first {
+                requested = try await evaluate(argument.value).number
+            } else {
+                requested = nil
+            }
             let index = max(Int(requested ?? 1) - 1, 0)
             return values.indices.contains(index) ? values[index] : .null
         case let (.map(values), _): return values[normalized] ?? .null
         case let (.object(object), _):
             if let nativeMethod = context.nativeTypes.type(named: object.typeName)?.method(named: name) {
-                let evaluatedArguments = try evaluate(arguments)
-                return try nativeMethod(object, evaluatedArguments, &context)
+                let evaluatedArguments = try await evaluate(arguments)
+                return try await nativeMethod(object, evaluatedArguments, &context)
             }
             guard let type = context.tagRegistry.type(named: object.typeName) else {
                 return object.value(for: name)
             }
-            if let value = try invokeMemberMethod(named: name, on: object, type: type, arguments: arguments) {
+            if let value = try await invokeMemberMethod(named: name, on: object, type: type, arguments: arguments) {
                 return value
             }
             return object.value(for: name)

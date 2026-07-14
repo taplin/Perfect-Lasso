@@ -30,7 +30,14 @@ let executor = PerfectCRUDLassoExecutor { datasource, query in
     return try Database(configuration: configuration).select(query)
 }
 
-var context = LassoContext(
+// `nonisolated(unsafe)`: top-level `var` bindings in an executable's
+// main.swift are implicitly main-actor-isolated in Swift 6, which blocks
+// passing them `inout` across the suspension inside `LassoRenderer.render`'s
+// now-`async` signature. This is a one-shot, single-threaded script with no
+// concurrent access to `context`, so opting out of isolation here is safe —
+// the same reasoning (and precedent) as `AsyncBridge.swift`'s own use of
+// `nonisolated(unsafe)` before this phase's conversion.
+nonisolated(unsafe) var context = LassoContext(
     globals: ["product_subset": .string(environment["LASSO_DEMO_PRODUCT_SUBSET"] ?? "")],
     inlineProvider: LassoDynamicInlineProvider(executor: executor)
 )
@@ -40,7 +47,7 @@ let source = """
     -MaxRecords=10,-search)]
 [records][field('mfr_style_no')]:[field('color')];[/records][/inline]
 """
-let output = try LassoRenderer().render(source, context: &context)
+let output = try await LassoRenderer().render(source, context: &context)
 print(output)
 
 enum LiveMySQLSmokeError: Error {

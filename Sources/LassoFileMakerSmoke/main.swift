@@ -18,38 +18,13 @@ let table = environment["LASSO_FILEMAKER_TABLE"] ?? "records"
 let useTLS = port == 443
 let scheme = useTLS ? "https" : "http"
 
-/// Duplicated from `Sources/LassoPerfectServer/AsyncBridge.swift`'s
-/// `runAsyncAndWait` -- executable targets can't import one another in
-/// SwiftPM, only library targets. `runBlockingOffCooperativePool`'s
-/// cooperative-pool isolation isn't needed here: this is a one-shot
-/// script with a single serial query, not a server handling concurrent
-/// requests on Swift's shared cooperative pool, so there's no thread
-/// pool to exhaust.
-@Sendable func runAsyncAndWait<T: Sendable>(_ operation: @escaping @Sendable () async throws -> T) throws -> T {
-    let outcome: Result<T, Error> = DispatchQueue.global(qos: .userInitiated).sync {
-        let semaphore = DispatchSemaphore(value: 0)
-        nonisolated(unsafe) var innerOutcome: Result<T, Error>!
-        Task {
-            do {
-                innerOutcome = .success(try await operation())
-            } catch {
-                innerOutcome = .failure(error)
-            }
-            semaphore.signal()
-        }
-        semaphore.wait()
-        return innerOutcome!
-    }
-    return try outcome.get()
-}
-
 let executor = PerfectFileMakerLassoExecutor(
     allowWrites: false,
     baseURL: "\(scheme)://\(host):\(port)"
 ) { query, kind, datasource in
     let server = FileMakerServer(host: host, port: port, userName: user, password: password, useTLS: useTLS)
     do {
-        return try runAsyncAndWait { try await server.query(query) }
+        return try await server.query(query)
     } catch let error as LassoFileMakerDatabaseActionError {
         throw error
     } catch {
@@ -57,7 +32,12 @@ let executor = PerfectFileMakerLassoExecutor(
     }
 }
 
-var context = LassoContext(
+// See LassoMySQLSmoke/main.swift's identical comment: a top-level `var` in
+// an executable's main.swift is implicitly main-actor-isolated in Swift 6,
+// which blocks passing it `inout` across the suspension inside
+// `LassoRenderer.render`'s now-`async` signature. Safe here — single-shot,
+// single-threaded script, no concurrent access.
+nonisolated(unsafe) var context = LassoContext(
     inlineProvider: LassoDynamicInlineProvider(executor: executor)
 )
 let source = """
@@ -67,5 +47,5 @@ found_count: [found_count]
 [/records]
 [/inline]
 """
-let output = try LassoRenderer().render(source, context: &context)
+let output = try await LassoRenderer().render(source, context: &context)
 print(output)

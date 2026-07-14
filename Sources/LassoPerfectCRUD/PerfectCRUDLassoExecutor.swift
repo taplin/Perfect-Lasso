@@ -128,7 +128,7 @@ public struct PerfectCRUDLassoExecutor: LassoDynamicQueryExecutor {
         capabilitiesResolver = capabilities
     }
 
-    public func execute(_ request: LassoInlineRequest) throws -> LassoInlineFrame {
+    public func execute(_ request: LassoInlineRequest) async throws -> LassoInlineFrame {
         guard let datasource = request.database, datasource.isEmpty == false else {
             throw PerfectCRUDLassoError.missingDatasource
         }
