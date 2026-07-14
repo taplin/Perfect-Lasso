@@ -1302,8 +1302,18 @@ not yet independently addressed), and an independent post-fix
 concurrency-correctness verification (traced actual thread/queue
 identity through `Perfect-NIO`'s real connection-handling code and
 `FileMakerServer.query`'s real implementation; verdict: "I'd ship this").
-**Not yet live-verified against the real FileMaker Server** — pending
-connection credentials.
+**Live-verified against the real FileMaker Server** (2026-07-14, v16,
+XML CWP) via a new gated `lasso-filemaker-smoke` executable: a real
+`-FindAll` against the real corpus's FileMaker-backed alias/layout
+returned a real found count (355 records) with correct per-record
+`keyfield_value` values and no error state — full round trip confirmed
+end-to-end against a real server. This also confirmed the security
+review's `useTLS`-override finding above is a real, live issue for this
+deployment, not just theoretical: the server logged a plaintext-HTTP
+credentials warning during the test. Still not yet verified: a real
+`-Add`/`-Update` write round trip (this pass was read-only,
+`allowWrites: false`) and a `LASSO_CRAWL_REPORT=1` sweep with both
+datasources configured.
 
 ## Recommended Execution Order
 

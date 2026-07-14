@@ -1274,8 +1274,36 @@ verification pass after the deadlock fix above), and covered by unit
 tests (executor request/response mapping, config decoding — including
 full back-compat with the pre-FileMaker flat config shape,
 `LassoMultiBackendInlineProvider` routing, the async bridge functions in
-isolation and under real concurrent HTTP load). **Not yet live-verified
-against a real FileMaker Server** — pending connection credentials.
+isolation and under real concurrent HTTP load).
+
+**Live-verified against the real FileMaker Server** (2026-07-14, v16,
+XML CWP, credentials supplied via the established `chmod 600` JSON
+config file convention) using a new gated smoke executable
+(`Sources/LassoFileMakerSmoke/`, `swift run lasso-filemaker-smoke`,
+matching `LassoMySQLSmoke`'s existing pattern — `LASSO_FILEMAKER_TESTS=1`
+plus `LASSO_FILEMAKER_HOST`/`_PORT`/`_USER`/`_PASSWORD`/`_DATASOURCE`/`_TABLE`).
+A real `-FindAll` against the real corpus's FileMaker-backed alias and
+layout returned a real found count (355 records) and correctly-mapped
+`keyfield_value` for each returned record, with no error state —
+confirming the full round trip end-to-end: config loading → executor →
+`runAsyncAndWait` → real `FileMakerServer.query` → `LassoInlineFrame` →
+`keyfield_value` native, against a real server, not a mock.
+
+This also confirmed one of the security-review findings above is real
+in practice, not just theoretical: the server logged `PerfectFileMaker:
+sending credentials to http://<host>:80/... over plain HTTP (useTLS not
+set and port != 443)` — this deployment's real FileMaker Server is on a
+private-network address without TLS, so Basic-Auth credentials genuinely
+transit in cleartext today. Flagged to the deployment owner; no code
+change made without an explicit decision on whether that's an accepted
+trade-off for this internal network or worth adding the missing `useTLS`
+config override for.
+
+**Not yet verified**: a real `-Add`/`-Update` write round trip (only a
+read-only `-FindAll` has been live-tested; `allowWrites` was `false` for
+this pass) and a `LASSO_CRAWL_REPORT=1` sweep with both datasources
+configured to measure how many previously-`inlineNotConfigured` real
+corpus pages now render cleanly.
 
 ## Next Compatibility Work
 
