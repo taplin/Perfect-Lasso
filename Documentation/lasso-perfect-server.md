@@ -37,10 +37,86 @@ Environment variables:
   to parse or render is logged to stderr and skipped; it does not prevent
   the server from starting or the rest of the folder from loading. See
   "Verified" below for what this surfaced against a real startup folder.
-- `LASSO_DATASOURCE_ALIAS`: datasource name used by Lasso pages, for example
-  `catalog_mysql`.
+- `LASSO_DATASOURCE_ALIAS`: MySQL-only, legacy single-alias form; datasource
+  name used by Lasso pages, for example `catalog_mysql`. Supports exactly
+  one alias, and only MySQL — see `LASSO_DATASOURCE_CONFIG_PATH` below for
+  multiple aliases and/or a FileMaker Server datasource.
 - `LASSO_MYSQL_HOST`, `LASSO_MYSQL_PORT`, `LASSO_MYSQL_DATABASE`,
   `LASSO_MYSQL_USER`, `LASSO_MYSQL_PASSWORD`: backend MySQL connection.
+- `LASSO_FILEMAKER_HOST`, `LASSO_FILEMAKER_PORT`, `LASSO_FILEMAKER_USER`,
+  `LASSO_FILEMAKER_PASSWORD`, `LASSO_FILEMAKER_ALLOW_WRITES`: backend
+  FileMaker Server connection — see "FileMaker Datasource" below. Only
+  meaningful alongside `LASSO_DATASOURCE_CONFIG_PATH`, since there's no
+  legacy single-alias env-var form for FileMaker (it postdates that
+  convention).
+- `LASSO_DATASOURCE_CONFIG_PATH`: path to a JSON file, for real deployments
+  with more than one Lasso-side datasource alias, a FileMaker Server
+  datasource, and/or where a real password shouldn't land on the command
+  line or in shell history. Takes priority over the env vars above when
+  set. Current shape:
+  ```json
+  {
+    "mysql": {
+      "host": "localhost",
+      "port": 3306,
+      "user": "perfect",
+      "password": "...",
+      "sessionDatabase": "sessions",
+      "allowWrites": false,
+      "allowRawSQL": false
+    },
+    "filemaker": {
+      "host": "203.0.113.10",
+      "port": 80,
+      "user": "perfect",
+      "password": "...",
+      "allowWrites": false
+    },
+    "datasources": {
+      "primary_mysql": {"type": "mysql", "schema": "primary_mysql"},
+      "orders_mysql": {"type": "mysql", "schema": "orders_mysql"},
+      "fm_catalog": {"type": "filemaker"}
+    }
+  }
+  ```
+  Both `mysql` and `filemaker` blocks are optional (a deployment with only
+  one backend just omits the other); every field within each is itself
+  optional, falling back to that backend's own env vars. `datasources`
+  maps each Lasso-side `-database='...'` alias to which backend it lives
+  on. A `mysql`-typed entry's `schema` names the real MySQL schema (every
+  MySQL alias shares the one `mysql` connection — real deployments'
+  MySQL datasources are typically separate schemas on the same server,
+  not separate servers; there's no per-alias host/port override). A
+  `filemaker`-typed entry needs no `schema` at all: the alias itself IS
+  the FileMaker database-file name (real Lasso's documented FileMaker
+  connector model — see "FileMaker Datasource" below), and every
+  FileMaker alias shares the one `filemaker` connection the same way.
+  Datasource alias keys are case-insensitive (matching Lasso's own
+  `-database=` matching) and share one namespace across both backends —
+  two keys differing only by case, MySQL vs. MySQL, FileMaker vs.
+  FileMaker, or MySQL vs. FileMaker, is a config error the server refuses
+  to start with, not a silent collision. `sessionDatabase` (inside
+  `mysql`) is a separate concern from `datasources`: it's the schema
+  `LASSO_SESSION_DRIVER=mysql` stores session data in (falls back to
+  `LASSO_MYSQL_DATABASE` when omitted) — session storage isn't itself an
+  inline-queryable Lasso datasource, so it doesn't belong in the
+  `datasources` map. **This file should be `chmod 600` and kept outside
+  the git repo** — matches this project's established "credentials go in
+  a permissioned file, never on the command line" practice.
+  `LassoSiteServer` rejects any MySQL datasource name that doesn't
+  resolve to a configured schema (`unknownDatasource`), so an unrecognized
+  `-database=` alias in a page fails closed rather than querying an
+  arbitrary same-named schema on the server; an unrecognized alias falls
+  through to that same MySQL rejection path regardless of which backend
+  it was meant for (see "FileMaker Datasource" below for the routing
+  design).
+
+  **Back-compat**: a config file written before FileMaker support — flat
+  top-level `host`/`port`/`user`/`password`/`sessionDatabase`/
+  `allowWrites`/`allowRawSQL` fields (read as the `mysql` block when no
+  nested `mysql` key is present) and a `datasources` map of bare
+  `"alias": "schemaName"` strings (read as `{type: "mysql", schema:
+  "schemaName"}`) — still decodes and behaves identically to before.
 - `LASSO_CRAWL_REPORT=1`: after the server starts listening, request every
   discovered page (recursively, skipping underscore-prefixed include-only
   files) over real HTTP, print a report grouped by the first unsupported
@@ -1070,6 +1146,136 @@ run against this session's own real before/after JSONs from the `inline`
 fix, reproduced byte-for-byte the 14-page bucket change already found by
 hand; the focused-rerun mechanism correctly crawled only the 14 pages
 matching `Encrypt_HMAC` instead of the full site.
+
+## FileMaker Datasource — 2026-07-14
+
+Real Lasso 8.5 supports a second datasource connector type — FileMaker
+Server, spoken to over classic XML Custom Web Publishing (`/fmi/xml/...`),
+not the modern Data API (FileMaker Server 17+ only). This project's real
+corpus has one FileMaker-backed datasource alongside its MySQL ones,
+which previously failed with "no configured datasource" — this session
+added a second, parallel backend rather than trying to make the MySQL
+connector serve both.
+
+### Real Lasso's FileMaker connector model
+
+Confirmed against Lasso 8.5's own documentation (Ch. 11, "FileMaker
+Queries"), not guessed from corpus inference:
+
+- `-Database` names the whole FileMaker file; `-Table` names a *layout*
+  within it, not a real SQL table.
+- The key field is always FileMaker's internal record ID — real corpus
+  confirms every `-KeyField` argument is passed as an empty string; only
+  `-KeyValue` (the record ID) is ever meaningful for `-Update`/`-Delete`.
+- Supported actions: `-Add`, `-Delete`, `-FindAll`, `-Search`, `-Update`.
+  `-Duplicate`, `-Random`, `-Show`, and `-RX` (raw FileMaker search-symbol
+  expressions) are documented but have zero real corpus evidence against
+  this project's one FileMaker datasource — deliberately not implemented,
+  not silently guessed at.
+- Operators: `-BW` (begins-with) is the *default* when `-Op` is omitted —
+  notably different from the MySQL connector's own `-EQ` (exact-match)
+  default. `-CN`, `-EQ`, `-EW`, `-GT`, `-GTE`, `-LT`, `-LTE` are supported;
+  there is no `-NEQ` — a bare `-Not` flag negates the entire compound
+  query group that follows it instead (real corpus: two pages each use
+  exactly one `-Not` to split a search into an un-negated group and a
+  negated one).
+- `-SQL` is explicitly documented as unsupported for FileMaker
+  datasources — no raw-SQL analogue exists on this connector at all.
+
+Two real, previously-unimplemented interpreter gaps were found and fixed
+as prerequisites, independent of FileMaker specifically:
+`LassoInlineRequest.criteriaGroups` (models `-Not` group negation;
+`Providers.swift`) and the `keyfield_value` native tag (reads a row's
+key value — for FileMaker, always the internal record ID — feeding
+`-KeyValue=(KeyField_Value)` round-trips on every write flow).
+
+### Executor design
+
+`PerfectFileMakerLassoExecutor` (`Sources/LassoPerfectFileMaker/`) holds
+no live `FileMakerServer` connection itself — it's parameterized by an
+injected `queryHandler: @Sendable (FMPQuery, LassoFileMakerActionFailureKind,
+String) throws -> FMPResultSet` closure, mirroring
+`PerfectCRUDLassoExecutor`'s own `queryHandler`/`mutationHandler`/
+`rawSQLHandler` convention exactly: the executor maps `LassoInlineRequest`
+to a backend-specific query/error shape and back, while the real
+backend connection is built once, at the composition root
+(`LassoSiteServer.init` in `main.swift`), matching where MySQL's own
+`Database<MySQLDatabaseConfiguration>` construction already lives. This
+keeps the executor fully unit-testable with a fake handler — no live
+server needed — and kept the blast radius of a later upstream API change
+(see "Adapting to the resurrected Perfect-FileMaker" below) contained to
+one closure in `main.swift`, not spread across the executor.
+
+`LassoMultiBackendInlineProvider` (`Sources/LassoPerfectServer/MultiBackendInlineProvider.swift`)
+routes each `[inline(...)]` call to the right backend by which alias set
+its `-database=` value belongs to — a FileMaker-configured alias goes
+straight to the FileMaker executor (no schema remapping: the alias name
+IS the FileMaker database-file name), and everything else — including a
+genuinely unconfigured alias — falls through to the MySQL provider,
+whose own `unknownDatasource` rejection is the existing "is this alias
+actually configured" security boundary. `LassoSiteServer.inlineProvider`
+widened from the concrete `LassoDynamicInlineProvider` type to
+`(any LassoInlineProvider)?` to hold either shape.
+
+Deliberately deferred, flagged rather than silently resolved: `-RX`,
+`-Duplicate`, `-Random`, `-Show`, portal/related-set (`FMPRecord.RecordItem
+.relatedSet`) reads — zero real corpus evidence for any of them.
+Container-field values map to a URL built from the configured
+`host`/`port`/scheme prefixed onto the field's already-server-relative
+`<data>` reference path — unverified against a real v16 server's exact
+`<data>` shape until live-tested.
+
+### Adapting to the resurrected Perfect-FileMaker
+
+The local `Perfect-FileMaker`/`Perfect-XML` sibling forks (under
+`~/Perfect-Resurrection/`) were modernized to this monorepo's current
+Swift 6 standard shape mid-session: `FileMakerServer`'s blocking
+`PerfectCURL`/libcurl transport became a genuinely `async`/`await`
+`URLSession`-backed API, and its old percent-encoder (which never
+escaped `& = ! ( ) * ;`) was replaced with a strict allow-list encoder,
+fixing a real query-injection gap and a previously-silently-broken
+`-GT`/`-LT`/`-GTE`/`-LTE` operator-encoding bug in the process.
+`FMPQuery`'s public builder API was unchanged, so
+`PerfectFileMakerLassoExecutor.swift` needed zero edits; only
+`main.swift`'s `queryHandler` closure (the one place that actually calls
+`FileMakerServer.query`) needed to change, confirming the closure-based
+decoupling above was worth it.
+
+That change surfaced a real, serious bug: the first async-to-sync bridge
+attempt (`Task { } + DispatchSemaphore.wait()`, called inline from the
+synchronous render pipeline) could deadlock the *entire* server, not
+just FileMaker requests — every HTTP connection is handled by an
+unstructured `Task` on Swift's fixed-size cooperative thread pool
+(`Perfect-NIO`'s `Server.swift`), and the naive bridge blocked one
+cooperative-pool thread while depending on a *second* cooperative-pool
+thread to ever complete; enough concurrent requests exhausts the pool
+outright. Fixed with two functions in `Sources/LassoPerfectServer/AsyncBridge.swift`:
+`runBlockingOffCooperativePool` moves the *entire* synchronous render
+(not just the FileMaker leaf call) onto a separate `libdispatch` queue
+via a genuine `await`ed checked continuation — a real suspension point
+that frees the cooperative-pool thread rather than blocking it — and
+`runAsyncAndWait` (the actual async-to-sync bridge for
+`FileMakerServer.query`) is only safe nested inside that wrapper. See
+`Documentation/synchronous-render-pipeline.md` for the full design
+rationale, including why this project's render pipeline stays
+synchronous rather than becoming `async` end-to-end. Verified via a real
+`Perfect-NIO` server bound to an ephemeral port with 50 concurrent real
+HTTP requests (`Tests/LassoPerfectServerTests/LassoPerfectServerTests.swift`,
+`realHTTPServerSurvivesConcurrentRequestsThroughTheBridgePattern`), not
+just an in-process concurrency test — a prior fix attempt that looked
+correct on paper passed narrower tests but still deadlocked under this
+one, which is why the stronger test exists.
+
+### Status
+
+Implemented, code-reviewed (functional-correctness pass, a dedicated
+security-focused pass, and an independent concurrency-correctness
+verification pass after the deadlock fix above), and covered by unit
+tests (executor request/response mapping, config decoding — including
+full back-compat with the pre-FileMaker flat config shape,
+`LassoMultiBackendInlineProvider` routing, the async bridge functions in
+isolation and under real concurrent HTTP load). **Not yet live-verified
+against a real FileMaker Server** — pending connection credentials.
 
 ## Next Compatibility Work
 

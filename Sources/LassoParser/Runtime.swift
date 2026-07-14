@@ -324,6 +324,18 @@ public struct LassoNativeRegistry: Sendable {
                 context.currentInlineFrame?.rows.first?[name] ??
                 .null
         }
+        // KeyField_Value — real Lasso's current-record key value, distinct
+        // from field()/column() (which only read named columns): a
+        // FileMaker record's key is always the out-of-band internal
+        // record ID, never a named field in the result set itself. Real
+        // corpus round-trips this directly into a later -KeyValue
+        // argument (`-KeyValue=(KeyField_Value)`) for -Update/-Delete —
+        // see LassoDataRow.keyValue and Documentation/lasso-perfect-server.md.
+        register("keyfield_value") { _, context in
+            context.currentRow?.keyValue ??
+                context.currentInlineFrame?.rows.first?.keyValue ??
+                .null
+        }
         register("found_count") { _, context in
             .integer(context.currentInlineFrame?.foundCount ?? 0)
         }

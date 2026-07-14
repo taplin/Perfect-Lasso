@@ -2,8 +2,10 @@ import Foundation
 import LassoCrawlReport
 import LassoParser
 import LassoPerfectCRUD
+import LassoPerfectFileMaker
 import LassoPerfectSession
 import PerfectCRUD
+import PerfectFileMaker
 import PerfectMySQL
 import PerfectNIO
 import NIOHTTP1
@@ -15,7 +17,17 @@ struct ServerConfig: Sendable {
     let port: Int
     let lassoExtensions: Set<String>
     let startupPath: URL?
-    let datasourceAlias: String?
+    /// Lasso-side datasource alias (e.g. `-database='catalog_mysql'`) ->
+    /// real MySQL schema name, one entry per configured datasource.
+    /// Empty means no live MySQL datasource is configured (inline()
+    /// throws inlineNotConfigured). All aliases share one MySQL
+    /// connection (mysqlHost/Port/User/Password below) — real corpus
+    /// datasources are separate schemas on the same server, not separate
+    /// servers; see `Documentation/lasso-perfect-server.md`. Populated
+    /// either from `LASSO_DATASOURCE_CONFIG_PATH` (a JSON file, supports
+    /// multiple aliases) or the legacy single-alias
+    /// `LASSO_DATASOURCE_ALIAS`/`LASSO_MYSQL_DATABASE` env var pair.
+    let datasourceMap: [String: String]
     let mysqlHost: String
     let mysqlPort: Int?
     let mysqlDatabase: String
@@ -26,6 +38,21 @@ struct ServerConfig: Sendable {
     /// disabled until a deployment explicitly opts in.
     let mysqlAllowWrites: Bool
     let mysqlAllowRawSQL: Bool
+    /// Lasso-side aliases configured with `type: "filemaker"` in the
+    /// datasource config file. Unlike `datasourceMap`, this doesn't map to
+    /// a different real name — the alias itself IS the FileMaker
+    /// database-file name (real Lasso's documented FileMaker connector
+    /// model: database = whole FileMaker file, table = layout). Empty
+    /// means no FileMaker datasource is configured.
+    let filemakerDatasourceAliases: Set<String>
+    let filemakerHost: String?
+    let filemakerPort: Int?
+    let filemakerUser: String?
+    let filemakerPassword: String?
+    /// Same default-false, explicit-opt-in policy as `mysqlAllowWrites` —
+    /// real Lasso documents no raw-SQL concept for FileMaker at all, so
+    /// there's no FileMaker analogue of `mysqlAllowRawSQL`.
+    let filemakerAllowWrites: Bool
     /// "memory" (default) or "mysql" — see Documentation/
     /// session-upload-support-plan.md's Milestone 3. PostgreSQL/Redis/
     /// SQLite session backends already exist in Perfect-Session but aren't
@@ -80,19 +107,63 @@ struct ServerConfig: Sendable {
             URL(fileURLWithPath: $0).standardizedFileURL.resolvingSymlinksInPath()
         }
 
+        // LASSO_DATASOURCE_CONFIG_PATH takes priority when set — a JSON
+        // file so real credentials never land on a command line or in
+        // shell history (matches this project's established "chmod-600
+        // credentials file, not a raw password on the command line"
+        // practice). Falls back to the legacy single-alias env-var pair
+        // for the existing one-datasource smoke-test flow.
+        let datasourceFile = try env["LASSO_DATASOURCE_CONFIG_PATH"].map { try DatasourceFileConfig.load(path: $0) }
+        let datasourceEntries = datasourceFile?.datasources ?? [:]
+        // A config file with no `datasources` entries at all falls back to
+        // the legacy single-alias env-var pair — MySQL-only, since it
+        // predates FileMaker support.
+        let datasourceMap: [String: String] = datasourceEntries.isEmpty
+            ? (env["LASSO_DATASOURCE_ALIAS"].map { [$0: env["LASSO_MYSQL_DATABASE"] ?? ""] } ?? [:])
+            : datasourceEntries.reduce(into: [:]) { result, entry in
+                guard entry.value.type == .mysql else { return }
+                result[entry.key] = entry.value.schema ?? entry.key
+            }
+        let filemakerDatasourceAliases = Set(
+            datasourceEntries.filter { $0.value.type == .filemaker }.keys
+        )
+        // LassoDynamicInlineProvider/LassoMultiBackendInlineProvider both
+        // lowercase alias keys themselves (case-insensitive Lasso
+        // -database= matching), which traps on a duplicate key — only
+        // reachable now that a config file can define more than one
+        // alias, across either backend. Catch a case-only collision here
+        // instead, where ServerConfig.load() can already throw a clear,
+        // actionable config error rather than crashing the whole process
+        // at startup.
+        let allAliasKeys = Array(datasourceMap.keys) + Array(filemakerDatasourceAliases)
+        let lowercasedAliasCount = Dictionary(grouping: allAliasKeys, by: { $0.lowercased() })
+        if let collision = lowercasedAliasCount.first(where: { $0.value.count > 1 }) {
+            throw ServerConfigError.duplicateDatasourceAlias(collision.value.sorted())
+        }
+        let filemakerHost = datasourceFile?.filemaker?.host ?? env["LASSO_FILEMAKER_HOST"]
+        if filemakerDatasourceAliases.isEmpty == false, filemakerHost == nil {
+            throw ServerConfigError.missingFileMakerHost
+        }
+
         return ServerConfig(
             siteRoot: root,
             port: env["LASSO_SERVER_PORT"].flatMap(Int.init) ?? 8181,
             lassoExtensions: Set(extensions),
             startupPath: startupPathValue,
-            datasourceAlias: env["LASSO_DATASOURCE_ALIAS"],
-            mysqlHost: env["LASSO_MYSQL_HOST"] ?? "localhost",
-            mysqlPort: env["LASSO_MYSQL_PORT"].flatMap(Int.init),
-            mysqlDatabase: env["LASSO_MYSQL_DATABASE"] ?? "",
-            mysqlUser: env["LASSO_MYSQL_USER"],
-            mysqlPassword: env["LASSO_MYSQL_PASSWORD"],
-            mysqlAllowWrites: Self.isTruthyEnv(env["LASSO_MYSQL_ALLOW_WRITES"]),
-            mysqlAllowRawSQL: Self.isTruthyEnv(env["LASSO_MYSQL_ALLOW_RAW_SQL"]),
+            datasourceMap: datasourceMap,
+            mysqlHost: datasourceFile?.mysql?.host ?? env["LASSO_MYSQL_HOST"] ?? "localhost",
+            mysqlPort: datasourceFile?.mysql?.port ?? env["LASSO_MYSQL_PORT"].flatMap(Int.init),
+            mysqlDatabase: datasourceFile?.mysql?.sessionDatabase ?? env["LASSO_MYSQL_DATABASE"] ?? "",
+            mysqlUser: datasourceFile?.mysql?.user ?? env["LASSO_MYSQL_USER"],
+            mysqlPassword: datasourceFile?.mysql?.password ?? env["LASSO_MYSQL_PASSWORD"],
+            mysqlAllowWrites: datasourceFile?.mysql?.allowWrites ?? Self.isTruthyEnv(env["LASSO_MYSQL_ALLOW_WRITES"]),
+            mysqlAllowRawSQL: datasourceFile?.mysql?.allowRawSQL ?? Self.isTruthyEnv(env["LASSO_MYSQL_ALLOW_RAW_SQL"]),
+            filemakerDatasourceAliases: filemakerDatasourceAliases,
+            filemakerHost: filemakerHost,
+            filemakerPort: datasourceFile?.filemaker?.port ?? env["LASSO_FILEMAKER_PORT"].flatMap(Int.init),
+            filemakerUser: datasourceFile?.filemaker?.user ?? env["LASSO_FILEMAKER_USER"],
+            filemakerPassword: datasourceFile?.filemaker?.password ?? env["LASSO_FILEMAKER_PASSWORD"],
+            filemakerAllowWrites: datasourceFile?.filemaker?.allowWrites ?? Self.isTruthyEnv(env["LASSO_FILEMAKER_ALLOW_WRITES"]),
             sessionDriver: (env["LASSO_SESSION_DRIVER"] ?? "memory").lowercased(),
             crawlReportMode: Self.isTruthyEnv(env["LASSO_CRAWL_REPORT"]),
             crawlReportOutputPath: env["LASSO_CRAWL_REPORT_PATH"],
@@ -112,12 +183,153 @@ struct ServerConfig: Sendable {
     }
 }
 
+/// `LASSO_DATASOURCE_CONFIG_PATH` — a JSON file with real datasource
+/// connection details and a `datasources` map (Lasso-side alias -> which
+/// backend it lives on). Real credentials belong in this file, not on the
+/// command line or in an env var (shell history, `ps`, and process
+/// environment inspection all leak env vars far more easily than a file
+/// permissioned `chmod 600`, which this file should be). Every MySQL
+/// alias shares one MySQL connection, and every FileMaker alias shares
+/// one FileMaker Server connection — real corpus datasources are separate
+/// schemas/files on the same server, not separate servers. See
+/// `Documentation/lasso-perfect-server.md`.
+///
+/// Current shape:
+/// ```json
+/// {
+///   "mysql": {"host": "...", "port": 3306, "user": "...", "password": "...",
+///             "sessionDatabase": "...", "allowWrites": false, "allowRawSQL": false},
+///   "filemaker": {"host": "...", "port": 80, "user": "...", "password": "...",
+///                 "allowWrites": false},
+///   "datasources": {
+///     "some_mysql_alias": {"type": "mysql", "schema": "some_schema"},
+///     "some_filemaker_alias": {"type": "filemaker"}
+///   }
+/// }
+/// ```
+/// Back-compat: a config file written before FileMaker support — flat
+/// top-level `host`/`port`/`user`/`password`/`sessionDatabase`/
+/// `allowWrites`/`allowRawSQL` fields (read as the `mysql` block when no
+/// nested `mysql` key is present) and a `datasources` map of bare
+/// `"alias": "schemaName"` strings (read as `{type: "mysql", schema:
+/// "schemaName"}`) — still decodes and behaves identically.
+struct DatasourceFileConfig: Decodable {
+    var mysql: MySQLConnectionFileConfig?
+    var filemaker: FileMakerConnectionFileConfig?
+    var datasources: [String: DatasourceEntry]
+
+    private enum CodingKeys: String, CodingKey {
+        case mysql, filemaker, datasources
+        case host, port, user, password, sessionDatabase, allowWrites, allowRawSQL
+    }
+
+    init(from decoder: Decoder) throws {
+        let container = try decoder.container(keyedBy: CodingKeys.self)
+        datasources = try container.decodeIfPresent([String: DatasourceEntry].self, forKey: .datasources) ?? [:]
+        filemaker = try container.decodeIfPresent(FileMakerConnectionFileConfig.self, forKey: .filemaker)
+        if let nestedMySQL = try container.decodeIfPresent(MySQLConnectionFileConfig.self, forKey: .mysql) {
+            mysql = nestedMySQL
+        } else {
+            let flatHost = try container.decodeIfPresent(String.self, forKey: .host)
+            let flatPort = try container.decodeIfPresent(Int.self, forKey: .port)
+            let flatUser = try container.decodeIfPresent(String.self, forKey: .user)
+            let flatPassword = try container.decodeIfPresent(String.self, forKey: .password)
+            let flatSessionDatabase = try container.decodeIfPresent(String.self, forKey: .sessionDatabase)
+            let flatAllowWrites = try container.decodeIfPresent(Bool.self, forKey: .allowWrites)
+            let flatAllowRawSQL = try container.decodeIfPresent(Bool.self, forKey: .allowRawSQL)
+            let anyFlatFieldPresent = flatHost != nil || flatPort != nil || flatUser != nil ||
+                flatPassword != nil || flatSessionDatabase != nil || flatAllowWrites != nil || flatAllowRawSQL != nil
+            mysql = anyFlatFieldPresent ? MySQLConnectionFileConfig(
+                host: flatHost,
+                port: flatPort,
+                user: flatUser,
+                password: flatPassword,
+                sessionDatabase: flatSessionDatabase,
+                allowWrites: flatAllowWrites,
+                allowRawSQL: flatAllowRawSQL
+            ) : nil
+        }
+    }
+
+    static func load(path: String) throws -> DatasourceFileConfig {
+        let url = URL(fileURLWithPath: path)
+        let data = try Data(contentsOf: url)
+        return try JSONDecoder().decode(DatasourceFileConfig.self, from: data)
+    }
+}
+
+struct MySQLConnectionFileConfig: Decodable {
+    var host: String?
+    var port: Int?
+    var user: String?
+    var password: String?
+    /// Schema `LASSO_SESSION_DRIVER=mysql` stores session data in — a
+    /// separate concern from `datasources` (which maps Lasso-side inline
+    /// datasource aliases to their own schemas), since session storage
+    /// isn't itself an inline-queryable Lasso datasource. Falls back to
+    /// `LASSO_MYSQL_DATABASE` when omitted.
+    var sessionDatabase: String?
+    var allowWrites: Bool?
+    var allowRawSQL: Bool?
+}
+
+struct FileMakerConnectionFileConfig: Decodable {
+    var host: String?
+    var port: Int?
+    var user: String?
+    var password: String?
+    var allowWrites: Bool?
+}
+
+/// One `datasources` entry. Decodes either the current shape
+/// (`{"type": "mysql"|"filemaker", "schema": "..."}`) or, for back-compat,
+/// a bare schema-name string (`"schemaName"`, implicitly `{type: "mysql",
+/// schema: "schemaName"}` — the only shape this key ever had before
+/// FileMaker support).
+struct DatasourceEntry: Decodable {
+    enum Backend: String, Decodable {
+        case mysql
+        case filemaker
+    }
+
+    var type: Backend
+    /// The real MySQL schema name — meaningful only for `.mysql` entries.
+    /// A `.filemaker` entry needs none: the alias itself IS the FileMaker
+    /// database-file name (real Lasso's documented FileMaker connector
+    /// model). `ServerConfig.load()` falls back to the alias itself when
+    /// this is omitted on a `.mysql` entry too.
+    var schema: String?
+
+    private enum CodingKeys: String, CodingKey { case type, schema }
+
+    init(from decoder: Decoder) throws {
+        if let single = try? decoder.singleValueContainer(), let flatSchema = try? single.decode(String.self) {
+            type = .mysql
+            schema = flatSchema
+            return
+        }
+        let container = try decoder.container(keyedBy: CodingKeys.self)
+        type = try container.decode(Backend.self, forKey: .type)
+        schema = try container.decodeIfPresent(String.self, forKey: .schema)
+    }
+}
+
 enum ServerConfigError: Error, CustomStringConvertible {
     case invalidSiteRoot(String)
+    case duplicateDatasourceAlias([String])
+    /// A `datasources` entry has `type: "filemaker"` but no `filemaker`
+    /// connection block (or `LASSO_FILEMAKER_HOST`) supplies a host —
+    /// caught here, at startup, rather than deferred to a confusing
+    /// failure the first time a page actually queries that alias.
+    case missingFileMakerHost
 
     var description: String {
         switch self {
         case .invalidSiteRoot(let path): "Invalid LASSO_SITE_ROOT: \(path)"
+        case .duplicateDatasourceAlias(let aliases):
+            "Datasource aliases differ only by case, which is ambiguous (Lasso datasource names are case-insensitive): \(aliases.joined(separator: ", "))"
+        case .missingFileMakerHost:
+            "A FileMaker datasource is configured but no FileMaker host was supplied (set \"filemaker\": {\"host\": ...} in the datasource config file, or LASSO_FILEMAKER_HOST)."
         }
     }
 }
@@ -126,7 +338,7 @@ struct LassoSiteServer: Sendable {
     let config: ServerConfig
     let includeLoader: LassoFileSystemIncludeLoader
     let uploadProcessor: LassoFileSystemUploadProcessor
-    let inlineProvider: LassoDynamicInlineProvider?
+    let inlineProvider: (any LassoInlineProvider)?
     /// One registry for the life of this server process. Every request
     /// gets a `LassoContext` wired with this same instance, so `library()`
     /// caching and `define`d custom tags are shared across every request
@@ -159,10 +371,19 @@ struct LassoSiteServer: Sendable {
             sessionDriver = MemorySessionDriver()
         }
 
-        if let alias = config.datasourceAlias, config.mysqlDatabase.isEmpty == false {
-            @Sendable func makeDatabase() throws -> Database<MySQLDatabaseConfiguration> {
+        let mysqlProvider: LassoDynamicInlineProvider?
+        if config.datasourceMap.isEmpty == false {
+            // The set of real MySQL schema names this deployment is
+            // configured for — LassoDynamicInlineProvider remaps a
+            // recognized Lasso-side alias to one of these before this
+            // executor ever sees it; an unrecognized alias passes through
+            // unmapped and is rejected here rather than allowing queries
+            // against arbitrary named schemas that happen to already
+            // exist on the server.
+            let knownDatabases = Set(config.datasourceMap.values)
+            @Sendable func makeDatabase(_ database: String) throws -> Database<MySQLDatabaseConfiguration> {
                 try Database(configuration: MySQLDatabaseConfiguration(
-                    database: config.mysqlDatabase,
+                    database: database,
                     host: config.mysqlHost,
                     port: config.mysqlPort,
                     username: config.mysqlUser,
@@ -171,7 +392,7 @@ struct LassoSiteServer: Sendable {
             }
             let executor = PerfectCRUDLassoExecutor(
                 capabilities: { datasource in
-                    guard datasource == config.mysqlDatabase else { return .readOnly }
+                    guard knownDatabases.contains(datasource) else { return .readOnly }
                     return LassoDatasourceCapabilities(
                         allowsInsert: config.mysqlAllowWrites,
                         allowsUpdate: config.mysqlAllowWrites,
@@ -180,11 +401,11 @@ struct LassoSiteServer: Sendable {
                     )
                 },
                 queryHandler: { datasource, query in
-                    guard datasource == config.mysqlDatabase else {
+                    guard knownDatabases.contains(datasource) else {
                         throw LassoSiteServerError.unknownDatasource(datasource)
                     }
                     do {
-                        return try makeDatabase().select(query)
+                        return try makeDatabase(datasource).select(query)
                     } catch let error as LassoDatabaseActionError {
                         throw error
                     } catch {
@@ -192,11 +413,11 @@ struct LassoSiteServer: Sendable {
                     }
                 },
                 mutationHandler: { datasource, mutation in
-                    guard datasource == config.mysqlDatabase else {
+                    guard knownDatabases.contains(datasource) else {
                         throw LassoSiteServerError.unknownDatasource(datasource)
                     }
                     do {
-                        return try makeDatabase().mutate(mutation)
+                        return try makeDatabase(datasource).mutate(mutation)
                     } catch let error as LassoDatabaseActionError {
                         throw error
                     } catch {
@@ -209,11 +430,11 @@ struct LassoSiteServer: Sendable {
                     }
                 },
                 rawSQLHandler: { datasource, sql in
-                    guard datasource == config.mysqlDatabase else {
+                    guard knownDatabases.contains(datasource) else {
                         throw LassoSiteServerError.unknownDatasource(datasource)
                     }
                     do {
-                        return try makeDatabase().execute(sql)
+                        return try makeDatabase(datasource).execute(sql)
                     } catch let error as LassoDatabaseActionError {
                         throw error
                     } catch {
@@ -221,12 +442,74 @@ struct LassoSiteServer: Sendable {
                     }
                 }
             )
-            inlineProvider = LassoDynamicInlineProvider(
+            mysqlProvider = LassoDynamicInlineProvider(
                 executor: executor,
-                datasourceAliases: [alias: config.mysqlDatabase]
+                datasourceAliases: config.datasourceMap
             )
         } else {
+            mysqlProvider = nil
+        }
+
+        let fileMakerProvider: LassoDynamicInlineProvider?
+        if config.filemakerDatasourceAliases.isEmpty == false {
+            // ServerConfig.load() already validates filemakerHost is set
+            // whenever any FileMaker alias is configured
+            // (ServerConfigError.missingFileMakerHost) — "localhost" here
+            // is just a defensive fallback for a ServerConfig built by
+            // hand (e.g. in tests) rather than through .load().
+            let filemakerHost = config.filemakerHost ?? "localhost"
+            let filemakerPort = config.filemakerPort ?? 80
+            let filemakerUser = config.filemakerUser ?? ""
+            let filemakerPassword = config.filemakerPassword ?? ""
+            let filemakerUseTLS = filemakerPort == 443
+            let filemakerScheme = filemakerUseTLS ? "https" : "http"
+            let executor = PerfectFileMakerLassoExecutor(
+                allowWrites: config.filemakerAllowWrites,
+                baseURL: "\(filemakerScheme)://\(filemakerHost):\(filemakerPort)"
+            ) { query, kind, datasource in
+                // A fresh FileMakerServer per call (matching makeDatabase's
+                // own per-call construction above), even though the
+                // resurrected FileMakerServer is now natively Sendable and
+                // could safely be built once and captured — keeps this
+                // closure's shape consistent with makeDatabase's and with
+                // how it looked before the resurrection, when
+                // FileMakerServer wasn't Sendable at all.
+                let server = FileMakerServer(
+                    host: filemakerHost, port: filemakerPort,
+                    userName: filemakerUser, password: filemakerPassword,
+                    useTLS: filemakerUseTLS
+                )
+                // FileMakerServer.query(_:) is now genuine async/await
+                // (the resurrected library replaced its blocking
+                // PerfectCURL/libcurl transport with URLSession), while
+                // this queryHandler must stay synchronous. See
+                // runAsyncAndWait's own doc comment (AsyncBridge.swift)
+                // for why a plain Task+semaphore bridge inline here would
+                // risk deadlocking the whole server under concurrent
+                // load, not just this datasource.
+                do {
+                    return try runAsyncAndWait { try await server.query(query) }
+                } catch let error as LassoFileMakerDatabaseActionError {
+                    throw error
+                } catch {
+                    throw LassoFileMakerDatabaseActionError(kind: kind, datasource: datasource, underlying: error)
+                }
+            }
+            // No alias remapping needed — the alias itself IS the
+            // FileMaker database-file name.
+            fileMakerProvider = LassoDynamicInlineProvider(executor: executor, datasourceAliases: [:])
+        } else {
+            fileMakerProvider = nil
+        }
+
+        if mysqlProvider == nil, fileMakerProvider == nil {
             inlineProvider = nil
+        } else {
+            inlineProvider = LassoMultiBackendInlineProvider(
+                mysqlProvider: mysqlProvider,
+                fileMakerProvider: fileMakerProvider,
+                fileMakerAliases: config.filemakerDatasourceAliases
+            )
         }
     }
 
@@ -415,7 +698,7 @@ struct LassoSiteServer: Sendable {
             )
         }
 
-        var context = LassoContext(
+        let context = LassoContext(
             globals: baseGlobals(for: request),
             includeLoader: includeLoader,
             includePath: includePath,
@@ -426,15 +709,26 @@ struct LassoSiteServer: Sendable {
             inlineProvider: inlineProvider,
             tagRegistry: tagRegistry
         )
-        let html: String
-        do {
-            html = try LassoRenderer().render(document, context: &context)
-        } catch {
-            throw LassoSiteRenderError(
-                underlying: error,
-                includeStack: context.includeStack,
-                parserDiagnostics: document.diagnostics.map(\.message)
-            )
+        // The synchronous render (including any blocking/bridged
+        // datasource call inside it, e.g. PerfectFileMakerLassoExecutor's
+        // runAsyncAndWait) must never run directly on one of Swift's
+        // cooperative-pool threads — see runBlockingOffCooperativePool's
+        // own doc comment and Documentation/synchronous-render-pipeline.md
+        // for why. `context`/`document` are both `Sendable` value types,
+        // captured by copy; the mutated copy never needs to leave this
+        // closure since nothing downstream reads `context` again (only
+        // `sink`, a separately-captured reference type, does).
+        let html = try await runBlockingOffCooperativePool {
+            var localContext = context
+            do {
+                return try LassoRenderer().render(document, context: &localContext)
+            } catch {
+                throw LassoSiteRenderError(
+                    underlying: error,
+                    includeStack: localContext.includeStack,
+                    parserDiagnostics: document.diagnostics.map(\.message)
+                )
+            }
         }
 
         if let sessionBridge {
@@ -946,10 +1240,13 @@ if let startupPath = config.startupPath {
     print("Startup folder: none")
 }
 print("Listening: http://localhost:\(config.port)")
-if let alias = config.datasourceAlias {
-    print("Datasource alias: \(alias) -> \(config.mysqlDatabase)@\(config.mysqlHost)")
+if config.datasourceMap.isEmpty {
+    print("Datasource aliases: none")
 } else {
-    print("Datasource alias: none")
+    let mapped = config.datasourceMap.sorted { $0.key < $1.key }
+        .map { "\($0.key) -> \($0.value)" }
+        .joined(separator: ", ")
+    print("Datasource aliases: \(mapped)@\(config.mysqlHost)")
 }
 print("Session driver: \(config.sessionDriver)")
 await siteServer.sessionDriver.setup()

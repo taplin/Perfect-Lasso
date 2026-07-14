@@ -3,7 +3,9 @@ import Testing
 @testable import LassoParser
 import LassoPerfectCRUD
 import LassoPerfectSession
+@testable import LassoPerfectFileMaker
 import PerfectCRUD
+import PerfectFileMaker
 import PerfectSessionCore
 
 @Test func allFixturesParseWithoutDiagnostics() throws {
@@ -1144,6 +1146,502 @@ import PerfectSessionCore
     #expect(delete.action == .delete)
     #expect(delete.fieldAssignments == [])
     #expect(delete.writeCriteria == [LassoInlineCriterion(field: "id", operation: "eq", value: .integer(42))])
+}
+
+@Test func inlineRequestSplitsCriteriaIntoNotDelimitedGroups() throws {
+    // Real corpus shape (pages/order_history.page.lasso,
+    // pages/order_reporting.page.lasso): -op='Eq', 'cust_id'=X, -Not,
+    // -op='Eq', 'status'='unchecked' -- one bare -Not splits the search
+    // into "cust_id = X" (not negated) and "status = 'unchecked'"
+    // (negated). Real Lasso's FileMaker connector documents -Not as
+    // negating the whole compound query group that follows it.
+    let request = LassoInlineRequest(arguments: [
+        EvaluatedArgument(label: "database", value: .string("fm_catalog")),
+        EvaluatedArgument(label: "table", value: .string("storefront")),
+        EvaluatedArgument(label: "op", value: .string("Eq")),
+        EvaluatedArgument(label: "cust_id", value: .integer(7)),
+        EvaluatedArgument(label: "not", value: .boolean(true)),
+        EvaluatedArgument(label: "op", value: .string("Eq")),
+        EvaluatedArgument(label: "status", value: .string("unchecked")),
+        EvaluatedArgument(label: "search", value: .boolean(true)),
+    ])
+    #expect(request.criteriaGroups == [
+        LassoInlineCriteriaGroup(
+            criteria: [LassoInlineCriterion(field: "cust_id", operation: "Eq", value: .integer(7))],
+            negated: false
+        ),
+        LassoInlineCriteriaGroup(
+            criteria: [LassoInlineCriterion(field: "status", operation: "Eq", value: .string("unchecked"))],
+            negated: true
+        ),
+    ])
+
+    // Regression for the fix: a bare -Not must not become a bogus
+    // "not" field criterion in the flat, negation-oblivious `criteria`
+    // array MySQL's executor still relies on, and must not shift the
+    // -Op positional alignment for the criterion after it.
+    #expect(request.criteria == [
+        LassoInlineCriterion(field: "cust_id", operation: "Eq", value: .integer(7)),
+        LassoInlineCriterion(field: "status", operation: "Eq", value: .string("unchecked")),
+    ])
+}
+
+@Test func inlineRequestWithNoNotProducesOneNonNegatedGroupMatchingFlatCriteria() throws {
+    let request = LassoInlineRequest(arguments: [
+        EvaluatedArgument(label: "database", value: .string("catalog")),
+        EvaluatedArgument(label: "table", value: .string("skus")),
+        EvaluatedArgument(label: "color", value: .string("red")),
+        EvaluatedArgument(label: "search", value: .boolean(true)),
+    ])
+    #expect(request.criteriaGroups.count == 1)
+    #expect(request.criteriaGroups.first?.negated == false)
+    #expect(request.criteriaGroups.first?.criteria == request.criteria)
+}
+
+@Test func keyfieldValueReadsLassoDataRowKeyValueAndIsNullWhenAbsent() throws {
+    var context = LassoContext(inlineProvider: LassoInMemoryInlineProvider(tables: [
+        "storefront": [LassoDataRow(["status": .string("unchecked")], keyValue: .integer(101))],
+    ]))
+    let output = try LassoRenderer().render(
+        "[inline(-database='catalog',-table='storefront',-search)][records][keyfield_value][/records][/inline]",
+        context: &context
+    )
+    #expect(output == "101")
+
+    // No current row (outside any inline/records) -- .null, not a crash.
+    var emptyContext = LassoContext()
+    let emptyOutput = try LassoRenderer().render("[keyfield_value]", context: &emptyContext)
+    #expect(emptyOutput == "")
+}
+
+// MARK: - PerfectFileMakerLassoExecutor
+
+/// Thrown by test `queryHandler` stubs after capturing the `FMPQuery` they
+/// were called with, so tests can inspect the mapped query (via its public
+/// `queryString`) without needing a real `FMPResultSet` -- `FMPResultSet`/
+/// `FMPRecord` have no public initializer anywhere in the upstream
+/// `Perfect-FileMaker` library (their only inits parse a real XML
+/// response), so no test in this file can construct a "successful" result
+/// on its own. Full read-path (row/field mapping) coverage instead comes
+/// from live-verifying against the real FileMaker Server once credentials
+/// are available -- see Documentation/lasso-perfect-server.md.
+private enum TestFileMakerProbeError: Error {
+    case stopAfterCapture
+}
+
+@Test func fileMakerExecutorThrowsMissingDatasourceWhenDatabaseAbsent() throws {
+    let executor = PerfectFileMakerLassoExecutor { _, _, _ in
+        Issue.record("queryHandler should not be called before -database is validated")
+        throw TestFileMakerProbeError.stopAfterCapture
+    }
+    let request = LassoInlineRequest(arguments: [
+        EvaluatedArgument(label: "table", value: .string("storefront")),
+        EvaluatedArgument(label: "findall", value: .boolean(true)),
+    ])
+    #expect(throws: LassoFileMakerLassoError.missingDatasource) {
+        try executor.execute(request)
+    }
+}
+
+@Test func fileMakerExecutorThrowsMissingTableWhenTableAbsent() throws {
+    let executor = PerfectFileMakerLassoExecutor { _, _, _ in
+        Issue.record("queryHandler should not be called before -table is validated")
+        throw TestFileMakerProbeError.stopAfterCapture
+    }
+    let request = LassoInlineRequest(arguments: [
+        EvaluatedArgument(label: "database", value: .string("fm_catalog")),
+        EvaluatedArgument(label: "findall", value: .boolean(true)),
+    ])
+    #expect(throws: LassoFileMakerLassoError.missingTable) {
+        try executor.execute(request)
+    }
+}
+
+@Test func fileMakerExecutorThrowsUnsupportedActionForShow() throws {
+    let executor = PerfectFileMakerLassoExecutor { _, _, _ in
+        Issue.record("queryHandler should not be called for an unsupported action")
+        throw TestFileMakerProbeError.stopAfterCapture
+    }
+    let request = LassoInlineRequest(arguments: [
+        EvaluatedArgument(label: "database", value: .string("fm_catalog")),
+        EvaluatedArgument(label: "table", value: .string("storefront")),
+        EvaluatedArgument(label: "show", value: .boolean(true)),
+    ])
+    #expect(throws: LassoFileMakerLassoError.unsupportedAction(.show)) {
+        try executor.execute(request)
+    }
+}
+
+@Test func fileMakerExecutorGatesAddUpdateDeleteBehindAllowWrites() throws {
+    let executor = PerfectFileMakerLassoExecutor(allowWrites: false) { _, _, _ in
+        Issue.record("queryHandler should not be called while writes are disabled")
+        throw TestFileMakerProbeError.stopAfterCapture
+    }
+    let base: [EvaluatedArgument] = [
+        EvaluatedArgument(label: "database", value: .string("fm_catalog")),
+        EvaluatedArgument(label: "table", value: .string("storefront")),
+    ]
+
+    let addFrame = try executor.execute(LassoInlineRequest(arguments: base + [
+        EvaluatedArgument(label: "add", value: .boolean(true)),
+        EvaluatedArgument(label: "status", value: .string("new")),
+    ]))
+    #expect(addFrame.error != .noError)
+    #expect(addFrame.error.kind == "add")
+
+    let updateFrame = try executor.execute(LassoInlineRequest(arguments: base + [
+        EvaluatedArgument(label: "update", value: .boolean(true)),
+        EvaluatedArgument(label: "keyfield", value: .string("")),
+        EvaluatedArgument(label: "keyvalue", value: .integer(101)),
+        EvaluatedArgument(label: "status", value: .string("checked")),
+    ]))
+    #expect(updateFrame.error != .noError)
+    #expect(updateFrame.error.kind == "update")
+
+    let deleteFrame = try executor.execute(LassoInlineRequest(arguments: base + [
+        EvaluatedArgument(label: "delete", value: .boolean(true)),
+        EvaluatedArgument(label: "keyfield", value: .string("")),
+        EvaluatedArgument(label: "keyvalue", value: .integer(101)),
+    ]))
+    #expect(deleteFrame.error != .noError)
+    #expect(deleteFrame.error.kind == "delete")
+}
+
+@Test func fileMakerExecutorThrowsMissingAssignmentsForAddAndUpdateWithNoFields() throws {
+    let executor = PerfectFileMakerLassoExecutor(allowWrites: true) { _, _, _ in
+        Issue.record("queryHandler should not be called with no field assignments")
+        throw TestFileMakerProbeError.stopAfterCapture
+    }
+    let base: [EvaluatedArgument] = [
+        EvaluatedArgument(label: "database", value: .string("fm_catalog")),
+        EvaluatedArgument(label: "table", value: .string("storefront")),
+    ]
+
+    #expect(throws: LassoFileMakerLassoError.missingAssignments(.add)) {
+        try executor.execute(LassoInlineRequest(arguments: base + [
+            EvaluatedArgument(label: "add", value: .boolean(true)),
+        ]))
+    }
+    #expect(throws: LassoFileMakerLassoError.missingAssignments(.update)) {
+        try executor.execute(LassoInlineRequest(arguments: base + [
+            EvaluatedArgument(label: "update", value: .boolean(true)),
+            EvaluatedArgument(label: "keyfield", value: .string("")),
+            EvaluatedArgument(label: "keyvalue", value: .integer(101)),
+        ]))
+    }
+}
+
+@Test func fileMakerExecutorReturnsRecoverableFrameWhenKeyValueMissingOrInvalid() throws {
+    let executor = PerfectFileMakerLassoExecutor(allowWrites: true) { _, _, _ in
+        Issue.record("queryHandler should not be called with an invalid record id")
+        throw TestFileMakerProbeError.stopAfterCapture
+    }
+    let base: [EvaluatedArgument] = [
+        EvaluatedArgument(label: "database", value: .string("fm_catalog")),
+        EvaluatedArgument(label: "table", value: .string("storefront")),
+    ]
+
+    // No -KeyValue at all (e.g. a tampered/missing hidden form field).
+    let updateFrame = try executor.execute(LassoInlineRequest(arguments: base + [
+        EvaluatedArgument(label: "update", value: .boolean(true)),
+        EvaluatedArgument(label: "status", value: .string("checked")),
+    ]))
+    #expect(updateFrame.error != .noError)
+    #expect(updateFrame.error.kind == "update")
+
+    // A -KeyValue that isn't a valid record id.
+    let deleteFrame = try executor.execute(LassoInlineRequest(arguments: base + [
+        EvaluatedArgument(label: "delete", value: .boolean(true)),
+        EvaluatedArgument(label: "keyfield", value: .string("")),
+        EvaluatedArgument(label: "keyvalue", value: .string("not-a-number")),
+    ]))
+    #expect(deleteFrame.error != .noError)
+    #expect(deleteFrame.error.kind == "delete")
+}
+
+@Test func fileMakerExecutorMapsSearchCriteriaAndOperatorsIntoFindQuery() throws {
+    final class Capture: @unchecked Sendable {
+        var query: FMPQuery?
+    }
+    let capture = Capture()
+    let executor = PerfectFileMakerLassoExecutor { query, _, _ in
+        capture.query = query
+        throw TestFileMakerProbeError.stopAfterCapture
+    }
+    let request = LassoInlineRequest(arguments: [
+        EvaluatedArgument(label: "database", value: .string("fm_catalog")),
+        EvaluatedArgument(label: "table", value: .string("storefront")),
+        EvaluatedArgument(label: "search", value: .boolean(true)),
+        EvaluatedArgument(label: "op", value: .string("eq")),
+        EvaluatedArgument(label: "status", value: .string("unchecked")),
+    ])
+    _ = try? executor.execute(request)
+    let queryString = try #require(capture.query?.queryString)
+    #expect(queryString.contains("-db=fm_catalog"))
+    #expect(queryString.contains("-lay=storefront"))
+    #expect(queryString.contains("-findquery"))
+    #expect(queryString.contains("status"))
+    #expect(queryString.contains("unchecked"))
+    // -Op='EQ' explicitly requested exact match -- FMPFieldOp.equal
+    // renders "==value" with no trailing "*" (see FMPQueryField.valueWithOp
+    // in the upstream Perfect-FileMaker source).
+    #expect(queryString.contains("==unchecked&") || queryString.hasSuffix("==unchecked"))
+    #expect(queryString.contains("==unchecked*") == false)
+}
+
+@Test func fileMakerExecutorDefaultsMissingOpToBeginsWithNotExactMatch() throws {
+    // Regression coverage for a real bug this session: a criterion with
+    // no -Op at all must NOT silently become an exact-match (-EQ) search.
+    // LassoInlineRequest's shared parsing (Providers.swift) represents
+    // "no -Op supplied" as operation == nil (distinct from an explicit
+    // -Op='EQ', which also lowercases to "eq") specifically so each
+    // executor can apply its own connector-correct default; the FileMaker
+    // connector's documented default is -BW (begins-with), NOT -EQ (real
+    // Lasso 8.5 Ch. 11 Table 4) -- PerfectCRUDLassoExecutor's own -EQ
+    // default is a distinct, correct-for-SQL-connectors default that must
+    // NOT leak into this one.
+    final class Capture: @unchecked Sendable {
+        var query: FMPQuery?
+    }
+    let capture = Capture()
+    let executor = PerfectFileMakerLassoExecutor { query, _, _ in
+        capture.query = query
+        throw TestFileMakerProbeError.stopAfterCapture
+    }
+    let request = LassoInlineRequest(arguments: [
+        EvaluatedArgument(label: "database", value: .string("fm_catalog")),
+        EvaluatedArgument(label: "table", value: .string("storefront")),
+        EvaluatedArgument(label: "search", value: .boolean(true)),
+        EvaluatedArgument(label: "status", value: .string("unchecked")),
+    ])
+    _ = try? executor.execute(request)
+    let queryString = try #require(capture.query?.queryString)
+    // FMPFieldOp.beginsWith renders "==value*" (trailing "*").
+    #expect(queryString.contains("==unchecked*"))
+}
+
+@Test func fileMakerExecutorMapsNotGroupToNegatedCompoundQuerySegment() throws {
+    final class Capture: @unchecked Sendable {
+        var query: FMPQuery?
+    }
+    let capture = Capture()
+    let executor = PerfectFileMakerLassoExecutor { query, _, _ in
+        capture.query = query
+        throw TestFileMakerProbeError.stopAfterCapture
+    }
+    // Mirrors the real corpus shape: an unnegated group followed by a
+    // bare -Not delimiting a second, negated group.
+    let request = LassoInlineRequest(arguments: [
+        EvaluatedArgument(label: "database", value: .string("fm_catalog")),
+        EvaluatedArgument(label: "table", value: .string("storefront")),
+        EvaluatedArgument(label: "search", value: .boolean(true)),
+        EvaluatedArgument(label: "cust_id", value: .integer(42)),
+        EvaluatedArgument(label: "not", value: .boolean(true)),
+        EvaluatedArgument(label: "status", value: .string("unchecked")),
+    ])
+    _ = try? executor.execute(request)
+    let queryString = try #require(capture.query?.queryString)
+    // compoundQueryString renders a negated group as "!(qN)" -- see
+    // FMPQuery.compoundQueryString in the upstream Perfect-FileMaker
+    // source -- but the resurrected library's fmpEscaped encoder (a
+    // deliberate query-injection fix: the old PerfectLib encoder left
+    // `& = ! ( ) * ;` unescaped) now percent-encodes the whole compound
+    // query segment, including its structural "!"/"("/")" characters, not
+    // just field values. "!(q2)" -> "%21%28q2%29", "(q1)" -> "%28q1%29".
+    #expect(queryString.contains("%21%28q2%29"))
+    #expect(queryString.contains("%28q1%29"))
+}
+
+@Test func fileMakerExecutorThrowsUnsupportedComparisonForUnknownOperator() throws {
+    let executor = PerfectFileMakerLassoExecutor { _, _, _ in
+        Issue.record("queryHandler should not be called for an unsupported operator")
+        throw TestFileMakerProbeError.stopAfterCapture
+    }
+    let request = LassoInlineRequest(arguments: [
+        EvaluatedArgument(label: "database", value: .string("fm_catalog")),
+        EvaluatedArgument(label: "table", value: .string("storefront")),
+        EvaluatedArgument(label: "search", value: .boolean(true)),
+        EvaluatedArgument(label: "op", value: .string("rx")),
+        EvaluatedArgument(label: "status", value: .string("unchecked")),
+    ])
+    // Structural/programmer-facing -- not caught by this executor's
+    // LassoFileMakerDatabaseActionError handling, so it propagates as a
+    // genuine Swift throw rather than becoming a silently-recoverable frame.
+    #expect(throws: LassoFileMakerLassoError.unsupportedComparison("rx")) {
+        try executor.execute(request)
+    }
+}
+
+@Test func fileMakerExecutorMapsFindAllActionWithSortAndPaging() throws {
+    final class Capture: @unchecked Sendable {
+        var query: FMPQuery?
+    }
+    let capture = Capture()
+    let executor = PerfectFileMakerLassoExecutor { query, _, _ in
+        capture.query = query
+        throw TestFileMakerProbeError.stopAfterCapture
+    }
+    let request = LassoInlineRequest(arguments: [
+        EvaluatedArgument(label: "database", value: .string("fm_catalog")),
+        EvaluatedArgument(label: "table", value: .string("storefront")),
+        EvaluatedArgument(label: "findall", value: .boolean(true)),
+        EvaluatedArgument(label: "sortfield", value: .string("last_name")),
+        EvaluatedArgument(label: "sortorder", value: .string("descending")),
+        EvaluatedArgument(label: "maxrecords", value: .integer(25)),
+        EvaluatedArgument(label: "skiprecords", value: .integer(50)),
+    ])
+    _ = try? executor.execute(request)
+    let queryString = try #require(capture.query?.queryString)
+    #expect(queryString.contains("-findall"))
+    #expect(queryString.contains("-sortfield.1=last_name"))
+    #expect(queryString.contains("-sortorder.1=descend"))
+    #expect(queryString.contains("-skip=50"))
+    #expect(queryString.contains("-max=25"))
+}
+
+@Test func fileMakerExecutorMapsAddActionWithFieldAssignments() throws {
+    final class Capture: @unchecked Sendable {
+        var query: FMPQuery?
+    }
+    let capture = Capture()
+    let executor = PerfectFileMakerLassoExecutor(allowWrites: true) { query, _, _ in
+        capture.query = query
+        throw TestFileMakerProbeError.stopAfterCapture
+    }
+    let request = LassoInlineRequest(arguments: [
+        EvaluatedArgument(label: "database", value: .string("fm_catalog")),
+        EvaluatedArgument(label: "table", value: .string("storefront")),
+        EvaluatedArgument(label: "add", value: .boolean(true)),
+        EvaluatedArgument(label: "status", value: .string("new")),
+    ])
+    _ = try? executor.execute(request)
+    let queryString = try #require(capture.query?.queryString)
+    #expect(queryString.contains("-new"))
+    #expect(queryString.contains("status"))
+}
+
+@Test func fileMakerExecutorMapsUpdateActionWithRecordIdFromKeyValue() throws {
+    final class Capture: @unchecked Sendable {
+        var query: FMPQuery?
+    }
+    let capture = Capture()
+    let executor = PerfectFileMakerLassoExecutor(allowWrites: true) { query, _, _ in
+        capture.query = query
+        throw TestFileMakerProbeError.stopAfterCapture
+    }
+    let request = LassoInlineRequest(arguments: [
+        EvaluatedArgument(label: "database", value: .string("fm_catalog")),
+        EvaluatedArgument(label: "table", value: .string("storefront")),
+        EvaluatedArgument(label: "update", value: .boolean(true)),
+        // Real corpus always passes -KeyField as empty -- FileMaker's key
+        // field is always the internal record id, only -KeyValue matters.
+        EvaluatedArgument(label: "keyfield", value: .string("")),
+        EvaluatedArgument(label: "keyvalue", value: .integer(101)),
+        EvaluatedArgument(label: "status", value: .string("checked")),
+    ])
+    _ = try? executor.execute(request)
+    let queryString = try #require(capture.query?.queryString)
+    #expect(queryString.contains("-recid=101"))
+    #expect(queryString.contains("-edit"))
+}
+
+@Test func fileMakerExecutorMapsDeleteActionWithRecordId() throws {
+    final class Capture: @unchecked Sendable {
+        var query: FMPQuery?
+    }
+    let capture = Capture()
+    let executor = PerfectFileMakerLassoExecutor(allowWrites: true) { query, _, _ in
+        capture.query = query
+        throw TestFileMakerProbeError.stopAfterCapture
+    }
+    let request = LassoInlineRequest(arguments: [
+        EvaluatedArgument(label: "database", value: .string("fm_catalog")),
+        EvaluatedArgument(label: "table", value: .string("storefront")),
+        EvaluatedArgument(label: "delete", value: .boolean(true)),
+        EvaluatedArgument(label: "keyfield", value: .string("")),
+        EvaluatedArgument(label: "keyvalue", value: .integer(101)),
+    ])
+    _ = try? executor.execute(request)
+    let queryString = try #require(capture.query?.queryString)
+    #expect(queryString.contains("-recid=101"))
+    #expect(queryString.contains("-delete"))
+}
+
+@Test func fileMakerExecutorTurnsClassifiedHandlerFailureIntoRecoverableFrame() throws {
+    // Mirrors what the real production `queryHandler` (built in
+    // main.swift, wrapping a semaphore-bridged FileMakerServer call) is
+    // expected to do: catch its own real backend failure and throw
+    // LassoFileMakerDatabaseActionError itself, since it -- not this
+    // executor -- is the only place with enough context (kind/datasource
+    // are passed to it directly) to classify the failure.
+    struct FakeServerError: Error {}
+    let executor = PerfectFileMakerLassoExecutor { _, kind, datasource in
+        throw LassoFileMakerDatabaseActionError(kind: kind, datasource: datasource, underlying: FakeServerError())
+    }
+    let request = LassoInlineRequest(arguments: [
+        EvaluatedArgument(label: "database", value: .string("fm_catalog")),
+        EvaluatedArgument(label: "table", value: .string("storefront")),
+        EvaluatedArgument(label: "findall", value: .boolean(true)),
+    ])
+    let frame = try executor.execute(request)
+    #expect(frame.rows == [])
+    #expect(frame.error != .noError)
+    #expect(frame.error.kind == "search")
+    #expect(frame.error.detail?.contains("FakeServerError") == true)
+}
+
+@Test func fileMakerExecutorPropagatesUnclassifiedHandlerFailureFatally() throws {
+    // The inverse of the above: an UNclassified error from the handler
+    // (a bug in the semaphore bridge, or any failure it forgot to wrap)
+    // must NOT be silently downgraded into a routine recoverable frame --
+    // matching PerfectCRUDLassoExecutor, whose own do/catch around
+    // queryHandler only catches LassoRecoverableError/LassoDatabaseActionError
+    // and lets anything else propagate. Swift Testing's #expect(throws:)
+    // can't match a non-Equatable error by value, so this asserts the
+    // throw happens and (separately) that it's the same instance.
+    struct FakeBugError: Error {}
+    let executor = PerfectFileMakerLassoExecutor { _, _, _ in
+        throw FakeBugError()
+    }
+    let request = LassoInlineRequest(arguments: [
+        EvaluatedArgument(label: "database", value: .string("fm_catalog")),
+        EvaluatedArgument(label: "table", value: .string("storefront")),
+        EvaluatedArgument(label: "findall", value: .boolean(true)),
+    ])
+    #expect {
+        try executor.execute(request)
+    } throws: { error in
+        error is FakeBugError
+    }
+}
+
+@Test func fileMakerExecutorRendersRecoverableErrorThroughInlineWhenWritesDisabled() throws {
+    let executor = PerfectFileMakerLassoExecutor(allowWrites: false) { _, _, _ in
+        throw TestFileMakerProbeError.stopAfterCapture
+    }
+    let provider = LassoDynamicInlineProvider(executor: executor, datasourceAliases: ["fm_catalog": "fm_catalog"])
+    var context = LassoContext(inlineProvider: provider)
+    let output = try LassoRenderer().render(
+        "[inline(-database='fm_catalog',-table='storefront',-add,'status'='new')][/inline][error_currenterror]",
+        context: &context
+    )
+    #expect(output.contains("not enabled"))
+}
+
+@Test func lassoValueMapsFileMakerFieldTypesToLassoValue() throws {
+    let executor = PerfectFileMakerLassoExecutor(baseURL: "http://203.0.113.10:80") { _, _, _ in
+        throw TestFileMakerProbeError.stopAfterCapture
+    }
+    #expect(executor.lassoValue(.text("Jane Doe")) == .string("Jane Doe"))
+    #expect(executor.lassoValue(.number(42.5)) == .decimal(42.5))
+    #expect(executor.lassoValue(.date("07/12/2026")) == .string("07/12/2026"))
+    #expect(executor.lassoValue(.time("14:30:00")) == .string("14:30:00"))
+    #expect(executor.lassoValue(.timestamp("07/12/2026 14:30:00")) == .string("07/12/2026 14:30:00"))
+    // Server-relative container path -- prefixed with the configured base URL.
+    #expect(executor.lassoValue(.container("/fmi/xml/cnt/photo.jpg?-db=fm_catalog")) ==
+        .string("http://203.0.113.10:80/fmi/xml/cnt/photo.jpg?-db=fm_catalog"))
+    // Already-absolute container reference -- passed through unprefixed.
+    #expect(executor.lassoValue(.container("http://elsewhere/photo.jpg")) == .string("http://elsewhere/photo.jpg"))
 }
 
 @Test func perfectCRUDExecutorRoutesAddUpdateDeleteToTheMutationHandler() throws {

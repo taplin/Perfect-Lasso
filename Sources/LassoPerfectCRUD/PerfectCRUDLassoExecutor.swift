@@ -173,7 +173,7 @@ public struct PerfectCRUDLassoExecutor: LassoDynamicQueryExecutor {
             predicates: try request.criteria.map {
                 DynamicPredicate(
                     field: $0.field,
-                    comparison: try comparison($0.operation),
+                    comparison: try comparison($0.operation ?? "eq"),
                     value: dynamicValue($0.value)
                 )
             },
@@ -284,7 +284,7 @@ public struct PerfectCRUDLassoExecutor: LassoDynamicQueryExecutor {
                 ($0.field, dynamicValue($0.value))
             }),
             predicates: try request.writeCriteria.map {
-                DynamicPredicate(field: $0.field, comparison: try comparison($0.operation), value: dynamicValue($0.value))
+                DynamicPredicate(field: $0.field, comparison: try comparison($0.operation ?? "eq"), value: dynamicValue($0.value))
             }
         )
         let result: DynamicResult
@@ -328,7 +328,7 @@ public struct PerfectCRUDLassoExecutor: LassoDynamicQueryExecutor {
             action: .delete,
             table: table,
             predicates: try request.writeCriteria.map {
-                DynamicPredicate(field: $0.field, comparison: try comparison($0.operation), value: dynamicValue($0.value))
+                DynamicPredicate(field: $0.field, comparison: try comparison($0.operation ?? "eq"), value: dynamicValue($0.value))
             }
         )
         let result: DynamicResult

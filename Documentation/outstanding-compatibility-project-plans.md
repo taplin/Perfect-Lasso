@@ -1212,6 +1212,99 @@ correctly selected its matching branch. A `LASSO_CRAWL_REPORT=1` sweep
 confirmed `unknownFunction("Select")` disappeared entirely (0 pages, was
 19) — 680/875 pages now render cleanly (up from 672).
 
+## 11. FileMaker Datasource Support
+
+### Implementation Status (2026-07-14)
+
+Implemented. This project's real corpus has one FileMaker Server-backed
+datasource alongside its MySQL ones (previously "no configured
+datasource"); real Lasso 8.5's FileMaker connector (Ch. 11 of the local
+reference doc) speaks classic XML Custom Web Publishing, not the modern
+Data API (FileMaker Server 17+ only) — confirmed the target server is a
+v16 instance, so XML CWP is the only option, not a choice.
+
+New `LassoPerfectFileMaker` package (`Sources/LassoPerfectFileMaker/PerfectFileMakerLassoExecutor.swift`)
+mirrors `LassoPerfectCRUD`'s `PerfectCRUDLassoExecutor` shape exactly:
+closure-injected `queryHandler`, no live backend connection held by the
+executor itself, structural errors thrown fatally, backend failures
+wrapped into a recoverable `LassoInlineFrame`. `DatasourceFileConfig`
+(`Sources/LassoPerfectServer/main.swift`) restructured from a flat,
+MySQL-only shape into a discriminated `mysql`/`filemaker`/`datasources{type}`
+one, with full back-compat decoding for every config file written before
+this change. New `LassoMultiBackendInlineProvider` routes `[inline(...)]`
+calls to the right backend by alias. Full design/rationale in
+`Documentation/lasso-perfect-server.md`'s "FileMaker Datasource" section
+— not duplicated here.
+
+**Two real, previously-unimplemented interpreter gaps found and fixed as
+prerequisites** (both apply beyond FileMaker, found via architect review
+and independently confirmed against real corpus): `-Not` group-negation
+(bare `-Not` was falling into the criteria list as a bogus `field: "not"`
+criterion, silently corrupting both the criteria list and `-Op`
+positional alignment for every criterion after it — two real pages use
+this) and `keyfield_value` (zero implementation anywhere in this
+codebase despite 33 real corpus files using it, feeding `-KeyValue`
+write-flow round-trips).
+
+**Found and fixed during code review, before merge**: a criterion with
+no explicit `-Op` was silently defaulting to exact-match (`-EQ`,
+inherited from the shared parser's fallback used by the MySQL
+connector), when real Lasso 8.5 documents the FileMaker connector's own
+default as begins-with (`-BW`) — a real, frequently-hit behavioral
+divergence, since specifying `-Op` on every field is verbose and most
+real pages don't. Fixed by making `LassoInlineCriterion.operation`
+optional (`nil` = no `-Op` supplied, distinct from an explicit
+`-Op='EQ'`) so each executor applies its own connector-correct default,
+rather than baking one default into the shared parser.
+
+**Judgment calls, explicitly flagged**:
+- `-Duplicate`, `-Random`, `-Show`, `-RX` (raw search expressions),
+  portal/related-set reads: all documented, zero real corpus evidence —
+  deferred, not guessed at.
+- Container-field values become a URL built from the configured
+  host/port/scheme prefixed onto the field's server-relative `<data>`
+  reference — the shape is doc-comment-derived from the XML CWP grammar,
+  not directly observed against a real server response yet.
+- FileMaker has no raw-SQL concept (`-SQL` is documented as unsupported
+  for FileMaker datasources) and no per-table allow-list/row-cap
+  mechanism analogous to `PerfectCRUDLassoExecutor`'s
+  `LassoDatasourceCapabilities.allowedTables`/`maxRows` — flagged by a
+  security-focused review pass as a real but *pre-existing, shared* gap
+  (MySQL's own `maxRows` capability isn't wired to a non-nil value
+  anywhere in `main.swift` either, so neither connector enforces a
+  result-set cap today), not something FileMaker specifically regressed.
+
+**A serious, independently-caught concurrency bug during the mid-session
+`Perfect-FileMaker`/`Perfect-XML` library resurrection**: modernizing the
+upstream library replaced its blocking transport with genuine
+`async`/`await`, requiring a sync-to-async bridge in `main.swift`'s
+composition root. The first bridge attempt looked correct, passed a
+narrower concurrency test, and could still deadlock the *entire server*
+under real concurrent load — not a FileMaker-only failure, since every
+HTTP connection shares Swift's one fixed-size cooperative thread pool.
+Full story, root cause, and the actual fix (`runBlockingOffCooperativePool`/
+`runAsyncAndWait` in `Sources/LassoPerfectServer/AsyncBridge.swift`) in
+`Documentation/lasso-perfect-server.md`'s "Adapting to the resurrected
+Perfect-FileMaker" subsection and `Documentation/synchronous-render-pipeline.md`.
+
+Verified via unit tests (executor request/response mapping — 16 tests;
+config decoding including back-compat — 6 tests; multi-backend routing
+— 3 tests; the async bridge, both in isolation under 50 concurrent
+in-process calls and — after the deadlock was found — under 50
+concurrent *real HTTP requests* against a real bound `Perfect-NIO`
+server — 6 tests) — 198/198 total across all four test targets, no
+regressions. Three review passes: functional correctness (found the
+`-Op` default bug above), a dedicated security-focused pass (found the
+concurrency deadlock's blast radius, a missing `useTLS` override for
+non-443 TLS deployments, and a potential internal-host leak via
+`[error_currenterror]` on unwrapped FileMaker errors — the latter two
+not yet independently addressed), and an independent post-fix
+concurrency-correctness verification (traced actual thread/queue
+identity through `Perfect-NIO`'s real connection-handling code and
+`FileMakerServer.query`'s real implementation; verdict: "I'd ship this").
+**Not yet live-verified against the real FileMaker Server** — pending
+connection credentials.
+
 ## Recommended Execution Order
 
 1. ~~Live MySQL verification and DB error framing.~~ Done.

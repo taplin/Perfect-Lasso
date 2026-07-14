@@ -2,9 +2,17 @@ import Foundation
 
 public struct LassoDataRow: Equatable, Sendable {
     private let values: [String: LassoValue]
+    /// The row's key/record-id value, for real Lasso's `KeyField_Value`
+    /// builtin. Real FileMaker rows always have one (the internal record
+    /// ID, never a named field `field()`/`column()` could already read —
+    /// see `Documentation/lasso-perfect-server.md`'s FileMaker datasource
+    /// section); MySQL rows have no equivalent concept wired up yet
+    /// (`nil`, since no corpus evidence any MySQL page relies on it).
+    public let keyValue: LassoValue?
 
-    public init(_ values: [String: LassoValue]) {
+    public init(_ values: [String: LassoValue], keyValue: LassoValue? = nil) {
         self.values = Dictionary(uniqueKeysWithValues: values.map { ($0.key.lowercased(), $0.value) })
+        self.keyValue = keyValue
     }
 
     public subscript(_ name: String) -> LassoValue {
@@ -92,13 +100,38 @@ public enum LassoInlineAction: String, Equatable, Sendable {
 
 public struct LassoInlineCriterion: Equatable, Sendable {
     public let field: String
-    public let operation: String
+    /// `nil` when the criterion's `-Op` argument was omitted entirely —
+    /// distinct from an explicit `-Op='EQ'`. Real Lasso 8.5's default
+    /// comparison operator differs by datasource connector (SQL connectors
+    /// default to `-EQ`; the FileMaker connector documents `-BW`, Ch. 11
+    /// Table 4), so each executor applies its own default rather than one
+    /// being baked in here.
+    public let operation: String?
     public let value: LassoValue
 
-    public init(field: String, operation: String, value: LassoValue) {
+    public init(field: String, operation: String?, value: LassoValue) {
         self.field = field
         self.operation = operation
         self.value = value
+    }
+}
+
+/// One `-Not`-delimited group of search criteria. Real Lasso's FileMaker
+/// connector documents `-Not` as negating the entire compound query group
+/// that follows it (there's no per-criterion `-NEQ`) — confirmed by real
+/// corpus usage: `pages/order_history.page.lasso`/`pages/order_reporting.page.lasso`
+/// each use exactly one bare `-Not` to split one search into "cust_id = X"
+/// (not negated) and "status = 'unchecked'" (negated). `LassoInlineRequest.criteria`
+/// stays flat and negation-oblivious for existing MySQL-shaped consumers
+/// (`PerfectCRUDLassoExecutor` has no negation concept); this grouped view
+/// is for FileMaker-style consumers that do.
+public struct LassoInlineCriteriaGroup: Equatable, Sendable {
+    public let criteria: [LassoInlineCriterion]
+    public let negated: Bool
+
+    public init(criteria: [LassoInlineCriterion], negated: Bool) {
+        self.criteria = criteria
+        self.negated = negated
     }
 }
 
@@ -130,6 +163,12 @@ public struct LassoInlineRequest: Equatable, Sendable {
     public let keyField: String?
     public let keyValue: LassoValue?
     public let criteria: [LassoInlineCriterion]
+    /// The same criteria, split into `-Not`-delimited groups. See
+    /// `LassoInlineCriteriaGroup`'s doc comment. Populated for every
+    /// action (harmless — a request with no `-Not` produces exactly one
+    /// non-negated group whose `criteria` matches `criteria` above), but
+    /// only meaningfully consumed by search-shaped actions.
+    public let criteriaGroups: [LassoInlineCriteriaGroup]
     /// `-StatementOnly` — generate the statement/predicates but don't
     /// execute the action. See `PerfectCRUDLassoExecutor`.
     public let statementOnly: Bool
@@ -197,10 +236,41 @@ public struct LassoInlineRequest: Equatable, Sendable {
         criteria = fieldArguments.enumerated().map { index, argument in
             LassoInlineCriterion(
                 field: argument.label ?? "",
-                operation: operations.indices.contains(index) ? operations[index] : "eq",
+                operation: operations.indices.contains(index) ? operations[index] : nil,
                 value: argument.value
             )
         }
+
+        // Single pass over the full (unfiltered) argument list — unlike
+        // `criteria` above, this needs each field argument's position
+        // relative to any `-Not` markers, which filtering to
+        // `fieldArguments` first would discard. `-Op` values are still
+        // consumed via the same parallel `operations` array (indexed by
+        // field-argument order, not by `-Not`'s position — a bare `-Not`
+        // contributes no `-Op` of its own).
+        var groups: [LassoInlineCriteriaGroup] = []
+        var currentGroup: [LassoInlineCriterion] = []
+        var currentGroupNegated = false
+        var operationIndex = 0
+        for argument in arguments {
+            guard let lowercasedLabel = argument.label?.lowercased() else { continue }
+            if lowercasedLabel == "not" {
+                if !currentGroup.isEmpty {
+                    groups.append(LassoInlineCriteriaGroup(criteria: currentGroup, negated: currentGroupNegated))
+                }
+                currentGroup = []
+                currentGroupNegated = true
+                continue
+            }
+            guard !reserved.contains(lowercasedLabel) else { continue }
+            let operation = operations.indices.contains(operationIndex) ? operations[operationIndex] : nil
+            operationIndex += 1
+            currentGroup.append(LassoInlineCriterion(field: argument.label ?? "", operation: operation, value: argument.value))
+        }
+        if !currentGroup.isEmpty {
+            groups.append(LassoInlineCriteriaGroup(criteria: currentGroup, negated: currentGroupNegated))
+        }
+        criteriaGroups = groups
 
         switch action {
         case .add:
@@ -234,6 +304,13 @@ public struct LassoInlineRequest: Equatable, Sendable {
         "search", "find", "findall", "add", "update", "delete", "show", "prepare", "nothing",
         "database", "table", "sql", "returnfield", "sortfield", "sortorder", "maxrecords",
         "skiprecords", "keyfield", "keyvalue", "op", "username", "password", "statementonly",
+        // A bare `-Not` flag (real corpus: order_history.page.lasso,
+        // order_reporting.page.lasso) negates a query group — it is not
+        // itself a field name. Without this, it fell into fieldArguments
+        // and produced a bogus `LassoInlineCriterion(field: "not", ...)`,
+        // silently corrupting both the criteria list and the -Op
+        // positional alignment for every criterion after it.
+        "not",
     ]
 }
 
@@ -805,7 +882,7 @@ public struct LassoInMemoryInlineProvider: LassoInlineProvider {
 
         rows = rows.filter { row in
             request.criteria.allSatisfy { criterion in
-                compare(row[criterion.field], criterion.operation, criterion.value)
+                compare(row[criterion.field], criterion.operation ?? "eq", criterion.value)
             }
         }
 
