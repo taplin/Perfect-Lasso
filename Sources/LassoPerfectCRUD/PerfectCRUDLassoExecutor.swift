@@ -128,6 +128,27 @@ public struct PerfectCRUDLassoExecutor: LassoDynamicQueryExecutor {
         capabilitiesResolver = capabilities
     }
 
+    /// `async throws` and `@concurrent`: `queryHandler`/`mutationHandler`/
+    /// `rawSQLHandler` wrap `PerfectCRUD`/`PerfectMySQL` calls, which are
+    /// genuinely blocking (no async API to bridge to). `@concurrent` moves
+    /// this whole method — including the private `executeRead`/
+    /// `executeInsert`/`executeUpdate`/`executeDelete`/`executeRawSQL`
+    /// helpers it calls, which stay deliberately synchronous themselves —
+    /// off the caller's executor and onto the concurrent thread pool, so a
+    /// slow query no longer stalls whatever actor (e.g. a MainActor request
+    /// handler) called in. Per SE-0461, `@concurrent` forces this
+    /// unconditionally — it does NOT depend on whether this target enables
+    /// the `ApproachableConcurrency` upcoming feature (unlike some other
+    /// targets in this package). It's the *absence* of `@concurrent` that
+    /// would make the offload depend on that flag staying off (Swift 6.2's
+    /// changed default has a plain `nonisolated async` function stay on the
+    /// caller's actor once `ApproachableConcurrency` is enabled) — which is
+    /// exactly why the attribute is explicit here rather than relied on
+    /// implicitly. See `Tests/LassoParserTests/ConcurrentOffloadTests.swift`
+    /// for the regression coverage, including a test that runs inside a
+    /// target with `ApproachableConcurrency` already enabled and still
+    /// passes, proving the offload holds regardless of that flag.
+    @concurrent
     public func execute(_ request: LassoInlineRequest) async throws -> LassoInlineFrame {
         guard let datasource = request.database, datasource.isEmpty == false else {
             throw PerfectCRUDLassoError.missingDatasource

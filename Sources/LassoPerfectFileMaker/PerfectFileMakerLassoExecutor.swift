@@ -97,10 +97,11 @@ public struct PerfectFileMakerLassoExecutor: LassoDynamicQueryExecutor {
     /// `async`/`await` shape — the production implementation in `main.swift`
     /// awaits it directly, with no sync/async bridge; unlike
     /// `PerfectCRUDLassoExecutor.QueryHandler` (still deliberately
-    /// synchronous, since `PerfectMySQL`'s underlying calls have no async
-    /// API to bridge to — see Phase 2 of
-    /// `Documentation/synchronous-render-pipeline.md`'s successor plan for
-    /// the thread-offload that's meant to address that separately).
+    /// synchronous internally, since `PerfectMySQL`'s underlying calls have
+    /// no async API to bridge to — but `PerfectCRUDLassoExecutor.execute`
+    /// itself is `@concurrent`, explicitly offloading those blocking calls
+    /// off the caller's executor; see
+    /// `Tests/LassoParserTests/ConcurrentOffloadTests.swift`).
     ///
     /// Takes `kind`/`datasource` alongside the query — unlike
     /// `PerfectCRUDLassoExecutor` (which splits `queryHandler`/
