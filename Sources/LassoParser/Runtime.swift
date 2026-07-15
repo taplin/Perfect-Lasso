@@ -683,6 +683,19 @@ public struct LassoContext: Sendable {
     public var includeLoader: (any LassoIncludeLoader)?
     public var includePath: String?
     public var includeStack: [String]
+    /// Where the first (deepest) render error surfaced — a source-level
+    /// complement to `includeStack`, which every enclosing
+    /// `performInclude`/`performLibrary` frame's own `defer` pops back to
+    /// empty as a genuine error unwinds, leaving nothing for a caller to
+    /// read once `LassoRenderer.render` has returned. These two fields
+    /// are set once (guarded by `lastErrorLocation == nil`) at the
+    /// deepest point an error is caught in `RendererEngine.render(_:)`,
+    /// then never touched again — no `defer` clears them, so they survive
+    /// intact all the way to the top-level caller via `inout` write-back,
+    /// which happens even when the function exits by throwing. See
+    /// `Documentation/lasso-perfect-server.md`'s error-page section.
+    public var lastErrorLocation: SourceRange?
+    public var lastErrorIncludeStack: [String]?
     /// Wired imperatively by whichever call site constructs both a
     /// `RendererEngine`/`Evaluator` and a `LassoContext` together — same
     /// convention as `Evaluator.renderNodes`, not a public initializer
@@ -768,6 +781,8 @@ public struct LassoContext: Sendable {
         self.includeLoader = includeLoader
         self.includePath = includePath
         includeStack = []
+        lastErrorLocation = nil
+        lastErrorIncludeStack = nil
         includeRenderService = nil
         includedOncePaths = []
         self.requestProvider = requestProvider

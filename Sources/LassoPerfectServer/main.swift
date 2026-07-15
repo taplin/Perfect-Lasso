@@ -725,8 +725,16 @@ struct LassoSiteServer: Sendable {
         } catch {
             throw LassoSiteRenderError(
                 underlying: error,
-                includeStack: localContext.includeStack,
-                parserDiagnostics: document.diagnostics.map(\.message)
+                // `includeStack` itself is always empty here — every
+                // enclosing `performInclude`/`performLibrary` frame's own
+                // `defer` already popped it back to empty as the error
+                // unwound. `lastErrorIncludeStack`/`lastErrorLocation`
+                // are the frozen snapshot `RendererEngine.render(_:)`
+                // recorded at the moment this first threw, before any of
+                // that unwinding happened.
+                includeStack: localContext.lastErrorIncludeStack ?? [],
+                parserDiagnostics: document.diagnostics.map(\.message),
+                location: localContext.lastErrorLocation
             )
         }
 
@@ -857,6 +865,7 @@ struct LassoSiteServer: Sendable {
             <p><strong>Filesystem path:</strong> <code>\((details.filePath ?? "(unresolved)").htmlEscaped)</code></p>
             <p><strong>Error type:</strong> <code>\(details.errorType.htmlEscaped)</code></p>
             <pre>\(details.errorDescription.htmlEscaped)</pre>
+            <p><strong>Failed at:</strong> <code>\(details.locationText.htmlEscaped)</code></p>
             <h2>Include Stack</h2>
             <pre>\(details.includeStackText.htmlEscaped)</pre>
             <h2>Parser Diagnostics</h2>
@@ -902,6 +911,11 @@ struct LassoSiteRenderError: Error, CustomStringConvertible {
     let underlying: Error
     let includeStack: [String]
     let parserDiagnostics: [String]
+    /// Where in the source this first surfaced — see
+    /// `LassoContext.lastErrorLocation`'s doc comment for how this
+    /// avoids the same defer-unwinding problem `includeStack` used to
+    /// have (fixed alongside this: see that field's comment).
+    let location: SourceRange?
 
     var description: String {
         String(describing: underlying)
@@ -945,9 +959,23 @@ struct RenderFailureDetails {
         return diagnostics.joined(separator: "\n")
     }
 
+    /// The file the error actually happened in — the deepest active
+    /// include (`includeStack`'s last-pushed entry) if any include was
+    /// active, otherwise the top-level page itself.
+    var failureFile: String {
+        renderError?.includeStack.last ?? resolvedPath
+    }
+
+    var locationText: String {
+        guard let location = renderError?.location else {
+            return "(unknown)"
+        }
+        return "\(failureFile):\(location.start.line):\(location.start.column)"
+    }
+
     var logLine: String {
         let file = filePath ?? "(unresolved)"
-        return "Lasso render error request=\(requestURI) route=\(routePath) resolved=\(resolvedPath) file=\(file) type=\(errorType) error=\(errorDescription)"
+        return "Lasso render error request=\(requestURI) route=\(routePath) resolved=\(resolvedPath) file=\(file) type=\(errorType) error=\(errorDescription) at=\(locationText)"
     }
 }
 

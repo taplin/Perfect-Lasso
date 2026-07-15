@@ -33,8 +33,9 @@ struct ScriptBodyParser {
             if parseBlockOpening() { continue }
             if parseIgnoredBrace() { continue }
 
+            let statementStart = index
             let statement = readStatement()
-            emitStatement(statement)
+            emitStatement(statement, start: statementStart, end: index)
         }
         for openName in openBraceBlockStack.reversed() {
             diagnostics.append(Diagnostic(message: "Unclosed \(openName) block", range: range))
@@ -341,14 +342,20 @@ struct ScriptBodyParser {
         return true
     }
 
-    private mutating func emitStatement(_ statement: String) {
+    private mutating func emitStatement(_ statement: String, start: Int, end: Int) {
         let trimmed = statement.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !trimmed.isEmpty else { return }
+        // A precise per-statement range (this parser's constant `range`
+        // covers the *entire* script-mode span it was constructed with —
+        // e.g. a whole `<?lasso ... ?>` block — which made every emitted
+        // node report the exact same "line 1, column 1"-ish location
+        // regardless of which statement actually failed).
+        let statementRange = SourceRange(start: position(start), end: position(end))
         var parser = ExpressionParser(normalizeReturn(trimmed))
         let expressions = parser.parseList()
         guard expressions.count == 1 else {
             if !expressions.isEmpty {
-                nodes.append(.code(expressions, .lasso9, delimiter, range))
+                nodes.append(.code(expressions, .lasso9, delimiter, statementRange))
             }
             return
         }
@@ -370,12 +377,28 @@ struct ScriptBodyParser {
         // same gap — see Documentation/outstanding-compatibility-project-plans.md.
         switch expressions[0] {
         case let .call(.identifier(name), arguments) where Self.bareBlockNames.contains(name.lowercased()):
-            nodes.append(.tag(name: name, arguments: arguments, closing: false, dialect: .lasso8, range: range))
+            nodes.append(.tag(name: name, arguments: arguments, closing: false, dialect: .lasso8, range: statementRange))
         case let .identifier(name) where Self.bareBlockNames.contains(name.lowercased()):
-            nodes.append(.tag(name: name, arguments: [], closing: false, dialect: .lasso8, range: range))
+            nodes.append(.tag(name: name, arguments: [], closing: false, dialect: .lasso8, range: statementRange))
         default:
-            nodes.append(.code(expressions, .lasso9, delimiter, range))
+            nodes.append(.code(expressions, .lasso9, delimiter, statementRange))
         }
+    }
+
+    /// Translates a local offset into `characters` (this parser's own
+    /// script-mode span) into an absolute `SourcePosition` in the whole
+    /// document, anchored at `range.start` (this span's own starting
+    /// position within that document).
+    private func position(_ offset: Int) -> SourcePosition {
+        var line = range.start.line
+        var lastNewlineIndex: Int?
+        let clampedOffset = min(offset, characters.count)
+        for index in 0..<clampedOffset where characters[index] == "\n" {
+            line += 1
+            lastNewlineIndex = index
+        }
+        let column = lastNewlineIndex.map { clampedOffset - $0 } ?? range.start.column + clampedOffset
+        return SourcePosition(offset: range.start.offset + clampedOffset, line: line, column: column)
     }
 
     private static let bareBlockNames: Set<String> = [

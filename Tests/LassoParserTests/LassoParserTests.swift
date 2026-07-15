@@ -4182,3 +4182,83 @@ private final class MapIncludeLoader: LassoIncludeLoader, @unchecked Sendable {
     )
     #expect(output.contains("a=1;"))
 }
+
+@Test func renderErrorRecordsTheDeepestLocationAndIncludeStackNotTheOutermostOne() async throws {
+    // Real corpus symptom this fixes: the dev server's error page always
+    // showed "Include Stack: (empty)" no matter how deep the actual
+    // include chain was — `LassoContext.includeStack` genuinely is empty
+    // by the time a caller reads it after `LassoRenderer.render` throws,
+    // because every `performInclude`/`performLibrary` frame's own
+    // `defer` pops its entry as the error unwinds through it. The fix
+    // records a frozen snapshot (`lastErrorLocation`/
+    // `lastErrorIncludeStack`) at the moment the error first surfaces,
+    // in `RendererEngine.render(_:)`, before any of that unwinding
+    // happens — and it must be the *deepest* node/include, not an outer
+    // one that only re-throws the same error on its way up.
+    final class InMemoryIncludeLoader: LassoIncludeLoader, @unchecked Sendable {
+        let content: String
+        init(content: String) { self.content = content }
+        func loadInclude(path: String, from includingPath: String?) throws -> String { content }
+    }
+
+    let loader = InMemoryIncludeLoader(content: "line1\nline2\n[totally_undefined_native()]\n")
+    var context = LassoContext(includeLoader: loader)
+
+    await #expect(throws: LassoRuntimeError.unknownFunction("totally_undefined_native")) {
+        _ = try await LassoRenderer().render("before\n[include('bad.lasso')]", context: &context)
+    }
+
+    // The failing call sits on line 3 *of the included file*, not the
+    // outer page (where the `[include(...)]` call itself is on line 2).
+    #expect(context.lastErrorLocation?.start.line == 3)
+    #expect(context.lastErrorIncludeStack == ["bad.lasso"])
+}
+
+@Test func renderErrorLocationIsNilForARecoverableErrorProtectSwallows() async throws {
+    // A `[protect]`-caught `LassoRecoverableError` is handled, not a real
+    // page failure — recording a location for it would misleadingly
+    // suggest the page crashed when it didn't. This also guards the
+    // `[protect]` mechanism itself: `RendererEngine.render(_:)` must
+    // rethrow `LassoRecoverableError` completely unwrapped/unmodified, or
+    // `[protect]`'s own `catch let recoverable as LassoRecoverableError`
+    // stops matching and every recoverable error becomes fatal instead.
+    // Same synthetic-tag setup as `protectCatchesRecoverableErrorAndSetsCurrentError`.
+    var natives = LassoNativeRegistry()
+    natives.register("fail_with_db_error") { _, _ in
+        throw LassoRecoverableError(LassoErrorState(code: 42, message: "Add failed", kind: "add"))
+    }
+    var context = LassoContext(natives: natives)
+    let output = try await LassoRenderer().render(
+        "[protect]during-[fail_with_db_error]-unreached[/protect]-after",
+        context: &context
+    )
+    // A protected body that fails partway discards everything rendered
+    // up to the failure point (see `protect`'s own doc comment in
+    // Renderer.swift) — "during-" never survives, only "-after" does.
+    #expect(output == "-after")
+    #expect(context.lastErrorLocation == nil)
+}
+
+@Test func renderErrorLocationIsPreciseToOneStatementInFullScriptModeFiles() async throws {
+    // `ScriptBodyParser` (full `<?lasso ... ?>`-mode files, e.g. real
+    // corpus includes/detail_a_sku.lasso) used to stamp every emitted
+    // node with the exact same range — the range of the *entire*
+    // script-mode span it was constructed with — so every error in such
+    // a file reported the same near-meaningless "line 1, column 1"-ish
+    // location regardless of which of potentially hundreds of statements
+    // actually failed. Each statement now gets its own precise range.
+    var context = LassoContext()
+    await #expect(throws: LassoRuntimeError.unknownFunction("totally_undefined_native")) {
+        _ = try await LassoRenderer().render(
+            """
+            <?lasso
+                local(a = 1)
+                local(b = 2)
+                totally_undefined_native()
+            ?>
+            """,
+            context: &context
+        )
+    }
+    #expect(context.lastErrorLocation?.start.line == 4)
+}

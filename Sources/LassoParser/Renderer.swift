@@ -8,18 +8,33 @@ public struct LassoRenderer: Sendable {
 
     public func render(_ document: LassoDocument, context: inout LassoContext) async throws -> String {
         var engine = RendererEngine(context: context)
-        var output = try await engine.render(document.nodes)
-        // A `return` at page/include level (not inside a called custom tag,
-        // which already consumes its own signal) contributes its value to
-        // the page's output — the same behavior `<?lassoscript ... return
-        // json_serialize(...) ?>`-style API pages already relied on before
-        // `return` gained real short-circuiting control flow.
-        if let returned = engine.evaluator.context.consumeReturnSignal() {
-            output += returned.outputString
+        do {
+            var output = try await engine.render(document.nodes)
+            // A `return` at page/include level (not inside a called custom
+            // tag, which already consumes its own signal) contributes its
+            // value to the page's output — the same behavior
+            // `<?lassoscript ... return json_serialize(...) ?>`-style API
+            // pages already relied on before `return` gained real
+            // short-circuiting control flow.
+            if let returned = engine.evaluator.context.consumeReturnSignal() {
+                output += returned.outputString
+            }
+            engine.evaluator.context.finalizeSessions()
+            context = engine.evaluator.context
+            return output
+        } catch {
+            // Write back the engine's mutated context even on failure —
+            // this is what actually exposes `lastErrorLocation`/
+            // `lastErrorIncludeStack` (set inside `RendererEngine.render`
+            // at the moment the error first surfaces) to the caller.
+            // Without this, `context` here is `inout`, but the local
+            // `engine` variable's own copy is a completely separate value
+            // that was never written back on the throw path — the
+            // caller's `context` argument would silently stay exactly as
+            // it was *before* rendering ever started.
+            context = engine.evaluator.context
+            throw error
         }
-        engine.evaluator.context.finalizeSessions()
-        context = engine.evaluator.context
-        return output
     }
 }
 
@@ -30,9 +45,19 @@ private struct RendererEngine {
         evaluator = Evaluator(context: context)
         evaluator.renderNodes = { nodes, context in
             var engine = RendererEngine(context: context)
-            let output = try await engine.render(nodes)
-            context = engine.evaluator.context
-            return output
+            do {
+                let output = try await engine.render(nodes)
+                context = engine.evaluator.context
+                return output
+            } catch {
+                // Write back even on failure — see `LassoRenderer.render`'s
+                // matching comment; without this, `lastErrorLocation`/
+                // `lastErrorIncludeStack` set deeper in this same call
+                // chain (e.g. inside a custom tag body rendered through
+                // this closure) never reach the caller.
+                context = engine.evaluator.context
+                throw error
+            }
         }
         if evaluator.context.includeRenderService == nil {
             evaluator.context.includeRenderService = RendererIncludeService()
@@ -42,30 +67,62 @@ private struct RendererEngine {
     mutating func render(_ nodes: [LassoNode]) async throws -> String {
         var output = ""
         for node in nodes {
-            switch node {
-            case let .text(text, _):
-                output += text
-            case let .expression(expression, _, _, _):
-                if case let .identifier(name) = expression, name.lowercased() == "no_square_brackets" {
+            do {
+                switch node {
+                case let .text(text, _):
+                    output += text
+                case let .expression(expression, _, _, _):
+                    if case let .identifier(name) = expression, name.lowercased() == "no_square_brackets" {
+                        continue
+                    }
+                    output += try await renderExpression(expression)
+                case let .code(expressions, _, _, _):
+                    for expression in expressions {
+                        output += try await renderExpression(expression)
+                        if evaluator.context.returnSignal != nil { break }
+                    }
+                case let .block(name, arguments, body, alternate, _, _):
+                    output += try await renderBlock(
+                        name: name,
+                        arguments: arguments,
+                        body: body,
+                        alternate: alternate
+                    )
+                case let .typeDefinition(definition, _, _):
+                    evaluator.context.tagRegistry.registerType(definition)
+                case .tag:
                     continue
                 }
-                output += try await renderExpression(expression)
-            case let .code(expressions, _, _, _):
-                for expression in expressions {
-                    output += try await renderExpression(expression)
-                    if evaluator.context.returnSignal != nil { break }
+            } catch let recoverable as LassoRecoverableError {
+                // Must stay unwrapped and unrecorded: `[protect]` (below)
+                // catches this exact type via `catch let recoverable as
+                // LassoRecoverableError` around its own `render(body)`
+                // call, and a recoverable error is by definition handled,
+                // not a real page failure worth an error-location report.
+                throw recoverable
+            } catch {
+                // Record where this first surfaced, then rethrow the
+                // *original, unwrapped* error — many tests assert on the
+                // concrete thrown type (`LassoRuntimeError.xyz`, etc.) and
+                // a wrapper type here would break all of them. Recording
+                // onto `context` instead works because `context` is
+                // `inout` all the way up: Swift writes back an `inout`
+                // parameter's final value even when the function exits by
+                // throwing, so `lastErrorLocation`/`lastErrorIncludeStack`
+                // still reach the top-level caller intact — unlike
+                // `includeStack` itself, which every enclosing
+                // `performInclude`/`performLibrary` frame's own `defer`
+                // pops back to empty during that same unwind. Guarding on
+                // `== nil` keeps the *first* (deepest, most precise) catch
+                // as the one that sticks — this same catch block re-fires
+                // for every enclosing `render(_:)` call the error
+                // unwinds through (nested blocks, then include frames),
+                // and each of those is progressively shallower.
+                if evaluator.context.lastErrorLocation == nil {
+                    evaluator.context.lastErrorLocation = node.range
+                    evaluator.context.lastErrorIncludeStack = evaluator.context.includeStack
                 }
-            case let .block(name, arguments, body, alternate, _, _):
-                output += try await renderBlock(
-                    name: name,
-                    arguments: arguments,
-                    body: body,
-                    alternate: alternate
-                )
-            case let .typeDefinition(definition, _, _):
-                evaluator.context.tagRegistry.registerType(definition)
-            case .tag:
-                continue
+                throw error
             }
             if evaluator.context.returnSignal != nil { break }
         }
@@ -418,9 +475,22 @@ struct RendererIncludeService: LassoIncludeRenderService {
             context.tagRegistry.cacheInclude(forKey: cacheKey, source: source, document: document)
         }
         var engine = RendererEngine(context: context)
-        let output = try await engine.render(document.nodes)
-        context = engine.evaluator.context
-        return output
+        do {
+            let output = try await engine.render(document.nodes)
+            context = engine.evaluator.context
+            return output
+        } catch {
+            // Write back even on failure — see `LassoRenderer.render`'s
+            // matching comment. This also matters for the `defer` above:
+            // it pops exactly one `includeStack`/`includePath` frame off
+            // `context` at whatever `context` holds when this function
+            // exits, so it must reflect this include's real final state
+            // (including any deeper, already-failed nested includes)
+            // rather than silently reverting to what `context` looked
+            // like before this include even started.
+            context = engine.evaluator.context
+            throw error
+        }
     }
 
     /// Loads and runs a library. `once`, when true, applies LassoSoft's
@@ -462,7 +532,14 @@ struct RendererIncludeService: LassoIncludeRenderService {
 
         let source = try loader.loadInclude(path: path, from: context.includePath)
         var engine = RendererEngine(context: context)
-        _ = try await engine.render(LassoParser().parse(source).nodes)
-        context = engine.evaluator.context
+        do {
+            _ = try await engine.render(LassoParser().parse(source).nodes)
+            context = engine.evaluator.context
+        } catch {
+            // Write back even on failure — see `performInclude`'s
+            // matching comment just above.
+            context = engine.evaluator.context
+            throw error
+        }
     }
 }

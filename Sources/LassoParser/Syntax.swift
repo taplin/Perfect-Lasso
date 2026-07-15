@@ -154,4 +154,19 @@ public indirect enum LassoNode: Equatable, Sendable {
         range: SourceRange
     )
     case typeDefinition(LassoTypeDefinition, LassoDialect, SourceRange)
+
+    /// Every case's trailing `SourceRange` — used to attach a "failed at
+    /// line N" location to a render error at the point it's first thrown,
+    /// before any unwinding. See `RendererEngine.render(_:)`.
+    public var range: SourceRange {
+        switch self {
+        case let .text(_, range),
+             let .expression(_, _, _, range),
+             let .tag(_, _, _, _, range),
+             let .code(_, _, _, range),
+             let .block(_, _, _, _, _, range),
+             let .typeDefinition(_, _, range):
+            range
+        }
+    }
 }
