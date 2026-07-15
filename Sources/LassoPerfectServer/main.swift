@@ -85,6 +85,17 @@ struct ServerConfig: Sendable {
     /// `LASSO_CRAWL_ONLY_FAILURE` — a substring matched against
     /// `crawlBaselinePath`'s `errorDescription` values.
     let crawlOnlyFailure: String?
+    /// `LASSO_IMAGE_PROXY_PREFIX`/`LASSO_IMAGE_PROXY_TARGET` — a temporary
+    /// escape hatch for a local site-root copy that's missing a real image
+    /// tree: any request whose resolved path starts with `imageProxyPrefix`
+    /// (e.g. "product_images") gets redirected (302) to
+    /// `imageProxyTarget` + the remainder of the path instead of being
+    /// resolved against the local filesystem — e.g.
+    /// "product_images/koi/247.jpg" -> "https://api.iscrubs.com/
+    /// product_images/koi/247.jpg". Both unset (the default) disables
+    /// this entirely. See Documentation/lasso-perfect-server.md.
+    let imageProxyPrefix: String?
+    let imageProxyTarget: String?
 
     static func load() throws -> ServerConfig {
         let env = ProcessInfo.processInfo.environment
@@ -173,7 +184,9 @@ struct ServerConfig: Sendable {
                 .filter { $0.isEmpty == false },
             crawlPathListPath: env["LASSO_CRAWL_PATH_LIST"],
             crawlBaselinePath: env["LASSO_CRAWL_BASELINE"],
-            crawlOnlyFailure: env["LASSO_CRAWL_ONLY_FAILURE"]
+            crawlOnlyFailure: env["LASSO_CRAWL_ONLY_FAILURE"],
+            imageProxyPrefix: env["LASSO_IMAGE_PROXY_PREFIX"]?.trimmingCharacters(in: CharacterSet(charactersIn: "/")),
+            imageProxyTarget: env["LASSO_IMAGE_PROXY_TARGET"]?.trimmingCharacters(in: CharacterSet(charactersIn: "/"))
         )
     }
 
@@ -544,6 +557,13 @@ struct LassoSiteServer: Sendable {
         do {
             let path = try resolveRequestPath(trailingPath)
             resolvedPath = path
+            if let redirect = imageProxyRedirect(for: path) {
+                return redirect
+            }
+            if Self.imageExtensions.contains(URL(fileURLWithPath: path).pathExtension.lowercased()),
+               localFileExists(path) == false {
+                return Self.missingImagePlaceholderOutput()
+            }
             let fileURL = try fileURL(for: path)
             resolvedFileURL = fileURL
             if shouldRender(fileURL) {
@@ -562,6 +582,49 @@ struct LassoSiteServer: Sendable {
                 fileURL: resolvedFileURL
             )
         }
+    }
+
+    /// `LASSO_IMAGE_PROXY_PREFIX`/`LASSO_IMAGE_PROXY_TARGET` — see
+    /// `ServerConfig`'s doc comment. Checked before any local filesystem
+    /// resolution, so a configured prefix (e.g. "product_images") never
+    /// falls through to the missing-image placeholder below; it always
+    /// redirects to the real source instead.
+    private func imageProxyRedirect(for path: String) -> HTTPOutput? {
+        guard let prefix = config.imageProxyPrefix, let target = config.imageProxyTarget,
+              prefix.isEmpty == false, target.isEmpty == false else { return nil }
+        guard path == prefix || path.hasPrefix(prefix + "/") else { return nil }
+        let remainder = path.dropFirst(prefix.count)
+        return RedirectOutput(to: target + remainder, status: .found)
+    }
+
+    private static let imageExtensions: Set<String> = ["jpg", "jpeg", "png", "gif", "webp", "bmp", "ico", "svg"]
+
+    /// A same-size-agnostic placeholder so a real product/template image
+    /// missing from a local site-root copy shows a visible, deliberate
+    /// "image not available" box instead of a broken-image icon (whose
+    /// intrinsic size is usually 0x0 or browser-chrome-dependent) —
+    /// keeping the surrounding page layout intact rather than mangled.
+    /// SVG scales to whatever width/height the `<img>` tag or its CSS
+    /// specifies, unlike a fixed-dimension raster placeholder.
+    private static func missingImagePlaceholderOutput() -> HTTPOutput {
+        let svg = """
+        <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 400 300" preserveAspectRatio="xMidYMid meet">
+        <rect width="400" height="300" fill="#eeeeee"/>
+        <rect x="0.5" y="0.5" width="399" height="299" fill="none" stroke="#cccccc"/>
+        <g stroke="#bbbbbb" stroke-width="2">
+        <line x1="40" y1="40" x2="360" y2="260"/>
+        <line x1="360" y1="40" x2="40" y2="260"/>
+        </g>
+        <text x="200" y="280" font-family="sans-serif" font-size="14" fill="#999999" text-anchor="middle">Image not available</text>
+        </svg>
+        """
+        return BytesOutput(
+            head: HTTPHead(status: .ok, headers: HTTPHeaders([
+                ("Content-Type", "image/svg+xml"),
+                ("Cache-Control", "no-store"),
+            ])),
+            body: Array(svg.utf8)
+        )
     }
 
     /// Reads and parses the request body asynchronously, before the
@@ -624,6 +687,20 @@ struct LassoSiteServer: Sendable {
             }
         }.joined(separator: "/")
         return normalized.isEmpty ? "index.lasso" : normalized
+    }
+
+    /// A non-throwing existence check mirroring `fileURL(for:)`'s own
+    /// candidate resolution, used ahead of it so the missing-image
+    /// placeholder path never has to catch-and-inspect a thrown
+    /// `ErrorOutput` (which doesn't expose its status code publicly).
+    private func localFileExists(_ relativePath: String) -> Bool {
+        let candidate = config.siteRoot
+            .appendingPathComponent(relativePath)
+            .standardizedFileURL
+            .resolvingSymlinksInPath()
+        guard isWithinRoot(candidate) else { return false }
+        var isDirectory: ObjCBool = false
+        return FileManager.default.fileExists(atPath: candidate.path, isDirectory: &isDirectory) && isDirectory.boolValue == false
     }
 
     private func fileURL(for relativePath: String) throws -> URL {
