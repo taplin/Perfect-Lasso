@@ -4112,3 +4112,73 @@ private final class MapIncludeLoader: LassoIncludeLoader, @unchecked Sendable {
     )
     #expect(output == "3")
 }
+
+@Test func arrayInsertBuildsAnArrayOfPairsMutatingTheInvocantInPlace() async throws {
+    // Real corpus: includes/detail_a_sku.lasso's
+    // `$skuArrayItem->insert(field('scrubs_sku') = $temp_array)` (a bare
+    // `key = value` call argument constructs a `.pair`, since
+    // `field('scrubs_sku')` can't be a valid assignment target — this is
+    // real Lasso 9 Pair-literal syntax, not an assignment) and
+    // `$skuArrayColor->insert(field('color'))` (plain value, no pair) —
+    // both called as bare statements with no `=`, relying on `->insert`
+    // mutating the invocant variable in place. Read back via
+    // includes/detail_by_color.lasso's `#skuItem->second->get:1` (a
+    // colon-call on a member-access result).
+    var context = LassoContext()
+    let output = try await LassoRenderer().render(
+        """
+        [var(items::array = array)]
+        [$items->insert('a' = array(1, 2, 3))]
+        [$items->insert('b' = array(4, 5, 6))]
+        size=[$items->size]|first_key=[$items->first->first]|second_value_elem2=[$items->first->second->get:2]
+        [var(plain::array = array)]
+        [$plain->insert('x')]
+        [$plain->insert('y')]
+        plain=[$plain->get:1],[$plain->get:2]
+        """,
+        context: &context
+    )
+    #expect(output.contains("size=2"))
+    #expect(output.contains("first_key=a"))
+    #expect(output.contains("second_value_elem2=2"))
+    #expect(output.contains("plain=x,y"))
+}
+
+@Test func mapInsertAddsAKeyedEntryMutatingTheInvocantInPlace() async throws {
+    // Real corpus: includes/detail_by_size.lasso's
+    // `var(skuArrayItem = map)` followed by
+    // `$skuArrayItem->insert(field('scrubs_sku')=array(...))` — unlike
+    // the array case above, a `key = value` argument on a *map* invocant
+    // is a real map insertion (add/overwrite the entry keyed by the left
+    // side), not a Pair literal.
+    var context = LassoContext()
+    let output = try await LassoRenderer().render(
+        """
+        [var(m::map = map)]
+        [$m->insert('koi247' = 'red')]
+        value=[$m->koi247]
+        """,
+        context: &context
+    )
+    #expect(output.contains("value=red"))
+}
+
+@Test func iterateBindsTheNamedVariableFromItsSecondArgumentAndYieldsPairsForMaps() async throws {
+    // Real corpus: includes/detail_by_size.lasso's
+    // `iterate($skuArrayItem, var(skuItem))` (where `$skuArrayItem` is a
+    // `map`, built via repeated `->insert(key = value)`), whose body only
+    // ever references `$skuItem`/`#skuItem->second`, never the previous
+    // hardcoded `loop_value` binding — and map iteration must yield
+    // Pair(key, value) elements, not bare values, for `->first`/`->second`
+    // to mean anything.
+    var context = LassoContext()
+    let output = try await LassoRenderer().render(
+        """
+        [var(m::map = map)]
+        [$m->insert('a' = 1)]
+        [iterate($m, var(item))][$item->first]=[$item->second->asString(-precision=0)];[/iterate]
+        """,
+        context: &context
+    )
+    #expect(output.contains("a=1;"))
+}

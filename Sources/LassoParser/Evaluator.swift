@@ -58,6 +58,15 @@ struct Evaluator {
             }
             return try binary(try await evaluate(left), op, try await evaluate(right))
         case let .call(callee, arguments):
+            // `expr->get:1` (bare colon-call on a member access, no `(`)
+            // parses as `.call(callee: .member(base, "get", nil), args)` —
+            // the colon-call's arguments belong to the member call, not a
+            // second, separate call on its result. Real corpus:
+            // includes/detail_by_color.lasso's
+            // `#skuItem->second->get:1`.
+            if case let .member(base, name, nil) = callee {
+                return try await member(try await evaluate(base), name, arguments)
+            }
             guard case let .identifier(name) = callee else {
                 throw LassoRuntimeError.unsupportedExpression("Dynamic call")
             }
@@ -76,7 +85,21 @@ struct Evaluator {
             }
             throw LassoRuntimeError.unknownFunction(name)
         case let .member(base, name, arguments):
-            return try await member(try await evaluate(base), name, arguments ?? [])
+            let result = try await member(try await evaluate(base), name, arguments ?? [])
+            // A handful of array methods mutate the invocant in place in
+            // real Lasso (`->insert` etc.), rather than returning a new
+            // array for the caller to reassign — real corpus:
+            // includes/detail_a_sku.lasso's bare-statement
+            // `$skuArrayItem->insert(...)` (no `=`), used purely for its
+            // side effect. `LassoValue.array` is a value type here, so
+            // that side effect has to be applied explicitly: write the
+            // computed result back to `base` when it's an assignable
+            // target shape (a plain variable, matching every real corpus
+            // use of these methods so far).
+            if Self.selfMutatingArrayMethods.contains(name.lowercased()), Self.assignmentLabel(base) != nil {
+                try await assign(result, to: base, defaultScope: .unscoped)
+            }
+            return result
         case let .unknown(value):
             throw LassoRuntimeError.unsupportedExpression(value)
         }
@@ -442,8 +465,44 @@ struct Evaluator {
             return .string(try await formattedNumber(value, arguments))
         case let (.decimal(value), "ceil"): return .decimal(value.rounded(.up))
         case let (.integer(value), "ceil"): return .integer(value)
+        case let (.pair(key, _), "first"): return key
+        case let (.pair(_, value), "second"): return value
         case let (.array(values), "size"): return .integer(values.count)
         case let (.array(values), "first"): return values.first ?? .null
+        case let (.array(values), "insert"):
+            // Real corpus: includes/detail_a_sku.lasso's
+            // `$skuArrayItem->insert(field('scrubs_sku') = $temp_array)`
+            // (a bare `key = value` call argument constructs a `.pair`,
+            // not an assignment — `field('scrubs_sku')` can't be a valid
+            // assignment target anyway) and
+            // `$skuArrayColor->insert(field('color'))` (plain value,
+            // no pair). Mutation write-back to the invocant variable
+            // happens in `evaluate(_:)`'s `.member` case, not here — this
+            // just computes the new array value.
+            let newElement: LassoValue
+            if let argument = arguments.first {
+                if case let .assignment(target, value) = argument.value {
+                    newElement = .pair(try await evaluate(target), try await evaluate(value))
+                } else {
+                    newElement = try await evaluate(argument.value)
+                }
+            } else {
+                newElement = .void
+            }
+            return .array(values + [newElement])
+        case let (.map(values), "insert"):
+            // Real corpus: includes/detail_by_size.lasso's
+            // `$skuArrayItem->insert(field('scrubs_sku')=array(...))`,
+            // where `$skuArrayItem` is declared `var(skuArrayItem = map)`
+            // — the `key = value` argument here is a real map insertion
+            // (add/overwrite the entry keyed by the left side), not a
+            // Pair literal, unlike the `.array` case above.
+            guard let argument = arguments.first, case let .assignment(target, value) = argument.value else {
+                return .map(values)
+            }
+            var updated = values
+            updated[try await evaluate(target).outputString] = try await evaluate(value)
+            return .map(updated)
         case let (.array(values), "get"):
             let requested: Double?
             if let argument = arguments.first {
@@ -487,4 +546,9 @@ struct Evaluator {
         guard case let .identifier(name) = callee else { return false }
         return name.caseInsensitiveCompare("var") == .orderedSame || name.caseInsensitiveCompare("local") == .orderedSame
     }
+
+    /// Array methods real Lasso mutates the invocant with, rather than
+    /// returning a new array for the caller to reassign. See the
+    /// `.member` case's write-back comment above.
+    private static let selfMutatingArrayMethods: Set<String> = ["insert"]
 }

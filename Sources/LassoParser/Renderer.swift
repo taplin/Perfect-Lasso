@@ -206,16 +206,32 @@ private struct RendererEngine {
             if let argument = arguments.first {
                 switch try await evaluator.evaluate(argument.value) {
                 case let .array(items): values = items
-                case let .map(items): values = items.values.map { $0 }
+                // Real Lasso map iteration yields Pair(key, value)
+                // elements, not bare values — real corpus:
+                // includes/detail_by_size.lasso's
+                // `iterate($skuArrayItem, var(skuItem))` (where
+                // `$skuArrayItem` is a `map`) followed by
+                // `$skuItem->second->get(1)`.
+                case let .map(items): values = items.map { .pair(.string($0.key), $0.value) }
                 case .void, .null: values = []
                 case let value: values = [value]
                 }
             } else {
                 values = []
             }
+            // `iterate(collection, var(name))`/`local(name)` binds each
+            // element to that name (in addition to the always-set
+            // `loop_value`) — real corpus: the same
+            // `iterate($skuArrayItem, var(skuItem))` call above, whose
+            // body only ever references `$skuItem`/`#skuItem`, never
+            // `loop_value`.
+            let binding = arguments.count > 1 ? Self.iterateBinding(arguments[1].value) : nil
             var output = ""
             for (index, value) in values.enumerated() {
                 evaluator.context.set(value, for: "loop_value", scope: .local)
+                if let binding {
+                    evaluator.context.set(value, for: binding.name, scope: binding.scope)
+                }
                 evaluator.context.set(.integer(index + 1), for: "loop_count", scope: .local)
                 output += try await render(body)
             }
@@ -323,6 +339,36 @@ private struct RendererEngine {
             throw LassoRuntimeError.includeNotConfigured
         }
         return try await service.performInclude(path: path, once: false, context: &evaluator.context) ?? ""
+    }
+
+    /// Extracts the loop-variable name and scope from
+    /// `iterate(collection, var(name))`/`local(name)`'s second argument —
+    /// real corpus: includes/detail_by_size.lasso's
+    /// `iterate($skuArrayItem, var(skuItem))`, later read back as
+    /// `$skuItem` (not `#skuItem`) — `var(...)` binds in the same
+    /// default/global-ish scope `declare(_:local:)` uses for a bare
+    /// `var(...)` declaration, `local(...)` binds in `.local` scope,
+    /// matching that same function's `local ? .local : .global` mapping.
+    private static func iterateBinding(_ expression: LassoExpression) -> (name: String, scope: VariableScope)? {
+        switch expression {
+        case let .identifier(name), let .string(name):
+            return (name, .global)
+        case let .variable(name, scope):
+            return (name, scope)
+        case let .call(callee, arguments):
+            guard case let .identifier(calleeName) = callee,
+                  let firstArgument = arguments.first,
+                  let inner = iterateBinding(firstArgument.value) else { return nil }
+            if calleeName.caseInsensitiveCompare("local") == .orderedSame {
+                return (inner.name, .local)
+            }
+            if calleeName.caseInsensitiveCompare("var") == .orderedSame {
+                return (inner.name, .global)
+            }
+            return nil
+        default:
+            return nil
+        }
     }
 }
 

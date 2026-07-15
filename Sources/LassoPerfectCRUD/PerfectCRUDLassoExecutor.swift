@@ -441,7 +441,7 @@ public struct PerfectCRUDLassoExecutor: LassoDynamicQueryExecutor {
         case .integer(let value): .int(Int64(value))
         case .decimal(let value): .double(value)
         case .string(let value): .string(value)
-        case .array, .map, .object: .string(value.outputString)
+        case .array, .map, .object, .pair: .string(value.outputString)
         }
     }
 

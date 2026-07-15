@@ -10,6 +10,15 @@ public indirect enum LassoValue: Equatable, Sendable {
     case array([LassoValue])
     case map([String: LassoValue])
     case object(LassoObjectInstance)
+    /// A real Lasso 9 `Pair` — the value produced by a bare `key = value`
+    /// expression appearing somewhere OTHER than an assignment-target
+    /// position (an assignment target is a name/`::type`/member-access
+    /// shape `assign(_:to:defaultScope:)` recognizes; anything else in
+    /// that position, e.g. `field('scrubs_sku') = $temp_array`, is a Pair
+    /// literal instead). Real corpus: includes/detail_a_sku.lasso's
+    /// `$skuArrayItem->insert(field('scrubs_sku') = $temp_array)`, read
+    /// back via `->second` (includes/detail_by_color.lasso).
+    case pair(LassoValue, LassoValue)
 
     public var isTruthy: Bool {
         switch self {
@@ -21,6 +30,7 @@ public indirect enum LassoValue: Equatable, Sendable {
         case let .array(value): !value.isEmpty
         case let .map(value): !value.isEmpty
         case .object: true
+        case .pair: true
         }
     }
 
@@ -34,6 +44,7 @@ public indirect enum LassoValue: Equatable, Sendable {
         case let .array(value): value.map(\.outputString).joined()
         case let .map(value): String(describing: value)
         case let .object(value): value.typeName
+        case let .pair(key, value): "\(key.outputString) = \(value.outputString)"
         }
     }
 
@@ -57,6 +68,7 @@ public indirect enum LassoValue: Equatable, Sendable {
         case .array: "array"
         case .map: "map"
         case let .object(value): value.typeName
+        case .pair: "pair"
         }
     }
 }
@@ -97,7 +109,16 @@ public struct LassoNativeRegistry: Sendable {
 
     private mutating func registerDefaultFunctions() {
         register("string") { arguments, _ in
-            .string(arguments.first?.value.outputString ?? "")
+            // Real corpus: includes/detail_a_sku.lasso's
+            // `var(sku = string($skuArrayItem->first))`, immediately
+            // followed by `$sku->second->get:1` — real Lasso's `string()`
+            // type-cast passes a `Pair` through unconverted (there's no
+            // sensible flattened string form that would keep `->second`
+            // meaningful), rather than forcing it through `outputString`.
+            if case let .pair(key, value)? = arguments.first?.value {
+                return .pair(key, value)
+            }
+            return .string(arguments.first?.value.outputString ?? "")
         }
         register("integer") { arguments, _ in
             .integer(Int(arguments.first?.value.number ?? 0))
@@ -294,6 +315,21 @@ public struct LassoNativeRegistry: Sendable {
             return .map(values)
         }
         register("array") { arguments, _ in
+            .array(arguments.map { $0.value })
+        }
+        // Real Lasso 9's `set` (an ordered, unique-valued collection) —
+        // real corpus: includes/detail_a_sku.lasso's
+        // `var('skuArrayColor' = set)` followed by
+        // `$skuArrayColor->insert(field('color'))`, building "a special
+        // 'color' array that contains every color/print found" (per that
+        // file's own comment) across a loop of skus, several sharing the
+        // same color. Modeled as a plain `.array` for now — real `set`
+        // additionally skips inserting a value already present, which
+        // this doesn't reproduce (a real gap: the resulting color list
+        // can contain duplicates this way), but an unrecognized bare
+        // `set` identifier previously evaluated to `.void`, so
+        // `->insert` threw outright and the whole page failed to render.
+        register("set") { arguments, _ in
             .array(arguments.map { $0.value })
         }
         register("json_serialize") { arguments, _ in
@@ -596,6 +632,8 @@ extension LassoValue {
             Dictionary(uniqueKeysWithValues: values.map { ($0.key, $0.value.jsonObject) })
         case let .object(value):
             value.snapshotData().mapValues(\.jsonObject)
+        case let .pair(key, value):
+            ["first": key.jsonObject, "second": value.jsonObject]
         }
     }
 
