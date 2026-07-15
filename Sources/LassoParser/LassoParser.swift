@@ -334,6 +334,33 @@ private struct TemplateScanner {
         var parser = ExpressionParser(body)
         let expressions = parser.parseList()
         if delimiter == .square, let first = expressions.first {
+            if expressions.count > 1,
+               case let .call(callee, _) = first,
+               case let .identifier(name) = callee,
+               Self.blockTagNames.contains(name.lowercased()) {
+                // A whole block-tag statement — condition, body, `else`,
+                // closing `/name` — embedded in ONE square-bracket span,
+                // e.g. real corpus's `[if($product_subset == 'all')
+                // var(temp_tbl='ca_web') else var(temp_tbl='lc_web') /if]`
+                // (pages/subcats.page.lasso). The plain path below only
+                // keeps `expressions.first` (the opening call) and
+                // silently drops everything after it in this same body —
+                // no body, no `else`, no closing tag ever becomes a real
+                // node — so `BlockBuilder` pairs this phantom open with
+                // whatever `[/if]`/`[else]` happens to appear *later* in
+                // the page, silently swallowing real content in between
+                // (confirmed live: this exact page's category list and
+                // product thumbnails never rendered). `expressions.count
+                // > 1` is the signal that more than just the opening call
+                // was parsed from this one span — needs the same
+                // statement/block-aware `ScriptBodyParser` treatment
+                // `bodyOpensWithDefine`/`bodyOpensWithLegacyDefinition`
+                // above already get for the same reason.
+                var scriptParser = ScriptBodyParser(source: body, range: range, delimiter: .square)
+                nodes.append(contentsOf: scriptParser.parse())
+                diagnostics.append(contentsOf: scriptParser.diagnostics)
+                return
+            }
             if case let .call(callee, arguments) = first,
                case let .identifier(name) = callee,
                Self.blockTagNames.contains(name.lowercased()) {

@@ -3830,3 +3830,91 @@ private final class MapIncludeLoader: LassoIncludeLoader, @unchecked Sendable {
     )
     #expect(output == "no<br>smoking<br>allowed")
 }
+
+@Test func fullIfElseBlockEmbeddedInOneSquareBracketSpanDoesNotSwallowFollowingContent() async throws {
+    // Real corpus (pages/subcats.page.lasso) wraps a full condition/body/
+    // else/close sequence in ONE square-bracket span:
+    // `[if($product_subset == 'all') var(temp_tbl='ca_web') else
+    // var(temp_tbl='lc_web') /if]` — not the usual `[if(...)] ... [/if]`
+    // shape with separate bracket tags. The generic path only kept
+    // `expressions.first` (the opening `if(...)` call) and silently
+    // dropped everything else in that same span — no body, no `else`, no
+    // closing tag ever became a real node — so `BlockBuilder` paired this
+    // phantom open with whatever `[/if]`/`[else]` happened to appear
+    // *later* in the page, swallowing all real content in between
+    // (confirmed live: this exact page's category list and product
+    // thumbnails never rendered).
+    var trueContext = LassoContext(globals: ["product_subset": .string("all")])
+    let trueOutput = try await LassoRenderer().render(
+        """
+        before
+        [if($product_subset == 'all')
+            var(temp_tbl::string = 'ca_web')
+        else
+            var(temp_tbl::string = 'lc_web')
+        /if]
+        temp_tbl is [$temp_tbl]
+        after
+        """,
+        context: &trueContext
+    )
+    #expect(trueOutput.contains("temp_tbl is ca_web"))
+    #expect(trueOutput.contains("after"))
+
+    var falseContext = LassoContext(globals: ["product_subset": .string("koi")])
+    let falseOutput = try await LassoRenderer().render(
+        """
+        before
+        [if($product_subset == 'all')
+            var(temp_tbl::string = 'ca_web')
+        else
+            var(temp_tbl::string = 'lc_web')
+        /if]
+        temp_tbl is [$temp_tbl]
+        after
+        """,
+        context: &falseContext
+    )
+    #expect(falseOutput.contains("temp_tbl is lc_web"))
+    #expect(falseOutput.contains("after"))
+}
+
+@Test func bareComparisonOperatorFlagIsEquivalentToOpEquals() async throws {
+    // `-Cn` (and every other bare comparison-operator shorthand — `-Eq`,
+    // `-Bw`, `-Ew`, `-Gt`, `-Gte`, `-Lt`, `-Lte`, `-Neq` — real Lasso/
+    // FileMaker CWP syntax) is equivalent to `-Op='cn'` etc. Before this
+    // was recognized, an unrecognized bare `-cn` fell into fieldArguments
+    // and produced a bogus `LassoInlineCriterion(field: "cn", ...)`,
+    // corrupting the generated SQL with a literal `cn` column reference
+    // instead of applying `.contains` to the criterion that actually
+    // followed it. Found live via pages/subcats.page.lasso's
+    // `-cn, 'parent_id'=$bottom_cat, 'store_id'=$product_subset` — a
+    // subcategory listing query that silently returned zero real category
+    // rows (masked as "no matching data" until logging the underlying
+    // MySQL error revealed "Unknown column 'cn' in 'where clause'").
+    final class QueryRecorder: @unchecked Sendable {
+        private(set) var queries: [DynamicQuery] = []
+        func record(_ query: DynamicQuery) { queries.append(query) }
+    }
+    let recorder = QueryRecorder()
+    let executor = PerfectCRUDLassoExecutor(
+        capabilities: { _ in .readOnly },
+        queryHandler: { _, query in
+            recorder.record(query)
+            return DynamicResult(rows: [], statement: "SELECT ...")
+        }
+    )
+    let provider = LassoDynamicInlineProvider(executor: executor, datasourceAliases: ["catalog_mysql": "catalog"])
+    var context = LassoContext(inlineProvider: provider)
+
+    _ = try await LassoRenderer().render(
+        "[inline(-database='catalog_mysql',-table='skus',-cn,'store_id'='abc',-search)][/inline]",
+        context: &context
+    )
+
+    let seenQueries = recorder.queries
+    #expect(seenQueries.count == 1)
+    #expect(seenQueries[0].predicates == [
+        DynamicPredicate(field: "store_id", comparison: .contains, value: .string("abc")),
+    ])
+}

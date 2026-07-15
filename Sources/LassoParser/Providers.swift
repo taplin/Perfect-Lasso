@@ -227,7 +227,23 @@ public struct LassoInlineRequest: Equatable, Sendable {
         }
         self.action = action
 
-        let operations = arguments.strings(named: "op")
+        // `-Op='cn'` and bare `-Cn` are the same real Lasso/FileMaker CWP
+        // comparison-operator syntax — the bare form is shorthand for the
+        // matching `-Op=` value (`-Eq`/`-Cn`/`-Bw`/`-Ew`/`-Gt`/`-Gte`/`-Lt`/
+        // `-Lte`/`-Neq`, matching every alias `PerfectCRUDLassoExecutor`'s
+        // `comparison(_:)` recognizes). Found live via
+        // pages/subcats.page.lasso's bare `-cn,` flag: since "cn" wasn't in
+        // `reservedNames`, it fell into `fieldArguments` and produced a
+        // bogus `LassoInlineCriterion(field: "cn", ...)`, corrupting the
+        // generated SQL with a literal `cn` column reference instead of
+        // applying `.contains` to the criterion that follows it — exactly
+        // the same `-Op` positional-alignment corruption `-Not` was fixed
+        // for below, just from a different unrecognized bare flag.
+        let operations: [String] = arguments.compactMap { argument in
+            guard let label = argument.label?.lowercased() else { return nil }
+            if label == "op" { return argument.value.outputString }
+            return Self.comparisonAliases.contains(label) ? label : nil
+        }
         let reserved = Self.reservedNames
         let fieldArguments = arguments.filter { argument in
             guard let label = argument.label?.lowercased() else { return false }
@@ -300,7 +316,7 @@ public struct LassoInlineRequest: Equatable, Sendable {
         }
     }
 
-    private static let reservedNames: Set<String> = [
+    private static let reservedNames: Set<String> = Set<String>([
         "search", "find", "findall", "add", "update", "delete", "show", "prepare", "nothing",
         "database", "table", "sql", "returnfield", "sortfield", "sortorder", "maxrecords",
         "skiprecords", "keyfield", "keyvalue", "op", "username", "password", "statementonly",
@@ -311,6 +327,16 @@ public struct LassoInlineRequest: Equatable, Sendable {
         // silently corrupting both the criteria list and the -Op
         // positional alignment for every criterion after it.
         "not",
+    ]).union(comparisonAliases)
+
+    /// Bare comparison-operator shorthand flags — `-Cn` is real Lasso/
+    /// FileMaker CWP syntax for the same thing as `-Op='cn'` (real corpus:
+    /// pages/subcats.page.lasso's bare `-cn,`). Matches every alias
+    /// `PerfectCRUDLassoExecutor.comparison(_:)` recognizes for the
+    /// explicit `-Op=` value form, so both spellings behave identically.
+    private static let comparisonAliases: Set<String> = [
+        "eq", "equals", "neq", "ne", "notequals", "gt", "gte", "lt", "lte",
+        "bw", "beginswith", "ew", "endswith", "cn", "contains",
     ]
 }
 
