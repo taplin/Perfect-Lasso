@@ -2280,6 +2280,55 @@ func perfectCRUDConnectorFailuresBecomeInlineErrorFrames(source: String, expecte
     #expect(falseOutput == "else")
 }
 
+@Test func bareConditionBraceIfWithNoParensAndNoArrowIsRecognizedAsRealControlFlow() async throws {
+    // A THIRD `if` syntax variant found live in
+    // components/site_setup_tags.inc's excludeBots(): a bare (paren-less)
+    // condition immediately followed by a brace body, no `=>` arrow at
+    // all (`if #request == '' { ... } else { ... }`) — distinct from both
+    // `if(cond) ... /if` and `if(cond) => { ... }`. Before this fix,
+    // parseBlockOpening required an immediate '(' after "if", so this fell
+    // through entirely to being parsed as a bare ExpressionParser
+    // expression with no concept of brace bodies — the lexer tokenized
+    // the bare '{' as a symbol, producing .unknown("{"), which threw at
+    // evaluation. This was a real, live-blocking bug: excludeBots is
+    // called unconditionally on every page via _begin.lasso -> library().
+    var context = LassoContext()
+
+    let emptyOutput = try await LassoRenderer().render(
+        """
+        <?lasso
+        define classify(request::String) => {
+            if #request == '' {
+                return 'empty'
+            } else {
+                return 'has-value'
+            }
+        }
+        ?>
+        [classify('')]
+        """,
+        context: &context
+    ).trimmingCharacters(in: .whitespacesAndNewlines)
+    #expect(emptyOutput == "empty")
+
+    let nonEmptyOutput = try await LassoRenderer().render(
+        """
+        <?lasso
+        define classify(request::String) => {
+            if #request == '' {
+                return 'empty'
+            } else {
+                return 'has-value'
+            }
+        }
+        ?>
+        [classify('Mozilla/5.0')]
+        """,
+        context: &context
+    ).trimmingCharacters(in: .whitespacesAndNewlines)
+    #expect(nonEmptyOutput == "has-value")
+}
+
 @Test func colonCallIfOpenerIsRecognizedAsRealControlFlow() async throws {
     // Lasso 8's colon-call convention (`if:(condition);` ... `else;` ...
     // `/if;`) is just as valid an opener as the parenthesized-call style —
@@ -4353,4 +4402,136 @@ private final class MapIncludeLoader: LassoIncludeLoader, @unchecked Sendable {
         context: &context
     )
     #expect(output == "beforeafter")
+}
+
+@Test func doubleGreaterThanOperatorMeansStringContainsNotGreaterThan() async throws {
+    // Real Lasso 8/9's documented `>>` operator is string-contains
+    // ("left contains right"), not a synonym for `>`. It was previously
+    // implemented as one, which fell back to `compare`'s no-numeric-
+    // operand path — comparing string *lengths*, not content — so it
+    // only happened to look right for inputs where the length
+    // comparison and the real contains-check agreed by coincidence.
+    // Real corpus: ~32 files use `left >> 'substring'` for host/
+    // environment detection and bot-string matching (e.g.
+    // components/koi_setup.inc's `server_name >> 'www2'` chain).
+    var context = LassoContext()
+    let output = try await LassoRenderer().render(
+        "[('127.0.0.1' >> 'www2')]|[('www2.example.com' >> 'www2')]|[(12 > 3)]",
+        context: &context
+    )
+    #expect(output == "false|true|true")
+}
+
+@Test func elseWithConditionNestsAsRealIfElseIfNotAnUnconditionalBranch() async throws {
+    // Real Lasso 8's if-else-if chaining (`if(A) ... else(B) ... else(C)
+    // ... else ... /if`) must become nested if/else, not a flat
+    // alternate. `BlockBuilder` previously discarded `else(condition)`'s
+    // own condition entirely and always rendered whatever followed the
+    // *first* else, silently dropping any branch past the second one —
+    // real corpus: components/koi_setup.inc's server_name-based
+    // environment-detection chain always picked its second branch
+    // (secure3.iscrubs.com) regardless of the real host.
+    var context = LassoContext()
+    let output = try await LassoRenderer().render(
+        """
+        <?lasso
+        if('x' == 'nope')
+          'branch1'
+        else('x' == 'nope')
+          'branch2'
+        else('x' == 'x')
+          'branch3-correct'
+        else
+          'branch4-final'
+        /if
+        ?>
+        """,
+        context: &context
+    )
+    #expect(output.trimmingCharacters(in: .whitespacesAndNewlines) == "branch3-correct")
+
+    // Every condition false must fall all the way through to the real
+    // final (bare) else, not silently render nothing.
+    var contextAllFalse = LassoContext()
+    let outputAllFalse = try await LassoRenderer().render(
+        """
+        <?lasso
+        if('x' == 'nope')
+          'branch1'
+        else('x' == 'nope')
+          'branch2'
+        else
+          'branch3-final'
+        /if
+        ?>
+        """,
+        context: &contextAllFalse
+    )
+    #expect(outputAllFalse.trimmingCharacters(in: .whitespacesAndNewlines) == "branch3-final")
+}
+
+@Test func serverNameIsExposedAsABareGlobalTagNotJustAWebRequestMember() async throws {
+    // Real Lasso 8's bare `server_name` global tag was completely
+    // unregistered — it fell through to an ordinary (always
+    // undeclared/empty) variable lookup, silently comparing against ""
+    // in every real corpus usage (e.g. components/koi_setup.inc's
+    // environment-detection chain). `web_request->serverName` already
+    // exposed the same underlying value under a different calling
+    // convention the corpus doesn't use.
+    struct RequestProvider: LassoRequestProvider {
+        let parameters: [String: LassoValue] = [:]
+        func parameter(named name: String) -> LassoValue { .void }
+        func header(named name: String) -> LassoValue { .void }
+        func cookie(named name: String) -> LassoValue { .void }
+        var serverName: String { "127.0.0.1" }
+    }
+    var context = LassoContext(requestProvider: RequestProvider())
+    let output = try await LassoRenderer().render("[server_name]", context: &context)
+    #expect(output == "127.0.0.1")
+}
+
+@Test func multipleOrdinaryStatementsInOneSquareBracketSpanAllExecute() async throws {
+    // Real corpus: tims_loader.lasso's `[include('/a.inc')
+    // include('/b.inc') include('/c.inc')]` — three sequential calls in
+    // one square-bracket span, none of them a block-tag opener (unlike
+    // the already-handled `if(...) ... else ... /if`-in-one-span case),
+    // so the parser's fallback path only kept `expressions.first` and
+    // silently dropped the rest. This made a real "reload my custom
+    // tags" workflow only ever re-run the *first* included file's
+    // defines, no matter how many files the loader page listed.
+    final class InMemoryIncludeLoader: LassoIncludeLoader, @unchecked Sendable {
+        func loadInclude(path: String, from includingPath: String?) throws -> String {
+            switch path {
+            case "/a.inc": return "<?lasso define greetA() => { return('hello A') } ?>"
+            case "/b.inc": return "<?lasso define greetB() => { return('hello B') } ?>"
+            default: return ""
+            }
+        }
+    }
+    var context = LassoContext(includeLoader: InMemoryIncludeLoader())
+    let output = try await LassoRenderer().render(
+        "[\ninclude('/a.inc')\ninclude('/b.inc')\n][greetA] / [greetB]",
+        context: &context
+    )
+    #expect(output.contains("hello A"))
+    #expect(output.contains("hello B"))
+}
+
+@Test func wrappedMemberCallWithNestedCallConsumesBothClosingParens() async throws {
+    // `->(Method(args))` — real corpus's dominant wrapped member-call
+    // shape (e.g. pages/subcats3.page.lasso's
+    // `$uniform_restrictions->(Replace('!','<br>'))`). The old
+    // `finishWrappedMember()` path consumed only the *inner* call's
+    // closing paren (which happened to produce the right argument list)
+    // and left the wrap's own outer closing paren dangling as a bogus
+    // trailing token — invisible only because something else discarded
+    // extra top-level expressions in the same span. Also covers the
+    // `->(name: args)` colon-call and bare `->(name)` wrapped shapes,
+    // which share the same parsing branch.
+    var context = LassoContext()
+    let output = try await LassoRenderer().render(
+        "before[('no!smoking!allowed')->(Replace('!','<br>'))]after",
+        context: &context
+    )
+    #expect(output == "beforeno<br>smoking<br>allowedafter")
 }

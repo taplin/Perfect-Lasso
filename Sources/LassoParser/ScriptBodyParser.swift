@@ -134,6 +134,31 @@ struct ScriptBodyParser {
             skipHorizontalWhitespace()
         }
         guard index < characters.count, characters[index] == "(" else {
+            // Real Lasso 9 also allows `if` with a bare, paren-less
+            // condition immediately followed by a brace body
+            // (`if #request == '' { ... } else { ... }`) — distinct from
+            // both `if(cond) ... /if` and `if(cond) => { ... }`. Found
+            // live: components/site_setup_tags.inc's excludeBots(),
+            // called unconditionally on every page via
+            // _begin.lasso -> library(). Scoped to "if" only since that's
+            // the only block name with real corpus evidence of this shape.
+            if normalized == "if", let condition = readBareConditionBeforeBraceBody() {
+                let trimmedCondition = condition.trimmingCharacters(in: .whitespacesAndNewlines)
+                if !trimmedCondition.isEmpty, consumeArrowBlockStartIfPresent() {
+                    openBraceBlockStack.append(name)
+                    var conditionParser = ExpressionParser(trimmedCondition)
+                    let conditionExpression = conditionParser.parseExpression()
+                    skipLineRemainder()
+                    nodes.append(.tag(
+                        name: name,
+                        arguments: [LassoArgument(label: nil, value: conditionExpression)],
+                        closing: false,
+                        dialect: .lasso9,
+                        range: range
+                    ))
+                    return true
+                }
+            }
             index = start
             return false
         }
@@ -569,6 +594,49 @@ struct ScriptBodyParser {
         }
 
         return String(characters[start..<index])
+    }
+
+    /// Reads a bare (paren-less) `if` condition up to, but not including,
+    /// its terminating `{` or `=>` at paren-depth 0 outside any quote —
+    /// leaving `index` positioned right at that terminator so the caller
+    /// can hand off to `consumeArrowBlockStartIfPresent()` uniformly for
+    /// both the `=> {` and bare `{` sub-shapes. Returns `nil` (and rewinds
+    /// `index`) if a top-level newline or `;` is hit first, meaning this
+    /// isn't actually the bare-brace-if shape.
+    private mutating func readBareConditionBeforeBraceBody() -> String? {
+        let start = index
+        var parenDepth = 0
+        var quote: Character?
+
+        while index < characters.count {
+            let character = characters[index]
+            if let activeQuote = quote {
+                index += 1
+                if character == "\\" {
+                    index = min(index + 1, characters.count)
+                } else if character == activeQuote {
+                    quote = nil
+                }
+                continue
+            }
+
+            if character == "'" || character == "\"" {
+                quote = character
+            } else if character == "(" {
+                parenDepth += 1
+            } else if character == ")" {
+                parenDepth = max(parenDepth - 1, 0)
+            } else if parenDepth == 0, character == "{" || matches("=>") {
+                return String(characters[start..<index])
+            } else if parenDepth == 0, character == "\n" || character == ";" {
+                index = start
+                return nil
+            }
+            index += 1
+        }
+
+        index = start
+        return nil
     }
 
     /// True if `keyword` (case-insensitive) appears at `position` as a

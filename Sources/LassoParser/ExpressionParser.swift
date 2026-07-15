@@ -250,7 +250,36 @@ struct ExpressionParser {
                 let name = readMemberName()
                 let arguments: [LassoArgument]?
                 if wrapped {
-                    arguments = consume(":") ? parseArguments(closing: ")") : finishWrappedMember()
+                    if consume(":") {
+                        // `->(name: arg1, arg2)` — the colon-call form
+                        // inside the wrap. Only one closing paren is ever
+                        // expected here (the wrap's own), since there's
+                        // no separate inner call to close first.
+                        arguments = parseArguments(closing: ")")
+                    } else if consume("(") {
+                        // `->(name(arg1, arg2))` — real corpus's
+                        // dominant wrapped shape (e.g.
+                        // `$msg->(Replace('!','<br>'))`). Two closing
+                        // parens follow: the inner call's own, then the
+                        // wrap's. `finishWrappedMember()`'s old single
+                        // `parseArguments(closing: ")")` call consumed
+                        // only the *inner* call's closing paren (which
+                        // incidentally produced the right argument list,
+                        // since the inner call's own arguments are what
+                        // real Lasso means here) and left the wrap's
+                        // outer closing paren dangling — parsed as its
+                        // own bogus top-level `.unknown(")")` expression
+                        // by whatever came next, silently swallowed only
+                        // because a single-expression-per-span
+                        // assumption elsewhere discarded it unnoticed.
+                        arguments = parseArguments(closing: ")")
+                        _ = consume(")")
+                    } else {
+                        // `->(name)` — bare member access wrapped in
+                        // parens, no call at all.
+                        arguments = nil
+                        _ = consume(")")
+                    }
                 } else {
                     arguments = consume("(") ? parseArguments(closing: ")") : nil
                 }
@@ -268,11 +297,6 @@ struct ExpressionParser {
         default:
             return .unknown("<type>")
         }
-    }
-
-    mutating private func finishWrappedMember() -> [LassoArgument]? {
-        if consume(")") { return [] }
-        return parseArguments(closing: ")")
     }
 
     mutating private func parseArguments(closing: String?) -> [LassoArgument] {

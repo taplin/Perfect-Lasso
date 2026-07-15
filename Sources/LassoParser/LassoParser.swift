@@ -368,6 +368,20 @@ private struct TemplateScanner {
             } else if case let .identifier(name) = first,
                       Self.bareBlockTagNames.contains(name.lowercased()) {
                 nodes.append(.tag(name: name, arguments: [], closing: false, dialect: dialect, range: range))
+            } else if expressions.count > 1 {
+                // Multiple ordinary (non-block-tag) statements in one
+                // square-bracket span — e.g. real corpus's
+                // tims_loader.lasso: `[include('/a.inc')
+                // include('/b.inc') include('/c.inc')]`, three
+                // sequential calls with no block-tag body/closer among
+                // them, so the `expressions.count > 1` branch above
+                // (which only fires when `first` is itself a
+                // `blockTagNames` call) never triggers. Falling to
+                // `.expression(first, ...)` below kept only the very
+                // first call and silently dropped the rest — the second
+                // and third `include()` calls (and every `define`
+                // inside them) never ran at all.
+                nodes.append(.code(expressions, dialect, delimiter, range))
             } else {
                 nodes.append(.expression(first, dialect, delimiter, range))
             }

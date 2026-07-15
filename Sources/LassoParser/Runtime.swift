@@ -397,6 +397,19 @@ public struct LassoNativeRegistry: Sendable {
                 arguments.first?.value.outputString ?? ""
             return context.requestProvider?.parameter(named: name) ?? .void
         }
+        // Real Lasso 8's bare `server_name` global tag — same underlying
+        // value `web_request->serverName` already exposes
+        // (NativeTypes.swift), just also reachable without the
+        // `web_request->` prefix, matching real corpus usage (e.g.
+        // components/koi_setup.inc's `if(server_name >> 'www2' ...)`
+        // environment-detection chain). Previously unregistered
+        // entirely — a bare `server_name` fell through to
+        // `context.value(for: "server_name")`, an ordinary (always
+        // empty/undeclared) variable lookup, so every one of that
+        // chain's conditions silently compared against "".
+        register("server_name") { _, context in
+            .string(context.requestProvider?.serverName ?? "")
+        }
         // Lasso 8 request tags — see Documentation/post-body-support-plan.md.
         // `form_param` is documented as equivalent to the modern combined
         // `action_param` lookup (POST before GET). The `client_*` tags map

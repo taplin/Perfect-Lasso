@@ -364,7 +364,21 @@ struct Evaluator {
         case "%": return .integer(Int(left.number ?? 0) % max(Int(right.number ?? 0), 1))
         case "==": return .boolean(left.outputString == right.outputString)
         case "!=": return .boolean(left.outputString != right.outputString)
-        case ">", ">>": return compare(left, right, >)
+        case ">": return compare(left, right, >)
+        case ">>":
+            // Real Lasso 8/9's documented string-contains operator
+            // (`left >> right` — "does left contain right") — not a
+            // synonym for `>`. Treating it as `>` silently compared
+            // string *lengths* instead of content (`compare`'s
+            // no-numeric-operand fallback), which happened to look
+            // right for some inputs by sheer coincidence (e.g. `'' >>
+            // 'www3'` is false either way, since 0 > 4 is also false)
+            // but was wrong in general. Real corpus: ~32 files use this
+            // exact `left >> 'substring'` shape for host/environment
+            // detection (e.g. components/koi_setup.inc's
+            // `server_name >> 'www2'` chain) and bot-string matching
+            // (site_setup_tags.inc's `excludeBots`).
+            return .boolean(left.outputString.contains(right.outputString))
         case "<": return compare(left, right, <)
         case ">=": return compare(left, right, >=)
         case "<=": return compare(left, right, <=)

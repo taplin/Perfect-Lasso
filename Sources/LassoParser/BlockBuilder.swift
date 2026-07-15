@@ -37,7 +37,37 @@ struct BlockBuilder {
                     continue
                 }
                 let branch = buildSequence(until: "if")
-                alternate = branch.nodes
+                if arguments.isEmpty {
+                    // A bare `else` (no condition) is the unconditional
+                    // final branch — nothing further to nest.
+                    alternate = branch.nodes
+                } else {
+                    // `else(condition)` — real Lasso 8's if-else-if
+                    // chaining (`if(A) ... else(B) ... else(C) ... else
+                    // ... /if`). This must become NESTED if/else, not a
+                    // flat alternate: previously this branch discarded
+                    // `arguments` (the condition) entirely and returned
+                    // immediately with `alternate: branch.nodes`, which
+                    // silently dropped `branch.alternate` — meaning any
+                    // `else(condition)` behaved exactly like an
+                    // unconditional `else` (always "true"), and every
+                    // branch past the *second* one (any further
+                    // `else(condition)`/final `else`) was lost from the
+                    // tree entirely. Real corpus:
+                    // components/koi_setup.inc's environment-detection
+                    // chain (`if(server_name >> 'www2' ...) ... else
+                    // (server_name >> 'www3' ...) ... else(...) ... else
+                    // ... /if`) always picked the second branch
+                    // regardless of `server_name`'s real value.
+                    alternate = [.block(
+                        name: "if",
+                        arguments: arguments,
+                        body: branch.nodes,
+                        alternate: branch.alternate,
+                        dialect: dialect,
+                        range: SourceRange(start: range.start, end: branch.closingRange?.end ?? range.end)
+                    )]
+                }
                 return SequenceResult(
                     nodes: result,
                     alternate: alternate,
