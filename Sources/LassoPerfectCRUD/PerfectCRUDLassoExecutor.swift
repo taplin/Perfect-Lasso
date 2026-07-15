@@ -203,7 +203,7 @@ public struct PerfectCRUDLassoExecutor: LassoDynamicQueryExecutor {
                     request.sortOrders[index].lowercased().contains("desc")
                 return DynamicOrdering(field: field, descending: descending)
             },
-            limit: cappedLimit(request.maxRecords, capabilities: capabilities),
+            limit: cappedLimit(request.maxRecords, capabilities: capabilities, hasOffset: request.skipRecords != nil),
             offset: request.skipRecords
         )
         let result: DynamicResult
@@ -398,8 +398,19 @@ public struct PerfectCRUDLassoExecutor: LassoDynamicQueryExecutor {
         return allowedTables.contains(table)
     }
 
-    private func cappedLimit(_ requested: Int?, capabilities: LassoDatasourceCapabilities) -> Int? {
-        guard let maxRows = capabilities.maxRows else { return requested }
+    private func cappedLimit(_ requested: Int?, capabilities: LassoDatasourceCapabilities, hasOffset: Bool) -> Int? {
+        guard let maxRows = capabilities.maxRows else {
+            // Real Lasso/FileMaker CWP treats `-SkipRecords` with no
+            // `-Maxrecords` as "skip N, return everything else" — no upper
+            // bound. Real corpus: pages/advanced_search.page.lasso's
+            // top-category query sets `-SkipRecords=0` with no
+            // `-Maxrecords` at all. The underlying `DynamicQuery` (a
+            // sibling package, Perfect-CRUD) requires a non-nil `limit`
+            // whenever `offset` is set, so a request with an offset but no
+            // real cap needs a sentinel large enough to never actually
+            // constrain results.
+            return requested ?? (hasOffset ? Int.max : nil)
+        }
         guard let requested else { return maxRows }
         return min(requested, maxRows)
     }

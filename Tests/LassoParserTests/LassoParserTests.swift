@@ -917,13 +917,36 @@ import PerfectSessionCore
     try "NO".write(to: root.appendingPathComponent("secret.json"), atomically: true, encoding: .utf8)
     defer { try? FileManager.default.removeItem(at: root) }
 
-    let loader = try LassoFileSystemIncludeLoader(root: root)
+    // An explicit, non-empty `allowedExtensions` still confines includes to
+    // it — the mechanism itself still works when a caller opts in.
+    let loader = try LassoFileSystemIncludeLoader(root: root, allowedExtensions: ["lasso"])
     #expect(try loader.loadInclude(path: "../shared.lasso", from: "pages/home.lasso") == "OK")
     #expect(throws: LassoFileSystemIncludeError.extensionNotAllowed("json")) {
         try loader.loadInclude(path: "secret.json", from: nil)
     }
     #expect(throws: LassoFileSystemIncludeError.pathOutsideRoot("../../outside.lasso")) {
         try loader.loadInclude(path: "../../outside.lasso", from: "pages/home.lasso")
+    }
+}
+
+@Test func filesystemIncludeLoaderDefaultAllowsAnyExtensionButStillConfinesPaths() throws {
+    // Real Lasso's `[Include(...)]` tag has no extension gate at all —
+    // real corpus: pages/detail.page.lasso's
+    // `[include('javascripts/magnify.js')]`, a real product detail page
+    // include that failed outright with `extensionNotAllowed("js")` under
+    // the previous restrictive default (`lasso, inc, html, htm, txt`
+    // only). Path confinement (not extension) is the real security
+    // boundary and must still apply with no `allowedExtensions` override.
+    let root = FileManager.default.temporaryDirectory
+        .appendingPathComponent("lasso-loader-\(UUID().uuidString)")
+    try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
+    try "console.log('hi')".write(to: root.appendingPathComponent("magnify.js"), atomically: true, encoding: .utf8)
+    defer { try? FileManager.default.removeItem(at: root) }
+
+    let loader = try LassoFileSystemIncludeLoader(root: root)
+    #expect(try loader.loadInclude(path: "magnify.js", from: nil) == "console.log('hi')")
+    #expect(throws: LassoFileSystemIncludeError.pathOutsideRoot("../../outside.js")) {
+        try loader.loadInclude(path: "../../outside.js", from: "pages/home.lasso")
     }
 }
 
@@ -1099,6 +1122,43 @@ import PerfectSessionCore
         context: &context
     )
     #expect(output == "247:Black;701:Navy;")
+}
+
+@Test func perfectCRUDExecutorSuppliesASentinelLimitWhenSkipRecordsHasNoMaxrecords() async throws {
+    // Real Lasso/FileMaker CWP treats `-SkipRecords` with no `-Maxrecords`
+    // as "skip N, return everything else" — no upper bound. Real corpus:
+    // pages/advanced_search.page.lasso's top-category query,
+    // `-SkipRecords=0` with no `-Maxrecords` at all. `DynamicQuery` (the
+    // sibling Perfect-CRUD package) requires a non-nil `limit` whenever
+    // `offset` is set — the previous code left `limit` nil whenever no
+    // server-side cap was configured, regardless of whether an offset was
+    // present, so this real query threw "Dynamic query offset requires a
+    // limit" on every request, silently zeroing the "Show Only <category>"
+    // checkbox list on the real Advanced Search page.
+    final class QueryRecorder: @unchecked Sendable {
+        private(set) var queries: [DynamicQuery] = []
+        func record(_ query: DynamicQuery) { queries.append(query) }
+    }
+    let recorder = QueryRecorder()
+    let executor = PerfectCRUDLassoExecutor(
+        capabilities: { _ in .readOnly },
+        queryHandler: { _, query in
+            recorder.record(query)
+            return DynamicResult(rows: [], statement: "SELECT ...")
+        }
+    )
+    let provider = LassoDynamicInlineProvider(executor: executor, datasourceAliases: ["catalog_mysql": "catalog"])
+    var context = LassoContext(inlineProvider: provider)
+
+    _ = try await LassoRenderer().render(
+        "[inline(-database='catalog_mysql',-table='lc_web',-op='eq','parent_id'='0',-SkipRecords=0,-search)][/inline]",
+        context: &context
+    )
+
+    let seenQueries = recorder.queries
+    #expect(seenQueries.count == 1)
+    #expect(seenQueries[0].offset == 0)
+    #expect(seenQueries[0].limit != nil)
 }
 
 @Test func inlineRequestSplitsFieldAssignmentsFromSearchCriteria() throws {

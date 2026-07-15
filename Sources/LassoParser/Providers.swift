@@ -379,7 +379,19 @@ public struct LassoFileSystemIncludeLoader: LassoIncludeLoader {
 
     public init(
         root: URL,
-        allowedExtensions: Set<String> = ["lasso", "inc", "html", "htm", "txt"]
+        // Real Lasso's `[Include(...)]`/`[Include_currentpath(...)]` tags
+        // have no extension gate at all — they render whatever file the
+        // path resolves to (parsing any embedded `[...]` tags, passing the
+        // rest through as literal text) regardless of extension. Real
+        // corpus: pages/detail.page.lasso's
+        // `[include('javascripts/magnify.js')]`, which the previous
+        // restrictive default (`lasso, inc, html, htm, txt` only) rejected
+        // outright with `extensionNotAllowed("js")` — a real product
+        // detail page that renders fine in production failed to render at
+        // all locally. `isWithinRoot`'s path-confinement check (still
+        // enforced below) is the actual, meaningful security boundary
+        // here; an extension allowlist was never real Lasso behavior.
+        allowedExtensions: Set<String> = []
     ) throws {
         let resolvedRoot = root.standardizedFileURL.resolvingSymlinksInPath()
         var isDirectory: ObjCBool = false
