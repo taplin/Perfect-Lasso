@@ -41,7 +41,13 @@ private struct ExpressionLexer {
         }
         if character.isLetter || character == "_" { return .identifier(readIdentifier()) }
 
-        for op in ["->", "==", "!=", ">=", "<=", "&&", "||", "::", "=>", ">>"] where matches(op) {
+        // Compound assignment (`+=`/`-=`/`*=`/`/=`) — real corpus: hundreds
+        // of `$html += '...'`-shaped accumulator statements across the
+        // detail/cart pages (e.g. includes/detail_a_sku.lasso), previously
+        // lexed as separate `+`/`=` tokens, which broke parsing outright
+        // (a bare `=` with nothing before it is not a valid expression on
+        // its own) and silently dropped large chunks of built-up page HTML.
+        for op in ["->", "==", "!=", ">=", "<=", "&&", "||", "::", "=>", ">>", "+=", "-=", "*=", "/="] where matches(op) {
             index += op.count
             return .symbol(op)
         }
@@ -73,7 +79,23 @@ private struct ExpressionLexer {
             index += 1
             if character == quote { break }
             if character == "\\", index < characters.count {
-                value.append(characters[index])
+                // Real Lasso string literals support the standard `\n`/
+                // `\t`/`\r` control-character escapes, not just "escape
+                // the quote character" (`\'`/`\"`) — anything else
+                // (including those) is literal, matching the previous
+                // behavior. Found live: real corpus (e.g.
+                // includes/detail_a_sku.lasso) builds page HTML with
+                // string literals like `'...\n|<br>|...'`, relying on
+                // `\n` being an actual newline (invisible in HTML output)
+                // — treating it as literal "drop the backslash, keep the
+                // letter n" instead inserted a visible, spurious "n"
+                // wherever one of these appeared.
+                switch characters[index] {
+                case "n": value.append("\n")
+                case "t": value.append("\t")
+                case "r": value.append("\r")
+                default: value.append(characters[index])
+                }
                 index += 1
             } else {
                 value.append(character)
@@ -144,9 +166,15 @@ struct ExpressionParser {
               let precedence = Self.precedence[op],
               precedence >= minimumPrecedence {
             index += 1
-            let right = parseExpression(minimumPrecedence: precedence + (op == "=" ? 0 : 1))
-            left = op == "=" ? .assignment(target: left, value: right) :
-                .binary(left: left, operator: op, right: right)
+            let isAssignment = op == "=" || Self.compoundAssignmentOperators[op] != nil
+            let right = parseExpression(minimumPrecedence: precedence + (isAssignment ? 0 : 1))
+            if op == "=" {
+                left = .assignment(target: left, value: right)
+            } else if let baseOperator = Self.compoundAssignmentOperators[op] {
+                left = .assignment(target: left, value: .binary(left: left, operator: baseOperator, right: right))
+            } else {
+                left = .binary(left: left, operator: op, right: right)
+            }
         }
         // Lasso 8's `condition ? whenTrue | whenFalse` conditional-expression
         // operator — not a binary operator (not in `precedence`, and its
@@ -301,7 +329,13 @@ struct ExpressionParser {
     }
 
     private static let precedence = [
-        "=": 1, "||": 2, "&&": 3, "==": 4, "!=": 4, ">": 5, "<": 5,
+        "=": 1, "+=": 1, "-=": 1, "*=": 1, "/=": 1,
+        "||": 2, "&&": 3, "==": 4, "!=": 4, ">": 5, "<": 5,
         ">=": 5, "<=": 5, ">>": 5, "+": 6, "-": 6, "*": 7, "/": 7, "%": 7,
     ]
+
+    /// `+=`/`-=`/`*=`/`/=` is sugar for `target = target OP value` — maps
+    /// a compound-assignment symbol to the plain binary operator it
+    /// expands around.
+    private static let compoundAssignmentOperators = ["+=": "+", "-=": "-", "*=": "*", "/=": "/"]
 }

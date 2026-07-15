@@ -98,6 +98,17 @@ struct Evaluator {
             // use of these methods so far).
             if Self.selfMutatingArrayMethods.contains(name.lowercased()), Self.assignmentLabel(base) != nil {
                 try await assign(result, to: base, defaultScope: .unscoped)
+                // The mutation itself is what matters here — real corpus
+                // never uses `->insert`'s return value (every call is a
+                // bare statement, `$x->insert(...)` on its own line).
+                // Returning the mutated array/map as this *expression's*
+                // own value made a bare `[...]`/script-mode statement
+                // that calls `->insert` auto-echo the entire container's
+                // contents as visible page text (found live: a raw
+                // `KOI247-060-XS = Galaxy...` field dump appearing on a
+                // real product detail page, right where `$skuArrayItem
+                // ->insert(...)` runs as its own statement).
+                return .void
             }
             return result
         case let .unknown(value):

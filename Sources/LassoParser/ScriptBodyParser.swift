@@ -403,6 +403,18 @@ struct ScriptBodyParser {
 
     private static let bareBlockNames: Set<String> = [
         "define_tag", "define_type", "output_none", "html_comment", "encode_set", "inline",
+        // `records`/`rows` need no arguments at all — real corpus:
+        // includes/detail_a_sku.lasso's bare `records` ... `/records`
+        // (no parens, no colon-call, just the identifier). Without this,
+        // `parseBlockOpening` requires a `(` immediately after the name
+        // and falls through, so `records` became a meaningless bare
+        // top-level `.identifier` statement instead of a real block
+        // opener — its "body" (everything up to `/records`) ran as flat,
+        // un-looped top-level statements exactly once, using whatever
+        // row the search's Field() cursor defaulted to, instead of once
+        // per found row. On a real product detail page this silently
+        // built a one-size dropdown instead of one option per real SKU.
+        "records", "rows",
     ]
 
     private func normalizeReturn(_ statement: String) -> String {

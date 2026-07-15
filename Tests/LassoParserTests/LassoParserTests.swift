@@ -4262,3 +4262,95 @@ private final class MapIncludeLoader: LassoIncludeLoader, @unchecked Sendable {
     }
     #expect(context.lastErrorLocation?.start.line == 4)
 }
+
+@Test func compoundAssignmentOperatorsDesugarToAssignTargetOpValue() async throws {
+    // `+=`/`-=`/`*=`/`/=` weren't in the lexer's multi-character symbol
+    // list at all, so `$html += '...'` lexed as separate `+` and `=`
+    // tokens — a bare `=` with nothing before it isn't a valid
+    // expression, throwing `unsupportedExpression("=")`. Real corpus:
+    // ~300 occurrences of `$html +=`/`#out +=`-shaped HTML accumulator
+    // statements across detail/cart pages (e.g.
+    // includes/detail_a_sku.lasso), each one silently losing whatever
+    // HTML the page had built up to that point.
+    var context = LassoContext(globals: ["html": .string("a")])
+    let output = try await LassoRenderer().render(
+        "[$html += 'b'][$html]|[local(n = 10)][#n -= 3][#n]|[local(m = 4)][#m *= 2][#m]|[local(d = 10)][#d /= 4][#d]",
+        context: &context
+    )
+    #expect(output == "ab|7|8|2.5")
+}
+
+@Test func stringLiteralInterpretsBackslashNTAndRAsRealControlCharacters() async throws {
+    // Real Lasso string literals support the standard `\n`/`\t`/`\r`
+    // control-character escapes — the lexer previously just dropped the
+    // backslash and kept the literal next letter (`\n` -> "n", not an
+    // actual newline). Real corpus: includes/detail_a_sku.lasso builds
+    // page HTML via string literals like `'...\n|<br>|...'`, relying on
+    // `\n` being an invisible real newline in the rendered HTML —
+    // treating it as literal text inserted a visible, spurious "n"
+    // everywhere one of these appeared, corrupting the whole product
+    // detail page's dropdown/pricing markup.
+    var context = LassoContext()
+    let output = try await LassoRenderer().render("['a\\nb\\tc\\rd\\'e']", context: &context)
+    #expect(output == "a\nb\tc\rd'e")
+}
+
+@Test func bareRecordsWithNoParensLoopsOnceForEachSearchResultInScriptMode() async throws {
+    // `records` ... `/records` with no parens at all — real corpus:
+    // includes/detail_a_sku.lasso's bare `records` on its own line
+    // (script-mode, no `[...]` brackets). `parseBlockOpening` requires a
+    // `(` immediately after the name, so this fell through to a
+    // meaningless bare `.identifier` statement instead of a real block
+    // opener — its "body" (everything up to `/records`) ran as flat,
+    // un-looped top-level statements exactly once (using whatever row
+    // Field() defaulted to with no active loop cursor), not once per
+    // found row. On the real product detail page this silently built a
+    // one-size dropdown instead of one `<option>` per real SKU.
+    let executor = PerfectCRUDLassoExecutor(
+        capabilities: { _ in .readOnly },
+        queryHandler: { _, _ in
+            DynamicResult(
+                rows: [
+                    DynamicRow(["size": .string("XS")]),
+                    DynamicRow(["size": .string("SM")]),
+                    DynamicRow(["size": .string("XL")]),
+                ],
+                statement: "SELECT ..."
+            )
+        }
+    )
+    let provider = LassoDynamicInlineProvider(executor: executor, datasourceAliases: ["catalog_mysql": "catalog"])
+    var context = LassoContext(inlineProvider: provider)
+    let output = try await LassoRenderer().render(
+        """
+        <?lasso
+            var('sizes' = array)
+            inline(-database='catalog_mysql', -table='skus', -search)
+                records
+                    $sizes->insert(field('size'))
+                /records
+            /inline
+        ?>
+        count=[$sizes->size]
+        """,
+        context: &context
+    )
+    #expect(output.contains("count=3"))
+}
+
+@Test func arrayInsertReturnsVoidNotTheMutatedContainerAsAStatementValue() async throws {
+    // `->insert` mutates the invocant, but its *own* return value must be
+    // void, not the mutated array/map — a bare script-mode or bracket
+    // statement that calls `->insert` always echoes an expression's
+    // return value, and no real corpus usage of `->insert` ever consumes
+    // it. Returning the container here made a real product detail page
+    // print a raw field dump (`KOI247-060-XS = Galaxy...`) directly onto
+    // the page, right where `$skuArrayItem->insert(...)` runs as its own
+    // statement (includes/detail_a_sku.lasso).
+    var context = LassoContext()
+    let output = try await LassoRenderer().render(
+        "before[var(items::array = array)][$items->insert('a')]after",
+        context: &context
+    )
+    #expect(output == "beforeafter")
+}
