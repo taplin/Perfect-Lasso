@@ -380,6 +380,30 @@ struct Evaluator {
                 separator = ""
             }
             return .array(value.components(separatedBy: separator).map(LassoValue.string))
+        case let (.string(value), "replace"):
+            // `string->replace(find, replaceWith)` — real Lasso 8.5/9
+            // documented positional form (also accepts `-Find=`/`-Replace=`
+            // keyword form; only the positional shape has real corpus
+            // evidence so far, see pages/subcats3.page.lasso's
+            // `$uniform_restrictions->(Replace('!','<br>'))`). Replaces every
+            // occurrence of `find` with `replaceWith`, matching Swift's own
+            // `replacingOccurrences` semantics; a missing `find`/`replaceWith`
+            // argument defaults to an empty string, same fallback this file
+            // already uses for `contains`/`split`.
+            let find: String
+            if let argument = arguments.first {
+                find = try await evaluate(argument.value).outputString
+            } else {
+                find = ""
+            }
+            let replacement: String
+            if arguments.count > 1 {
+                replacement = try await evaluate(arguments[1].value).outputString
+            } else {
+                replacement = ""
+            }
+            guard find.isEmpty == false else { return .string(value) }
+            return .string(value.replacingOccurrences(of: find, with: replacement))
         case let (.array(values), "size"): return .integer(values.count)
         case let (.array(values), "first"): return values.first ?? .null
         case let (.array(values), "get"):

@@ -3791,3 +3791,42 @@ private final class MapIncludeLoader: LassoIncludeLoader, @unchecked Sendable {
     )
     #expect(realConditionOutput == "yes", "Real if(...) with parens must still work as a genuine block")
 }
+
+@Test func bareTernaryStatementGuardWithNoElseBranchAssignsOnlyWhenTrue() async throws {
+    // Lasso 8's bare statement-guard ternary — `condition ? statement`, no
+    // `|` else-branch at all — is a separate dialect from the documented
+    // value form (`condition ? whenTrue | whenFalse`). Real corpus:
+    // pages/subcats.page.lasso's `[string($cid) != '' ? $bottom_cat=$cid]`,
+    // repeated for cid/cid2.../cid8. Previously this silently swallowed
+    // whatever text followed (ExpressionParser kept trying to parse a
+    // whenFalse that was never there), producing an empty
+    // `unsupportedExpression("")` — confirmed live via
+    // koi.lasso?cid=...&page=subcats.
+    var trueContext = LassoContext()
+    let trueOutput = try await LassoRenderer().render(
+        "[var(cid::string='CATEGORY123')][string($cid) != '' ? var(bottom_cat=$cid)][$bottom_cat] after",
+        context: &trueContext
+    )
+    #expect(trueOutput.contains("CATEGORY123"), "Guard's statement should have run when the condition is true")
+    #expect(trueOutput.contains("after"), "Content after the guard must still render, not be swallowed")
+
+    var falseContext = LassoContext()
+    let falseOutput = try await LassoRenderer().render(
+        "[var(cid::string='')][string($cid) != '' ? var(bottom_cat='should not run')] after",
+        context: &falseContext
+    )
+    #expect(falseOutput.contains("should not run") == false, "Guard's statement must not run when the condition is false")
+    #expect(falseOutput.contains("after"), "Content after a false guard must still render")
+}
+
+@Test func stringReplaceReplacesAllOccurrences() async throws {
+    // string->replace(find, replaceWith) — real corpus:
+    // pages/subcats3.page.lasso's
+    // `$uniform_restrictions->(Replace('!','<br>'))`.
+    var context = LassoContext()
+    let output = try await LassoRenderer().render(
+        "[var(msg::string='no!smoking!allowed')][$msg->(Replace('!','<br>'))]",
+        context: &context
+    )
+    #expect(output == "no<br>smoking<br>allowed")
+}

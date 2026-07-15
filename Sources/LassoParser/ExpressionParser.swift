@@ -160,9 +160,22 @@ struct ExpressionParser {
         // inside a larger binary/assignment expression.
         if minimumPrecedence == 0, consume("?") {
             let whenTrue = parseExpression()
-            _ = consume("|")
-            let whenFalse = parseExpression()
-            left = .ternary(condition: left, whenTrue: whenTrue, whenFalse: whenFalse)
+            if consume("|") {
+                let whenFalse = parseExpression()
+                left = .ternary(condition: left, whenTrue: whenTrue, whenFalse: whenFalse)
+            } else {
+                // Lasso 8's bare statement-guard form — `condition ?
+                // statement`, no `|` branch at all (a separate dialect from
+                // the value form above; real corpus: Auto_Record.inc,
+                // mini_cart_tag.inc, pages/subcats.page.lasso's repeated
+                // `[string($cid) != '' ? $bottom_cat=$cid]`). Previously this
+                // fell through to unconditionally parsing a whenFalse that
+                // was never there, consuming past the end of the bracket
+                // body and producing an empty `unsupportedExpression("")`.
+                // When false, the guard contributes nothing — `.void`
+                // matches that; there's no real "else" value in this form.
+                left = .ternary(condition: left, whenTrue: whenTrue, whenFalse: .void)
+            }
         }
         return left
     }
