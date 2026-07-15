@@ -252,7 +252,16 @@ public struct LassoInlineRequest: Equatable, Sendable {
         let reserved = Self.reservedNames
         var currentOperation: String?
         func trackOperation(_ label: String, _ argument: EvaluatedArgument) -> Bool {
-            if label == "op" {
+            // `-Operator` is real Lasso 8/FileMaker CWP's longhand alias for
+            // `-Op` (both accepted, same meaning). Real corpus:
+            // pages/category_map.page.lasso's
+            // `-Operator='cn', 'store_id'=$search_store` — since
+            // "operator" wasn't recognized, it fell into fieldArguments as
+            // a literal `LassoInlineCriterion(field: "operator", ...)`,
+            // corrupting the generated SQL with a nonexistent `operator`
+            // column and silently failing the entire query (the whole
+            // Site Map page renders empty behind that one failed inline).
+            if label == "op" || label == "operator" {
                 currentOperation = argument.value.outputString
                 return true
             }
@@ -334,7 +343,7 @@ public struct LassoInlineRequest: Equatable, Sendable {
     private static let reservedNames: Set<String> = Set<String>([
         "search", "find", "findall", "add", "update", "delete", "show", "prepare", "nothing",
         "database", "table", "sql", "returnfield", "sortfield", "sortorder", "maxrecords",
-        "skiprecords", "keyfield", "keyvalue", "op", "username", "password", "statementonly",
+        "skiprecords", "keyfield", "keyvalue", "op", "operator", "username", "password", "statementonly",
         // A bare `-Not` flag (real corpus: order_history.page.lasso,
         // order_reporting.page.lasso) negates a query group — it is not
         // itself a field name. Without this, it fell into fieldArguments

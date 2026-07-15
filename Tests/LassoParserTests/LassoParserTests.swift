@@ -4027,6 +4027,43 @@ private final class MapIncludeLoader: LassoIncludeLoader, @unchecked Sendable {
     ])
 }
 
+@Test func operatorFlagIsRecognizedAsALonghandAliasForOp() async throws {
+    // `-Operator` is real Lasso 8/FileMaker CWP's longhand alias for
+    // `-Op` — real corpus: pages/category_map.page.lasso's
+    // `-Operator='cn', 'store_id'=$search_store`. Since "operator" wasn't
+    // recognized, it fell into fieldArguments as a literal
+    // `LassoInlineCriterion(field: "operator", ...)`, corrupting the
+    // generated SQL with a nonexistent `operator` column reference and
+    // silently failing the whole query — blanking the entire Site Map
+    // page behind that one failed inline.
+    final class QueryRecorder: @unchecked Sendable {
+        private(set) var queries: [DynamicQuery] = []
+        func record(_ query: DynamicQuery) { queries.append(query) }
+    }
+    let recorder = QueryRecorder()
+    let executor = PerfectCRUDLassoExecutor(
+        capabilities: { _ in .readOnly },
+        queryHandler: { _, query in
+            recorder.record(query)
+            return DynamicResult(rows: [], statement: "SELECT ...")
+        }
+    )
+    let provider = LassoDynamicInlineProvider(executor: executor, datasourceAliases: ["catalog_mysql": "catalog"])
+    var context = LassoContext(inlineProvider: provider)
+
+    _ = try await LassoRenderer().render(
+        "[inline(-database='catalog_mysql',-table='lc_web','parent_id'='0',-Operator='cn','store_id'='abc',-search)][/inline]",
+        context: &context
+    )
+
+    let seenQueries = recorder.queries
+    #expect(seenQueries.count == 1)
+    #expect(seenQueries[0].predicates == [
+        DynamicPredicate(field: "parent_id", comparison: .equal, value: .string("0")),
+        DynamicPredicate(field: "store_id", comparison: .contains, value: .string("abc")),
+    ])
+}
+
 @Test func varCallWithTypeAnnotationAsAssignmentTargetDeclaresAndAssigns() async throws {
     // `Var(name::type) = value` — declare-then-assign as two tokens joined
     // by `=`, distinct from the single-call `var(name::type = default)`
