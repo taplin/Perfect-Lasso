@@ -409,6 +409,7 @@ struct LassoSiteServer: Sendable {
                     } catch let error as LassoDatabaseActionError {
                         throw error
                     } catch {
+                        logDatasourceActionFailure(kind: "search", datasource: datasource, error: error)
                         throw LassoDatabaseActionError(kind: .search, datasource: datasource, underlying: error)
                     }
                 },
@@ -426,6 +427,7 @@ struct LassoSiteServer: Sendable {
                         case .update: .update
                         case .delete: .delete
                         }
+                        logDatasourceActionFailure(kind: kind.rawValue, datasource: datasource, error: error)
                         throw LassoDatabaseActionError(kind: kind, datasource: datasource, underlying: error)
                     }
                 },
@@ -438,6 +440,7 @@ struct LassoSiteServer: Sendable {
                     } catch let error as LassoDatabaseActionError {
                         throw error
                     } catch {
+                        logDatasourceActionFailure(kind: "sql", datasource: datasource, error: error)
                         throw LassoDatabaseActionError(kind: .sql, datasource: datasource, underlying: error)
                     }
                 }
@@ -489,6 +492,7 @@ struct LassoSiteServer: Sendable {
                 } catch let error as LassoFileMakerDatabaseActionError {
                     throw error
                 } catch {
+                    logDatasourceActionFailure(kind: "\(kind)", datasource: datasource, error: error)
                     throw LassoFileMakerDatabaseActionError(kind: kind, datasource: datasource, underlying: error)
                 }
             }
@@ -874,6 +878,24 @@ struct LassoSiteServer: Sendable {
             "url_prefix": .string(""),
         ]
     }
+}
+
+/// Every datasource action failure (a genuine connector-level error — bad
+/// credentials, connection refused, an unexpected schema mismatch, etc.)
+/// gets logged here, even though it's also caught and converted into a
+/// recoverable Lasso error frame (`LassoDatabaseActionError`/
+/// `LassoFileMakerDatabaseActionError`) the page can inspect via
+/// `error_currenterror`. Without this, a real backend outage — e.g. MySQL
+/// access denied — is otherwise invisible outside the adapter entirely:
+/// `error_currenterror` only exposes a generic "Search failed for
+/// datasource 'X'." message (the real underlying error only lives in
+/// `LassoErrorState.detail`, which no native tag currently exposes to
+/// Lasso script), and nothing else surfaces it anywhere. A query that
+/// legitimately finds zero rows and one that silently can't reach the
+/// database at all look identical from inside the page — this stderr
+/// line is what actually distinguishes them operationally.
+func logDatasourceActionFailure(kind: String, datasource: String, error: Error) {
+    fputs("Datasource action failed kind=\(kind) datasource=\(datasource) error=\(error)\n", stderr)
 }
 
 struct LassoSiteRenderError: Error, CustomStringConvertible {
