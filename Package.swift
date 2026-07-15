@@ -19,11 +19,11 @@ let package = Package(
         .executable(name: "lasso-perfect-server", targets: ["LassoPerfectServer"]),
     ],
     dependencies: [
-        .package(path: "../../Perfect-Resurrection/Perfect-CRUD"),
-        .package(path: "../../Perfect-Resurrection/Perfect-MySQL"),
-        .package(path: "../../Perfect-Resurrection/Perfect-NIO"),
-        .package(path: "../../Perfect-Resurrection/Perfect-Session"),
-        .package(path: "../../Perfect-Resurrection/Perfect-FileMaker"),
+        .package(path: "../Perfect-Resurrection/Perfect-CRUD"),
+        .package(path: "../Perfect-Resurrection/Perfect-MySQL"),
+        .package(path: "../Perfect-Resurrection/Perfect-NIO"),
+        .package(path: "../Perfect-Resurrection/Perfect-Session"),
+        .package(path: "../Perfect-Resurrection/Perfect-FileMaker"),
         .package(url: "https://github.com/apple/swift-crypto.git", from: "4.5.0"),
     ],
     targets: [
