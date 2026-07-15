@@ -361,7 +361,7 @@ private struct RendererEngine {
                 return ""
             }
         }
-        return try await evaluator.evaluate(expression).outputString
+        return try await evaluator.evaluateStatement(expression).outputString
     }
 
     /// Loads and runs a library exactly once per path *for this request's

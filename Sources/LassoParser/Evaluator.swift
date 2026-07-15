@@ -85,32 +85,18 @@ struct Evaluator {
             }
             throw LassoRuntimeError.unknownFunction(name)
         case let .member(base, name, arguments):
-            let result = try await member(try await evaluate(base), name, arguments ?? [])
-            // A handful of array methods mutate the invocant in place in
-            // real Lasso (`->insert` etc.), rather than returning a new
-            // array for the caller to reassign — real corpus:
-            // includes/detail_a_sku.lasso's bare-statement
-            // `$skuArrayItem->insert(...)` (no `=`), used purely for its
-            // side effect. `LassoValue.array` is a value type here, so
-            // that side effect has to be applied explicitly: write the
-            // computed result back to `base` when it's an assignable
-            // target shape (a plain variable, matching every real corpus
-            // use of these methods so far).
-            if Self.selfMutatingArrayMethods.contains(name.lowercased()), Self.assignmentLabel(base) != nil {
-                try await assign(result, to: base, defaultScope: .unscoped)
-                // The mutation itself is what matters here — real corpus
-                // never uses `->insert`'s return value (every call is a
-                // bare statement, `$x->insert(...)` on its own line).
-                // Returning the mutated array/map as this *expression's*
-                // own value made a bare `[...]`/script-mode statement
-                // that calls `->insert` auto-echo the entire container's
-                // contents as visible page text (found live: a raw
-                // `KOI247-060-XS = Galaxy...` field dump appearing on a
-                // real product detail page, right where `$skuArrayItem
-                // ->insert(...)` runs as its own statement).
-                return .void
-            }
-            return result
+            // Self-mutating methods (`->insert`, `->replace`, etc.) are
+            // handled here as *plain, value-returning* calls — real Lasso
+            // only suppresses their return value and treats the mutation
+            // as the whole point when the call is the entire top-level
+            // statement (see `evaluateStatement(_:)`, called by
+            // `Renderer.renderExpression` for exactly that case). Nested
+            // usage still needs the real computed value: real corpus
+            // `_begin.lasso`/`components/_begin_tags.inc`'s
+            // `#out = '-' + #out->replace('-','')` reads `->replace`'s
+            // result as part of a larger expression, which would silently
+            // collapse to `'-' + ''` if this case voided it unconditionally.
+            return try await member(try await evaluate(base), name, arguments ?? [])
         case let .unknown(value):
             throw LassoRuntimeError.unsupportedExpression(value)
         }
@@ -362,8 +348,19 @@ struct Evaluator {
         case "*": return numeric(left, right, *)
         case "/": return numeric(left, right, /)
         case "%": return .integer(Int(left.number ?? 0) % max(Int(right.number ?? 0), 1))
-        case "==": return .boolean(left.outputString == right.outputString)
-        case "!=": return .boolean(left.outputString != right.outputString)
+        case "==":
+            // Real Lasso 9 string equality is case-INSENSITIVE by default
+            // (case-sensitive comparison needs an explicit `-case` flag on
+            // `string->compare`, not the bare `==` operator). Found live:
+            // pages/thumbs2.page.lasso's `if(string(field('new_item')) ==
+            // 'yes')` ribbon check — the real `skus` table stores this
+            // column as `'Yes'` (capital Y), and production still shows
+            // the "New" ribbon on every New Items product, confirming the
+            // comparison is meant to match regardless of case. A
+            // case-sensitive `==` silently hid the ribbon on every item.
+            return .boolean(left.outputString.caseInsensitiveCompare(right.outputString) == .orderedSame)
+        case "!=":
+            return .boolean(left.outputString.caseInsensitiveCompare(right.outputString) != .orderedSame)
         case ">": return compare(left, right, >)
         case ">>":
             // Real Lasso 8/9's documented string-contains operator
@@ -572,8 +569,43 @@ struct Evaluator {
         return name.caseInsensitiveCompare("var") == .orderedSame || name.caseInsensitiveCompare("local") == .orderedSame
     }
 
-    /// Array methods real Lasso mutates the invocant with, rather than
-    /// returning a new array for the caller to reassign. See the
-    /// `.member` case's write-back comment above.
-    private static let selfMutatingArrayMethods: Set<String> = ["insert"]
+    /// Methods real Lasso mutates the invocant with, rather than returning
+    /// a new value for the caller to reassign — array/map `->insert` and
+    /// string `->replace` both qualify (real corpus: includes/detail_a_sku.lasso's
+    /// bare `$skuArrayItem->insert(...)`; pages/thumbs2.page.lasso's bare
+    /// `$cleaned_product_name->(Replace('(',''))` chain, and the same
+    /// shape in templates/*/master.template.lasso's
+    /// `$meta_keywords->(Replace('-',','))` — used across every template
+    /// in the site). Only consulted by `evaluateStatement(_:)`, not the
+    /// generic recursive `evaluate(_:)` — see that method's doc for why.
+    static let selfMutatingMethods: Set<String> = ["insert", "replace"]
+
+    /// Evaluates the *entire* root expression of a top-level statement —
+    /// the whole content of a bare `[...]`/script-mode statement, called
+    /// only from `Renderer.renderExpression` (never recursively from
+    /// `evaluate(_:)` itself). Real Lasso's self-mutating methods
+    /// (`->insert`, `->replace`, ...) mutate their invocant in place and
+    /// produce no visible output when the call *is* the statement — but
+    /// the same call nested inside a larger expression still needs its
+    /// plain, computed value (see the `.member` case's comment on
+    /// `_begin.lasso`'s `#out = '-' + #out->replace('-','')`), so this
+    /// check only fires when the member call is the statement's own root,
+    /// not buried in `evaluate(_:)`'s shared recursive path.
+    mutating func evaluateStatement(_ expression: LassoExpression) async throws -> LassoValue {
+        // A real *variable* base only — `assignmentLabel` also accepts
+        // `.string`/`.identifier` bases (valid for its other use, labeling
+        // a dynamic call argument), but those can't be written back to.
+        // Real corpus: `pages/subcats3.page.lasso`'s
+        // `('no!smoking!allowed')->(Replace('!','<br>'))`-shaped literal
+        // base must still just return its computed value, not attempt a
+        // write-back.
+        if case let .member(base, name, arguments) = expression,
+           Self.selfMutatingMethods.contains(name.lowercased()),
+           case .variable = base {
+            let result = try await member(try await evaluate(base), name, arguments ?? [])
+            try await assign(result, to: base, defaultScope: .unscoped)
+            return .void
+        }
+        return try await evaluate(expression)
+    }
 }

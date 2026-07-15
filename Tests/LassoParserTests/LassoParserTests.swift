@@ -3928,16 +3928,82 @@ private final class MapIncludeLoader: LassoIncludeLoader, @unchecked Sendable {
     #expect(falseOutput.contains("after"), "Content after a false guard must still render")
 }
 
-@Test func stringReplaceReplacesAllOccurrences() async throws {
-    // string->replace(find, replaceWith) — real corpus:
-    // pages/subcats3.page.lasso's
-    // `$uniform_restrictions->(Replace('!','<br>'))`.
+@Test func stringReplaceMutatesTheInvocantInPlaceAndProducesNoOutputAsABareStatement() async throws {
+    // string->replace(find, replaceWith) mutates its invocant in place —
+    // like array/map ->insert — rather than merely computing a new
+    // string, when the base is a real variable and the call is the whole
+    // bare statement. Real corpus: pages/subcats3.page.lasso's
+    // `[$uniform_restrictions->(Replace('!','<br>'))]` (bare, no echo)
+    // followed later by a separate `[$uniform_restrictions]` reference —
+    // confirmed live against thekoiwarehouse.com/koi.lasso?page=subcats2,
+    // whose master.template.lasso-shared `[$meta_keywords->(Replace('-',','))]`
+    // and pages/thumbs2.page.lasso's 5-step `$cleaned_product_name`
+    // cleanup chain produce zero visible output on production — echoing
+    // the mutated value here (the old, unverified assumption) instead
+    // printed every intermediate step's string as stray page text.
     var context = LassoContext()
     let output = try await LassoRenderer().render(
-        "[var(msg::string='no!smoking!allowed')][$msg->(Replace('!','<br>'))]",
+        "[var(msg::string='no!smoking!allowed')][$msg->(Replace('!','<br>'))][$msg]",
         context: &context
     )
     #expect(output == "no<br>smoking<br>allowed")
+}
+
+@Test func stringReplaceOnANonVariableBaseStillReturnsItsComputedValue() async throws {
+    // The self-mutating write-back only applies to a real *variable*
+    // base — a string literal (or any other non-assignable expression)
+    // can't be written back to, so ->replace on one still just computes
+    // and returns the transformed value normally. Covered separately from
+    // `wrappedMemberCallWithNestedCallConsumesBothClosingParens`, which
+    // exercises the same shape for a different reason (paren-consumption).
+    var context = LassoContext()
+    let output = try await LassoRenderer().render(
+        "[('no!smoking!allowed')->(Replace('!','<br>'))]",
+        context: &context
+    )
+    #expect(output == "no<br>smoking<br>allowed")
+}
+
+@Test func stringReplaceNestedInsideALargerExpressionStillReadsItsComputedValue() async throws {
+    // The self-mutating write-back only fires when the ->replace call
+    // IS the whole top-level statement (`Renderer.renderExpression` ->
+    // `Evaluator.evaluateStatement`) — nested inside a larger expression,
+    // it must still behave as a plain, value-returning call. Real corpus:
+    // _begin.lasso / components/_begin_tags.inc's
+    // `#out >> '-' ? #out = '-' + #out->replace('-','')` reads ->replace's
+    // result as part of the concatenation; voiding it here would silently
+    // collapse the expression to `'-' + ''`.
+    var context = LassoContext()
+    let output = try await LassoRenderer().render(
+        "[var(out::string='--leading')][$out = '-' + $out->replace('-','')][$out]",
+        context: &context
+    )
+    #expect(output == "-leading")
+}
+
+@Test func chainedStringReplaceCallsBuildASlugWithNoStrayOutput() async throws {
+    // The exact real-corpus shape from pages/thumbs2.page.lasso (also
+    // pages/thumbs.page.lasso, thumbs3.page.lasso, and every
+    // templates/*/master.template.lasso's `$meta_keywords` line): several
+    // bare `$var->(Replace(...))` statements in a row, progressively
+    // cleaning a slug for later use in a URL. Before this fix, each of
+    // the 5 calls echoed its (unchanged, since "Style (Test)" has none of
+    // the *other* find characters at each step) intermediate value as
+    // stray page text — reproduced live via
+    // thekoiwarehouse.com/koi.lasso?page=subcats2, whose New Items grid
+    // showed each product's style code repeated 5 times above its card.
+    var context = LassoContext()
+    let output = try await LassoRenderer().render(
+        "[var(cleaned_product_name::string='Style (Test)')]" +
+        "[$cleaned_product_name->(Replace('(',''))]" +
+        "[$cleaned_product_name->(Replace(')',''))]" +
+        "[$cleaned_product_name->(Replace('- ',''))]" +
+        "[$cleaned_product_name->(Replace('\"',''))]" +
+        "[$cleaned_product_name->(Replace(' ','-'))]" +
+        "slug=[$cleaned_product_name]",
+        context: &context
+    )
+    #expect(output == "slug=Style-Test")
 }
 
 @Test func fullIfElseBlockEmbeddedInOneSquareBracketSpanDoesNotSwallowFollowingContent() async throws {
@@ -4420,6 +4486,24 @@ private final class MapIncludeLoader: LassoIncludeLoader, @unchecked Sendable {
         context: &context
     )
     #expect(output == "false|true|true")
+}
+
+@Test func equalityOperatorComparesStringsCaseInsensitively() async throws {
+    // Real Lasso 9 string `==` is case-insensitive by default (case-
+    // sensitive comparison needs an explicit `-case` flag on
+    // `string->compare`, not the bare operator). Found live:
+    // pages/thumbs2.page.lasso's `if(string(field('new_item')) == 'yes')`
+    // ribbon check — the real `skus` table stores this column as `'Yes'`
+    // (capital Y, confirmed via a direct query against the real
+    // datasource), yet production still shows the "New" ribbon on every
+    // item in the New Items grid. A case-sensitive `==` made every
+    // comparison fail, silently hiding the ribbon on the whole page.
+    var context = LassoContext()
+    let output = try await LassoRenderer().render(
+        "[('Yes' == 'yes')]|[('Yes' != 'yes')]|[('Yes' == 'No')]",
+        context: &context
+    )
+    #expect(output == "true|false|false")
 }
 
 @Test func elseWithConditionNestsAsRealIfElseIfNotAnUnconditionalBranch() async throws {
