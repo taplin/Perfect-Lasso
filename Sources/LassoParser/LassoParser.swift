@@ -339,7 +339,7 @@ private struct TemplateScanner {
                Self.blockTagNames.contains(name.lowercased()) {
                 nodes.append(.tag(name: name, arguments: arguments, closing: false, dialect: dialect, range: range))
             } else if case let .identifier(name) = first,
-                      Self.blockTagNames.contains(name.lowercased()) {
+                      Self.bareBlockTagNames.contains(name.lowercased()) {
                 nodes.append(.tag(name: name, arguments: [], closing: false, dialect: dialect, range: range))
             } else {
                 nodes.append(.expression(first, dialect, delimiter, range))
@@ -510,4 +510,20 @@ private struct TemplateScanner {
         "if", "else", "inline", "records", "rows", "loop", "iterate", "while", "define", "protect",
         "output_none", "html_comment", "encode_set", "select", "case",
     ]
+
+    /// `blockTagNames` minus `"if"` — used only for the bare-identifier
+    /// (zero-argument, no-parens) fallback below. A real Lasso `if` requires
+    /// a condition; a bare `[if]`/`[If IE 8]` (no parens at all, so
+    /// `ExpressionParser` can't parse a call and falls back to just the
+    /// leading identifier, silently dropping any trailing tokens) has no
+    /// sensible zero-argument meaning and was never valid Lasso syntax —
+    /// unlike `records`/`rows`/`else`/`case`/etc., which do have legitimate,
+    /// commonly-used bare forms. Matches `ScriptBodyParser.bareBlockNames`,
+    /// which already deliberately excludes `"if"` for the same reason.
+    /// Found via a real corpus page (`templates/koi/master.template.lasso`)
+    /// whose HTML5-Boilerplate-style IE conditional comments
+    /// (`<!--[if IE 8]> ... <![endif]-->`) were being misparsed as a real,
+    /// always-present `if` block, silently swallowing the entire page body
+    /// until an unrelated `[/if]` elsewhere happened to close it.
+    private static let bareBlockTagNames: Set<String> = blockTagNames.subtracting(["if"])
 }

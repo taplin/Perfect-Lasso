@@ -3750,3 +3750,44 @@ private final class MapIncludeLoader: LassoIncludeLoader, @unchecked Sendable {
     }
     #expect(path == "downloads/report.pdf")
 }
+
+@Test func ieConditionalCommentsDoNotSwallowPageBodyAsABareIfBlock() async throws {
+    // HTML5-Boilerplate-style IE conditional comments (found in real corpus
+    // templates, e.g. templates/koi/master.template.lasso) are just inert
+    // HTML comments to a real browser, but the literal text `[if IE 8]`
+    // inside them used to be misparsed: no parens means ExpressionParser
+    // can't produce a `.call`, so it fell back to the bare identifier `if`
+    // — and `if` used to be accepted as a valid zero-argument block opener,
+    // silently swallowing everything until an unrelated `[/if]` closed it.
+    var context = LassoContext(globals: ["marker": .string("real content")])
+    let source = """
+    <!--[if IE 8]> <html class="ie8"> <![endif]-->
+    <!--[if !IE]> --><html><!-- <![endif]-->
+    [$marker]
+    """
+    let output = try await LassoRenderer().render(source, context: &context)
+    #expect(output.contains("real content"), "Page content after the IE conditional comments was swallowed: \(output)")
+}
+
+@Test func bareIfWithNoParensIsNotTreatedAsAConditionlessBlock() async throws {
+    // A bare `[if]`/`[if somebareword]` (no parens, no real condition) has
+    // no sensible Lasso meaning and must not become a real if-block opener
+    // — only `if(...)`/`if:(...)` (a genuine condition) should. Otherwise
+    // any literal text containing `[if ...]`-shaped brackets anywhere (not
+    // just inside HTML comments) would silently swallow real page content
+    // up to an unrelated `[/if]`.
+    var context = LassoContext()
+    let output = try await LassoRenderer().render(
+        "before [if bareword] middle [/if] after",
+        context: &context
+    )
+    #expect(output.contains("before"))
+    #expect(output.contains("after"))
+
+    var realConditionContext = LassoContext()
+    let realConditionOutput = try await LassoRenderer().render(
+        "[if(true)]yes[else]no[/if]",
+        context: &realConditionContext
+    )
+    #expect(realConditionOutput == "yes", "Real if(...) with parens must still work as a genuine block")
+}
