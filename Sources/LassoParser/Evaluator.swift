@@ -260,6 +260,21 @@ struct Evaluator {
         switch target {
         case let .binary(left, "::", _):
             try await assign(value, to: left, defaultScope: defaultScope)
+        case let .call(callee, arguments) where Self.isVarOrLocalCallee(callee) && arguments.count == 1 && arguments[0].label == nil:
+            // `Var(name::type) = value` / `Local(name::type) = value` — the
+            // declare-then-assign form (distinct from `var(name::type =
+            // default)`, which is a single call already handled via
+            // `declare(_:local:)`). Real corpus: pages/thumbs.page.lasso's
+            // `[Var(cleaned_product_name::string) = string(Field(...))]`.
+            // The `::type` annotation carries no runtime meaning here (this
+            // codebase doesn't enforce declared types), so this just
+            // unwraps to the same name/scope assignment as a bare
+            // `$name = value`, reusing the `::` unwrap above.
+            guard case let .identifier(callee) = callee else {
+                throw LassoRuntimeError.invalidAssignment
+            }
+            let scope: VariableScope = callee.caseInsensitiveCompare("local") == .orderedSame ? .local : .global
+            try await assign(value, to: arguments[0].value, defaultScope: scope)
         case let .variable(name, scope):
             context.set(value, for: name, scope: scope == .unscoped ? defaultScope : scope)
         case let .identifier(name):
@@ -282,6 +297,16 @@ struct Evaluator {
         default:
             throw LassoRuntimeError.invalidAssignment
         }
+    }
+
+    private mutating func formattedNumber(_ value: Double, _ arguments: [LassoArgument]) async throws -> String {
+        var precision: Int?
+        for argument in arguments {
+            guard argument.label?.caseInsensitiveCompare("precision") == .orderedSame else { continue }
+            precision = Int(try await evaluate(argument.value).number ?? 0)
+        }
+        guard let precision else { return String(value) }
+        return String(format: "%.\(max(precision, 0))f", value)
     }
 
     private func unary(_ op: String, _ value: LassoValue) throws -> LassoValue {
@@ -404,6 +429,19 @@ struct Evaluator {
             }
             guard find.isEmpty == false else { return .string(value) }
             return .string(value.replacingOccurrences(of: find, with: replacement))
+        case let (.integer(value), "asstring"):
+            return .string(try await formattedNumber(Double(value), arguments))
+        case let (.decimal(value), "asstring"):
+            // Real corpus: pages/thumbs.page.lasso's
+            // `decimal(field('starting_price'))->asString(-precision=2)`
+            // (`-precision` fixes the number of digits after the decimal
+            // point; real Lasso also accepts it on integers, e.g.
+            // lassoBackup/scrubs/LassoApps/ds/_init.lasso's
+            // `(...)->asstring(-precision=3)` on a `Double` literal
+            // expression, hence the shared `formattedNumber` helper).
+            return .string(try await formattedNumber(value, arguments))
+        case let (.decimal(value), "ceil"): return .decimal(value.rounded(.up))
+        case let (.integer(value), "ceil"): return .integer(value)
         case let (.array(values), "size"): return .integer(values.count)
         case let (.array(values), "first"): return values.first ?? .null
         case let (.array(values), "get"):
@@ -443,5 +481,10 @@ struct Evaluator {
         default:
             return nil
         }
+    }
+
+    private static func isVarOrLocalCallee(_ callee: LassoExpression) -> Bool {
+        guard case let .identifier(name) = callee else { return false }
+        return name.caseInsensitiveCompare("var") == .orderedSame || name.caseInsensitiveCompare("local") == .orderedSame
     }
 }

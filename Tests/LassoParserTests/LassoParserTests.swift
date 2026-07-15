@@ -3918,3 +3918,100 @@ private final class MapIncludeLoader: LassoIncludeLoader, @unchecked Sendable {
         DynamicPredicate(field: "store_id", comparison: .contains, value: .string("abc")),
     ])
 }
+
+@Test func opCarriesForwardToEveryFollowingFieldUntilOverridden() async throws {
+    // A real `-Op` (or bare alias) applies to every field argument that
+    // follows it, not just the one immediately after — it stays in effect
+    // until the next `-Op`/alias overrides it. Found live via
+    // pages/thumbs.page.lasso: `-op='cn', 'product_name'=$keyword,
+    // 'special'=$show_specials, 'closeout'=$show_closeouts` has no `-op`
+    // between `product_name` and `special`/`closeout`, so real Lasso
+    // carries `cn` forward to all three. The previous implementation
+    // zipped a flat operator list positionally against field arguments,
+    // silently falling back to the default `Eq` for `special`/`closeout`
+    // — turning a blank filter value's intended "no constraint" `LIKE
+    // '%%'` into `= ''`, which matches nothing and silently zeroed out
+    // every product search on a real corpus category page.
+    final class QueryRecorder: @unchecked Sendable {
+        private(set) var queries: [DynamicQuery] = []
+        func record(_ query: DynamicQuery) { queries.append(query) }
+    }
+    let recorder = QueryRecorder()
+    let executor = PerfectCRUDLassoExecutor(
+        capabilities: { _ in .readOnly },
+        queryHandler: { _, query in
+            recorder.record(query)
+            return DynamicResult(rows: [], statement: "SELECT ...")
+        }
+    )
+    let provider = LassoDynamicInlineProvider(executor: executor, datasourceAliases: ["catalog_mysql": "catalog"])
+    var context = LassoContext(inlineProvider: provider)
+
+    _ = try await LassoRenderer().render(
+        """
+        [inline(-database='catalog_mysql',-table='products',-op='cn',
+          'product_name'='',
+          'special'='',
+          'closeout'='',
+        -search)][/inline]
+        """,
+        context: &context
+    )
+
+    let seenQueries = recorder.queries
+    #expect(seenQueries.count == 1)
+    #expect(seenQueries[0].predicates == [
+        DynamicPredicate(field: "product_name", comparison: .contains, value: .string("")),
+        DynamicPredicate(field: "special", comparison: .contains, value: .string("")),
+        DynamicPredicate(field: "closeout", comparison: .contains, value: .string("")),
+    ])
+}
+
+@Test func varCallWithTypeAnnotationAsAssignmentTargetDeclaresAndAssigns() async throws {
+    // `Var(name::type) = value` — declare-then-assign as two tokens joined
+    // by `=`, distinct from the single-call `var(name::type = default)`
+    // form already handled by `declare(_:local:)`. Real corpus:
+    // pages/thumbs.page.lasso's `[Var(cleaned_product_name::string) =
+    // string(Field('product_name'))]`, inside the product-thumbnail loop.
+    // This loop body was never exercised before the `-op` carry-forward
+    // fix (the products query always returned zero rows), so this was a
+    // latent parser gap the fix newly exposed rather than a regression —
+    // `assign()`'s target-expression switch had no case for a `.call`
+    // target at all, so it always fell to the `default: throw
+    // invalidAssignment`.
+    var context = LassoContext()
+    let output = try await LassoRenderer().render(
+        "[Var(greeting::string) = 'hello']|[$greeting]",
+        context: &context
+    )
+    #expect(output == "|hello")
+}
+
+@Test func decimalConstructorAndAsStringWithPrecisionFormatFixedDecimalPlaces() async throws {
+    // `decimal(...)` (a native type constructor, like the already-supported
+    // `integer(...)`/`string(...)`) plus `->asString(-precision=N)` — real
+    // corpus: pages/thumbs.page.lasso's
+    // `decimal(field('starting_price'))->asString(-precision=2)`, inside
+    // the product-thumbnail loop. Also exercises `->asString(-precision=N)`
+    // on a plain numeric expression (no explicit `decimal(...)` wrapper),
+    // matching lassoBackup/scrubs/LassoApps/ds/_init.lasso's
+    // `(...)->asstring(-precision=3)`.
+    var context = LassoContext()
+    let output = try await LassoRenderer().render(
+        "[(decimal(19.5))->asString(-precision=2)]|[(3)->asString(-precision=1)]",
+        context: &context
+    )
+    #expect(output == "19.50|3.0")
+}
+
+@Test func decimalCeilRoundsUpToTheNextWholeNumber() async throws {
+    // `decimal->ceil` — real corpus: pages/thumbs.page.lasso's pagination
+    // math, `((Decimal(Found_Count)) / Decimal($max_thumbs_displayed))->ceil`
+    // (page count = total items divided by page size, rounded up).
+    var context = LassoContext()
+    let output = try await LassoRenderer().render(
+        "[Integer((Decimal(7) / Decimal(3))->ceil)]",
+        context: &context
+    )
+    #expect(output == "3")
+}

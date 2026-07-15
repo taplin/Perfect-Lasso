@@ -102,6 +102,9 @@ public struct LassoNativeRegistry: Sendable {
         register("integer") { arguments, _ in
             .integer(Int(arguments.first?.value.number ?? 0))
         }
+        register("decimal") { arguments, _ in
+            .decimal(arguments.first?.value.number ?? 0)
+        }
         register("var_defined") { arguments, context in
             let name = arguments.first?.value.outputString ?? ""
             switch context.value(for: name) {

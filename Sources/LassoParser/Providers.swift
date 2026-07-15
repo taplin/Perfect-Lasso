@@ -231,43 +231,59 @@ public struct LassoInlineRequest: Equatable, Sendable {
         // comparison-operator syntax — the bare form is shorthand for the
         // matching `-Op=` value (`-Eq`/`-Cn`/`-Bw`/`-Ew`/`-Gt`/`-Gte`/`-Lt`/
         // `-Lte`/`-Neq`, matching every alias `PerfectCRUDLassoExecutor`'s
-        // `comparison(_:)` recognizes). Found live via
-        // pages/subcats.page.lasso's bare `-cn,` flag: since "cn" wasn't in
-        // `reservedNames`, it fell into `fieldArguments` and produced a
-        // bogus `LassoInlineCriterion(field: "cn", ...)`, corrupting the
-        // generated SQL with a literal `cn` column reference instead of
-        // applying `.contains` to the criterion that follows it — exactly
-        // the same `-Op` positional-alignment corruption `-Not` was fixed
-        // for below, just from a different unrecognized bare flag.
-        let operations: [String] = arguments.compactMap { argument in
-            guard let label = argument.label?.lowercased() else { return nil }
-            if label == "op" { return argument.value.outputString }
-            return Self.comparisonAliases.contains(label) ? label : nil
-        }
+        // `comparison(_:)` recognizes).
+        //
+        // A real `-Op` (or bare alias) applies to every field argument that
+        // follows it, not just the one immediately after — it stays in
+        // effect until the next `-Op`/alias overrides it. Found live via
+        // pages/thumbs.page.lasso: `-op='cn', 'product_name'=$keyword,
+        // 'special'=$show_specials, 'closeout'=$show_closeouts` has no
+        // `-op` between `product_name` and `special`/`closeout`, so real
+        // Lasso carries `cn` forward to all three. The previous
+        // implementation zipped a flat `operations` array positionally
+        // against field arguments (index N's field got operations[N]),
+        // which silently fell back to the default `Eq` for any field not
+        // immediately preceded by its own `-op` — corrupting queries whose
+        // trailing fields relied on an earlier operator carrying forward
+        // (here, turning `special LIKE '%%'`/`closeout LIKE '%%'`, which
+        // real Lasso treats as "no constraint" for a blank filter value,
+        // into `special = ''`/`closeout = ''`, which matches nothing and
+        // silently zeroed out every product search).
         let reserved = Self.reservedNames
-        let fieldArguments = arguments.filter { argument in
-            guard let label = argument.label?.lowercased() else { return false }
-            return !reserved.contains(label)
-        }
-        criteria = fieldArguments.enumerated().map { index, argument in
-            LassoInlineCriterion(
-                field: argument.label ?? "",
-                operation: operations.indices.contains(index) ? operations[index] : nil,
-                value: argument.value
-            )
+        var currentOperation: String?
+        func trackOperation(_ label: String, _ argument: EvaluatedArgument) -> Bool {
+            if label == "op" {
+                currentOperation = argument.value.outputString
+                return true
+            }
+            if Self.comparisonAliases.contains(label) {
+                currentOperation = label
+                return true
+            }
+            return false
         }
 
-        // Single pass over the full (unfiltered) argument list — unlike
+        var flatCriteria: [LassoInlineCriterion] = []
+        var fieldArguments: [EvaluatedArgument] = []
+        for argument in arguments {
+            guard let label = argument.label?.lowercased() else { continue }
+            if trackOperation(label, argument) { continue }
+            guard !reserved.contains(label) else { continue }
+            fieldArguments.append(argument)
+            flatCriteria.append(LassoInlineCriterion(field: argument.label ?? "", operation: currentOperation, value: argument.value))
+        }
+        criteria = flatCriteria
+
+        // Second pass over the full (unfiltered) argument list — unlike
         // `criteria` above, this needs each field argument's position
         // relative to any `-Not` markers, which filtering to
-        // `fieldArguments` first would discard. `-Op` values are still
-        // consumed via the same parallel `operations` array (indexed by
-        // field-argument order, not by `-Not`'s position — a bare `-Not`
-        // contributes no `-Op` of its own).
+        // `fieldArguments` first would discard. Operator state is tracked
+        // independently here (a `-Not` doesn't reset it) with the same
+        // carry-forward semantics as above.
         var groups: [LassoInlineCriteriaGroup] = []
         var currentGroup: [LassoInlineCriterion] = []
         var currentGroupNegated = false
-        var operationIndex = 0
+        currentOperation = nil
         for argument in arguments {
             guard let lowercasedLabel = argument.label?.lowercased() else { continue }
             if lowercasedLabel == "not" {
@@ -278,10 +294,9 @@ public struct LassoInlineRequest: Equatable, Sendable {
                 currentGroupNegated = true
                 continue
             }
+            if trackOperation(lowercasedLabel, argument) { continue }
             guard !reserved.contains(lowercasedLabel) else { continue }
-            let operation = operations.indices.contains(operationIndex) ? operations[operationIndex] : nil
-            operationIndex += 1
-            currentGroup.append(LassoInlineCriterion(field: argument.label ?? "", operation: operation, value: argument.value))
+            currentGroup.append(LassoInlineCriterion(field: argument.label ?? "", operation: currentOperation, value: argument.value))
         }
         if !currentGroup.isEmpty {
             groups.append(LassoInlineCriteriaGroup(criteria: currentGroup, negated: currentGroupNegated))
