@@ -2,6 +2,64 @@
 
 Date: 2026-07-14
 
+## Status: superseded — the pipeline is now async (updated 2026-07-15)
+
+Everything below this notice describes a **since-resolved** past state
+and the reasoning that led to converting it — kept as the historical
+record of that decision, not as a description of the current codebase.
+**The technical claims in "Current shape" below (`Evaluator`/
+`RendererEngine`/`Renderer.swift` being plain synchronous Swift with "no
+`async`, no `await`, anywhere in that call graph") are no longer true.**
+
+What actually happened, as a properly-scoped project separate from the
+FileMaker bridge bug fix (matching this doc's own "Recommendation"
+below):
+
+- **Phase 1 — full async conversion.** `Evaluator.swift`/`Renderer.swift`
+  and everything between `LassoRenderer.render` and a leaf `[inline]`
+  call are now `async throws` end to end, confirmed directly against
+  the current source. The bridge this doc describes
+  (`Sources/LassoPerfectServer/AsyncBridge.swift`, the `Task { } ` +
+  `DispatchSemaphore` construction) no longer exists at all — deleted
+  once nothing called it, exactly as the "Advantages" section below
+  predicted ("removes the bridge entirely, for every future backend").
+  Crucially, the "Concerns" section's `LassoContext`-must-become-a-class
+  worry turned out to be **wrong** once actually researched: `LassoContext`
+  stayed a `struct: Sendable`, since custom-tag-local scoping already
+  worked via explicit dictionary save/restore
+  (`snapshotLocals()`/`replaceLocals(_:)`), not value-type COW — a
+  mechanism identical under `async`. The real blast radius was also
+  smaller than predicted: of 62 free-function native registrations and
+  43 native-type methods, only 4 could ever reach a nested render; every
+  other native tag needed only its registration's function-type
+  signature to change (Swift infers `async` for a closure literal when
+  the contextual type requires it) with zero body edits.
+- **Phase 2 — MySQL offload.** `PerfectCRUDLassoExecutor.execute` is
+  `@concurrent` (SE-0461), explicitly offloading `PerfectCRUD`/
+  `PerfectMySQL`'s genuinely-blocking C calls off the shared executor —
+  the second, complementary half of "async pipeline" and "blocking
+  MySQL calls" being two different problems (see "Concerns" below,
+  which correctly separated them).
+- **Phase 3 — async MySQL client research.** A follow-up research pass
+  investigating whether `PerfectMySQL`/`Perfect-CRUD` could gain a
+  genuinely-async client API (rather than continuing to offload a
+  synchronous one indefinitely) — a separate question from whether the
+  interpreter's own pipeline is async, which Phases 1-2 already answered.
+- **Verification status**: the full test suite and MySQL-backed corpus
+  checks pass against the converted pipeline. Full verification against
+  a live FileMaker backend specifically is still pending — blocked on
+  FileMaker WPE server infrastructure that isn't available yet (not a
+  concern about the async conversion itself). Don't treat that as this
+  conversion being incomplete or risky; it's an infrastructure
+  dependency for one datasource's live-verification step, tracked
+  separately.
+
+Read what follows as: here is the reasoning that justified treating this
+as its own scoped project rather than reacting to the bridge bug — the
+barriers turned out to be real engineering questions worth answering
+properly (and one, the `LassoContext` concern, turned out to have a
+better answer than assumed), not reasons to avoid the work indefinitely.
+
 ## Current shape
 
 `LassoRenderer.render(_:context:)` and everything it calls —
