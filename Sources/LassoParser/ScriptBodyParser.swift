@@ -7,6 +7,23 @@ struct ScriptBodyParser {
     private var index = 0
     private var nodes: [LassoNode] = []
     private(set) var diagnostics: [Diagnostic] = []
+    /// Tag-open-form recognition counts, folded up from every nested
+    /// `ScriptBodyParser`/`TypeBodyParser` this instance constructs (Phase 3
+    /// of tag-form consolidation). Plain, unsynchronized local accumulation
+    /// — this parser is a value type scoped to one parse call; the shared,
+    /// locked, cross-request store only ever receives a batched merge, at
+    /// the request boundary in `main.swift`, never a per-match write.
+    private(set) var openFormFires: [TagOpenFormFire: Int] = [:]
+
+    private mutating func recordFire(_ tagName: String, _ form: TagOpenForm) {
+        openFormFires[TagOpenFormFire(tagName: tagName.lowercased(), form: form), default: 0] += 1
+    }
+
+    private mutating func mergeFires(from other: [TagOpenFormFire: Int]) {
+        for (fire, count) in other {
+            openFormFires[fire, default: 0] += count
+        }
+    }
     /// Names of block keywords currently open via an arrow-brace body
     /// (`if(...) => { ... }`), so a later bare `}` — which by itself
     /// carries no name — knows which block it's closing. Slash-closed
@@ -140,13 +157,27 @@ struct ScriptBodyParser {
         // colon-call expression statement (`if` treated as a bare
         // function name), throwing unknownFunction("if") at evaluation
         // time instead of ever reaching real if/else control flow.
-        if index < characters.count, characters[index] == ":" {
+        let colonConsumed = index < characters.count && characters[index] == ":"
+        if colonConsumed {
             index += 1
             skipHorizontalWhitespace()
         }
         guard index < characters.count, characters[index] == "(" else {
             index = start
             return false
+        }
+
+        // Recorded whenever this tag has ANY documented open form at all
+        // (not gated on the specific form matched) — deliberately a
+        // broader net than "only count attested forms," so a real
+        // colon-call on a tag the catalog currently lists as
+        // `.parenCall`-only (e.g. a hypothetical `inline:(...)`) still
+        // surfaces as a real sighting instead of being silently dropped.
+        // Knowing about genuinely unsupported/unattested forms in real
+        // corpus traffic is exactly as important as knowing how often the
+        // documented ones fire (Phase 3 design decision).
+        if !entry.openForms.isEmpty {
+            recordFire(normalized, colonConsumed ? .colonCall : .parenCall)
         }
 
         let body = readBalanced(open: "(", close: ")")
@@ -229,6 +260,7 @@ struct ScriptBodyParser {
             case .bareCondition, .bareIdentifier:
                 preconditionFailure("classifyIfOpen's .parenOrColonCall case only ever carries .parenCall/.colonCall")
             }
+            recordFire(name, form)
             let body = readBalanced(open: "(", close: ")")
             let arguments = parseCallArguments(name: name, body: body)
             if consumeArrowBlockStartIfPresent() {
@@ -238,6 +270,7 @@ struct ScriptBodyParser {
             nodes.append(.tag(name: name, arguments: arguments, closing: false, dialect: .lasso9, range: range))
             return true
         case let .bareCondition(trimmedCondition):
+            recordFire(name, .bareCondition)
             openBraceBlockStack.append(name)
             var conditionParser = ExpressionParser(trimmedCondition)
             let conditionExpression = conditionParser.parseExpression()
@@ -308,6 +341,7 @@ struct ScriptBodyParser {
             var typeParser = TypeBodyParser(source: bodySource, typeName: name, range: range)
             let definition = typeParser.parse()
             diagnostics.append(contentsOf: typeParser.diagnostics)
+            mergeFires(from: typeParser.openFormFires)
             nodes.append(.typeDefinition(definition, .lasso9, range))
             return true
         }
@@ -345,12 +379,13 @@ struct ScriptBodyParser {
         var nestedParser = ScriptBodyParser(source: bodySource, range: range)
         let flatNestedBody = nestedParser.parse()
         diagnostics.append(contentsOf: nestedParser.diagnostics)
+        mergeFires(from: nestedParser.openFormFires)
         // parse() returns a flat open/close-tag stream — pairing it into
         // nested .block structures (if/loop/inline/etc.) is normally a
         // separate BlockBuilder pass that only runs at the top-level
         // LassoParser.parse() entry. Run it here too, since this body is
         // parsed independently of that entry point.
-        var nestedBuilder = BlockBuilder(nodes: flatNestedBody, diagnostics: [])
+        var nestedBuilder = BlockBuilder(nodes: flatNestedBody, diagnostics: [], openFormFires: [:])
         let nestedResult = nestedBuilder.build()
         diagnostics.append(contentsOf: nestedResult.diagnostics)
 
@@ -493,8 +528,23 @@ struct ScriptBodyParser {
         // Phase 2), it just isn't separately dispatched here.
         switch expressions[0] {
         case let .call(.identifier(name), arguments) where TagCatalog.allowsBareOpen(name, in: .scriptBody):
+            // Only records/rows carry a real .bareIdentifier form — this
+            // cascade is also how inline/encode_set/define_tag/define_type's
+            // bare colon-call forms reach a .tag node, but none of those has
+            // a TagOpenForm case to record against (a documented gap, see
+            // TagCatalog.swift's Phase 3 note); recording only by exact name
+            // here avoids inventing a count for something that isn't
+            // characterized.
+            let lowered = name.lowercased()
+            if lowered == "records" || lowered == "rows" {
+                recordFire(lowered, .bareIdentifier)
+            }
             nodes.append(.tag(name: name, arguments: arguments, closing: false, dialect: .lasso8, range: statementRange))
         case let .identifier(name) where TagCatalog.allowsBareOpen(name, in: .scriptBody):
+            let lowered = name.lowercased()
+            if lowered == "records" || lowered == "rows" {
+                recordFire(lowered, .bareIdentifier)
+            }
             nodes.append(.tag(name: name, arguments: [], closing: false, dialect: .lasso8, range: statementRange))
         default:
             nodes.append(.code(expressions, .lasso9, delimiter, statementRange))

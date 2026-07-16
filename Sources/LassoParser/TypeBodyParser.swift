@@ -8,6 +8,10 @@ struct TypeBodyParser {
     private var dataMembers: [LassoDataMemberDefinition] = []
     private var methods: [LassoMethodDefinition] = []
     private(set) var diagnostics: [Diagnostic] = []
+    /// Tag-open-form recognition counts folded up from every nested
+    /// `ScriptBodyParser` this instance constructs for a method body
+    /// (Phase 3 of tag-form consolidation).
+    private(set) var openFormFires: [TagOpenFormFire: Int] = [:]
 
     init(source: String, typeName: String, range: SourceRange) {
         characters = Array(source)
@@ -134,7 +138,10 @@ struct TypeBodyParser {
         var parser = ScriptBodyParser(source: source, range: range)
         let flat = parser.parse()
         diagnostics.append(contentsOf: parser.diagnostics)
-        var builder = BlockBuilder(nodes: flat, diagnostics: [])
+        for (fire, count) in parser.openFormFires {
+            openFormFires[fire, default: 0] += count
+        }
+        var builder = BlockBuilder(nodes: flat, diagnostics: [], openFormFires: [:])
         let result = builder.build()
         diagnostics.append(contentsOf: result.diagnostics)
         return result.nodes

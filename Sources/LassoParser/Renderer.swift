@@ -7,6 +7,14 @@ public struct LassoRenderer: Sendable {
     }
 
     public func render(_ document: LassoDocument, context: inout LassoContext) async throws -> String {
+        // Seed the request's fire-count accumulator from this top-level
+        // document's own recognition counts (Phase 3 of tag-form
+        // consolidation) before the engine's context copy is made, so it
+        // flows through to every include/library merge below and survives
+        // the same success/failure write-back `lastErrorLocation` does.
+        for (fire, count) in document.openFormFires {
+            context.openFormFires[fire, default: 0] += count
+        }
         var engine = RendererEngine(context: context)
         do {
             var output = try await engine.render(document.nodes)
@@ -474,6 +482,14 @@ struct RendererIncludeService: LassoIncludeRenderService {
             document = LassoParser().parse(source)
             context.tagRegistry.cacheInclude(forKey: cacheKey, source: source, document: document)
         }
+        // Merge this include's fire counts into the per-request accumulator
+        // (Phase 3) — on a cache hit too, since the document (and its
+        // counts, computed once at parse time) still reflects a real use of
+        // this include on this render, which is exactly the traffic-weighted
+        // signal live fire-counting is for.
+        for (fire, count) in document.openFormFires {
+            context.openFormFires[fire, default: 0] += count
+        }
         var engine = RendererEngine(context: context)
         do {
             let output = try await engine.render(document.nodes)
@@ -531,9 +547,17 @@ struct RendererIncludeService: LassoIncludeRenderService {
         defer { _ = context.libraryStack.popLast() }
 
         let source = try loader.loadInclude(path: path, from: context.includePath)
+        let document = LassoParser().parse(source)
+        // Merge this library's fire counts into the per-request accumulator
+        // (Phase 3) — the library's own text output is discarded by design
+        // (see this function's doc comment), but its tag-open-form counts
+        // are real evidence about this render regardless.
+        for (fire, count) in document.openFormFires {
+            context.openFormFires[fire, default: 0] += count
+        }
         var engine = RendererEngine(context: context)
         do {
-            _ = try await engine.render(LassoParser().parse(source).nodes)
+            _ = try await engine.render(document.nodes)
             context = engine.evaluator.context
         } catch {
             // Write back even on failure — see `performInclude`'s

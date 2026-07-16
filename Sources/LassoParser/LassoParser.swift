@@ -6,7 +6,7 @@ public struct LassoParser: Sendable {
     public func parse(_ source: String) -> LassoDocument {
         var scanner = TemplateScanner(source)
         let scanned = scanner.scan()
-        var builder = BlockBuilder(nodes: scanned.nodes, diagnostics: scanned.diagnostics)
+        var builder = BlockBuilder(nodes: scanned.nodes, diagnostics: scanned.diagnostics, openFormFires: scanned.openFormFires)
         return builder.build()
     }
 }
@@ -18,6 +18,17 @@ private struct TemplateScanner {
     var squareBracketsEnabled = true
     var nodes: [LassoNode] = []
     var diagnostics: [Diagnostic] = []
+    /// Tag-open-form recognition counts folded up from every nested
+    /// `ScriptBodyParser` this scanner constructs (Phase 3). Plain,
+    /// unsynchronized accumulation — this scanner is a value type scoped to
+    /// one parse call, never shared across requests.
+    var openFormFires: [TagOpenFormFire: Int] = [:]
+
+    private mutating func mergeFires(from other: [TagOpenFormFire: Int]) {
+        for (fire, count) in other {
+            openFormFires[fire, default: 0] += count
+        }
+    }
 
     init(_ source: String) {
         // Swift's `Character` is an extended grapheme cluster, and "\r\n"
@@ -65,7 +76,7 @@ private struct TemplateScanner {
             }
         }
         emitText(through: characters.count)
-        return LassoDocument(nodes: nodes, diagnostics: diagnostics)
+        return LassoDocument(nodes: nodes, diagnostics: diagnostics, openFormFires: openFormFires)
     }
 
     /// Detects the classic `[/* ... */]` idiom, which real Lasso treats as a
@@ -295,6 +306,7 @@ private struct TemplateScanner {
             var parser = ScriptBodyParser(source: body, range: range, delimiter: .square)
             nodes.append(contentsOf: parser.parse())
             diagnostics.append(contentsOf: parser.diagnostics)
+            mergeFires(from: parser.openFormFires)
             return
         }
 
@@ -313,6 +325,7 @@ private struct TemplateScanner {
             let parsed = parser.parse()
             nodes.append(contentsOf: parsed)
             diagnostics.append(contentsOf: parser.diagnostics)
+            mergeFires(from: parser.openFormFires)
             return
         }
 
@@ -328,6 +341,7 @@ private struct TemplateScanner {
             var parser = ScriptBodyParser(source: body, range: range, delimiter: delimiter)
             nodes.append(contentsOf: parser.parse())
             diagnostics.append(contentsOf: parser.diagnostics)
+            mergeFires(from: parser.openFormFires)
             return
         }
 
@@ -359,6 +373,7 @@ private struct TemplateScanner {
                 var scriptParser = ScriptBodyParser(source: body, range: range, delimiter: .square)
                 nodes.append(contentsOf: scriptParser.parse())
                 diagnostics.append(contentsOf: scriptParser.diagnostics)
+                mergeFires(from: scriptParser.openFormFires)
                 return
             }
             if case let .call(callee, arguments) = first,

@@ -41,6 +41,12 @@ public struct Diagnostic: Equatable, Sendable {
 public struct LassoDocument: Equatable, Sendable {
     public let nodes: [LassoNode]
     public let diagnostics: [Diagnostic]
+    /// Tag-open-form recognition counts from this parse (Phase 3 of tag-form
+    /// consolidation). Deliberately no default value: every construction
+    /// site must supply it explicitly, so a future site that forgets to
+    /// thread real counts through fails to compile instead of silently
+    /// producing an empty-but-plausible-looking document.
+    public let openFormFires: [TagOpenFormFire: Int]
 }
 
 public enum LassoMemberVisibility: String, Equatable, Sendable {

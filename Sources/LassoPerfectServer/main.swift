@@ -96,6 +96,14 @@ struct ServerConfig: Sendable {
     /// this entirely. See Documentation/lasso-perfect-server.md.
     let imageProxyPrefix: String?
     let imageProxyTarget: String?
+    /// `LASSO_TAG_FORM_COUNTERS=1` — Phase 3 of tag-form consolidation.
+    /// Enables a process-lifetime, cross-request fire-count of which real
+    /// tag-open-form (`TagOpenForm`) actually gets recognized during
+    /// rendering, exposed at `__lasso_tag_form_counters`. Default false:
+    /// zero overhead (a `NoOpTagOpenFormCounterStore`) unless explicitly
+    /// enabled for a real-corpus verification sweep. See
+    /// `Documentation/` for the design writeup once it lands.
+    let tagFormCountersEnabled: Bool
 
     static func load() throws -> ServerConfig {
         let env = ProcessInfo.processInfo.environment
@@ -186,7 +194,8 @@ struct ServerConfig: Sendable {
             crawlBaselinePath: env["LASSO_CRAWL_BASELINE"],
             crawlOnlyFailure: env["LASSO_CRAWL_ONLY_FAILURE"],
             imageProxyPrefix: env["LASSO_IMAGE_PROXY_PREFIX"]?.trimmingCharacters(in: CharacterSet(charactersIn: "/")),
-            imageProxyTarget: env["LASSO_IMAGE_PROXY_TARGET"]?.trimmingCharacters(in: CharacterSet(charactersIn: "/"))
+            imageProxyTarget: env["LASSO_IMAGE_PROXY_TARGET"]?.trimmingCharacters(in: CharacterSet(charactersIn: "/")),
+            tagFormCountersEnabled: Self.isTruthyEnv(env["LASSO_TAG_FORM_COUNTERS"])
         )
     }
 
@@ -363,9 +372,18 @@ struct LassoSiteServer: Sendable {
     /// storage, matching how a real Lasso instance's session store outlives
     /// any single request.
     let sessionDriver: any SessionDriver
+    /// One instance for the process lifetime, like `tagRegistry` — but
+    /// unlike `tagRegistry`, which config can't be given inline (its shape
+    /// depends on `config.tagFormCountersEnabled`), so it's set in `init`
+    /// below instead of as a stored-property default (Phase 3 of tag-form
+    /// consolidation).
+    let tagFormCounters: any TagOpenFormCounterStore
 
     init(config: ServerConfig) throws {
         self.config = config
+        tagFormCounters = config.tagFormCountersEnabled
+            ? CountingTagOpenFormCounterStore()
+            : NoOpTagOpenFormCounterStore()
         includeLoader = try LassoFileSystemIncludeLoader(root: config.siteRoot)
         uploadProcessor = try LassoFileSystemUploadProcessor(root: config.siteRoot)
 
@@ -531,6 +549,15 @@ struct LassoSiteServer: Sendable {
         let health = root().GET.path("__lasso_health").map { _ -> HTTPOutput in
             TextOutput("ok")
         }
+        // Phase 3 of tag-form consolidation: a plaintext dump of which real
+        // tag-open-forms have actually fired during this process's
+        // lifetime, sorted by descending count. Empty (and says so) when
+        // LASSO_TAG_FORM_COUNTERS isn't enabled — mirrors __lasso_health's
+        // pattern, an unauthenticated admin route intended only for local
+        // real-corpus verification sweeps, never a public deployment.
+        let tagFormCountersRoute = root().GET.path("__lasso_tag_form_counters").map { _ -> HTTPOutput in
+            TextOutput(self.renderTagFormCountersReport())
+        }
         let rootFile = root().GET.map { request -> HTTPOutput in
             try await handle(request: request, trailingPath: "")
         }
@@ -548,7 +575,22 @@ struct LassoSiteServer: Sendable {
         let filesPost = root().POST.trailing { request, path -> HTTPOutput in
             try await handle(request: request, trailingPath: path)
         }
-        return try root().dir(health, rootFile, files, rootFilePost, filesPost)
+        return try root().dir(health, tagFormCountersRoute, rootFile, files, rootFilePost, filesPost)
+    }
+
+    /// `tag\tform\tcount`, one line per fire, descending by count — plain
+    /// and greppable rather than JSON, matching this admin surface's
+    /// throwaway, developer-facing purpose.
+    private func renderTagFormCountersReport() -> String {
+        let snapshot = tagFormCounters.snapshot()
+        guard !snapshot.isEmpty else {
+            return "(no tag-open-form fires recorded; set LASSO_TAG_FORM_COUNTERS=1 to enable)\n"
+        }
+        var lines = ["tag\tform\tcount"]
+        for (fire, count) in snapshot.sorted(by: { $0.value > $1.value }) {
+            lines.append("\(fire.tagName)\t\(fire.form.displayName)\t\(count)")
+        }
+        return lines.joined(separator: "\n") + "\n"
     }
 
     private func handle(request: any HTTPRequest, trailingPath: String) async throws -> HTTPOutput {
@@ -814,6 +856,14 @@ struct LassoSiteServer: Sendable {
                 location: localContext.lastErrorLocation
             )
         }
+
+        // Merge this request's fire counts into the shared store (Phase 3
+        // of tag-form consolidation) — placed here, immediately after the
+        // render's own do/catch, so it runs on every successful render
+        // (including the redirect/file-serve/session-finalize paths below)
+        // but never on a throw, which rethrows above before reaching this
+        // line. A no-op when counters aren't enabled (`NoOpTagOpenFormCounterStore`).
+        tagFormCounters.merge(localContext.openFormFires)
 
         if let sessionBridge {
             let actions = await sessionBridge.finalize(driver: sessionDriver)

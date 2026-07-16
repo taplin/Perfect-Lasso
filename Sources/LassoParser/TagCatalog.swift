@@ -91,7 +91,12 @@ enum CatalogScope: CaseIterable {
 /// supports, with the canonical Lasso 9 form always listed first, so a
 /// classifier can try it first and never pay a legacy-form probing cost on
 /// modern input.
-enum TagOpenForm {
+// `public`: Phase 3's fire-count reporting (`TagOpenFormFire.form` in
+// `TagOpenFormCounters.swift`, read from `LassoPerfectServer/main.swift`
+// across the module boundary) needs this type and its `displayName`.
+// `TagCatalog`/`TagEntry`/`CatalogScope` stay internal — nothing else
+// outside `LassoParser` needs them.
+public enum TagOpenForm: Hashable, Sendable {
     /// `if(cond)` / `inline(...)` — the canonical, modern Lasso 9 shape.
     case parenCall
     /// `if:(cond)` — Lasso 8's legacy colon-call convention.
@@ -105,6 +110,19 @@ enum TagOpenForm {
     /// argument list (if any) comes from the enclosing `inline`'s result,
     /// not from this tag itself.
     case bareIdentifier
+
+    /// Human-readable label for fire-count reports (Phase 3). An exhaustive
+    /// switch, deliberately: one more forced compile-error site alongside
+    /// `TagCatalog`'s `openForms` array literals and `parseIfOpening`'s
+    /// classifier switch if a case is ever retired.
+    public var displayName: String {
+        switch self {
+        case .parenCall: return "parenCall"
+        case .colonCall: return "colonCall"
+        case .bareCondition: return "bareCondition"
+        case .bareIdentifier: return "bareIdentifier"
+        }
+    }
 }
 
 /// One tag's participation across the three scopes above.

@@ -709,6 +709,15 @@ public struct LassoContext: Sendable {
     /// `Documentation/lasso-perfect-server.md`'s error-page section.
     public var lastErrorLocation: SourceRange?
     public var lastErrorIncludeStack: [String]?
+    /// Tag-open-form recognition counts accumulated across this request's
+    /// whole render — the top-level document's own fires, plus every
+    /// include's/library's, folded in as each is parsed (Phase 3 of
+    /// tag-form consolidation). A plain per-request dictionary, not a
+    /// store: survives `inout` write-back the same way `lastErrorLocation`
+    /// does (including on a mid-render throw), and is merged into the
+    /// shared, cross-request `TagOpenFormCounterStore` exactly once, at the
+    /// request boundary, only on a successful render.
+    public var openFormFires: [TagOpenFormFire: Int]
     /// Wired imperatively by whichever call site constructs both a
     /// `RendererEngine`/`Evaluator` and a `LassoContext` together — same
     /// convention as `Evaluator.renderNodes`, not a public initializer
@@ -796,6 +805,7 @@ public struct LassoContext: Sendable {
         includeStack = []
         lastErrorLocation = nil
         lastErrorIncludeStack = nil
+        openFormFires = [:]
         includeRenderService = nil
         includedOncePaths = []
         self.requestProvider = requestProvider

@@ -1,11 +1,17 @@
 struct BlockBuilder {
     let nodes: [LassoNode]
     var diagnostics: [Diagnostic]
+    /// Tag-open-form recognition counts from the scan stage (Phase 3).
+    /// `BlockBuilder` never produces fires of its own — it only nests flat
+    /// tag pairs into `.block` nodes, an unrelated recognition question —
+    /// so this is passed straight through, unchanged, into the document it
+    /// returns.
+    let openFormFires: [TagOpenFormFire: Int]
     var index = 0
 
     mutating func build() -> LassoDocument {
         let result = buildSequence(until: nil)
-        return LassoDocument(nodes: result.nodes, diagnostics: diagnostics)
+        return LassoDocument(nodes: result.nodes, diagnostics: diagnostics, openFormFires: openFormFires)
     }
 
     private mutating func buildSequence(until expectedClose: String?) -> SequenceResult {
