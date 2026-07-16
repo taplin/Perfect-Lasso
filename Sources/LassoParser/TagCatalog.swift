@@ -12,10 +12,23 @@
 /// Tag-form consolidation status:
 /// - **Phase 1** (Commit A: catalog as a pure data refactor reproducing the
 ///   five original `Set<String>` tables exactly, no behavior change; Commit
-///   B: routed `if` and bare `records`/`rows` through an exhaustive
-///   `TagOpenForm` switch in `ScriptBodyParser`, since both have a genuine
-///   surface-form ambiguity — reached by a fallible cascade — where a
-///   missing case previously meant silent wrong output, not an error).
+///   B: routed `if` through an exhaustive `TagOpenForm` switch in
+///   `ScriptBodyParser` — `classifyIfOpen`/`parseIfOpening` — the one tag
+///   with a genuine surface-form ambiguity reached by a fallible cascade,
+///   where a missing case previously meant silent wrong output, not an
+///   error. **Correction** (found during the Phase 3 design-panel review,
+///   2026-07-16): `records`/`rows`'s `.bareIdentifier` form is documented
+///   in this catalog but was never routed through a dedicated switch of its
+///   own — both names reach the same generic, non-form-differentiating
+///   cascades every other bare-open tag does (`parseBlockOpening`'s
+///   colon-then-paren cascade; `emitStatement`'s
+///   `TagCatalog.allowsBareOpen`-gated cascade). A dedicated case there
+///   would only reproduce what those generic paths already do — which is
+///   exactly why Phase 1's own Swift-expert review had the redundant
+///   records/rows case in `emitStatement` removed after an earlier draft
+///   added it (see that function's history). This file's `openForms` entry
+///   for `records`/`rows` remains accurate as documentation; only this
+///   comment's claim that a switch dispatches on it was wrong.
 /// - **Phase 2** (this state): re-examined all 15 remaining tags against
 ///   Phase 1's real lesson and found NONE of them have that same kind of
 ///   ambiguity — every one either collapses to identical shared-cascade
@@ -34,6 +47,19 @@
 ///   records/rows-style switch for any of them would have been ceremony
 ///   over a tautology, the exact mistake Phase 1's own review process
 ///   caught and fixed.
+/// - **Phase 3** (planned, not yet implemented): fire-count instrumentation
+///   for evidence-based decisions about legacy-form cascade ordering — see
+///   `Documentation/` for the design-panel writeup once it lands. One known
+///   gap surfaced by that panel's review, left deliberately unresolved
+///   here: `inline`'s, `encode_set`'s, and `define_tag`'s/`define_type`'s
+///   real bare colon-call forms (`inline: -database=...;`,
+///   `Encode_Set: -EncodeNone`, `Define_Tag: 'name', ...;`) have no
+///   `TagOpenForm` case representing them at all today — they're reached
+///   via `emitStatement`'s bare-open path but have never been characterized
+///   as a form the way `.bareIdentifier` characterizes `records`/`rows`.
+///   Whether that's worth a new case (e.g. a `.bareColonCall`) is its own
+///   small catalog decision for whoever picks up Phase 3, not something to
+///   paper over by force-fitting an existing case.
 enum CatalogScope: CaseIterable {
     /// `ScriptBodyParser.blockNames`/`bareBlockNames` — script-mode
     /// (`<?lasso ... ?>`) block pairing. Tags with their own dedicated
