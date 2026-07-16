@@ -1385,6 +1385,14 @@ What's wired in:
   included) the moment an admin-triggered crawl finished. This action
   calls `CrawlReport.run`/`CrawlReport.printAndWrite` directly, with no
   `exit()` anywhere in its path.
+  - **Known limitation, not yet fixed**: page discovery is a filesystem
+    walk (every on-disk template file, requested bare with no query
+    string/session state), not a link-following crawl — it can't see
+    pages only reachable through a dynamically generated link (e.g. a
+    record-detail page keyed by `?id=123`). Treat a clean crawl-report
+    run as "every statically discoverable page renders," not "the site
+    works." See `Documentation/crawl-report-filtering-plan.md`'s "Known
+    limitation" section for the full writeup.
   - **Live status on the action's chip**: `CrawlRunTracker`
     (`Sources/LassoPerfectServer/CrawlRunTracker.swift`), an actor the
     delegate holds, tracks whether a crawl is currently running, its
