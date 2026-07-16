@@ -257,7 +257,7 @@ struct ScriptBodyParser {
             switch form {
             case .parenCall, .colonCall:
                 break
-            case .bareCondition, .bareIdentifier:
+            case .bareCondition, .bareIdentifier, .bareColonCall:
                 preconditionFailure("classifyIfOpen's .parenOrColonCall case only ever carries .parenCall/.colonCall")
             }
             recordFire(name, form)
@@ -511,40 +511,30 @@ struct ScriptBodyParser {
         // output) instead of `.code(...)` so `BlockBuilder` can pair it
         // with its `/name;` closer. See
         // Documentation/legacy-define-tag-type-plan.md and
-        // Documentation/output-tags-plan.md. `inline` joined this set
-        // after real corpus evidence (`inline: -database=..., -sql=...;
-        // ... /inline;`, no parens at all) showed it hitting the exact
-        // same gap — see Documentation/outstanding-compatibility-project-plans.md.
-        // `records`/`rows`'s bare zero-arg form (real corpus:
-        // includes/detail_a_sku.lasso's bare `records` ... `/records`) is
-        // the only shape reachable here for those two names — a
-        // parenthesized `records(...)` would already have been consumed by
-        // `parseBlockOpening` before `emitStatement` ever runs — so there's
-        // no real form ambiguity for this switch to guard against the way
-        // `parseIfOpening` genuinely has for "if"; a dedicated case here
-        // would just re-produce what the generic case below already does.
-        // `TagCatalog`'s `openForms` entry for `records`/`rows` still
-        // documents `.bareIdentifier` as a supported form (useful data for
-        // Phase 2), it just isn't separately dispatched here.
+        // Documentation/output-tags-plan.md. `iterate`/`while`/`protect`
+        // joined this set in Phase 4 of tag-form consolidation, after
+        // real corpus evidence (components/inSite/tables.inc's
+        // `iterate: vars, local:'i'`, components/inSite/urlencode.inc's
+        // `while: #url_string >> '++'`, _botscript.lasso's bare
+        // `protect`) showed all three hitting the exact same gap
+        // `inline` did before it — a real block-pairing bug, not just a
+        // documentation gap (see TagCatalog.swift's Phase 4 note).
+        // A parenthesized/colon-with-parens form (`records(...)`,
+        // `if:(...)`) is already consumed by `parseBlockOpening` before
+        // `emitStatement` ever runs, so there's no real form ambiguity for
+        // this switch to guard against the way `parseIfOpening` genuinely
+        // has for "if" — every name reaching either arm below has exactly
+        // one real shape: a colon-call with arguments (`.bareColonCall`)
+        // in the `.call` arm, or a bare zero-arg identifier
+        // (`.bareIdentifier`) in the `.identifier` arm. Recording is
+        // therefore unconditional within each arm (both are already gated
+        // by `TagCatalog.allowsBareOpen`), not name-specific.
         switch expressions[0] {
         case let .call(.identifier(name), arguments) where TagCatalog.allowsBareOpen(name, in: .scriptBody):
-            // Only records/rows carry a real .bareIdentifier form — this
-            // cascade is also how inline/encode_set/define_tag/define_type's
-            // bare colon-call forms reach a .tag node, but none of those has
-            // a TagOpenForm case to record against (a documented gap, see
-            // TagCatalog.swift's Phase 3 note); recording only by exact name
-            // here avoids inventing a count for something that isn't
-            // characterized.
-            let lowered = name.lowercased()
-            if lowered == "records" || lowered == "rows" {
-                recordFire(lowered, .bareIdentifier)
-            }
+            recordFire(name, .bareColonCall)
             nodes.append(.tag(name: name, arguments: arguments, closing: false, dialect: .lasso8, range: statementRange))
         case let .identifier(name) where TagCatalog.allowsBareOpen(name, in: .scriptBody):
-            let lowered = name.lowercased()
-            if lowered == "records" || lowered == "rows" {
-                recordFire(lowered, .bareIdentifier)
-            }
+            recordFire(name, .bareIdentifier)
             nodes.append(.tag(name: name, arguments: [], closing: false, dialect: .lasso8, range: statementRange))
         default:
             nodes.append(.code(expressions, .lasso9, delimiter, statementRange))

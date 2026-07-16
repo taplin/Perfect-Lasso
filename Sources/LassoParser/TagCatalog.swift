@@ -47,19 +47,41 @@
 ///   records/rows-style switch for any of them would have been ceremony
 ///   over a tautology, the exact mistake Phase 1's own review process
 ///   caught and fixed.
-/// - **Phase 3** (planned, not yet implemented): fire-count instrumentation
-///   for evidence-based decisions about legacy-form cascade ordering — see
-///   `Documentation/` for the design-panel writeup once it lands. One known
-///   gap surfaced by that panel's review, left deliberately unresolved
-///   here: `inline`'s, `encode_set`'s, and `define_tag`'s/`define_type`'s
-///   real bare colon-call forms (`inline: -database=...;`,
-///   `Encode_Set: -EncodeNone`, `Define_Tag: 'name', ...;`) have no
-///   `TagOpenForm` case representing them at all today — they're reached
-///   via `emitStatement`'s bare-open path but have never been characterized
-///   as a form the way `.bareIdentifier` characterizes `records`/`rows`.
-///   Whether that's worth a new case (e.g. a `.bareColonCall`) is its own
-///   small catalog decision for whoever picks up Phase 3, not something to
-///   paper over by force-fitting an existing case.
+/// - **Phase 3** (shipped): live-server fire-count instrumentation recording
+///   which real `TagOpenForm` each tag was actually recognized with during
+///   real rendering — see `TagOpenFormCounters.swift`. Left one known gap
+///   unresolved at the time: `inline`'s, `encode_set`'s, and
+///   `define_tag`'s/`define_type`'s real bare colon-call forms had no
+///   `TagOpenForm` case representing them at all, and (found investigating
+///   that gap) `iterate`'s/`while`'s real paren-less-colon usage and
+///   `protect`'s real bare usage weren't even recognized as block openers
+///   in `scriptBody` at all — a genuine parsing bug, not just a missing
+///   taxonomy entry (see Phase 4).
+/// - **Phase 4**: fixed the `iterate`/`while`/`protect` script-mode
+///   block-pairing bug this file's own Phase 2/3 comments had documented as
+///   merely "currently-unhandled" — real corpus `iterate: vars, local:'i';`
+///   (components/inSite/tables.inc) and `while: #url_string >> '++';`
+///   (components/inSite/urlencode.inc) were falling all the way through
+///   `parseBlockOpening` (which requires a `(` immediately after an
+///   optional colon) into `emitStatement`, where `allowsBareOpen` was
+///   `false` for these three names — so the whole `tagname: args;` or bare
+///   `tagname` statement became a meaningless flat `.code(...)` expression
+///   instead of a real `.tag(..., closing: false, ...)` opener, and
+///   `BlockBuilder` could never pair it with its real `/tagname;` closer
+///   (confirmed live: `_botscript.lasso`'s bare `protect ... /protect`,
+///   real corpus, wasn't actually wrapping anything in error protection at
+///   all). Fixed by widening `iterate`/`while`/`protect`'s
+///   `bareOpenScopes` to include `.scriptBody`, exactly like
+///   `inline`/`encode_set` already did — no new dispatch code needed, since
+///   `emitStatement`'s existing generic `allowsBareOpen`-gated cascade
+///   already does the right thing once the catalog says these names
+///   qualify. Also introduced `TagOpenForm.bareColonCall` (a real, distinct
+///   shape from `.colonCall`, which means colon-WITH-parens) to finally
+///   characterize the colon-plus-arguments-no-parens form `iterate`/
+///   `while`/`inline`/`encode_set`/`define_tag`/`define_type` all share,
+///   closing the gap Phase 3 left open — `protect`'s bare zero-arg form
+///   reuses the existing `.bareIdentifier` case instead (same shape
+///   `records`/`rows` already have).
 enum CatalogScope: CaseIterable {
     /// `ScriptBodyParser.blockNames`/`bareBlockNames` — script-mode
     /// (`<?lasso ... ?>`) block pairing. Tags with their own dedicated
@@ -106,10 +128,24 @@ public enum TagOpenForm: Hashable, Sendable {
     /// components/site_setup_tags.inc's `excludeBots`. Only `if` has real
     /// corpus evidence of this shape.
     case bareCondition
-    /// `records` / `rows` — zero arguments, no parens at all; the
-    /// argument list (if any) comes from the enclosing `inline`'s result,
-    /// not from this tag itself.
+    /// `records` / `rows` — zero arguments, no parens at all. For
+    /// `records`/`rows` specifically the (absent) argument list would
+    /// otherwise come from the enclosing `inline`'s result; `protect`
+    /// shares this same zero-arg, no-parens, no-colon shape but simply
+    /// never takes arguments at all.
     case bareIdentifier
+    /// `iterate: vars, local('i');` / `inline: -database=...;` — Lasso 8's
+    /// colon-call convention with NO enclosing parens at all (distinct from
+    /// `.colonCall`, which means colon-WITH-parens, `if:(cond)`). Real
+    /// corpus: components/inSite/tables.inc's `iterate: vars, local:'i'`,
+    /// components/inSite/urlencode.inc's `while: #url_string >> '++'`,
+    /// pages_internal/categories.lasso's `inline: -database=...`,
+    /// includes/coupon.include.lasso's `Encode_Set: -EncodeNone`,
+    /// components/js_timer.inc's `define_type: 'js_timer', 'integer',
+    /// -prototype;`. Reached only via `emitStatement`'s bare-open path,
+    /// never `parseBlockOpening`'s cascade (which requires `(` immediately
+    /// after an optional colon).
+    case bareColonCall
 
     /// Human-readable label for fire-count reports (Phase 3). An exhaustive
     /// switch, deliberately: one more forced compile-error site alongside
@@ -121,6 +157,7 @@ public enum TagOpenForm: Hashable, Sendable {
         case .colonCall: return "colonCall"
         case .bareCondition: return "bareCondition"
         case .bareIdentifier: return "bareIdentifier"
+        case .bareColonCall: return "bareColonCall"
         }
     }
 }
@@ -191,12 +228,11 @@ enum TagCatalog {
         // and throughout). Its bare, paren-less colon-call form
         // (`inline: -database=...;`, pages_internal/categories.lasso) is a
         // DIFFERENT form than `.colonCall` (which means colon-WITH-parens,
-        // matching `if:(cond)`) — it's reached only via `emitStatement`'s
-        // bare-open path (`bareOpenScopes` above already includes
-        // `.scriptBody`), never through `parseBlockOpening`'s cascade, so
-        // it isn't represented here; encoding it as `.colonCall` would
-        // falsely assert the cascade handles it.
-        TagEntry(name: "inline", blockScopes: [.scriptBody, .blockBuilder, .lassoParser], bareOpenScopes: [.scriptBody, .lassoParser], openForms: [.parenCall]),
+        // matching `if:(cond)`) — it's `.bareColonCall` (Phase 4), reached
+        // only via `emitStatement`'s bare-open path (`bareOpenScopes` above
+        // already includes `.scriptBody`), never through
+        // `parseBlockOpening`'s cascade.
+        TagEntry(name: "inline", blockScopes: [.scriptBody, .blockBuilder, .lassoParser], bareOpenScopes: [.scriptBody, .lassoParser], openForms: [.parenCall, .bareColonCall]),
         // `records`/`rows` need no arguments at all — real corpus:
         // includes/detail_a_sku.lasso's bare `records` ... `/records` (no
         // parens, no colon-call, just the identifier). Without bare-open
@@ -211,39 +247,53 @@ enum TagCatalog {
         // per real SKU.
         TagEntry(name: "records", blockScopes: [.scriptBody, .blockBuilder, .lassoParser], bareOpenScopes: [.scriptBody, .lassoParser], openForms: [.parenCall, .colonCall, .bareIdentifier]),
         TagEntry(name: "rows", blockScopes: [.scriptBody, .blockBuilder, .lassoParser], bareOpenScopes: [.scriptBody, .lassoParser], openForms: [.parenCall, .colonCall, .bareIdentifier]),
-        // loop/iterate/while/protect have no real bare-open form in
-        // scriptBody (parseBlockOpening requires a `(` for these), but DO
-        // qualify for lassoParser's bare-open set — that set is literally
-        // "every lassoParser block name except if" (see the "if" entry's
-        // comment above), not a curated list, so anything block-shaped in
-        // lassoParser other than "if" belongs here too.
         // loop's paren-call (pages_internal/categorize.lasso's `Loop(20)`)
         // AND colon-WITH-parens (pages/online_return_items.page.lasso's
         // `[Loop: ($no_of_items)]`) are both real — the only remaining
         // entry with two genuinely cascade-handled forms, matching `if`'s
         // shape but without a divergent-handling ambiguity worth its own
         // dispatch (both forms reach identical `readBalanced`/
-        // `parseCallArguments` logic in `parseBlockOpening`).
+        // `parseCallArguments` logic in `parseBlockOpening`). loop has no
+        // real bare-open form in scriptBody (no paren-less colon usage
+        // attested), but DOES qualify for lassoParser's bare-open set —
+        // that set is literally "every lassoParser block name except if"
+        // (see the "if" entry's comment above), not a curated list.
         TagEntry(name: "loop", blockScopes: [.scriptBody, .blockBuilder, .lassoParser], bareOpenScopes: [.lassoParser], openForms: [.parenCall, .colonCall]),
         // iterate's paren-call is real (_clear_cache.lasso's
         // `iterate(globals->keys, local(gkey))`). Its real corpus colon
         // usage (components/inSite/tables.inc's `iterate: vars,
-        // local:'i'`) is paren-LESS — a different, currently-unhandled
-        // form (see the separately-tracked script-mode block-pairing bug;
-        // not `.colonCall`, which means colon-with-parens).
-        TagEntry(name: "iterate", blockScopes: [.scriptBody, .blockBuilder, .lassoParser], bareOpenScopes: [.lassoParser], openForms: [.parenCall]),
+        // local:'i'`) is paren-LESS — `.bareColonCall`, not `.colonCall`
+        // (which means colon-WITH-parens). **Phase 4 bug fix**: this form
+        // was previously NOT reaching `emitStatement`'s bare-open path at
+        // all (`bareOpenScopes` lacked `.scriptBody`), so the whole
+        // `iterate: vars, local:'i';` statement fell through to a
+        // meaningless flat `.code(...)` expression instead of a real
+        // `.tag(..., closing: false, ...)` opener — `BlockBuilder` could
+        // never pair it with its real `/iterate;` closer, so the loop body
+        // ran as flat top-level statements exactly once instead of once
+        // per element. Fixed by adding `.scriptBody` here, matching
+        // `inline`/`encode_set`'s existing bare-open recognition — no new
+        // dispatch code needed, `emitStatement`'s existing generic cascade
+        // already does the right thing once the catalog says so.
+        TagEntry(name: "iterate", blockScopes: [.scriptBody, .blockBuilder, .lassoParser], bareOpenScopes: [.scriptBody, .lassoParser], openForms: [.parenCall, .bareColonCall]),
         // while has NO corpus evidence of a paren-call form at all — every
         // `while(` hit in the corpus is embedded JavaScript, not Lasso. Its
         // only real Lasso usage (components/inSite/urlencode.inc's
         // `while: #url_string >> '++';`, lp_string_firstwords.inc) is
-        // paren-less colon, the same currently-unhandled form as
-        // `iterate`'s (see the separately-tracked bug) — left `[]` rather
-        // than asserting an unattested `.parenCall`.
-        TagEntry(name: "while", blockScopes: [.scriptBody, .blockBuilder, .lassoParser], bareOpenScopes: [.lassoParser], openForms: []),
+        // paren-less colon — `.bareColonCall`. **Phase 4 bug fix**: same
+        // block-pairing bug as `iterate` above (`bareOpenScopes` lacked
+        // `.scriptBody`), fixed the same way.
+        TagEntry(name: "while", blockScopes: [.scriptBody, .blockBuilder, .lassoParser], bareOpenScopes: [.scriptBody, .lassoParser], openForms: [.bareColonCall]),
         // protect's only attested corpus form is bare zero-arg `protect
         // ... /protect` (_botscript.lasso) — no paren or colon usage found
-        // at all, so there's no cascade-reachable form to list.
-        TagEntry(name: "protect", blockScopes: [.scriptBody, .blockBuilder, .lassoParser], bareOpenScopes: [.lassoParser], openForms: []),
+        // at all, so `.bareIdentifier` (the same zero-arg shape
+        // `records`/`rows` use) is the only real form. **Phase 4 bug fix**:
+        // same block-pairing bug as `iterate`/`while` above (`bareOpenScopes`
+        // lacked `.scriptBody`) — confirmed live in the real corpus:
+        // `_botscript.lasso`'s bare `protect ... /protect` wasn't actually
+        // pairing at all, so its body wasn't wrapped in error protection.
+        // Fixed the same way.
+        TagEntry(name: "protect", blockScopes: [.scriptBody, .blockBuilder, .lassoParser], bareOpenScopes: [.scriptBody, .lassoParser], openForms: [.bareIdentifier]),
         // output_none's only attested form is bare zero-arg
         // (scrubsetc.lasso/utscrubs.lasso), already reached via
         // `emitStatement`'s bare-open path (`bareOpenScopes` above) — no
@@ -256,9 +306,10 @@ enum TagCatalog {
         // encode_set's paren-call is real (iscrubs/LassoEcho.lasso's
         // `[Encode_Set(-EncodeNone)]`); its colon usage
         // (includes/coupon.include.lasso's `[Encode_Set: -EncodeNone]`) is
-        // paren-less, same category as inline's bare colon form — reached
-        // via `emitStatement`'s bare-open path, not the cascade.
-        TagEntry(name: "encode_set", blockScopes: [.scriptBody, .blockBuilder, .lassoParser], bareOpenScopes: [.scriptBody, .lassoParser], openForms: [.parenCall]),
+        // paren-less — `.bareColonCall`, same shape as inline's bare colon
+        // form — reached via `emitStatement`'s bare-open path, not the
+        // cascade.
+        TagEntry(name: "encode_set", blockScopes: [.scriptBody, .blockBuilder, .lassoParser], bareOpenScopes: [.scriptBody, .lassoParser], openForms: [.parenCall, .bareColonCall]),
 
         // select: a block in scriptBody (no dedicated opener there, so it
         // needs the generic path) and lassoParser (span routing), but NOT
@@ -279,11 +330,11 @@ enum TagCatalog {
         // modern `define name(...) => {}` form separately) and via
         // BlockBuilder's pairing. Absent from lassoParser entirely — no
         // real corpus evidence of this legacy form inside a bracket span.
-        // `openForms` is `[]`: this bare colon-call is the same category as
+        // This bare colon-call is `.bareColonCall`, the same category as
         // inline's bare form (reached via `emitStatement`'s bare-open path,
-        // not the `parseBlockOpening` cascade `TagOpenForm` describes).
-        TagEntry(name: "define_tag", blockScopes: [.blockBuilder], bareOpenScopes: [.scriptBody], openForms: []),
-        TagEntry(name: "define_type", blockScopes: [.blockBuilder], bareOpenScopes: [.scriptBody], openForms: []),
+        // not the `parseBlockOpening` cascade).
+        TagEntry(name: "define_tag", blockScopes: [.blockBuilder], bareOpenScopes: [.scriptBody], openForms: [.bareColonCall]),
+        TagEntry(name: "define_type", blockScopes: [.blockBuilder], bareOpenScopes: [.scriptBody], openForms: [.bareColonCall]),
 
         // define: the modern paren-call form has its own dedicated
         // ScriptBodyParser.parseDefineOpening (not the generic path, hence

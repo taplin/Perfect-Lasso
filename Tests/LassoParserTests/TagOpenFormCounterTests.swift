@@ -110,18 +110,131 @@ import Testing
     #expect(rowsDocument.openFormFires[TagOpenFormFire(tagName: "rows", form: .bareIdentifier)] == 1)
 }
 
-@Test func whileProtectSelectNeverRecordAnyFire() {
-    // openForms is [] for all three (TagCatalog.swift) — the recognition
-    // gate at parseBlockOpening is "openForms non-empty," so these must
-    // never appear in the fire table at all, not even as a zero.
-    let whileDocument = LassoParser().parse("<?lasso while: #x >> 0; #x -= 1 /while; ?>")
-    #expect(whileDocument.openFormFires.keys.contains { $0.tagName == "while" } == false)
-
-    let protectDocument = LassoParser().parse("[protect]during[/protect]")
-    #expect(protectDocument.openFormFires.keys.contains { $0.tagName == "protect" } == false)
-
+@Test func selectNeverRecordsAnyFireInScriptBody() {
+    // select's openForms stays [] (TagCatalog.swift) — its real complexity
+    // is branch-lowering in BlockBuilder, not a TagOpenForm concern — and
+    // it never gained the Phase 4 bareOpenScopes widening while/protect did
+    // (select's bare form was never real corpus syntax). Must never appear
+    // in the fire table at all, not even as a zero.
     let selectDocument = LassoParser().parse("<?lasso select(1) case(1) 'one' /select ?>")
     #expect(selectDocument.openFormFires.keys.contains { $0.tagName == "select" } == false)
+}
+
+@Test func whileBareColonCallIsRecordedAsBareColonCall() {
+    // Phase 4: while's real, paren-less colon-call form
+    // (components/inSite/urlencode.inc's `while: #url_string >> '++';`)
+    // now has a real TagOpenForm case and reaches emitStatement's bare-open
+    // cascade — see the paired behavioral test below proving this also
+    // fixed the actual block-pairing bug, not just the fire-count.
+    let document = LassoParser().parse(
+        """
+        <?lasso
+        while: #x >> 0;
+            #x -= 1
+        /while;
+        ?>
+        """
+    )
+    #expect(document.openFormFires[TagOpenFormFire(tagName: "while", form: .bareColonCall)] == 1)
+}
+
+@Test func protectBareFormIsRecordedAsBareIdentifier() {
+    // Phase 4: protect's real bare zero-arg form (_botscript.lasso's bare
+    // `protect ... /protect`) now has bareOpenScopes including .scriptBody,
+    // reaching emitStatement's bare-open cascade as .bareIdentifier — the
+    // same shape records/rows already had.
+    let document = LassoParser().parse(
+        """
+        <?lasso
+        protect
+            'body'
+        /protect
+        ?>
+        """
+    )
+    #expect(document.openFormFires[TagOpenFormFire(tagName: "protect", form: .bareIdentifier)] == 1)
+}
+
+// MARK: - Phase 4 regression: iterate:/while:/protect script-mode block-pairing bug
+
+@Test func iterateBareColonCallNowLoopsOncePerElementInsteadOfRunningFlatOnce() async throws {
+    // Before Phase 4, `iterate`'s bareOpenScopes lacked `.scriptBody`, so
+    // `parseBlockOpening` (which requires `(` immediately after an optional
+    // colon) fell through, and `emitStatement`'s bare-open cascade didn't
+    // recognize `iterate` either — the whole `iterate: vars, local('i');`
+    // statement became a meaningless flat `.code(...)` expression instead
+    // of a real `.tag(..., closing: false, ...)` opener, so `BlockBuilder`
+    // could never pair it with its `/iterate;` closer. Real corpus:
+    // components/inSite/tables.inc's `iterate: vars, local:'i';`.
+    // Reads `#out` back via bracket-mode syntax after the script block
+    // closes, rather than relying on a bare script-mode expression
+    // statement's own echo behavior, to isolate this test to exactly the
+    // opener-pairing fix under test.
+    var context = LassoContext()
+    let output = try await LassoRenderer().render(
+        """
+        <?lasso
+        local('out' = '')
+        iterate: array('a', 'b', 'c'), local('i');
+            #out += #i
+        /iterate;
+        ?>[#out]
+        """,
+        context: &context
+    )
+    #expect(output.trimmingCharacters(in: .whitespacesAndNewlines) == "abc")
+}
+
+@Test func whileBareColonCallNowLoopsUntilConditionFalseInsteadOfRunningOnce() async throws {
+    // Same bug class as iterate above. Real corpus:
+    // components/inSite/urlencode.inc's `while: #url_string >> '++';`.
+    var context = LassoContext()
+    let output = try await LassoRenderer().render(
+        """
+        <?lasso
+        local('x' = 0)
+        while: #x < 3;
+            #x += 1
+        /while;
+        ?>[#x]
+        """,
+        context: &context
+    )
+    #expect(output.trimmingCharacters(in: .whitespacesAndNewlines) == "3")
+}
+
+@Test func protectBareFormNowActuallyCatchesErrorsInsteadOfLettingThemPropagate() async throws {
+    // Same bug class as iterate/while above, but for protect's bare
+    // zero-arg form. Real corpus: _botscript.lasso's bare
+    // `protect ... /protect` (called from bot-blocking logic) — before
+    // Phase 4 this wasn't pairing at all in script mode, so its body's
+    // errors weren't actually being caught. Same synthetic
+    // LassoRecoverableError setup as the existing bracket-mode
+    // `protectCatchesRecoverableErrorAndSetsCurrentError` test, just
+    // opened with the bare script-mode form instead of `[protect]`.
+    // Uses `local('log')` accumulation plus a bracket-mode readback after
+    // the script block closes, rather than relying on bare script-mode
+    // expression-statement echo behavior, to isolate this test to exactly
+    // the opener-pairing fix under test.
+    var natives = LassoNativeRegistry()
+    natives.register("fail_with_db_error") { _, _ in
+        throw LassoRecoverableError(LassoErrorState(code: 42, message: "Add failed", kind: "add"))
+    }
+    var context = LassoContext(natives: natives)
+    let output = try await LassoRenderer().render(
+        """
+        before-<?lasso
+        local('log' = '')
+        protect
+            #log += 'during-'
+            fail_with_db_error
+            #log += 'unreached'
+        /protect
+        ?>[#log]after-[error_currenterror]-[error_currenterror(-errorcode)]
+        """,
+        context: &context
+    )
+    #expect(output == "before-during-after-Add failed-42")
 }
 
 @Test func inlineColonWithParensRecordsAnUnattestedColonCallSighting() {
@@ -147,12 +260,12 @@ import Testing
     #expect(document.openFormFires[TagOpenFormFire(tagName: "inline", form: .colonCall)] == 1)
 }
 
-@Test func inlineBareColonCallWithNoParensNeverRecordsAnyFire() {
-    // The documented gap (TagCatalog.swift's Phase 3 note): inline's real
-    // bare (paren-less) colon-call form has no TagOpenForm case to record
-    // against, and emitStatement's bare-open cascade only records for
-    // records/rows by exact name. Confirms this phase does not silently
-    // force-fit a count here.
+@Test func inlineBareColonCallWithNoParensRecordsBareColonCall() {
+    // Phase 4 closed the gap Phase 3 left open (TagCatalog.swift's Phase 4
+    // note): inline's real bare (paren-less) colon-call form now has a
+    // real TagOpenForm case (.bareColonCall), and emitStatement's bare-open
+    // cascade records it for any tag reaching that arm, not just
+    // records/rows by exact name.
     let document = LassoParser().parse(
         """
         <?lasso
@@ -165,7 +278,7 @@ import Testing
         ?>
         """
     )
-    #expect(document.openFormFires.keys.contains { $0.tagName == "inline" } == false)
+    #expect(document.openFormFires[TagOpenFormFire(tagName: "inline", form: .bareColonCall)] == 1)
 }
 
 // MARK: - Nested fold-up: define bodies, type methods, all four LassoParser

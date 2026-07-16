@@ -4811,9 +4811,15 @@ private final class MapIncludeLoader: LassoIncludeLoader, @unchecked Sendable {
         Expectation(name: "records", scriptBodyBlock: true, scriptBodyBare: true, blockBuilderBlock: true, lassoParserBlock: true, lassoParserBare: true),
         Expectation(name: "rows", scriptBodyBlock: true, scriptBodyBare: true, blockBuilderBlock: true, lassoParserBlock: true, lassoParserBare: true),
         Expectation(name: "loop", scriptBodyBlock: true, scriptBodyBare: false, blockBuilderBlock: true, lassoParserBlock: true, lassoParserBare: true),
-        Expectation(name: "iterate", scriptBodyBlock: true, scriptBodyBare: false, blockBuilderBlock: true, lassoParserBlock: true, lassoParserBare: true),
-        Expectation(name: "while", scriptBodyBlock: true, scriptBodyBare: false, blockBuilderBlock: true, lassoParserBlock: true, lassoParserBare: true),
-        Expectation(name: "protect", scriptBodyBlock: true, scriptBodyBare: false, blockBuilderBlock: true, lassoParserBlock: true, lassoParserBare: true),
+        // iterate/while/protect gained real scriptBody bare-open recognition
+        // in Phase 4 of tag-form consolidation — see TagCatalog.swift's
+        // Phase 4 note: this fixed a genuine block-pairing bug (the
+        // paren-less colon/bare form was previously falling through to a
+        // meaningless flat `.code(...)` expression instead of a real
+        // `.tag(...)` opener BlockBuilder could pair with its closer).
+        Expectation(name: "iterate", scriptBodyBlock: true, scriptBodyBare: true, blockBuilderBlock: true, lassoParserBlock: true, lassoParserBare: true),
+        Expectation(name: "while", scriptBodyBlock: true, scriptBodyBare: true, blockBuilderBlock: true, lassoParserBlock: true, lassoParserBare: true),
+        Expectation(name: "protect", scriptBodyBlock: true, scriptBodyBare: true, blockBuilderBlock: true, lassoParserBlock: true, lassoParserBare: true),
         Expectation(name: "output_none", scriptBodyBlock: true, scriptBodyBare: true, blockBuilderBlock: true, lassoParserBlock: true, lassoParserBare: true),
         Expectation(name: "html_comment", scriptBodyBlock: true, scriptBodyBare: true, blockBuilderBlock: true, lassoParserBlock: true, lassoParserBare: true),
         Expectation(name: "encode_set", scriptBodyBlock: true, scriptBodyBare: true, blockBuilderBlock: true, lassoParserBlock: true, lassoParserBare: true),
@@ -4890,22 +4896,29 @@ private final class MapIncludeLoader: LassoIncludeLoader, @unchecked Sendable {
 // claim, proposed then caught and corrected during this phase's review —
 // the corpus has zero real Lasso `while(...)` usage, only JavaScript false
 // positives) just as much as it would catch a value going missing.
+// Updated for Phase 4: `iterate`/`while`/`protect` gained real
+// `bareOpenScopes` recognition (a genuine block-pairing bug fix, not just
+// documentation — see TagCatalog.swift's Phase 4 note), and
+// `.bareColonCall` now characterizes the colon-plus-arguments-no-parens
+// shape `iterate`/`while`/`inline`/`encode_set`/`define_tag`/`define_type`
+// all share (`protect`'s bare zero-arg form reuses `.bareIdentifier`
+// instead, the same shape `records`/`rows` already had).
 @Test func openFormsAreCharacterizedForEveryCatalogEntry() throws {
     let expected: [String: [TagOpenForm]] = [
         "if": [.parenCall, .colonCall, .bareCondition],
-        "inline": [.parenCall],
+        "inline": [.parenCall, .bareColonCall],
         "records": [.parenCall, .colonCall, .bareIdentifier],
         "rows": [.parenCall, .colonCall, .bareIdentifier],
         "loop": [.parenCall, .colonCall],
-        "iterate": [.parenCall],
-        "while": [],
-        "protect": [],
+        "iterate": [.parenCall, .bareColonCall],
+        "while": [.bareColonCall],
+        "protect": [.bareIdentifier],
         "output_none": [],
         "html_comment": [],
-        "encode_set": [.parenCall],
+        "encode_set": [.parenCall, .bareColonCall],
         "select": [],
-        "define_tag": [],
-        "define_type": [],
+        "define_tag": [.bareColonCall],
+        "define_type": [.bareColonCall],
         "define": [],
         "with": [],
         "else": [],
