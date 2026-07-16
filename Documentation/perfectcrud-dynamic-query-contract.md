@@ -87,6 +87,23 @@ featured case also verifies that nested queries restore the outer inline row.
 - Bind every runtime value.
 - Keep raw SQL disabled by default or behind a separate capability.
 - Apply configurable maximum rows and execution timeout.
+- **"Quote every runtime identifier through the connector" is necessary
+  but not sufficient.** Perfect-MySQL's `quote(identifier:)`
+  (`MySQLCRUD.swift`) wraps an identifier in backticks but does not
+  escape embedded backticks — a crafted identifier can break out of the
+  quoting. Real Lasso corpus code can set an inline argument's field name
+  dynamically (`#fieldNameVar = value`, where `#fieldNameVar`'s runtime
+  value becomes the search/sort/return field — see
+  `pages/detail.page.lasso`'s `#product_search = #search_by`), so this
+  codebase cannot rely on the connector alone to safely handle an
+  arbitrary runtime string as an identifier. `Evaluator.swift`'s
+  `validateDynamicFieldLabel(_:)` validates any dynamically-resolved
+  argument label against `\A[A-Za-z_][A-Za-z0-9_]*\z` before it becomes
+  an `EvaluatedArgument.label` — do not remove or bypass this check when
+  touching that code path, and note that `-Table`/`-ReturnField`/
+  `-SortField`/`-KeyField` argument *values* reach the same unescaped
+  quoting sink through a different, still-unvalidated path (tracked as a
+  follow-up, not yet fixed).
 
 ## Current Implementation
 

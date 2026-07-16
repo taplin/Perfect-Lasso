@@ -1012,4 +1012,5 @@ public enum LassoRuntimeError: Error, Equatable {
     case includeDepthExceeded
     case inlineNotConfigured
     case tagCallDepthExceeded
+    case unsafeDynamicFieldName(String)
 }

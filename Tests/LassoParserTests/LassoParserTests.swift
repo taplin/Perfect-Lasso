@@ -240,6 +240,60 @@ import PerfectSessionCore
     #expect(output == "hit")
 }
 
+@Test func dynamicVariableAsAnUnlabeledArgumentResolvesToItsValueAsTheKeyword() async throws {
+    // `#dynamicField = value` — real corpus: pages/detail.page.lasso's
+    // `#product_search = #search_by` inside an Inline(...) -search call,
+    // where #product_search holds 'mfr_style_no' or 'scrubs_style_color'
+    // at runtime, picking which column the search filters on. Previously
+    // this fell through to `assignmentLabel`, which also matches
+    // `.variable` and returned the variable's own NAME
+    // ("product_search") used verbatim as a raw SQL column — this test
+    // covers both real values, plus the sibling literal-labeled argument
+    // ('active'='active', matching the real call's exact shape) staying
+    // unaffected in the same call.
+    var context = LassoContext(inlineProvider: LassoInMemoryInlineProvider(tables: [
+        "skus": [
+            LassoDataRow(["mfr_style_no": .string("ABC"), "scrubs_style_color": .string("ABC-Red"), "active": .string("active"), "swatch_image": .string("abc.jpg")]),
+            LassoDataRow(["mfr_style_no": .string("XYZ"), "scrubs_style_color": .string("XYZ-Blue"), "active": .string("active"), "swatch_image": .string("xyz.jpg")]),
+        ],
+    ]))
+
+    let byStyleNumber = try await LassoRenderer().render(
+        "[local(product_search::string='mfr_style_no')][local(search_by::string='ABC')]" +
+        "[inline(-database='catalog',-table='skus','active'='active',#product_search=#search_by,-search)]" +
+        "[records][field('swatch_image')][/records][/inline]",
+        context: &context
+    )
+    #expect(byStyleNumber == "abc.jpg")
+
+    let byStyleColor = try await LassoRenderer().render(
+        "[local(product_search::string='scrubs_style_color')][local(search_by::string='XYZ-Blue')]" +
+        "[inline(-database='catalog',-table='skus','active'='active',#product_search=#search_by,-search)]" +
+        "[records][field('swatch_image')][/records][/inline]",
+        context: &context
+    )
+    #expect(byStyleColor == "xyz.jpg")
+}
+
+@Test func dynamicArgumentKeywordRejectsAnUnsafeResolvedFieldName() async throws {
+    // Once a variable's runtime VALUE can become a raw SQL column name
+    // (DynamicPredicate.field in PerfectCRUDLassoExecutor.swift),
+    // Perfect-MySQL's `quote(identifier:)` only wraps it in backticks —
+    // it does not escape embedded backticks — so an unvalidated dynamic
+    // label would be a real SQL identifier-injection path. This is
+    // defense-in-depth: nothing in the real corpus sets this variable
+    // from untrusted input today, but the interpreter itself can't know
+    // that's true for every page, so it validates unconditionally.
+    var context = LassoContext(inlineProvider: LassoInMemoryInlineProvider(tables: ["skus": []]))
+    await #expect(throws: LassoRuntimeError.unsafeDynamicFieldName("mfr_style_no`; DROP TABLE skus; --")) {
+        _ = try await LassoRenderer().render(
+            "[local(product_search::string='mfr_style_no`; DROP TABLE skus; --')][local(search_by::string='ABC')]" +
+            "[inline(-database='catalog',-table='skus',#product_search=#search_by,-search)]",
+            context: &context
+        )
+    }
+}
+
 // Expected values computed independently via Python's stdlib hmac/hashlib
 // (not hand-derived or quoted from memory) for key="key",
 // message="The quick brown fox jumps over the lazy dog" — the standard

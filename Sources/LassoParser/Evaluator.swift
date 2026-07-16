@@ -106,13 +106,43 @@ struct Evaluator {
         var results: [EvaluatedArgument] = []
         results.reserveCapacity(arguments.count)
         for argument in arguments {
-            if argument.label == nil,
-               case let .assignment(target, value) = argument.value,
-               let label = Self.assignmentLabel(target) {
-                results.append(EvaluatedArgument(label: label, value: try await evaluate(value)))
-            } else {
-                results.append(EvaluatedArgument(label: argument.label, value: try await evaluate(argument.value)))
+            if argument.label == nil, case let .assignment(target, value) = argument.value {
+                if case let .variable(name, scope) = target {
+                    // `#dynamicField = value` — a real variable on the
+                    // left is a Lasso idiom for a RUNTIME-CHOSEN argument
+                    // keyword, not an assignment: the variable's current
+                    // VALUE becomes the label, not its name. Real corpus:
+                    // pages/detail.page.lasso's `#product_search =
+                    // #search_by` inside an Inline(...) -search call,
+                    // where #product_search holds 'mfr_style_no' or
+                    // 'scrubs_style_color' at runtime, picking which
+                    // column the search filters on. Previously this fell
+                    // through to `assignmentLabel`, which matches
+                    // `.variable` too and returned the variable's own
+                    // NAME ("product_search") — used verbatim as a raw
+                    // SQL column downstream, throwing "Unknown column
+                    // 'product_search'".
+                    let resolvedLabel = context.value(for: name, scope: scope).outputString
+                    // This label can now reach `DynamicPredicate.field`
+                    // (PerfectCRUDLassoExecutor.swift) as a runtime value
+                    // rather than a parse-time-fixed literal — and
+                    // Perfect-MySQL's `quote(identifier:)` only wraps in
+                    // backticks without escaping embedded ones, so an
+                    // unvalidated dynamic label would be a real SQL
+                    // identifier-injection path. Literal labels
+                    // (`'active' = 'active'`) stay exempt: those are
+                    // fixed in the template source by its own author, the
+                    // same trust boundary as the rest of the page.
+                    try Self.validateDynamicFieldLabel(resolvedLabel)
+                    results.append(EvaluatedArgument(label: resolvedLabel, value: try await evaluate(value)))
+                    continue
+                }
+                if let label = Self.assignmentLabel(target) {
+                    results.append(EvaluatedArgument(label: label, value: try await evaluate(value)))
+                    continue
+                }
             }
+            results.append(EvaluatedArgument(label: argument.label, value: try await evaluate(argument.value)))
         }
         return results
     }
@@ -548,6 +578,25 @@ struct Evaluator {
             }
             return object.value(for: name)
         default: throw LassoRuntimeError.unsupportedExpression("Member \(name)")
+        }
+    }
+
+    /// Only real Lasso identifier characters — a dynamically-resolved
+    /// argument label (see `evaluate(_ arguments:)`'s `.variable` case)
+    /// can reach `DynamicPredicate.field` as a runtime SQL column name.
+    /// Perfect-MySQL's `quote(identifier:)` (Perfect-MySQL's
+    /// MySQLCRUD.swift) only wraps an identifier in backticks — it does
+    /// not escape embedded backticks — so this codebase can't rely on the
+    /// connector to safely handle an arbitrary runtime string as an
+    /// identifier. This check is deliberately stricter than MySQL's own
+    /// unquoted-identifier grammar; both real corpus values
+    /// ('mfr_style_no', 'scrubs_style_color') satisfy it comfortably.
+    private static func validateDynamicFieldLabel(_ label: String) throws {
+        // `\A`/`\z` (absolute string boundaries), not `^`/`$` — ICU/NSRegularExpression's
+        // `$` also matches immediately before a single trailing line terminator,
+        // which would let a label like "colname\n" slip through unnoticed.
+        guard label.range(of: "\\A[A-Za-z_][A-Za-z0-9_]*\\z", options: .regularExpression) != nil else {
+            throw LassoRuntimeError.unsafeDynamicFieldName(label)
         }
     }
 
