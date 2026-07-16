@@ -90,6 +90,7 @@ let package = Package(
                 .product(name: "PerfectSessionCore", package: "Perfect-Session"),
                 .product(name: "PerfectSessionMySQL", package: "Perfect-Session"),
                 .product(name: "PerfectFileMaker", package: "Perfect-FileMaker"),
+                .product(name: "PerfectAdminConsole", package: "Perfect-NIO"),
             ]
         ),
         // Targets are the basic building blocks of a package, defining a module or a test suite.
@@ -117,6 +118,7 @@ let package = Package(
                 "LassoPerfectServer",
                 "LassoParser",
                 .product(name: "PerfectNIO", package: "Perfect-NIO"),
+                .product(name: "PerfectAdminConsole", package: "Perfect-NIO"),
             ]
         ),
         .testTarget(

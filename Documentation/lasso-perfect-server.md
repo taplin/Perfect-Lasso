@@ -123,6 +123,12 @@ Environment variables:
   construct, and exit — see the crawl/report mode implementation note
   below. `LASSO_CRAWL_REPORT_PATH` optionally writes the full per-page
   JSON results to a file.
+- `LASSO_ADMIN_CONSOLE=1`: start `PerfectAdminConsole` alongside the main
+  server — see "Admin Console" below. Off by default.
+- `LASSO_ADMIN_PORT`: admin console port, default `8990`. Always bound to
+  `127.0.0.1` only, regardless of what `LASSO_SERVER_PORT` is bound to.
+- `LASSO_ADMIN_TOKEN_PATH`: where the generated bearer token is written
+  (`chmod 600`). Defaults under `NSTemporaryDirectory()`.
 
 ## Current Behavior
 
@@ -1304,6 +1310,71 @@ read-only `-FindAll` has been live-tested; `allowWrites` was `false` for
 this pass) and a `LASSO_CRAWL_REPORT=1` sweep with both datasources
 configured to measure how many previously-`inlineNotConfigured` real
 corpus pages now render cleanly.
+
+## Admin Console — 2026-07-16
+
+`PerfectAdminConsole` (a general-purpose, opt-in Perfect-NIO library
+target — bound exclusively to `127.0.0.1`, bearer-token auth, CSRF on
+mutating routes) is wired into `lasso-perfect-server` via
+`LassoAdminDelegate` (`Sources/LassoPerfectServer/AdminConsoleIntegration.swift`).
+Disabled by default; `LASSO_ADMIN_CONSOLE=1` starts it alongside the main
+server as a background `Task`, matching the existing crawl-report-mode
+pattern for "run something concurrently with the main serve loop without
+blocking it."
+
+What's wired in, this pass:
+
+- **Status page**: server port/uptime, plus a "Lasso Site" section (site
+  root, startup folder, render extensions, session driver, image proxy
+  config if set).
+- **Route inspector**: the actual five routes `LassoSiteServer.routes()`
+  registers (`GET/POST /`, `GET/POST /**`, `GET /__lasso_health`) — a
+  literal list, not introspected from `Routes<...>`, since Perfect-NIO's
+  route tree isn't designed to be enumerated after construction. Keep
+  this in sync by hand if `routes()` changes.
+- **Datasource list + on-demand test**: every configured MySQL and
+  FileMaker alias, sanitized (alias/schema/driver only, no credentials),
+  with a real connectivity ping on demand (`Database(configuration:)`'s
+  connect for MySQL, `FileMakerServer.databaseNames()` for FileMaker),
+  latency reported in the toast. Both branches are `@concurrent`
+  (SE-0461), matching `PerfectCRUDLassoExecutor.execute(_:)`'s own
+  established pattern for keeping blocking/network work off whatever
+  executor called in.
+
+Deliberately **not** wired in this pass — left for a follow-up once
+there's a concrete need, not because of any technical blocker:
+
+- **Custom actions** (`AdminConsoleDelegate.availableActions()`/
+  `executeAction(_:)`) — e.g. triggering a `LASSO_CRAWL_REPORT`-style
+  sweep from the dashboard instead of an env var + restart.
+- **Live datasource config switching** (`availableConfigs(for:)`/
+  `switchDatasource(name:to:)`) — `DatasourceConfigInfo`'s own doc
+  comments were written with a Lasso-shaped use case in mind (reload a
+  different `.conf`-equivalent and reinitialize the alias), but this
+  server currently builds every datasource executor once, at
+  `LassoSiteServer.init` time, with no reload path — supporting this for
+  real would mean making that construction re-runnable at runtime, a
+  meaningfully bigger change than the read-only wiring above.
+- **TLS operations** — this server doesn't terminate TLS itself
+  (`AdminConsole`'s `tlsManager`/`acmeResponder` params are both `nil`
+  here), so `/api/tls`, `/api/acme`, cert reload/remove are inert;
+  `reloadTLSCertificate(for:)` stays at its protocol default no-op.
+- **Metrics** (`AdminMetrics`) — no `AdminMetrics` instance is
+  constructed/fed request counts yet; `/api/metrics` returns an empty
+  snapshot.
+- **Log tail** (`LogCapture`) — not fed from this server's existing
+  stderr logging (`logDatasourceActionFailure` and friends) yet;
+  `/api/logs` returns empty.
+
+Tested: `Tests/LassoPerfectServerTests/LassoPerfectServerTests.swift`'s
+`lassoAdminDelegate*` tests (config → `DatasourceInfo` mapping, status
+section content, unknown-datasource-name failure path — the live
+MySQL/FileMaker connectivity branches of `testDatasource` aren't unit
+tested, only the structural logic around them). Live-verified: started
+the server with `LASSO_ADMIN_CONSOLE=1` against a scratch site root and
+curled `/api/status`, `/api/routes`, `/api/datasources` with the real
+generated bearer token — all three returned correct, live data end to
+end.
 
 ## Next Compatibility Work
 

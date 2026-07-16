@@ -2,6 +2,7 @@ import Foundation
 import Testing
 @testable import LassoPerfectServer
 import LassoParser
+import PerfectAdminConsole
 import PerfectNIO
 
 // See Documentation/web-response-include-plan.md. Covers the pure
@@ -239,4 +240,118 @@ private struct RecordingExecutor: LassoDynamicQueryExecutor {
         )
     }
     #expect(recorder.calls == [])
+}
+
+// MARK: - LassoAdminDelegate
+
+// See Documentation/lasso-perfect-server.md's Admin Console section.
+// `testDatasource`'s live-connectivity paths (real MySQL/FileMaker
+// network calls) aren't exercised here -- covered by the manual smoke
+// check against a real server instead; these tests cover the delegate's
+// own pure logic (config -> DatasourceInfo mapping, status content,
+// name-lookup miss path).
+
+private func sampleServerConfig(
+    datasourceMap: [String: String] = [:],
+    filemakerDatasourceAliases: Set<String> = [],
+    sessionDriver: String = "memory",
+    startupPath: URL? = nil,
+    adminConsoleEnabled: Bool = false
+) -> ServerConfig {
+    ServerConfig(
+        siteRoot: URL(fileURLWithPath: "/tmp/sample-site"),
+        port: 8181,
+        lassoExtensions: ["lasso", "inc"],
+        startupPath: startupPath,
+        datasourceMap: datasourceMap,
+        mysqlHost: "localhost",
+        mysqlPort: nil,
+        mysqlDatabase: "",
+        mysqlUser: nil,
+        mysqlPassword: nil,
+        mysqlAllowWrites: false,
+        mysqlAllowRawSQL: false,
+        filemakerDatasourceAliases: filemakerDatasourceAliases,
+        filemakerHost: filemakerDatasourceAliases.isEmpty ? nil : "192.0.2.1",
+        filemakerPort: nil,
+        filemakerUser: nil,
+        filemakerPassword: nil,
+        filemakerAllowWrites: false,
+        sessionDriver: sessionDriver,
+        crawlReportMode: false,
+        crawlReportOutputPath: nil,
+        crawlExcludePaths: [],
+        crawlPathListPath: nil,
+        crawlBaselinePath: nil,
+        crawlOnlyFailure: nil,
+        imageProxyPrefix: nil,
+        imageProxyTarget: nil,
+        adminConsoleEnabled: adminConsoleEnabled,
+        adminConsolePort: 8990,
+        adminConsoleTokenPath: "/tmp/sample-admin.token"
+    )
+}
+
+@Test func lassoAdminDelegateExposesServerPortAndStartTime() {
+    let start = Date()
+    let config = sampleServerConfig()
+    let delegate = LassoAdminDelegate(config: config, startTime: start)
+    #expect(delegate.serverPort == 8181)
+    #expect(delegate.serverStartTime == start)
+    #expect(delegate.registeredRoutes.map(\.uri).isEmpty == false)
+}
+
+@Test func lassoAdminDelegateReturnsSortedDatasourcesAcrossBothBackends() async {
+    let config = sampleServerConfig(
+        datasourceMap: ["catalog_mysql": "catalog"],
+        filemakerDatasourceAliases: ["fm_catalog"]
+    )
+    let delegate = LassoAdminDelegate(config: config, startTime: Date())
+    let sources = await delegate.registeredDatasources()
+
+    #expect(sources.count == 2)
+    // Sorted by lowercased alias -- "catalog_mysql" before "fm_catalog".
+    #expect(sources[0].alias == "catalog_mysql")
+    #expect(sources[0].driver == "MySQL")
+    #expect(sources[0].schema == "catalog")
+    #expect(sources[0].name == "catalog_mysql")
+    #expect(sources[1].alias == "fm_catalog")
+    #expect(sources[1].driver == "FileMaker")
+    // FileMaker's own connector model: the alias IS the schema/file name.
+    #expect(sources[1].schema == "fm_catalog")
+}
+
+@Test func lassoAdminDelegateReturnsEmptyDatasourcesWhenNoneConfigured() async {
+    let delegate = LassoAdminDelegate(config: sampleServerConfig(), startTime: Date())
+    let sources = await delegate.registeredDatasources()
+    #expect(sources.isEmpty)
+}
+
+@Test func lassoAdminDelegateStatusSectionReflectsSiteConfig() async throws {
+    let startup = URL(fileURLWithPath: "/tmp/sample-startup")
+    let config = sampleServerConfig(sessionDriver: "mysql", startupPath: startup)
+    let delegate = LassoAdminDelegate(config: config, startTime: Date())
+    let sections = await delegate.additionalStatusSections()
+
+    let siteSection = try #require(sections.first { $0.title == "Lasso Site" })
+    let items = Dictionary(uniqueKeysWithValues: siteSection.items)
+    #expect(items["Site root"] == "/tmp/sample-site")
+    #expect(items["Startup folder"] == "/tmp/sample-startup")
+    #expect(items["Session driver"] == "mysql")
+    #expect(items["Render extensions"] == "inc, lasso")
+}
+
+@Test func lassoAdminDelegateStatusSectionShowsNoStartupFolderWhenUnset() async {
+    let delegate = LassoAdminDelegate(config: sampleServerConfig(), startTime: Date())
+    let sections = await delegate.additionalStatusSections()
+    let items = Dictionary(uniqueKeysWithValues: sections[0].items)
+    #expect(items["Startup folder"] == "none")
+}
+
+@Test func lassoAdminDelegateTestDatasourceFailsCleanlyForUnknownName() async throws {
+    let config = sampleServerConfig(datasourceMap: ["catalog_mysql": "catalog"])
+    let delegate = LassoAdminDelegate(config: config, startTime: Date())
+    let result = try await delegate.testDatasource(name: "not_a_real_alias")
+    #expect(result.success == false)
+    #expect(result.message.contains("not_a_real_alias"))
 }

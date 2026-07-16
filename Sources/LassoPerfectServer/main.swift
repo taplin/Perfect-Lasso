@@ -4,6 +4,7 @@ import LassoParser
 import LassoPerfectCRUD
 import LassoPerfectFileMaker
 import LassoPerfectSession
+import PerfectAdminConsole
 import PerfectCRUD
 import PerfectFileMaker
 import PerfectMySQL
@@ -96,6 +97,18 @@ struct ServerConfig: Sendable {
     /// this entirely. See Documentation/lasso-perfect-server.md.
     let imageProxyPrefix: String?
     let imageProxyTarget: String?
+    /// `LASSO_ADMIN_CONSOLE=1` — start `PerfectAdminConsole` (bound to
+    /// 127.0.0.1 only, separate from the main site port) alongside the
+    /// main server. Off by default: this is an operator tool, not
+    /// something a deployment should run unless it's asked for.
+    let adminConsoleEnabled: Bool
+    /// `LASSO_ADMIN_PORT`, default 8990 — matches `AdminConsole`'s own default.
+    let adminConsolePort: Int
+    /// `LASSO_ADMIN_TOKEN_PATH` — where the generated bearer token is
+    /// written (chmod 600 by `AdminConsole` itself). Defaults under
+    /// `NSTemporaryDirectory()`, matching the pattern
+    /// `PerfectAdminConsole`'s own README documents.
+    let adminConsoleTokenPath: String
 
     static func load() throws -> ServerConfig {
         let env = ProcessInfo.processInfo.environment
@@ -186,7 +199,11 @@ struct ServerConfig: Sendable {
             crawlBaselinePath: env["LASSO_CRAWL_BASELINE"],
             crawlOnlyFailure: env["LASSO_CRAWL_ONLY_FAILURE"],
             imageProxyPrefix: env["LASSO_IMAGE_PROXY_PREFIX"]?.trimmingCharacters(in: CharacterSet(charactersIn: "/")),
-            imageProxyTarget: env["LASSO_IMAGE_PROXY_TARGET"]?.trimmingCharacters(in: CharacterSet(charactersIn: "/"))
+            imageProxyTarget: env["LASSO_IMAGE_PROXY_TARGET"]?.trimmingCharacters(in: CharacterSet(charactersIn: "/")),
+            adminConsoleEnabled: Self.isTruthyEnv(env["LASSO_ADMIN_CONSOLE"]),
+            adminConsolePort: env["LASSO_ADMIN_PORT"].flatMap(Int.init) ?? 8990,
+            adminConsoleTokenPath: env["LASSO_ADMIN_TOKEN_PATH"]
+                ?? (NSTemporaryDirectory() + "lasso-perfect-server-admin.token")
         )
     }
 
@@ -1409,6 +1426,29 @@ if config.crawlReportMode {
         CrawlReport.printAndWrite(results, outputPath: config.crawlReportOutputPath, excludedCount: excludedCount)
         exit(0)
     }
+}
+
+if config.adminConsoleEnabled {
+    print("Admin console: enabled on http://127.0.0.1:\(config.adminConsolePort) — token: \(config.adminConsoleTokenPath)")
+    let adminDelegate = LassoAdminDelegate(config: config, startTime: Date())
+    let admin = try AdminConsole(
+        port: config.adminConsolePort,
+        tokenFilePath: config.adminConsoleTokenPath,
+        delegate: adminDelegate
+    )
+    // Runs concurrently with the main server's own blocking .run() below —
+    // matches the existing crawl-report-mode Task above, this project's
+    // established pattern for "start something alongside the main serve
+    // loop without blocking it."
+    Task {
+        do {
+            try await admin.run()
+        } catch {
+            fputs("[AdminConsole] failed to start: \(error)\n", stderr)
+        }
+    }
+} else {
+    print("Admin console: disabled (set LASSO_ADMIN_CONSOLE=1 to enable)")
 }
 
 try await Server(routes: try siteServer.routes(), port: config.port).run()
