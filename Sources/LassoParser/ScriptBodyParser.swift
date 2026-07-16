@@ -116,9 +116,20 @@ struct ScriptBodyParser {
         let name = readIdentifier()
         guard !name.isEmpty else { return false }
         let normalized = name.lowercased()
-        guard TagCatalog.isBlock(normalized, in: .scriptBody) else {
+        guard let entry = TagCatalog.entry(normalized), entry.blockScopes.contains(.scriptBody) else {
             index = start
             return false
+        }
+
+        // "if" is the only scriptBody block with a real `.bareCondition`
+        // form (see TagOpenForm's doc) — route it through the exhaustive
+        // classifier/switch in parseIfOpening. Every other block name
+        // keeps using the shared cascade below, untouched: this fork
+        // exists specifically so that restructuring can't accidentally
+        // change behavior for tags it was never meant to touch (tag-form
+        // consolidation Commit B — see TagCatalog.swift).
+        if entry.openForms.contains(.bareCondition) {
+            return parseIfOpening(name: name, statementStart: start)
         }
 
         skipHorizontalWhitespace()
@@ -134,31 +145,6 @@ struct ScriptBodyParser {
             skipHorizontalWhitespace()
         }
         guard index < characters.count, characters[index] == "(" else {
-            // Real Lasso 9 also allows `if` with a bare, paren-less
-            // condition immediately followed by a brace body
-            // (`if #request == '' { ... } else { ... }`) — distinct from
-            // both `if(cond) ... /if` and `if(cond) => { ... }`. Found
-            // live: components/site_setup_tags.inc's excludeBots(),
-            // called unconditionally on every page via
-            // _begin.lasso -> library(). Scoped to "if" only since that's
-            // the only block name with real corpus evidence of this shape.
-            if normalized == "if", let condition = readBareConditionBeforeBraceBody() {
-                let trimmedCondition = condition.trimmingCharacters(in: .whitespacesAndNewlines)
-                if !trimmedCondition.isEmpty, consumeArrowBlockStartIfPresent() {
-                    openBraceBlockStack.append(name)
-                    var conditionParser = ExpressionParser(trimmedCondition)
-                    let conditionExpression = conditionParser.parseExpression()
-                    skipLineRemainder()
-                    nodes.append(.tag(
-                        name: name,
-                        arguments: [LassoArgument(label: nil, value: conditionExpression)],
-                        closing: false,
-                        dialect: .lasso9,
-                        range: range
-                    ))
-                    return true
-                }
-            }
             index = start
             return false
         }
@@ -171,6 +157,100 @@ struct ScriptBodyParser {
         skipLineRemainder()
         nodes.append(.tag(name: name, arguments: arguments, closing: false, dialect: .lasso9, range: range))
         return true
+    }
+
+    /// The result of actually inspecting the character stream for "if"'s
+    /// three surface forms — as opposed to a `TagOpenForm` value assigned
+    /// from a compile-time literal, this is a genuinely *computed*
+    /// classification, so the `switch` in `parseIfOpening` that dispatches
+    /// on it is load-bearing: a new case added here that dispatch doesn't
+    /// handle is a real compile error over real logic, not a tautology.
+    /// (An earlier version of this code assigned `let form: TagOpenForm =
+    /// .bareCondition` one line above its own `switch form`, which type-
+    /// checks as "exhaustive" but is a switch over a constant — it can't
+    /// catch anything a future form would break. Fixed after review.)
+    private enum IfOpenClassification {
+        case parenOrColonCall(TagOpenForm)
+        /// The bare-condition form fully validated (non-empty condition,
+        /// real arrow-brace-or-bare-brace body start already consumed) —
+        /// carries the trimmed condition text, since re-deriving it would
+        /// mean re-scanning already-consumed input.
+        case bareCondition(String)
+    }
+
+    /// Classifies which of "if"'s three forms is present at the current
+    /// position, in the same priority order the shared cascade in
+    /// `parseBlockOpening` uses for every other block name (an optional
+    /// colon-prefix consumed first, then a paren-check, then the
+    /// bare-condition fallback). Returns `nil` — with `index` rewound to
+    /// wherever it started this call — if none match; every match leaves
+    /// `index` positioned exactly where the pre-consolidation cascade did.
+    private mutating func classifyIfOpen(colonConsumed: Bool) -> IfOpenClassification? {
+        if index < characters.count, characters[index] == "(" {
+            return .parenOrColonCall(colonConsumed ? .colonCall : .parenCall)
+        }
+
+        // Real Lasso 9 also allows `if` with a bare, paren-less condition
+        // immediately followed by a brace body (`if #request == '' { ... }
+        // else { ... }`) — distinct from both `if(cond) ... /if` and
+        // `if(cond) => { ... }`. Found live: components/site_setup_tags.inc's
+        // excludeBots(), called unconditionally on every page via
+        // _begin.lasso -> library().
+        let bareConditionStart = index
+        if let condition = readBareConditionBeforeBraceBody() {
+            let trimmedCondition = condition.trimmingCharacters(in: .whitespacesAndNewlines)
+            if !trimmedCondition.isEmpty, consumeArrowBlockStartIfPresent() {
+                return .bareCondition(trimmedCondition)
+            }
+            index = bareConditionStart
+        }
+
+        return nil
+    }
+
+    private mutating func parseIfOpening(name: String, statementStart: Int) -> Bool {
+        skipHorizontalWhitespace()
+        let colonConsumed = index < characters.count && characters[index] == ":"
+        if colonConsumed {
+            index += 1
+            skipHorizontalWhitespace()
+        }
+
+        guard let classification = classifyIfOpen(colonConsumed: colonConsumed) else {
+            index = statementStart
+            return false
+        }
+
+        switch classification {
+        case let .parenOrColonCall(form):
+            switch form {
+            case .parenCall, .colonCall:
+                break
+            case .bareCondition, .bareIdentifier:
+                preconditionFailure("classifyIfOpen's .parenOrColonCall case only ever carries .parenCall/.colonCall")
+            }
+            let body = readBalanced(open: "(", close: ")")
+            let arguments = parseCallArguments(name: name, body: body)
+            if consumeArrowBlockStartIfPresent() {
+                openBraceBlockStack.append(name)
+            }
+            skipLineRemainder()
+            nodes.append(.tag(name: name, arguments: arguments, closing: false, dialect: .lasso9, range: range))
+            return true
+        case let .bareCondition(trimmedCondition):
+            openBraceBlockStack.append(name)
+            var conditionParser = ExpressionParser(trimmedCondition)
+            let conditionExpression = conditionParser.parseExpression()
+            skipLineRemainder()
+            nodes.append(.tag(
+                name: name,
+                arguments: [LassoArgument(label: nil, value: conditionExpression)],
+                closing: false,
+                dialect: .lasso9,
+                range: range
+            ))
+            return true
+        }
     }
 
     /// Handles `define name(params) => { body }`, compiling a reusable
@@ -400,6 +480,17 @@ struct ScriptBodyParser {
         // after real corpus evidence (`inline: -database=..., -sql=...;
         // ... /inline;`, no parens at all) showed it hitting the exact
         // same gap — see Documentation/outstanding-compatibility-project-plans.md.
+        // `records`/`rows`'s bare zero-arg form (real corpus:
+        // includes/detail_a_sku.lasso's bare `records` ... `/records`) is
+        // the only shape reachable here for those two names — a
+        // parenthesized `records(...)` would already have been consumed by
+        // `parseBlockOpening` before `emitStatement` ever runs — so there's
+        // no real form ambiguity for this switch to guard against the way
+        // `parseIfOpening` genuinely has for "if"; a dedicated case here
+        // would just re-produce what the generic case below already does.
+        // `TagCatalog`'s `openForms` entry for `records`/`rows` still
+        // documents `.bareIdentifier` as a supported form (useful data for
+        // Phase 2), it just isn't separately dispatched here.
         switch expressions[0] {
         case let .call(.identifier(name), arguments) where TagCatalog.allowsBareOpen(name, in: .scriptBody):
             nodes.append(.tag(name: name, arguments: arguments, closing: false, dialect: .lasso8, range: statementRange))

@@ -4861,3 +4861,23 @@ private final class MapIncludeLoader: LassoIncludeLoader, @unchecked Sendable {
     #expect(TagCatalog.isBlock("IF", in: .scriptBody))
     #expect(TagCatalog.isBlock("Records", in: .blockBuilder))
 }
+
+// A code-review finding on Commit B: `ScriptBodyParser.parseBlockOpening`'s
+// fork into `parseIfOpening` is gated on `entry.openForms.contains(.bareCondition)`,
+// which today only "if" satisfies — but nothing in the parity test above
+// asserted that, so a future edit accidentally adding `.bareCondition` to
+// some other entry would silently misroute that tag into "if"-specific
+// parsing with no test catching it. This locks the invariant the fork
+// depends on directly, rather than only indirectly via "if"'s own bare-
+// condition rendering test.
+@Test func onlyIfCarriesTheBareConditionFormRecordsAndRowsCarryBareIdentifier() throws {
+    for (name, entry) in TagCatalog.shared {
+        if name == "if" {
+            #expect(entry.openForms.contains(.bareCondition), "if should support .bareCondition")
+        } else {
+            #expect(!entry.openForms.contains(.bareCondition), "\(name) should not support .bareCondition — only if does")
+        }
+    }
+    #expect(TagCatalog.entry("records")?.openForms.contains(.bareIdentifier) == true)
+    #expect(TagCatalog.entry("rows")?.openForms.contains(.bareIdentifier) == true)
+}

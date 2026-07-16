@@ -41,6 +41,28 @@ enum CatalogScope: CaseIterable {
     case lassoParser
 }
 
+/// The finite set of ways a tag can open, in the ScriptBodyParser (script-
+/// mode) grammar. Not a global "every form in the language" enumeration —
+/// each `TagEntry.openForms` lists only the forms THAT tag actually
+/// supports, with the canonical Lasso 9 form always listed first, so a
+/// classifier can try it first and never pay a legacy-form probing cost on
+/// modern input.
+enum TagOpenForm {
+    /// `if(cond)` / `inline(...)` — the canonical, modern Lasso 9 shape.
+    case parenCall
+    /// `if:(cond)` — Lasso 8's legacy colon-call convention.
+    case colonCall
+    /// `if cond { ... }` — no parens, no colon, terminated by a brace body
+    /// with no `=>` arrow either. Real corpus:
+    /// components/site_setup_tags.inc's `excludeBots`. Only `if` has real
+    /// corpus evidence of this shape.
+    case bareCondition
+    /// `records` / `rows` — zero arguments, no parens at all; the
+    /// argument list (if any) comes from the enclosing `inline`'s result,
+    /// not from this tag itself.
+    case bareIdentifier
+}
+
 /// One tag's participation across the three scopes above.
 struct TagEntry {
     let name: String
@@ -58,6 +80,14 @@ struct TagEntry {
     /// two independently-declared sets (rather than one derived from the
     /// other) is deliberate — see each entry below for why they differ.
     let bareOpenScopes: Set<CatalogScope>
+    /// The script-mode opening forms this tag actually supports, canonical
+    /// form first. Commit B (this same file's consumer,
+    /// `ScriptBodyParser.parseBlockOpening`/`emitStatement`) only reads
+    /// this for "if" and "records"/"rows" — every other entry is left `[]`
+    /// deliberately rather than guessed at, so this field never silently
+    /// asserts something about a tag Commit B hasn't actually verified.
+    /// Characterizing the rest is Phase 2's job.
+    let openForms: [TagOpenForm]
 }
 
 enum TagCatalog {
@@ -92,8 +122,8 @@ enum TagCatalog {
         // were being misparsed as a real, always-present `if` block,
         // silently swallowing the entire page body until an unrelated
         // `[/if]` elsewhere happened to close it.
-        TagEntry(name: "if", blockScopes: [.scriptBody, .blockBuilder, .lassoParser], bareOpenScopes: []),
-        TagEntry(name: "inline", blockScopes: [.scriptBody, .blockBuilder, .lassoParser], bareOpenScopes: [.scriptBody, .lassoParser]),
+        TagEntry(name: "if", blockScopes: [.scriptBody, .blockBuilder, .lassoParser], bareOpenScopes: [], openForms: [.parenCall, .colonCall, .bareCondition]),
+        TagEntry(name: "inline", blockScopes: [.scriptBody, .blockBuilder, .lassoParser], bareOpenScopes: [.scriptBody, .lassoParser], openForms: []),
         // `records`/`rows` need no arguments at all — real corpus:
         // includes/detail_a_sku.lasso's bare `records` ... `/records` (no
         // parens, no colon-call, just the identifier). Without bare-open
@@ -106,27 +136,27 @@ enum TagCatalog {
         // instead of once per found row. On a real product detail page
         // this silently built a one-size dropdown instead of one option
         // per real SKU.
-        TagEntry(name: "records", blockScopes: [.scriptBody, .blockBuilder, .lassoParser], bareOpenScopes: [.scriptBody, .lassoParser]),
-        TagEntry(name: "rows", blockScopes: [.scriptBody, .blockBuilder, .lassoParser], bareOpenScopes: [.scriptBody, .lassoParser]),
+        TagEntry(name: "records", blockScopes: [.scriptBody, .blockBuilder, .lassoParser], bareOpenScopes: [.scriptBody, .lassoParser], openForms: [.parenCall, .colonCall, .bareIdentifier]),
+        TagEntry(name: "rows", blockScopes: [.scriptBody, .blockBuilder, .lassoParser], bareOpenScopes: [.scriptBody, .lassoParser], openForms: [.parenCall, .colonCall, .bareIdentifier]),
         // loop/iterate/while/protect have no real bare-open form in
         // scriptBody (parseBlockOpening requires a `(` for these), but DO
         // qualify for lassoParser's bare-open set — that set is literally
         // "every lassoParser block name except if" (see the "if" entry's
         // comment above), not a curated list, so anything block-shaped in
         // lassoParser other than "if" belongs here too.
-        TagEntry(name: "loop", blockScopes: [.scriptBody, .blockBuilder, .lassoParser], bareOpenScopes: [.lassoParser]),
-        TagEntry(name: "iterate", blockScopes: [.scriptBody, .blockBuilder, .lassoParser], bareOpenScopes: [.lassoParser]),
-        TagEntry(name: "while", blockScopes: [.scriptBody, .blockBuilder, .lassoParser], bareOpenScopes: [.lassoParser]),
-        TagEntry(name: "protect", blockScopes: [.scriptBody, .blockBuilder, .lassoParser], bareOpenScopes: [.lassoParser]),
-        TagEntry(name: "output_none", blockScopes: [.scriptBody, .blockBuilder, .lassoParser], bareOpenScopes: [.scriptBody, .lassoParser]),
-        TagEntry(name: "html_comment", blockScopes: [.scriptBody, .blockBuilder, .lassoParser], bareOpenScopes: [.scriptBody, .lassoParser]),
-        TagEntry(name: "encode_set", blockScopes: [.scriptBody, .blockBuilder, .lassoParser], bareOpenScopes: [.scriptBody, .lassoParser]),
+        TagEntry(name: "loop", blockScopes: [.scriptBody, .blockBuilder, .lassoParser], bareOpenScopes: [.lassoParser], openForms: []),
+        TagEntry(name: "iterate", blockScopes: [.scriptBody, .blockBuilder, .lassoParser], bareOpenScopes: [.lassoParser], openForms: []),
+        TagEntry(name: "while", blockScopes: [.scriptBody, .blockBuilder, .lassoParser], bareOpenScopes: [.lassoParser], openForms: []),
+        TagEntry(name: "protect", blockScopes: [.scriptBody, .blockBuilder, .lassoParser], bareOpenScopes: [.lassoParser], openForms: []),
+        TagEntry(name: "output_none", blockScopes: [.scriptBody, .blockBuilder, .lassoParser], bareOpenScopes: [.scriptBody, .lassoParser], openForms: []),
+        TagEntry(name: "html_comment", blockScopes: [.scriptBody, .blockBuilder, .lassoParser], bareOpenScopes: [.scriptBody, .lassoParser], openForms: []),
+        TagEntry(name: "encode_set", blockScopes: [.scriptBody, .blockBuilder, .lassoParser], bareOpenScopes: [.scriptBody, .lassoParser], openForms: []),
 
         // select: a block in scriptBody (no dedicated opener there, so it
         // needs the generic path) and lassoParser (span routing), but NOT
         // blockBuilder, where it's special-cased ahead of the membership
         // check (see CatalogScope.blockBuilder's doc).
-        TagEntry(name: "select", blockScopes: [.scriptBody, .lassoParser], bareOpenScopes: [.lassoParser]),
+        TagEntry(name: "select", blockScopes: [.scriptBody, .lassoParser], bareOpenScopes: [.lassoParser], openForms: []),
 
         // define_tag/define_type: the legacy colon-call form
         // (`Define_Tag: 'name', ...;`). Only ever reached via
@@ -135,21 +165,21 @@ enum TagCatalog {
         // `define name(...) => {}` form separately) and via BlockBuilder's
         // pairing. Absent from lassoParser entirely — no real corpus
         // evidence of this legacy form inside a bracket span.
-        TagEntry(name: "define_tag", blockScopes: [.blockBuilder], bareOpenScopes: [.scriptBody]),
-        TagEntry(name: "define_type", blockScopes: [.blockBuilder], bareOpenScopes: [.scriptBody]),
+        TagEntry(name: "define_tag", blockScopes: [.blockBuilder], bareOpenScopes: [.scriptBody], openForms: []),
+        TagEntry(name: "define_type", blockScopes: [.blockBuilder], bareOpenScopes: [.scriptBody], openForms: []),
 
         // define: the modern paren-call form has its own dedicated
         // ScriptBodyParser.parseDefineOpening (not the generic path, hence
         // absent from scriptBody's block set here), but still needs
         // blockBuilder pairing and lassoParser span-routing/bare-open
         // recognition for the bracket-mode dialect.
-        TagEntry(name: "define", blockScopes: [.blockBuilder, .lassoParser], bareOpenScopes: [.lassoParser]),
+        TagEntry(name: "define", blockScopes: [.blockBuilder, .lassoParser], bareOpenScopes: [.lassoParser], openForms: []),
 
         // with: has its own dedicated ScriptBodyParser.parseWithOpening
         // (absent from scriptBody's block set for the same reason as
         // define above) and no real corpus evidence of bracket-mode usage
         // at all, so absent from lassoParser entirely.
-        TagEntry(name: "with", blockScopes: [.blockBuilder], bareOpenScopes: []),
+        TagEntry(name: "with", blockScopes: [.blockBuilder], bareOpenScopes: [], openForms: []),
 
         // else/case: flat branch separators, not paired blocks — each has
         // its own dedicated ScriptBodyParser function (parseElseTag/
@@ -158,7 +188,7 @@ enum TagCatalog {
         // to; case is split out of a select's body after the fact). Only
         // lassoParser's broader "does this bracket span need block-aware
         // treatment" question includes them.
-        TagEntry(name: "else", blockScopes: [.lassoParser], bareOpenScopes: [.lassoParser]),
-        TagEntry(name: "case", blockScopes: [.lassoParser], bareOpenScopes: [.lassoParser]),
+        TagEntry(name: "else", blockScopes: [.lassoParser], bareOpenScopes: [.lassoParser], openForms: []),
+        TagEntry(name: "case", blockScopes: [.lassoParser], bareOpenScopes: [.lassoParser], openForms: []),
     ]
 }
