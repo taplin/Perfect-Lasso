@@ -30,19 +30,26 @@ final class LassoAdminDelegate: AdminConsoleDelegate {
     /// actually run a crawl-report action against real HTTP, matching how
     /// `main.swift`'s `LASSO_CRAWL_REPORT=1` CLI mode calls `CrawlReport.run`.
     private let baseURL: String
+    /// Live/last-run state for the crawl-report action — see
+    /// `CrawlRunTracker`'s doc comment. Defaulted so existing call sites
+    /// (including tests) don't need to pass one; tests that want to drive
+    /// or inspect tracker state construct their own and pass it in.
+    private let crawlTracker: CrawlRunTracker
 
     init(
         config: ServerConfig,
         startTime: Date,
         fileMakerRegistry: FileMakerConnectionRegistry?,
         logCapture: LogCapture?,
-        baseURL: String
+        baseURL: String,
+        crawlTracker: CrawlRunTracker = CrawlRunTracker()
     ) {
         self.config = config
         self.startTime = startTime
         self.fileMakerRegistry = fileMakerRegistry
         self.logCapture = logCapture
         self.baseURL = baseURL
+        self.crawlTracker = crawlTracker
     }
 
     // MARK: - Phase 1: status display
@@ -87,12 +94,21 @@ final class LassoAdminDelegate: AdminConsoleDelegate {
     /// process — only `main.swift`'s own CLI-mode block (`LASSO_CRAWL_REPORT=1`
     /// at startup) calls `exit(0)` after printing results, and this action
     /// deliberately does not reuse that code path.
+    ///
+    /// The action's `description` is built fresh on every call from
+    /// `crawlTracker`, so a currently-running crawl shows live "N/M pages"
+    /// progress on its chip, and an idle one shows the last run's summary
+    /// instead of a static blurb — `AdminWebUI`'s dashboard re-fetches
+    /// `/api/actions` on every periodic refresh, so this updates live.
     func availableActions() async -> [AdminAction] {
-        [
+        let description = await crawlTracker.statusDescription(
+            fallback: "Request every discovered site page over real HTTP and log a pass/fail summary. Runs in the background; can take several minutes on a large site."
+        )
+        return [
             AdminAction(
                 name: "crawl-report",
                 label: "Run Crawl Report",
-                description: "Request every discovered site page over real HTTP and log a pass/fail summary. Runs in the background; can take several minutes on a large site.",
+                description: description,
                 category: "data",
                 isDestructive: false
             ),
@@ -103,9 +119,14 @@ final class LassoAdminDelegate: AdminConsoleDelegate {
         guard name == "crawl-report" else {
             return .failed("Unknown action: \(name)")
         }
+        guard await crawlTracker.tryBegin() else {
+            let status = await crawlTracker.statusDescription(fallback: "")
+            return .failed("A crawl report is already running. \(status)")
+        }
         let config = self.config
         let baseURL = self.baseURL
         let logCapture = self.logCapture
+        let crawlTracker = self.crawlTracker
         // Fire-and-forget, matching main.swift's own CLI-mode crawl Task —
         // a full crawl (~2,000 real pages, sequential requests) can take
         // minutes; blocking this action's HTTP response for that long
@@ -118,10 +139,16 @@ final class LassoAdminDelegate: AdminConsoleDelegate {
                 baseURL: baseURL,
                 siteRoot: config.siteRoot,
                 extensions: config.lassoExtensions,
-                excludePaths: config.crawlExcludePaths
+                excludePaths: config.crawlExcludePaths,
+                onProgress: { completed, total in
+                    Task { await crawlTracker.progress(completed, total) }
+                }
             )
             let cleanCount = results.count { $0.isClean }
             let failingCount = results.count - cleanCount
+            let finishedAt = DateFormatter.localizedString(from: Date(), dateStyle: .none, timeStyle: .short)
+            let summary = "Last run: \(results.count) page(s), \(cleanCount) clean, \(failingCount) failing, \(excludedCount) excluded (finished \(finishedAt))."
+            await crawlTracker.finish(summary: summary)
             await logCapture?.capture(
                 "[crawl-report] finished: \(results.count) page(s) crawled, \(cleanCount) clean, \(failingCount) failing, \(excludedCount) excluded"
             )

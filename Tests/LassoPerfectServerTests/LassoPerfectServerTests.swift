@@ -319,14 +319,16 @@ private func sampleDelegate(
     config: ServerConfig,
     fileMakerRegistry: FileMakerConnectionRegistry? = nil,
     logCapture: LogCapture? = nil,
-    startTime: Date = Date()
+    startTime: Date = Date(),
+    crawlTracker: CrawlRunTracker = CrawlRunTracker()
 ) -> LassoAdminDelegate {
     LassoAdminDelegate(
         config: config,
         startTime: startTime,
         fileMakerRegistry: fileMakerRegistry,
         logCapture: logCapture,
-        baseURL: "http://localhost:\(config.port)"
+        baseURL: "http://localhost:\(config.port)",
+        crawlTracker: crawlTracker
     )
 }
 
@@ -416,6 +418,78 @@ private func sampleDelegate(
     let delegate = sampleDelegate(config: sampleServerConfig())
     let result = try await delegate.switchDatasource(name: "fm_catalog", to: "primary")
     #expect(result.success == false)
+}
+
+@Test func lassoAdminDelegateAvailableActionsShowsStaticDescriptionWhenIdle() async {
+    let delegate = sampleDelegate(config: sampleServerConfig())
+    let actions = await delegate.availableActions()
+    let crawl = actions.first { $0.name == "crawl-report" }
+    #expect(crawl?.description.contains("Request every discovered site page") == true)
+}
+
+@Test func lassoAdminDelegateAvailableActionsShowsLiveProgressWhileRunning() async {
+    let tracker = CrawlRunTracker()
+    await tracker.tryBegin()
+    await tracker.progress(3, 10)
+    let delegate = sampleDelegate(config: sampleServerConfig(), crawlTracker: tracker)
+    let actions = await delegate.availableActions()
+    let crawl = actions.first { $0.name == "crawl-report" }
+    #expect(crawl?.description.contains("3/10 pages") == true)
+    #expect(crawl?.description.contains("Running now") == true)
+}
+
+@Test func lassoAdminDelegateExecuteActionRejectsSecondCrawlWhileFirstIsRunning() async throws {
+    let tracker = CrawlRunTracker()
+    await tracker.tryBegin()
+    let delegate = sampleDelegate(config: sampleServerConfig(), crawlTracker: tracker)
+    let result = try await delegate.executeAction("crawl-report")
+    #expect(result.success == false)
+    #expect(result.message.contains("already running"))
+}
+
+// MARK: - CrawlRunTracker (crawl-report live status)
+
+@Test func crawlRunTrackerTryBeginBlocksConcurrentStart() async {
+    let tracker = CrawlRunTracker()
+    let first = await tracker.tryBegin()
+    let second = await tracker.tryBegin()
+    #expect(first == true)
+    #expect(second == false)
+    #expect(await tracker.isRunning == true)
+}
+
+@Test func crawlRunTrackerProgressReflectsInStatusDescriptionWhileRunning() async {
+    let tracker = CrawlRunTracker()
+    await tracker.tryBegin()
+    await tracker.progress(42, 100)
+    let status = await tracker.statusDescription(fallback: "idle")
+    #expect(status.contains("42/100 pages"))
+    #expect(status.contains("Running now"))
+}
+
+@Test func crawlRunTrackerStatusDescriptionShowsStartingBeforeFirstProgressUpdate() async {
+    let tracker = CrawlRunTracker()
+    await tracker.tryBegin()
+    let status = await tracker.statusDescription(fallback: "idle")
+    #expect(status.contains("starting…"))
+}
+
+@Test func crawlRunTrackerFinishClearsRunningAndExposesSummary() async {
+    let tracker = CrawlRunTracker()
+    await tracker.tryBegin()
+    await tracker.progress(10, 10)
+    await tracker.finish(summary: "Last run: 10 page(s), 9 clean, 1 failing, 0 excluded (finished 1:00 PM).")
+    #expect(await tracker.isRunning == false)
+    let status = await tracker.statusDescription(fallback: "idle")
+    #expect(status.contains("9 clean"))
+    // A finished tracker allows starting again.
+    #expect(await tracker.tryBegin() == true)
+}
+
+@Test func crawlRunTrackerStatusDescriptionFallsBackWhenNeverRun() async {
+    let tracker = CrawlRunTracker()
+    let status = await tracker.statusDescription(fallback: "idle description")
+    #expect(status == "idle description")
 }
 
 // MARK: - FileMakerConnectionRegistry (live datasource switching)

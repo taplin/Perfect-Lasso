@@ -1385,6 +1385,26 @@ What's wired in:
   included) the moment an admin-triggered crawl finished. This action
   calls `CrawlReport.run`/`CrawlReport.printAndWrite` directly, with no
   `exit()` anywhere in its path.
+  - **Live status on the action's chip**: `CrawlRunTracker`
+    (`Sources/LassoPerfectServer/CrawlRunTracker.swift`), an actor the
+    delegate holds, tracks whether a crawl is currently running, its
+    live progress, and the last completed run's summary.
+    `availableActions()` builds the `crawl-report` action's
+    `description` fresh from the tracker on every call, so instead of a
+    static blurb the dashboard shows "Running now — 340/1,989 pages,
+    started 2m ago" while a crawl is in flight, or "Last run: 1,943
+    page(s), 1,897 clean, 46 failing, 892 excluded (finished 11:04 AM)."
+    once it's idle again. `AdminWebUI`'s dashboard re-fetches
+    `/api/actions` on every periodic refresh (not just once at page
+    load), so this updates live without a reload. `executeAction`
+    rejects a second `crawl-report` trigger while one is already
+    running (`CrawlRunTracker.tryBegin()` is atomic — actor
+    serialization rules out two near-simultaneous `POST /api/actions`
+    calls both starting a crawl) rather than letting two sweeps race
+    against the same site. `CrawlReport.run` gained an optional
+    `onProgress: (Int, Int) -> Void` callback (default `nil`, so the
+    CLI mode and every existing caller/test is unaffected) that this
+    action wires to `crawlTracker.progress(completed:total:)`.
 - **Metrics** (`GET /api/metrics`): `AdminMetrics`, constructed
   alongside `LogCapture` whenever `LASSO_ADMIN_CONSOLE=1`, is fed from
   the single choke point every site-serving request passes through
