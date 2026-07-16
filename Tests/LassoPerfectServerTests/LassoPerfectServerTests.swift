@@ -315,12 +315,26 @@ private func sampleServerConfig(
     )
 }
 
+/// A `Task<Void, Error>` that never completes on its own — mirrors the real
+/// site-server task's shape (parks until cancelled) closely enough for tests
+/// that don't specifically exercise the restart-server action's cancel/drain
+/// behavior. Tests that do should construct and pass their own.
+private func neverCompletingTask() -> Task<Void, Error> {
+    Task<Void, Error> {
+        while !Task.isCancelled {
+            try? await Task.sleep(for: .seconds(3600))
+        }
+    }
+}
+
 private func sampleDelegate(
     config: ServerConfig,
     fileMakerRegistry: FileMakerConnectionRegistry? = nil,
     logCapture: LogCapture? = nil,
     startTime: Date = Date(),
-    crawlTracker: CrawlRunTracker = CrawlRunTracker()
+    siteServerTask: Task<Void, Error> = neverCompletingTask(),
+    crawlTracker: CrawlRunTracker = CrawlRunTracker(),
+    restartCoordinator: RestartCoordinator = RestartCoordinator()
 ) -> LassoAdminDelegate {
     LassoAdminDelegate(
         config: config,
@@ -328,7 +342,9 @@ private func sampleDelegate(
         fileMakerRegistry: fileMakerRegistry,
         logCapture: logCapture,
         baseURL: "http://localhost:\(config.port)",
-        crawlTracker: crawlTracker
+        siteServerTask: siteServerTask,
+        crawlTracker: crawlTracker,
+        restartCoordinator: restartCoordinator
     )
 }
 
@@ -490,6 +506,128 @@ private func sampleDelegate(
     let tracker = CrawlRunTracker()
     let status = await tracker.statusDescription(fallback: "idle description")
     #expect(status == "idle description")
+}
+
+// MARK: - RestartCoordinator (restart-server concurrency guard)
+
+@Test func restartCoordinatorTryBeginBlocksConcurrentStart() async {
+    let coordinator = RestartCoordinator()
+    let first = await coordinator.tryBegin()
+    let second = await coordinator.tryBegin()
+    #expect(first == true)
+    #expect(second == false)
+    #expect(await coordinator.isRestarting == true)
+}
+
+@Test func restartCoordinatorResetAllowsStartingAgain() async {
+    let coordinator = RestartCoordinator()
+    await coordinator.tryBegin()
+    await coordinator.reset()
+    #expect(await coordinator.isRestarting == false)
+    #expect(await coordinator.tryBegin() == true)
+}
+
+// MARK: - RestartReadiness.MarkerScanner (restart-server readiness detection)
+
+@Test func markerScannerFindsAMarkerContainedInOneChunk() {
+    var scanner = RestartReadiness.MarkerScanner()
+    let found = scanner.feed("Listening: http://localhost:8281\n", markerPrefix: "Listening: http://localhost:")
+    #expect(found == true)
+}
+
+@Test func markerScannerFindsAMarkerSplitAcrossTwoFeeds() {
+    var scanner = RestartReadiness.MarkerScanner()
+    #expect(scanner.feed("Startup folder: none\nListen", markerPrefix: "Listening: http://localhost:") == false)
+    #expect(scanner.feed("ing: http://localhost:8281\n", markerPrefix: "Listening: http://localhost:") == true)
+}
+
+@Test func markerScannerIgnoresAnUnterminatedLineEvenIfItMatchesTheePrefix() {
+    var scanner = RestartReadiness.MarkerScanner()
+    // No trailing newline yet -- the line isn't confirmed complete, so this must
+    // not report a false positive before the rest of the line (or a real newline)
+    // has actually arrived.
+    let found = scanner.feed("Listening: http://localhost:8281", markerPrefix: "Listening: http://localhost:")
+    #expect(found == false)
+}
+
+@Test func markerScannerReturnsFalseForUnrelatedOutput() {
+    var scanner = RestartReadiness.MarkerScanner()
+    let found = scanner.feed("Site root: /tmp/sample-site\nSession driver: memory\n", markerPrefix: "Listening: http://localhost:")
+    #expect(found == false)
+}
+
+@Test func resolveOwnExecutablePathAcceptsAnAlreadyAbsolutePath() {
+    // The test executable itself is a real, executable, absolute path -- a
+    // convenient stand-in that doesn't depend on any fixture file existing.
+    let ownPath = ProcessInfo.processInfo.arguments[0]
+    let resolved = RestartReadiness.resolveOwnExecutablePath(
+        argv0: ownPath,
+        currentDirectoryPath: "/nonexistent",
+        pathEnvironment: nil
+    )
+    #expect(resolved == ownPath)
+}
+
+@Test func resolveOwnExecutablePathReturnsNilForAnAbsolutePathThatIsNotExecutable() {
+    let resolved = RestartReadiness.resolveOwnExecutablePath(
+        argv0: "/definitely/not/a/real/executable/path",
+        currentDirectoryPath: "/tmp",
+        pathEnvironment: nil
+    )
+    #expect(resolved == nil)
+}
+
+/// Creates a small, genuinely-executable dummy file in a fresh temp directory —
+/// a controlled fixture rather than relying on the real test binary's exact
+/// path shape, which isn't guaranteed to exercise every resolution branch.
+private func makeExecutableFixture() throws -> (directory: URL, filename: String) {
+    let directory = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString, isDirectory: true)
+    try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+    let filename = "dummy-executable"
+    let fileURL = directory.appendingPathComponent(filename)
+    try Data("#!/bin/sh\n".utf8).write(to: fileURL)
+    try FileManager.default.setAttributes([.posixPermissions: 0o755], ofItemAtPath: fileURL.path)
+    return (directory, filename)
+}
+
+@Test func resolveOwnExecutablePathResolvesARelativePathWithASlashAgainstTheCurrentDirectory() throws {
+    let (directory, filename) = try makeExecutableFixture()
+    defer { try? FileManager.default.removeItem(at: directory) }
+    let resolved = RestartReadiness.resolveOwnExecutablePath(
+        argv0: "./\(filename)",
+        currentDirectoryPath: directory.path,
+        pathEnvironment: nil
+    )
+    #expect(resolved != nil)
+}
+
+@Test func resolveOwnExecutablePathFindsABareCommandNameViaPathSearch() throws {
+    let (directory, filename) = try makeExecutableFixture()
+    defer { try? FileManager.default.removeItem(at: directory) }
+    let resolved = RestartReadiness.resolveOwnExecutablePath(
+        argv0: filename,
+        currentDirectoryPath: "/tmp",
+        pathEnvironment: "/usr/bin:\(directory.path):/bin"
+    )
+    #expect(resolved == directory.appendingPathComponent(filename).path)
+}
+
+@Test func resolveOwnExecutablePathReturnsNilWhenNothingMatchesAndThereIsNoPathToSearch() {
+    let resolved = RestartReadiness.resolveOwnExecutablePath(
+        argv0: "some-bare-command-name",
+        currentDirectoryPath: "/tmp",
+        pathEnvironment: nil
+    )
+    #expect(resolved == nil)
+}
+
+@Test func resolveOwnExecutablePathReturnsNilWhenBareCommandNameIsNotOnPath() {
+    let resolved = RestartReadiness.resolveOwnExecutablePath(
+        argv0: "some-bare-command-name",
+        currentDirectoryPath: "/tmp",
+        pathEnvironment: "/usr/bin:/bin"
+    )
+    #expect(resolved == nil)
 }
 
 // MARK: - FileMakerConnectionRegistry (live datasource switching)

@@ -35,6 +35,16 @@ final class LassoAdminDelegate: AdminConsoleDelegate {
     /// (including tests) don't need to pass one; tests that want to drive
     /// or inspect tracker state construct their own and pass it in.
     private let crawlTracker: CrawlRunTracker
+    /// Handle to the site server's own run loop (`main.swift`'s
+    /// `siteServerTask`) — the "restart-server" action cancels this,
+    /// gracefully draining in-flight connections, once a freshly spawned
+    /// replacement process has proven itself healthy. `Task<Void, Error>`
+    /// is unconditionally `Sendable`, so this is safe to store and call
+    /// `.cancel()`/`.value` on from any isolation context.
+    private let siteServerTask: Task<Void, Error>
+    /// Guards against two near-simultaneous restart clicks racing into two
+    /// concurrent process spawns. See `RestartCoordinator`.
+    private let restartCoordinator: RestartCoordinator
 
     init(
         config: ServerConfig,
@@ -42,14 +52,18 @@ final class LassoAdminDelegate: AdminConsoleDelegate {
         fileMakerRegistry: FileMakerConnectionRegistry?,
         logCapture: LogCapture?,
         baseURL: String,
-        crawlTracker: CrawlRunTracker = CrawlRunTracker()
+        siteServerTask: Task<Void, Error>,
+        crawlTracker: CrawlRunTracker = CrawlRunTracker(),
+        restartCoordinator: RestartCoordinator = RestartCoordinator()
     ) {
         self.config = config
         self.startTime = startTime
         self.fileMakerRegistry = fileMakerRegistry
         self.logCapture = logCapture
         self.baseURL = baseURL
+        self.siteServerTask = siteServerTask
         self.crawlTracker = crawlTracker
+        self.restartCoordinator = restartCoordinator
     }
 
     // MARK: - Phase 1: status display
@@ -104,6 +118,10 @@ final class LassoAdminDelegate: AdminConsoleDelegate {
         let description = await crawlTracker.statusDescription(
             fallback: "Request every discovered site page over real HTTP and log a pass/fail summary. Runs in the background; can take several minutes on a large site."
         )
+        var restartDescription = "Spawn a fresh instance, confirm it's healthy, then hand off — the running site keeps serving throughout, no dropped connections. Also how an edited datasource config file gets picked up without a rebuild."
+        if config.sessionDriver == "memory" {
+            restartDescription += " Uses the in-memory session driver: every logged-in visitor's session is lost on handoff."
+        }
         return [
             AdminAction(
                 name: "crawl-report",
@@ -112,10 +130,20 @@ final class LassoAdminDelegate: AdminConsoleDelegate {
                 category: "data",
                 isDestructive: false
             ),
+            AdminAction(
+                name: "restart-server",
+                label: "Restart Server",
+                description: restartDescription,
+                category: "maintenance",
+                isDestructive: true
+            ),
         ]
     }
 
     func executeAction(_ name: String) async throws -> AdminActionResult {
+        if name == "restart-server" {
+            return await executeRestartServer()
+        }
         guard name == "crawl-report" else {
             return .failed("Unknown action: \(name)")
         }
@@ -158,6 +186,81 @@ final class LassoAdminDelegate: AdminConsoleDelegate {
             CrawlReport.printAndWrite(results, outputPath: config.crawlReportOutputPath, excludedCount: excludedCount)
         }
         return .ok("Crawl report started in the background — watch the Logs tab for progress and a completion summary.")
+    }
+
+    /// Spawns a fresh copy of this process (inheriting the current environment, so
+    /// it re-reads any edited config files) and hands off to it — but only once it's
+    /// proven itself genuinely bound and serving via `RestartReadiness`. If it never
+    /// does, this instance is left completely untouched: no window with zero
+    /// processes serving, ever. See `RestartReadiness.swift`'s doc comment for why a
+    /// port health-check probe can't be used here instead (once `Server.alwaysReusePort`
+    /// is in play, an ordinary HTTP request to the shared port could land on either
+    /// process during the handoff window).
+    private func executeRestartServer() async -> AdminActionResult {
+        guard await restartCoordinator.tryBegin() else {
+            return .failed("A restart is already in progress.")
+        }
+        guard let executablePath = RestartReadiness.resolveOwnExecutablePath(
+            argv0: CommandLine.arguments[0],
+            currentDirectoryPath: FileManager.default.currentDirectoryPath,
+            pathEnvironment: ProcessInfo.processInfo.environment["PATH"]
+        ) else {
+            await restartCoordinator.reset()
+            return .failed("Could not resolve this server's own executable path from '\(CommandLine.arguments[0])' — refusing to restart.")
+        }
+
+        let outcome = await RestartReadiness.spawnAndAwaitHealthy(
+            executablePath: executablePath,
+            environment: ProcessInfo.processInfo.environment,
+            markerPrefix: "Listening: http://localhost:"
+        )
+
+        switch outcome {
+        case .failed(let reason):
+            await restartCoordinator.reset()
+            await logCapture?.capture("[admin] restart-server failed: \(reason)")
+            return .failed("\(reason) This instance was left running, unchanged.")
+
+        case .healthy(let pid):
+            await logCapture?.capture("[admin] restart-server: new instance (pid \(pid)) confirmed healthy — handing off")
+            let siteServerTask = self.siteServerTask
+            let logCapture = self.logCapture
+            // Fire-and-forget with a brief delay, matching the crawl-report action's
+            // own pattern — this action's HTTP response (below) needs to actually
+            // reach the caller before anything disruptive happens.
+            Task {
+                try? await Task.sleep(for: .milliseconds(300))
+                siteServerTask.cancel()
+                // Bounded: an actively-executing request or a WebSocket connection has
+                // no drain deadline of its own (see main.swift's siteServerTask doc
+                // comment) — if draining hasn't finished naturally within this window,
+                // force the process down anyway rather than let a stuck restart hang
+                // forever. This is graceful restart degrading to an ungraceful one, so
+                // it's logged distinctly rather than silently folded into a clean exit.
+                let drained = await withTaskGroup(of: Bool.self) { group in
+                    group.addTask {
+                        try? await siteServerTask.value
+                        return true
+                    }
+                    group.addTask {
+                        try? await Task.sleep(for: .seconds(10))
+                        return false
+                    }
+                    let result = await group.next() ?? false
+                    group.cancelAll()
+                    return result
+                }
+                if !drained {
+                    await logCapture?.capture("[admin] restart-server: old instance did not drain within 10s — forcing exit")
+                }
+                exit(0)
+            }
+            var message = "New instance confirmed healthy on port \(config.port) (pid \(pid)). This instance will shut down shortly — reconnect with the new token once it does."
+            if config.sessionDriver == "memory" {
+                message += " Logged-in sessions were reset."
+            }
+            return .ok(message)
+        }
     }
 
     // MARK: - Phase 3: datasource management

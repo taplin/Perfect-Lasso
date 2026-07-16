@@ -17,6 +17,7 @@ A single page where you can, without SSH access or a restart:
 - Trigger a full crawl-report sweep of the site and watch it progress in real time.
 - Tail recent log lines (datasource failures, admin actions) without shelling in.
 - See request/error counts for real site traffic.
+- **Restart the server** — including picking up an edited config file — with zero dropped connections, instead of a manual `kill` + relaunch.
 
 ## Quick start
 
@@ -106,6 +107,40 @@ run means "every statically discoverable page renders," not "the site
 works."** Full writeup: `crawl-report-filtering-plan.md`'s "Known
 limitation" section.
 
+## Restart Server action
+
+Spawns a fresh copy of the server process (inheriting the current
+environment — so it re-reads any edited config file, including
+`LASSO_DATASOURCE_CONFIG_PATH`) and hands off to it, with **zero requests
+refused during the handoff**. This is also the answer to "do I need to
+rebuild after editing the datasource config?" — you don't; a restart is
+enough, and this action is the no-shell-access way to trigger one.
+
+How it stays safe: the new process is never trusted until it prints
+confirmation that it genuinely bound the site port and started serving.
+Only then does the old process gracefully cancel its own accept loop (new
+connections already have somewhere to go — the new process, which shares
+the port via `SO_REUSEPORT` — while in-flight requests on the old process
+finish naturally rather than being cut off) and exit. If the new process
+never proves itself healthy within 10 seconds, or crashes on startup, the
+**old process is left running completely untouched** — there's never a
+window with zero processes serving the site.
+
+Two things worth knowing before you click it:
+- **Bearer token rotates.** A fresh random token is generated on every
+  process start, so the dashboard will 401 and drop back to the
+  token-entry screen once the handoff completes — re-paste the new token
+  from `LASSO_ADMIN_TOKEN_PATH`.
+- **Session state is lost under the default in-memory session driver.**
+  The new process boots with an empty session store, so every logged-in
+  visitor gets signed out. The action's own description calls this out
+  when `LASSO_SESSION_DRIVER` is unset or `memory`. Use a persistent
+  session driver if this matters for your site.
+
+A second restart can't be started while one is already in progress — the
+action returns a clear "already in progress" failure instead of racing two
+spawns.
+
 ## Security model
 
 - Admin port bound to `127.0.0.1` only.
@@ -126,7 +161,7 @@ All routes require `Authorization: Bearer <token>`; mutating routes (POST/DELETE
 | `/api/datasources/test` | POST | Body `{"name": "<alias>"}` |
 | `/api/datasources/switch` | POST | Body `{"name": "<alias>", "config": "<profile id>"}` |
 | `/api/actions` | GET | Built-in + Lasso-specific actions, descriptions reflect live state |
-| `/api/actions` | POST | Body `{"action": "crawl-report"}` (or `clear-logs`, `reload-tls`) |
+| `/api/actions` | POST | Body `{"action": "crawl-report"}` (or `restart-server`, `clear-logs`, `reload-tls`) |
 | `/api/logs` | GET | `?count=N`, default 100 |
 | `/api/logs` | DELETE | Clears the ring buffer |
 | `/api/metrics` | GET | Request/error counts, top routes |
@@ -137,4 +172,7 @@ All routes require `Authorization: Bearer <token>`; mutating routes (POST/DELETE
 - `Sources/LassoPerfectServer/AdminConsoleIntegration.swift` — `LassoAdminDelegate`, the `AdminConsoleDelegate` conformance.
 - `Sources/LassoPerfectServer/FileMakerConnectionRegistry.swift` — live per-alias FileMaker host resolution.
 - `Sources/LassoPerfectServer/CrawlRunTracker.swift` — crawl-report live status tracking.
+- `Sources/LassoPerfectServer/RestartCoordinator.swift` / `RestartReadiness.swift` — the restart action's concurrency guard and spawn/health-detection logic.
+- `Sources/LassoPerfectServer/main.swift` — `siteServerTask`, the cancellable handle the restart action hands off through.
+- `Perfect-NIO/Sources/PerfectNIO/Server.swift` — `alwaysReusePort`, the `SO_REUSEPORT` primitive the whole restart mechanism depends on.
 - `Perfect-NIO/Sources/PerfectAdminConsole/` — the general-purpose library (routes, auth, CSRF, the dashboard HTML/JS itself).

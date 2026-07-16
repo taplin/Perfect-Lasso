@@ -1457,6 +1457,29 @@ let config = try ServerConfig.load()
 let logCapture = config.adminConsoleEnabled ? LogCapture() : nil
 let metrics = config.adminConsoleEnabled ? AdminMetrics() : nil
 let siteServer = try LassoSiteServer(config: config, logCapture: logCapture, metrics: metrics)
+// Started below (after the "Listening" print moves inside its ready callback) as a
+// cancellable, awaitable Task rather than a bare blocking call — the admin console's
+// "restart-server" action needs a handle it can `.cancel()` to gracefully hand off to a
+// freshly spawned replacement process before this one exits. See RestartReadiness.swift.
+let siteServerTask = Task.detached {
+    // .detached, not a plain Task { } — top-level code in main.swift is implicitly
+    // MainActor-isolated in Swift 6, and Server.withServer's closure runs from
+    // inside its own internal (non-MainActor) task group; a MainActor-isolated
+    // closure can't safely cross that boundary. Nothing in this closure touches
+    // MainActor-isolated state, so detaching is correct, not just a workaround.
+    try await Server(routes: try siteServer.routes(), port: config.port, alwaysReusePort: true)
+        .withServer { boundPort in
+            print("Listening: http://localhost:\(boundPort)")
+            // stdout becomes block-buffered once redirected to a pipe (not a TTY) — a
+            // restart's spawned-child readiness watcher reads this process's stdout when
+            // *it's* the child, and without an explicit flush this line could sit in libc's
+            // buffer indefinitely instead of ever reaching the parent.
+            fflush(stdout)
+            while !Task.isCancelled {
+                try? await Task.sleep(for: .seconds(3600))
+            }
+        }
+}
 print("Lasso Perfect test server")
 print("Site root: \(config.siteRoot.path)")
 if let startupPath = config.startupPath {
@@ -1472,7 +1495,9 @@ if let startupPath = config.startupPath {
 } else {
     print("Startup folder: none")
 }
-print("Listening: http://localhost:\(config.port)")
+// "Listening: ..." now prints from inside siteServerTask's withServer callback (above),
+// only once the server has genuinely bound and started accepting — not unconditionally
+// here, ahead of the actual bind.
 if config.datasourceMap.isEmpty {
     print("Datasource aliases: none")
 } else {
@@ -1529,7 +1554,8 @@ if config.adminConsoleEnabled {
         startTime: Date(),
         fileMakerRegistry: siteServer.fileMakerRegistry,
         logCapture: logCapture,
-        baseURL: "http://localhost:\(config.port)"
+        baseURL: "http://localhost:\(config.port)",
+        siteServerTask: siteServerTask
     )
     let admin = try AdminConsole(
         port: config.adminConsolePort,
@@ -1542,15 +1568,47 @@ if config.adminConsoleEnabled {
     // matches the existing crawl-report-mode Task above, this project's
     // established pattern for "start something alongside the main serve
     // loop without blocking it."
+    //
+    // Retries on bind failure, unlike a bare one-shot attempt: the admin
+    // port deliberately does NOT use `alwaysReusePort` (see
+    // FileMakerConnectionRegistry.swift's sibling doc comment on
+    // AdminConsoleIntegration.swift's restart action for why), so when a
+    // "restart-server" handoff spawns this process, the *previous*
+    // process's admin console can still be bound to the same port for a
+    // little while after this one starts — its own shutdown isn't
+    // synchronized with the site server's readiness handoff, only
+    // triggered by it, with a drain step that can itself take a few
+    // seconds. Found live: without a retry, the very first restart in this
+    // feature's own testing left the new process with no admin console at
+    // all until the *next* restart. 20 attempts, 500ms apart (10s total) —
+    // matches the restart action's own bounded drain fallback, so this
+    // process gives the old one at least as long to actually let go of
+    // the port as that action is willing to wait for a graceful exit.
     Task {
-        do {
-            try await admin.run()
-        } catch {
-            fputs("[AdminConsole] failed to start: \(error)\n", stderr)
+        var lastError: Error?
+        for attempt in 1...20 {
+            do {
+                try await admin.run()
+                return // run() only returns after a clean, intentional shutdown
+            } catch {
+                lastError = error
+                if attempt < 20 {
+                    try? await Task.sleep(for: .milliseconds(500))
+                }
+            }
         }
+        fputs("[AdminConsole] failed to start after repeated attempts: \(lastError.map { "\($0)" } ?? "unknown error")\n", stderr)
     }
 } else {
     print("Admin console: disabled (set LASSO_ADMIN_CONSOLE=1 to enable)")
 }
 
-try await Server(routes: try siteServer.routes(), port: config.port).run()
+do {
+    try await siteServerTask.value
+} catch is CancellationError {
+    // Expected: the "restart-server" admin action cancelled this deliberately
+    // once a replacement process proved itself healthy.
+} catch {
+    fputs("Site server failed: \(error)\n", stderr)
+    exit(1)
+}
