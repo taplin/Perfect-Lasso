@@ -411,9 +411,25 @@ struct LassoSiteServer: Sendable {
     /// storage, matching how a real Lasso instance's session store outlives
     /// any single request.
     let sessionDriver: any SessionDriver
+    /// `nil` unless the admin console is enabled (`LASSO_ADMIN_CONSOLE=1`)
+    /// — no ring buffer to feed when nothing will ever read it.
+    let logCapture: LogCapture?
+    /// Same nil-when-unused policy as `logCapture`.
+    let metrics: AdminMetrics?
+    /// `nil` when no FileMaker datasource is configured. Owns the *live*,
+    /// runtime-mutable host/port each FileMaker alias currently resolves
+    /// to — see `FileMakerConnectionRegistry`'s own doc comment. Exposed
+    /// here (not just captured locally in the FileMaker queryHandler
+    /// closure below) so `LassoAdminDelegate`, constructed separately in
+    /// `main.swift`'s top-level code, can share the exact same instance —
+    /// real query traffic and the admin console's "switch datasource"
+    /// action must always agree on which host an alias currently means.
+    let fileMakerRegistry: FileMakerConnectionRegistry?
 
-    init(config: ServerConfig) throws {
+    init(config: ServerConfig, logCapture: LogCapture? = nil, metrics: AdminMetrics? = nil) throws {
         self.config = config
+        self.logCapture = logCapture
+        self.metrics = metrics
         includeLoader = try LassoFileSystemIncludeLoader(root: config.siteRoot)
         uploadProcessor = try LassoFileSystemUploadProcessor(root: config.siteRoot)
 
@@ -470,7 +486,7 @@ struct LassoSiteServer: Sendable {
                     } catch let error as LassoDatabaseActionError {
                         throw error
                     } catch {
-                        logDatasourceActionFailure(kind: "search", datasource: datasource, error: error)
+                        logDatasourceActionFailure(kind: "search", datasource: datasource, error: error, logCapture: logCapture)
                         throw LassoDatabaseActionError(kind: .search, datasource: datasource, underlying: error)
                     }
                 },
@@ -488,7 +504,7 @@ struct LassoSiteServer: Sendable {
                         case .update: .update
                         case .delete: .delete
                         }
-                        logDatasourceActionFailure(kind: kind.rawValue, datasource: datasource, error: error)
+                        logDatasourceActionFailure(kind: kind.rawValue, datasource: datasource, error: error, logCapture: logCapture)
                         throw LassoDatabaseActionError(kind: kind, datasource: datasource, underlying: error)
                     }
                 },
@@ -501,7 +517,7 @@ struct LassoSiteServer: Sendable {
                     } catch let error as LassoDatabaseActionError {
                         throw error
                     } catch {
-                        logDatasourceActionFailure(kind: "sql", datasource: datasource, error: error)
+                        logDatasourceActionFailure(kind: "sql", datasource: datasource, error: error, logCapture: logCapture)
                         throw LassoDatabaseActionError(kind: .sql, datasource: datasource, underlying: error)
                     }
                 }
@@ -527,27 +543,28 @@ struct LassoSiteServer: Sendable {
             let filemakerPassword = config.filemakerPassword ?? ""
             let filemakerUseTLS = filemakerPort == 443
             let filemakerScheme = filemakerUseTLS ? "https" : "http"
+            let registry = FileMakerConnectionRegistry(config: config)
+            fileMakerRegistry = registry
             // Container-field URLs (FMPFieldValue.container) are prefixed
             // with this single baseURL regardless of which alias's records
-            // they came from — known, accepted gap for an alias using a
-            // host override below: its container-field links would point
-            // at the wrong host. Not a concern for the connectivity-testing
-            // use case host overrides exist for; would need a per-alias
+            // they came from — known, accepted gap for an alias whose live
+            // resolution (below) currently points somewhere other than the
+            // shared block: its container-field links would point at the
+            // wrong host. Not a concern for the connectivity-testing/dev-
+            // server use case this exists for; would need a per-alias
             // baseURL (not just per-alias FileMakerServer) to fix properly.
             let executor = PerfectFileMakerLassoExecutor(
                 allowWrites: config.filemakerAllowWrites,
                 baseURL: "\(filemakerScheme)://\(filemakerHost):\(filemakerPort)"
             ) { query, kind, datasource in
-                // Per-alias host/port override (e.g. a dev/backup FileMaker
-                // Server tested under a second alias) reuses the shared
-                // block's credentials — there's no per-alias user/password,
-                // only host/port. Falls back to the shared connection when
-                // no override exists for this alias. Shares its resolution
-                // logic with LassoAdminDelegate.testDatasource so the admin
-                // console's "Test" button and real query traffic always
-                // agree on which host an alias means.
-                let (host, port) = LassoAdminDelegate.resolveFileMakerHost(for: datasource.lowercased(), config: config)
-                    ?? (filemakerHost, filemakerPort)
+                // Live resolution via the registry, not a value captured
+                // once at startup — this is what makes the admin console's
+                // "switch datasource" action take effect on the very next
+                // query. Falls back to the shared connection if the
+                // registry somehow doesn't recognize this alias (shouldn't
+                // happen for anything in config.filemakerDatasourceAliases,
+                // but a safe default beats a crash).
+                let (host, port) = await registry.resolve(alias: datasource) ?? (filemakerHost, filemakerPort)
                 let useTLS = port == 443
                 // A fresh FileMakerServer per call (matching makeDatabase's
                 // own per-call construction above), even though the
@@ -571,7 +588,7 @@ struct LassoSiteServer: Sendable {
                 } catch let error as LassoFileMakerDatabaseActionError {
                     throw error
                 } catch {
-                    logDatasourceActionFailure(kind: "\(kind)", datasource: datasource, error: error)
+                    logDatasourceActionFailure(kind: "\(kind)", datasource: datasource, error: error, logCapture: logCapture)
                     throw LassoFileMakerDatabaseActionError(kind: kind, datasource: datasource, underlying: error)
                 }
             }
@@ -579,6 +596,7 @@ struct LassoSiteServer: Sendable {
             // FileMaker database-file name.
             fileMakerProvider = LassoDynamicInlineProvider(executor: executor, datasourceAliases: [:])
         } else {
+            fileMakerRegistry = nil
             fileMakerProvider = nil
         }
 
@@ -618,6 +636,10 @@ struct LassoSiteServer: Sendable {
     }
 
     private func handle(request: any HTTPRequest, trailingPath: String) async throws -> HTTPOutput {
+        // Route key matches AdminMetrics' own documented convention
+        // ("METHOD:///path", e.g. "GET:///api/posts") so /api/metrics
+        // shows something directly comparable to that example.
+        await metrics?.recordRequest(route: "\(request.method.rawValue):///\(trailingPath)")
         var resolvedPath = trailingPath
         var resolvedFileURL: URL?
         do {
@@ -638,8 +660,10 @@ struct LassoSiteServer: Sendable {
             }
             return try FileOutput(localPath: fileURL.path)
         } catch let error as ErrorOutput {
+            await metrics?.recordError()
             throw error
         } catch {
+            await metrics?.recordError()
             return developerErrorOutput(
                 error,
                 request: request,
@@ -1046,8 +1070,22 @@ struct LassoSiteServer: Sendable {
 /// legitimately finds zero rows and one that silently can't reach the
 /// database at all look identical from inside the page — this stderr
 /// line is what actually distinguishes them operationally.
-func logDatasourceActionFailure(kind: String, datasource: String, error: Error) {
-    fputs("Datasource action failed kind=\(kind) datasource=\(datasource) error=\(error)\n", stderr)
+/// `logCapture` is optional and this function stays synchronous (not
+/// `async`) deliberately — `PerfectCRUDLassoExecutor`'s `queryHandler`/
+/// `mutationHandler`/`rawSQLHandler` closure types are plain synchronous
+/// throwing closures (matching PerfectCRUD's own synchronous connector
+/// API), so an `async` signature here would force those call sites into
+/// an unwanted bridge. A fire-and-forget `Task` for the actor-isolated
+/// `LogCapture` write is safe here — this is best-effort operator
+/// visibility, not something any caller waits on — matching this file's
+/// existing fire-and-forget `Task { }` precedent (crawl-report mode, the
+/// admin console's own startup).
+func logDatasourceActionFailure(kind: String, datasource: String, error: Error, logCapture: LogCapture? = nil) {
+    let line = "Datasource action failed kind=\(kind) datasource=\(datasource) error=\(error)"
+    fputs(line + "\n", stderr)
+    if let logCapture {
+        Task { await logCapture.capture("[datasource] " + line) }
+    }
 }
 
 struct LassoSiteRenderError: Error, CustomStringConvertible {
@@ -1411,7 +1449,14 @@ if let baselinePath = ProcessInfo.processInfo.environment["LASSO_CRAWL_DIFF_BASE
 }
 
 let config = try ServerConfig.load()
-let siteServer = try LassoSiteServer(config: config)
+// Constructed here (not inside the `config.adminConsoleEnabled` block
+// below) so `LassoSiteServer.init` can wire real request/error traffic
+// into them from the start — no ring buffer to feed or counters to
+// increment when the admin console is disabled, though, so both stay
+// `nil` in that case rather than paying for an actor nothing will ever read.
+let logCapture = config.adminConsoleEnabled ? LogCapture() : nil
+let metrics = config.adminConsoleEnabled ? AdminMetrics() : nil
+let siteServer = try LassoSiteServer(config: config, logCapture: logCapture, metrics: metrics)
 print("Lasso Perfect test server")
 print("Site root: \(config.siteRoot.path)")
 if let startupPath = config.startupPath {
@@ -1479,10 +1524,18 @@ if config.crawlReportMode {
 
 if config.adminConsoleEnabled {
     print("Admin console: enabled on http://127.0.0.1:\(config.adminConsolePort) — token: \(config.adminConsoleTokenPath)")
-    let adminDelegate = LassoAdminDelegate(config: config, startTime: Date())
+    let adminDelegate = LassoAdminDelegate(
+        config: config,
+        startTime: Date(),
+        fileMakerRegistry: siteServer.fileMakerRegistry,
+        logCapture: logCapture,
+        baseURL: "http://localhost:\(config.port)"
+    )
     let admin = try AdminConsole(
         port: config.adminConsolePort,
         tokenFilePath: config.adminConsoleTokenPath,
+        logCapture: logCapture,
+        metrics: metrics,
         delegate: adminDelegate
     )
     // Runs concurrently with the main server's own blocking .run() below —

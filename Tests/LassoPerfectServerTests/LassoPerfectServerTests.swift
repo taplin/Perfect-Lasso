@@ -315,10 +315,25 @@ private func sampleServerConfig(
     )
 }
 
+private func sampleDelegate(
+    config: ServerConfig,
+    fileMakerRegistry: FileMakerConnectionRegistry? = nil,
+    logCapture: LogCapture? = nil,
+    startTime: Date = Date()
+) -> LassoAdminDelegate {
+    LassoAdminDelegate(
+        config: config,
+        startTime: startTime,
+        fileMakerRegistry: fileMakerRegistry,
+        logCapture: logCapture,
+        baseURL: "http://localhost:\(config.port)"
+    )
+}
+
 @Test func lassoAdminDelegateExposesServerPortAndStartTime() {
     let start = Date()
     let config = sampleServerConfig()
-    let delegate = LassoAdminDelegate(config: config, startTime: start)
+    let delegate = sampleDelegate(config: config, startTime: start)
     #expect(delegate.serverPort == 8181)
     #expect(delegate.serverStartTime == start)
     #expect(delegate.registeredRoutes.map(\.uri).isEmpty == false)
@@ -329,7 +344,7 @@ private func sampleServerConfig(
         datasourceMap: ["catalog_mysql": "catalog"],
         filemakerDatasourceAliases: ["fm_catalog"]
     )
-    let delegate = LassoAdminDelegate(config: config, startTime: Date())
+    let delegate = sampleDelegate(config: config)
     let sources = await delegate.registeredDatasources()
 
     #expect(sources.count == 2)
@@ -345,7 +360,7 @@ private func sampleServerConfig(
 }
 
 @Test func lassoAdminDelegateReturnsEmptyDatasourcesWhenNoneConfigured() async {
-    let delegate = LassoAdminDelegate(config: sampleServerConfig(), startTime: Date())
+    let delegate = sampleDelegate(config: sampleServerConfig())
     let sources = await delegate.registeredDatasources()
     #expect(sources.isEmpty)
 }
@@ -353,7 +368,7 @@ private func sampleServerConfig(
 @Test func lassoAdminDelegateStatusSectionReflectsSiteConfig() async throws {
     let startup = URL(fileURLWithPath: "/tmp/sample-startup")
     let config = sampleServerConfig(sessionDriver: "mysql", startupPath: startup)
-    let delegate = LassoAdminDelegate(config: config, startTime: Date())
+    let delegate = sampleDelegate(config: config)
     let sections = await delegate.additionalStatusSections()
 
     let siteSection = try #require(sections.first { $0.title == "Lasso Site" })
@@ -365,7 +380,7 @@ private func sampleServerConfig(
 }
 
 @Test func lassoAdminDelegateStatusSectionShowsNoStartupFolderWhenUnset() async {
-    let delegate = LassoAdminDelegate(config: sampleServerConfig(), startTime: Date())
+    let delegate = sampleDelegate(config: sampleServerConfig())
     let sections = await delegate.additionalStatusSections()
     let items = Dictionary(uniqueKeysWithValues: sections[0].items)
     #expect(items["Startup folder"] == "none")
@@ -373,47 +388,103 @@ private func sampleServerConfig(
 
 @Test func lassoAdminDelegateTestDatasourceFailsCleanlyForUnknownName() async throws {
     let config = sampleServerConfig(datasourceMap: ["catalog_mysql": "catalog"])
-    let delegate = LassoAdminDelegate(config: config, startTime: Date())
+    let delegate = sampleDelegate(config: config)
     let result = try await delegate.testDatasource(name: "not_a_real_alias")
     #expect(result.success == false)
     #expect(result.message.contains("not_a_real_alias"))
 }
 
-// MARK: - resolveFileMakerHost (per-alias FileMaker host override)
+@Test func lassoAdminDelegateAvailableActionsAdvertisesCrawlReport() async {
+    let delegate = sampleDelegate(config: sampleServerConfig())
+    let actions = await delegate.availableActions()
+    #expect(actions.contains { $0.name == "crawl-report" })
+}
 
-@Test func resolveFileMakerHostUsesSharedConnectionWhenNoOverrideExists() {
+@Test func lassoAdminDelegateExecuteActionRejectsUnknownName() async throws {
+    let delegate = sampleDelegate(config: sampleServerConfig())
+    let result = try await delegate.executeAction("not-a-real-action")
+    #expect(result.success == false)
+}
+
+@Test func lassoAdminDelegateAvailableConfigsEmptyWithNoFileMakerRegistry() async {
+    let delegate = sampleDelegate(config: sampleServerConfig(filemakerDatasourceAliases: ["fm_catalog"]))
+    let configs = await delegate.availableConfigs(for: "fm_catalog")
+    #expect(configs.isEmpty)
+}
+
+@Test func lassoAdminDelegateSwitchDatasourceFailsCleanlyWithNoRegistry() async throws {
+    let delegate = sampleDelegate(config: sampleServerConfig())
+    let result = try await delegate.switchDatasource(name: "fm_catalog", to: "primary")
+    #expect(result.success == false)
+}
+
+// MARK: - FileMakerConnectionRegistry (live datasource switching)
+
+@Test func fileMakerConnectionRegistryResolvesToPrimaryByDefault() async {
     let config = sampleServerConfig(filemakerDatasourceAliases: ["fm_catalog"])
-    let resolved = LassoAdminDelegate.resolveFileMakerHost(for: "fm_catalog", config: config)
+    let registry = FileMakerConnectionRegistry(config: config)
+    let resolved = await registry.resolve(alias: "fm_catalog")
     #expect(resolved?.host == "192.0.2.1")
 }
 
-@Test func resolveFileMakerHostPrefersPerAliasOverride() {
+@Test func fileMakerConnectionRegistryResolvesOverriddenAliasToItsOwnHost() async {
     let config = sampleServerConfig(
         filemakerDatasourceAliases: ["fm_catalog", "fm_catalog_backup"],
         filemakerHostOverrides: ["fm_catalog_backup": FileMakerHostOverride(host: "203.0.113.5", port: 8080)]
     )
-    // The alias with no override still resolves to the shared connection.
-    let primary = LassoAdminDelegate.resolveFileMakerHost(for: "fm_catalog", config: config)
+    let registry = FileMakerConnectionRegistry(config: config)
+    let primary = await registry.resolve(alias: "fm_catalog")
     #expect(primary?.host == "192.0.2.1")
-
-    // The overridden alias resolves to the override's host/port instead.
-    let backup = LassoAdminDelegate.resolveFileMakerHost(for: "fm_catalog_backup", config: config)
+    let backup = await registry.resolve(alias: "fm_catalog_backup")
     #expect(backup?.host == "203.0.113.5")
     #expect(backup?.port == 8080)
 }
 
-@Test func resolveFileMakerHostOverrideFallsBackToSharedPortWhenOmitted() {
-    // An override can supply just a host, inheriting the shared block's port.
-    let config = sampleServerConfig(
-        filemakerDatasourceAliases: ["fm_catalog_backup"],
-        filemakerHostOverrides: ["fm_catalog_backup": FileMakerHostOverride(host: "203.0.113.5", port: nil)]
-    )
-    let resolved = LassoAdminDelegate.resolveFileMakerHost(for: "fm_catalog_backup", config: config)
-    #expect(resolved?.host == "203.0.113.5")
-    #expect(resolved?.port == 80) // sampleServerConfig's default FileMaker port
+@Test func fileMakerConnectionRegistryResolveReturnsNilForUnknownAlias() async {
+    let config = sampleServerConfig(filemakerDatasourceAliases: ["fm_catalog"])
+    let registry = FileMakerConnectionRegistry(config: config)
+    #expect(await registry.resolve(alias: "not_configured") == nil)
 }
 
-@Test func resolveFileMakerHostReturnsNilWhenNoConnectionConfiguredAtAll() {
-    let config = sampleServerConfig()
-    #expect(LassoAdminDelegate.resolveFileMakerHost(for: "anything", config: config) == nil)
+@Test func fileMakerConnectionRegistryAvailableProfilesListsAllKnownHostsWithActiveFlag() async {
+    let config = sampleServerConfig(
+        filemakerDatasourceAliases: ["fm_catalog", "fm_catalog_backup"],
+        filemakerHostOverrides: ["fm_catalog_backup": FileMakerHostOverride(host: "203.0.113.5", port: 8080)]
+    )
+    let registry = FileMakerConnectionRegistry(config: config)
+    let profiles = await registry.availableProfiles(for: "fm_catalog")
+    #expect(profiles.count == 2)
+    #expect(profiles.first { $0.id == "primary" }?.isActive == true)
+    #expect(profiles.first { $0.id == "fm_catalog_backup" }?.isActive == false)
+}
+
+@Test func fileMakerConnectionRegistryAvailableProfilesEmptyForUnknownAlias() async {
+    let config = sampleServerConfig(filemakerDatasourceAliases: ["fm_catalog"])
+    let registry = FileMakerConnectionRegistry(config: config)
+    #expect(await registry.availableProfiles(for: "not_configured").isEmpty)
+}
+
+@Test func fileMakerConnectionRegistrySwitchAliasTakesEffectImmediately() async {
+    let config = sampleServerConfig(
+        filemakerDatasourceAliases: ["fm_catalog", "fm_catalog_backup"],
+        filemakerHostOverrides: ["fm_catalog_backup": FileMakerHostOverride(host: "203.0.113.5", port: 8080)]
+    )
+    let registry = FileMakerConnectionRegistry(config: config)
+    #expect(await registry.resolve(alias: "fm_catalog")?.host == "192.0.2.1")
+
+    let switched = await registry.switchAlias("fm_catalog", to: "fm_catalog_backup")
+    #expect(switched?.host == "203.0.113.5")
+    #expect(await registry.resolve(alias: "fm_catalog")?.host == "203.0.113.5")
+
+    // The profile list now reflects the new active profile too.
+    let profiles = await registry.availableProfiles(for: "fm_catalog")
+    #expect(profiles.first { $0.id == "fm_catalog_backup" }?.isActive == true)
+    #expect(profiles.first { $0.id == "primary" }?.isActive == false)
+}
+
+@Test func fileMakerConnectionRegistrySwitchAliasFailsForUnknownAliasOrProfile() async {
+    let config = sampleServerConfig(filemakerDatasourceAliases: ["fm_catalog"])
+    let registry = FileMakerConnectionRegistry(config: config)
+    #expect(await registry.switchAlias("not_configured", to: "primary") == nil)
+    #expect(await registry.switchAlias("fm_catalog", to: "not_a_real_profile") == nil)
 }
