@@ -4881,3 +4881,39 @@ private final class MapIncludeLoader: LassoIncludeLoader, @unchecked Sendable {
     #expect(TagCatalog.entry("records")?.openForms.contains(.bareIdentifier) == true)
     #expect(TagCatalog.entry("rows")?.openForms.contains(.bareIdentifier) == true)
 }
+
+// Phase 2 of tag-form consolidation: every catalog entry's `openForms` is
+// now real, corpus-verified documentation (or a deliberate `[]` with an
+// architectural reason) rather than an unexamined guess. Pinning the exact
+// expected value per name catches an accidental edit silently
+// reintroducing an unattested form (e.g. `while`'s dishonest `.parenCall`
+// claim, proposed then caught and corrected during this phase's review —
+// the corpus has zero real Lasso `while(...)` usage, only JavaScript false
+// positives) just as much as it would catch a value going missing.
+@Test func openFormsAreCharacterizedForEveryCatalogEntry() throws {
+    let expected: [String: [TagOpenForm]] = [
+        "if": [.parenCall, .colonCall, .bareCondition],
+        "inline": [.parenCall],
+        "records": [.parenCall, .colonCall, .bareIdentifier],
+        "rows": [.parenCall, .colonCall, .bareIdentifier],
+        "loop": [.parenCall, .colonCall],
+        "iterate": [.parenCall],
+        "while": [],
+        "protect": [],
+        "output_none": [],
+        "html_comment": [],
+        "encode_set": [.parenCall],
+        "select": [],
+        "define_tag": [],
+        "define_type": [],
+        "define": [],
+        "with": [],
+        "else": [],
+        "case": [],
+    ]
+
+    #expect(TagCatalog.shared.count == expected.count, "catalog entry count drifted from this test's expected map")
+    for (name, forms) in expected {
+        #expect(TagCatalog.entry(name)?.openForms == forms, "\(name) openForms mismatch")
+    }
+}

@@ -9,13 +9,31 @@
 /// differences explicit and impossible to accidentally drift out of sync,
 /// not to force them into one flat, incorrect answer.
 ///
-/// This is Commit A of the tag-form consolidation project (see
-/// `Documentation/` for the design/plan/review write-ups) — a pure data
-/// refactor. It reproduces today's five `Set<String>` tables exactly; no
-/// parsing/dispatch behavior changes. Commit B (a follow-up) will route
-/// `if` and bare `records`/`rows` through an exhaustive `TagOpenForm`
-/// switch built on top of this catalog; every other tag is unaffected by
-/// either commit.
+/// Tag-form consolidation status:
+/// - **Phase 1** (Commit A: catalog as a pure data refactor reproducing the
+///   five original `Set<String>` tables exactly, no behavior change; Commit
+///   B: routed `if` and bare `records`/`rows` through an exhaustive
+///   `TagOpenForm` switch in `ScriptBodyParser`, since both have a genuine
+///   surface-form ambiguity — reached by a fallible cascade — where a
+///   missing case previously meant silent wrong output, not an error).
+/// - **Phase 2** (this state): re-examined all 15 remaining tags against
+///   Phase 1's real lesson and found NONE of them have that same kind of
+///   ambiguity — every one either collapses to identical shared-cascade
+///   handling regardless of which attested form matched (`inline`, `loop`,
+///   `iterate`, `encode_set`), has no cascade-reachable form worth
+///   characterizing at all (`while`, `protect`, `html_comment`,
+///   `output_none`), or already has its own genuinely-divergent handling
+///   solved elsewhere by dedicated, non-`TagOpenForm` code
+///   (`select`/`case`'s branch-lowering in `BlockBuilder`, `else`'s
+///   bare-vs-condition branching, `define`/`define_tag`/`define_type`/
+///   `with`'s dedicated opener functions). So Phase 2 is deliberately a
+///   documentation-only change: every entry's `openForms` is now populated
+///   with real, corpus-verified evidence (or left `[]` with an explicit
+///   architectural reason, never "not yet characterized") — no new
+///   dispatch machinery, because none of the 15 earned it. Building a
+///   records/rows-style switch for any of them would have been ceremony
+///   over a tautology, the exact mistake Phase 1's own review process
+///   caught and fixed.
 enum CatalogScope: CaseIterable {
     /// `ScriptBodyParser.blockNames`/`bareBlockNames` — script-mode
     /// (`<?lasso ... ?>`) block pairing. Tags with their own dedicated
@@ -81,12 +99,14 @@ struct TagEntry {
     /// other) is deliberate — see each entry below for why they differ.
     let bareOpenScopes: Set<CatalogScope>
     /// The script-mode opening forms this tag actually supports, canonical
-    /// form first. Commit B (this same file's consumer,
-    /// `ScriptBodyParser.parseBlockOpening`/`emitStatement`) only reads
-    /// this for "if" and "records"/"rows" — every other entry is left `[]`
-    /// deliberately rather than guessed at, so this field never silently
-    /// asserts something about a tag Commit B hasn't actually verified.
-    /// Characterizing the rest is Phase 2's job.
+    /// form first. `ScriptBodyParser.parseBlockOpening`/`emitStatement` only
+    /// dispatch on this for "if" and "records"/"rows" (Phase 1) — every
+    /// other entry's `openForms` (Phase 2) is populated as pure,
+    /// corpus-verified documentation, deliberately not read by any switch,
+    /// so this field never silently asserts dispatch behavior that doesn't
+    /// exist. An empty `[]` always means "no cascade-reachable form worth
+    /// characterizing," never "not yet characterized" — see each entry's
+    /// comment for the specific architectural reason.
     let openForms: [TagOpenForm]
 }
 
@@ -123,7 +143,16 @@ enum TagCatalog {
         // silently swallowing the entire page body until an unrelated
         // `[/if]` elsewhere happened to close it.
         TagEntry(name: "if", blockScopes: [.scriptBody, .blockBuilder, .lassoParser], bareOpenScopes: [], openForms: [.parenCall, .colonCall, .bareCondition]),
-        TagEntry(name: "inline", blockScopes: [.scriptBody, .blockBuilder, .lassoParser], bareOpenScopes: [.scriptBody, .lassoParser], openForms: []),
+        // inline's paren-call form is real corpus (iscrubs/LassoEcho.lasso
+        // and throughout). Its bare, paren-less colon-call form
+        // (`inline: -database=...;`, pages_internal/categories.lasso) is a
+        // DIFFERENT form than `.colonCall` (which means colon-WITH-parens,
+        // matching `if:(cond)`) — it's reached only via `emitStatement`'s
+        // bare-open path (`bareOpenScopes` above already includes
+        // `.scriptBody`), never through `parseBlockOpening`'s cascade, so
+        // it isn't represented here; encoding it as `.colonCall` would
+        // falsely assert the cascade handles it.
+        TagEntry(name: "inline", blockScopes: [.scriptBody, .blockBuilder, .lassoParser], bareOpenScopes: [.scriptBody, .lassoParser], openForms: [.parenCall]),
         // `records`/`rows` need no arguments at all — real corpus:
         // includes/detail_a_sku.lasso's bare `records` ... `/records` (no
         // parens, no colon-call, just the identifier). Without bare-open
@@ -144,27 +173,71 @@ enum TagCatalog {
         // "every lassoParser block name except if" (see the "if" entry's
         // comment above), not a curated list, so anything block-shaped in
         // lassoParser other than "if" belongs here too.
-        TagEntry(name: "loop", blockScopes: [.scriptBody, .blockBuilder, .lassoParser], bareOpenScopes: [.lassoParser], openForms: []),
-        TagEntry(name: "iterate", blockScopes: [.scriptBody, .blockBuilder, .lassoParser], bareOpenScopes: [.lassoParser], openForms: []),
+        // loop's paren-call (pages_internal/categorize.lasso's `Loop(20)`)
+        // AND colon-WITH-parens (pages/online_return_items.page.lasso's
+        // `[Loop: ($no_of_items)]`) are both real — the only remaining
+        // entry with two genuinely cascade-handled forms, matching `if`'s
+        // shape but without a divergent-handling ambiguity worth its own
+        // dispatch (both forms reach identical `readBalanced`/
+        // `parseCallArguments` logic in `parseBlockOpening`).
+        TagEntry(name: "loop", blockScopes: [.scriptBody, .blockBuilder, .lassoParser], bareOpenScopes: [.lassoParser], openForms: [.parenCall, .colonCall]),
+        // iterate's paren-call is real (_clear_cache.lasso's
+        // `iterate(globals->keys, local(gkey))`). Its real corpus colon
+        // usage (components/inSite/tables.inc's `iterate: vars,
+        // local:'i'`) is paren-LESS — a different, currently-unhandled
+        // form (see the separately-tracked script-mode block-pairing bug;
+        // not `.colonCall`, which means colon-with-parens).
+        TagEntry(name: "iterate", blockScopes: [.scriptBody, .blockBuilder, .lassoParser], bareOpenScopes: [.lassoParser], openForms: [.parenCall]),
+        // while has NO corpus evidence of a paren-call form at all — every
+        // `while(` hit in the corpus is embedded JavaScript, not Lasso. Its
+        // only real Lasso usage (components/inSite/urlencode.inc's
+        // `while: #url_string >> '++';`, lp_string_firstwords.inc) is
+        // paren-less colon, the same currently-unhandled form as
+        // `iterate`'s (see the separately-tracked bug) — left `[]` rather
+        // than asserting an unattested `.parenCall`.
         TagEntry(name: "while", blockScopes: [.scriptBody, .blockBuilder, .lassoParser], bareOpenScopes: [.lassoParser], openForms: []),
+        // protect's only attested corpus form is bare zero-arg `protect
+        // ... /protect` (_botscript.lasso) — no paren or colon usage found
+        // at all, so there's no cascade-reachable form to list.
         TagEntry(name: "protect", blockScopes: [.scriptBody, .blockBuilder, .lassoParser], bareOpenScopes: [.lassoParser], openForms: []),
+        // output_none's only attested form is bare zero-arg
+        // (scrubsetc.lasso/utscrubs.lasso), already reached via
+        // `emitStatement`'s bare-open path (`bareOpenScopes` above) — no
+        // cascade-reachable open form to list here.
         TagEntry(name: "output_none", blockScopes: [.scriptBody, .blockBuilder, .lassoParser], bareOpenScopes: [.scriptBody, .lassoParser], openForms: []),
+        // html_comment has no corpus attestation of any opening form at
+        // all — retained as a block name from the original five sets, but
+        // there's nothing real to characterize.
         TagEntry(name: "html_comment", blockScopes: [.scriptBody, .blockBuilder, .lassoParser], bareOpenScopes: [.scriptBody, .lassoParser], openForms: []),
-        TagEntry(name: "encode_set", blockScopes: [.scriptBody, .blockBuilder, .lassoParser], bareOpenScopes: [.scriptBody, .lassoParser], openForms: []),
+        // encode_set's paren-call is real (iscrubs/LassoEcho.lasso's
+        // `[Encode_Set(-EncodeNone)]`); its colon usage
+        // (includes/coupon.include.lasso's `[Encode_Set: -EncodeNone]`) is
+        // paren-less, same category as inline's bare colon form — reached
+        // via `emitStatement`'s bare-open path, not the cascade.
+        TagEntry(name: "encode_set", blockScopes: [.scriptBody, .blockBuilder, .lassoParser], bareOpenScopes: [.scriptBody, .lassoParser], openForms: [.parenCall]),
 
         // select: a block in scriptBody (no dedicated opener there, so it
         // needs the generic path) and lassoParser (span routing), but NOT
         // blockBuilder, where it's special-cased ahead of the membership
-        // check (see CatalogScope.blockBuilder's doc).
+        // check (see CatalogScope.blockBuilder's doc). `openForms` is `[]`
+        // deliberately, not "uncharacterized": select/case's real
+        // complexity is branch-lowering in `BlockBuilder.buildSequence`
+        // (`lowerSelectCase`/`splitIntoCaseBranches`) — an architecturally
+        // different concern than "which surface form did this tag open
+        // with," so `TagOpenForm` doesn't apply here at all.
         TagEntry(name: "select", blockScopes: [.scriptBody, .lassoParser], bareOpenScopes: [.lassoParser], openForms: []),
 
         // define_tag/define_type: the legacy colon-call form
-        // (`Define_Tag: 'name', ...;`). Only ever reached via
-        // ScriptBodyParser's bare-call path (never a "block" there in the
-        // paired-opener sense — parseDefineOpening owns the modern
-        // `define name(...) => {}` form separately) and via BlockBuilder's
-        // pairing. Absent from lassoParser entirely — no real corpus
-        // evidence of this legacy form inside a bracket span.
+        // (`Define_Tag: 'name', ...;`, components/js_timer.inc's
+        // `define_type: 'js_timer', 'integer', -prototype;`). Only ever
+        // reached via ScriptBodyParser's bare-call path (never a "block"
+        // there in the paired-opener sense — parseDefineOpening owns the
+        // modern `define name(...) => {}` form separately) and via
+        // BlockBuilder's pairing. Absent from lassoParser entirely — no
+        // real corpus evidence of this legacy form inside a bracket span.
+        // `openForms` is `[]`: this bare colon-call is the same category as
+        // inline's bare form (reached via `emitStatement`'s bare-open path,
+        // not the `parseBlockOpening` cascade `TagOpenForm` describes).
         TagEntry(name: "define_tag", blockScopes: [.blockBuilder], bareOpenScopes: [.scriptBody], openForms: []),
         TagEntry(name: "define_type", blockScopes: [.blockBuilder], bareOpenScopes: [.scriptBody], openForms: []),
 
@@ -172,13 +245,19 @@ enum TagCatalog {
         // ScriptBodyParser.parseDefineOpening (not the generic path, hence
         // absent from scriptBody's block set here), but still needs
         // blockBuilder pairing and lassoParser span-routing/bare-open
-        // recognition for the bracket-mode dialect.
+        // recognition for the bracket-mode dialect. `openForms` is `[]`:
+        // parseDefineOpening already dispatches its own genuinely-divergent
+        // body shapes (`=> type {}`/`=> {}`/`=> expr`) via real computed
+        // checks — a different, already-solved consolidation concern that
+        // predates and doesn't need `TagOpenForm`.
         TagEntry(name: "define", blockScopes: [.blockBuilder, .lassoParser], bareOpenScopes: [.lassoParser], openForms: []),
 
         // with: has its own dedicated ScriptBodyParser.parseWithOpening
         // (absent from scriptBody's block set for the same reason as
         // define above) and no real corpus evidence of bracket-mode usage
-        // at all, so absent from lassoParser entirely.
+        // at all, so absent from lassoParser entirely. `openForms` is `[]`:
+        // there is only one real form (`with name in expr do { }`), so
+        // there's no ambiguity for `TagOpenForm` to characterize.
         TagEntry(name: "with", blockScopes: [.blockBuilder], bareOpenScopes: [], openForms: []),
 
         // else/case: flat branch separators, not paired blocks — each has
@@ -187,7 +266,13 @@ enum TagCatalog {
         // block-to-pair (else is consumed by the "if" pairing it belongs
         // to; case is split out of a select's body after the fact). Only
         // lassoParser's broader "does this bracket span need block-aware
-        // treatment" question includes them.
+        // treatment" question includes them. `openForms` is `[]`: `else`'s
+        // real divergence (bare `else` vs. `else(condition)` chain-nesting —
+        // real corpus: components/koi_setup.inc's environment-detection
+        // chain, and the bug this exact ambiguity caused before it was
+        // fixed) already lives as a genuine computed 2-way branch in
+        // `BlockBuilder.buildSequence` (keyed on `arguments.isEmpty`), not
+        // as a scriptBody *opening* form — `TagOpenForm` doesn't model it.
         TagEntry(name: "else", blockScopes: [.lassoParser], bareOpenScopes: [.lassoParser], openForms: []),
         TagEntry(name: "case", blockScopes: [.lassoParser], bareOpenScopes: [.lassoParser], openForms: []),
     ]
