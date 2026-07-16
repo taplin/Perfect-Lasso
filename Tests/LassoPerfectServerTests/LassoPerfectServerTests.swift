@@ -102,6 +102,27 @@ private func sampleRequestInfo() -> HTTPRequestInfo {
     let entry = try JSONDecoder().decode(DatasourceEntry.self, from: Data(#"{"type": "filemaker"}"#.utf8))
     #expect(entry.type == .filemaker)
     #expect(entry.schema == nil)
+    #expect(entry.host == nil)
+    #expect(entry.port == nil)
+}
+
+@Test func datasourceEntryDecodesFileMakerHostPortOverride() throws {
+    // A second FileMaker alias pointing at a different server (e.g. a
+    // dev/backup instance) while reusing the shared filemaker block's
+    // credentials -- see ServerConfig.filemakerHostOverrides.
+    let entry = try JSONDecoder().decode(
+        DatasourceEntry.self,
+        from: Data(#"{"type": "filemaker", "host": "203.0.113.5", "port": 8080}"#.utf8)
+    )
+    #expect(entry.type == .filemaker)
+    #expect(entry.host == "203.0.113.5")
+    #expect(entry.port == 8080)
+}
+
+@Test func datasourceEntryLegacyBareStringHasNoHostOverride() throws {
+    let entry = try JSONDecoder().decode(DatasourceEntry.self, from: Data(#""catalog""#.utf8))
+    #expect(entry.host == nil)
+    #expect(entry.port == nil)
 }
 
 @Test func datasourceFileConfigDecodesLegacyFlatShapeAsMySQLBlock() throws {
@@ -254,6 +275,7 @@ private struct RecordingExecutor: LassoDynamicQueryExecutor {
 private func sampleServerConfig(
     datasourceMap: [String: String] = [:],
     filemakerDatasourceAliases: Set<String> = [],
+    filemakerHostOverrides: [String: FileMakerHostOverride] = [:],
     sessionDriver: String = "memory",
     startupPath: URL? = nil,
     adminConsoleEnabled: Bool = false
@@ -276,6 +298,7 @@ private func sampleServerConfig(
         filemakerPort: nil,
         filemakerUser: nil,
         filemakerPassword: nil,
+        filemakerHostOverrides: filemakerHostOverrides,
         filemakerAllowWrites: false,
         sessionDriver: sessionDriver,
         crawlReportMode: false,
@@ -354,4 +377,43 @@ private func sampleServerConfig(
     let result = try await delegate.testDatasource(name: "not_a_real_alias")
     #expect(result.success == false)
     #expect(result.message.contains("not_a_real_alias"))
+}
+
+// MARK: - resolveFileMakerHost (per-alias FileMaker host override)
+
+@Test func resolveFileMakerHostUsesSharedConnectionWhenNoOverrideExists() {
+    let config = sampleServerConfig(filemakerDatasourceAliases: ["fm_catalog"])
+    let resolved = LassoAdminDelegate.resolveFileMakerHost(for: "fm_catalog", config: config)
+    #expect(resolved?.host == "192.0.2.1")
+}
+
+@Test func resolveFileMakerHostPrefersPerAliasOverride() {
+    let config = sampleServerConfig(
+        filemakerDatasourceAliases: ["fm_catalog", "fm_catalog_backup"],
+        filemakerHostOverrides: ["fm_catalog_backup": FileMakerHostOverride(host: "203.0.113.5", port: 8080)]
+    )
+    // The alias with no override still resolves to the shared connection.
+    let primary = LassoAdminDelegate.resolveFileMakerHost(for: "fm_catalog", config: config)
+    #expect(primary?.host == "192.0.2.1")
+
+    // The overridden alias resolves to the override's host/port instead.
+    let backup = LassoAdminDelegate.resolveFileMakerHost(for: "fm_catalog_backup", config: config)
+    #expect(backup?.host == "203.0.113.5")
+    #expect(backup?.port == 8080)
+}
+
+@Test func resolveFileMakerHostOverrideFallsBackToSharedPortWhenOmitted() {
+    // An override can supply just a host, inheriting the shared block's port.
+    let config = sampleServerConfig(
+        filemakerDatasourceAliases: ["fm_catalog_backup"],
+        filemakerHostOverrides: ["fm_catalog_backup": FileMakerHostOverride(host: "203.0.113.5", port: nil)]
+    )
+    let resolved = LassoAdminDelegate.resolveFileMakerHost(for: "fm_catalog_backup", config: config)
+    #expect(resolved?.host == "203.0.113.5")
+    #expect(resolved?.port == 80) // sampleServerConfig's default FileMaker port
+}
+
+@Test func resolveFileMakerHostReturnsNilWhenNoConnectionConfiguredAtAll() {
+    let config = sampleServerConfig()
+    #expect(LassoAdminDelegate.resolveFileMakerHost(for: "anything", config: config) == nil)
 }

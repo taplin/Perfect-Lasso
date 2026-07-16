@@ -103,10 +103,9 @@ final class LassoAdminDelegate: AdminConsoleDelegate {
             }
         }
         if config.filemakerDatasourceAliases.contains(where: { $0.lowercased() == target }) {
-            guard let host = config.filemakerHost else {
+            guard let (host, port) = Self.resolveFileMakerHost(for: target, config: config) else {
                 return .failed("No FileMaker host configured")
             }
-            let port = config.filemakerPort ?? 80
             let server = FileMakerServer(
                 host: host, port: port,
                 userName: config.filemakerUser ?? "", password: config.filemakerPassword ?? "",
@@ -122,6 +121,20 @@ final class LassoAdminDelegate: AdminConsoleDelegate {
             }
         }
         return .failed("No datasource named '\(name)' is registered")
+    }
+
+    /// Resolves which FileMaker host/port a given (already-lowercased)
+    /// alias should connect through — the per-alias override in
+    /// `config.filemakerHostOverrides` if one exists (e.g. a dev/backup
+    /// server tested under a second alias, reusing the shared block's
+    /// credentials), otherwise the shared `filemaker` connection. A pure
+    /// function, deliberately factored out of `testDatasource` so this
+    /// selection logic is testable without a live network call.
+    static func resolveFileMakerHost(for lowercasedAlias: String, config: ServerConfig) -> (host: String, port: Int)? {
+        let override = config.filemakerHostOverrides[lowercasedAlias]
+        guard let host = override?.host ?? config.filemakerHost else { return nil }
+        let port = override?.port ?? config.filemakerPort ?? 80
+        return (host, port)
     }
 
     /// `Duration.components` is `(seconds, attoseconds)` where `attoseconds`

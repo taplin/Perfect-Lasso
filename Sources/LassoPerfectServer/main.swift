@@ -13,6 +13,12 @@ import NIOHTTP1
 import PerfectSessionCore
 import PerfectSessionMySQL
 
+/// A per-alias FileMaker host/port override — see `ServerConfig.filemakerHostOverrides`.
+struct FileMakerHostOverride: Sendable {
+    let host: String
+    let port: Int?
+}
+
 struct ServerConfig: Sendable {
     let siteRoot: URL
     let port: Int
@@ -50,6 +56,11 @@ struct ServerConfig: Sendable {
     let filemakerPort: Int?
     let filemakerUser: String?
     let filemakerPassword: String?
+    /// Per-alias FileMaker host/port overrides, keyed by lowercased alias
+    /// — e.g. a dev/backup FileMaker Server tested under a second alias
+    /// while still using the shared `filemakerUser`/`filemakerPassword`
+    /// above. An alias with no entry here uses `filemakerHost`/`filemakerPort`.
+    let filemakerHostOverrides: [String: FileMakerHostOverride]
     /// Same default-false, explicit-opt-in policy as `mysqlAllowWrites` —
     /// real Lasso documents no raw-SQL concept for FileMaker at all, so
     /// there's no FileMaker analogue of `mysqlAllowRawSQL`.
@@ -151,6 +162,10 @@ struct ServerConfig: Sendable {
         let filemakerDatasourceAliases = Set(
             datasourceEntries.filter { $0.value.type == .filemaker }.keys
         )
+        let filemakerHostOverrides: [String: FileMakerHostOverride] = datasourceEntries.reduce(into: [:]) { result, entry in
+            guard entry.value.type == .filemaker, let host = entry.value.host else { return }
+            result[entry.key.lowercased()] = FileMakerHostOverride(host: host, port: entry.value.port)
+        }
         // LassoDynamicInlineProvider/LassoMultiBackendInlineProvider both
         // lowercase alias keys themselves (case-insensitive Lasso
         // -database= matching), which traps on a duplicate key — only
@@ -187,6 +202,7 @@ struct ServerConfig: Sendable {
             filemakerPort: datasourceFile?.filemaker?.port ?? env["LASSO_FILEMAKER_PORT"].flatMap(Int.init),
             filemakerUser: datasourceFile?.filemaker?.user ?? env["LASSO_FILEMAKER_USER"],
             filemakerPassword: datasourceFile?.filemaker?.password ?? env["LASSO_FILEMAKER_PASSWORD"],
+            filemakerHostOverrides: filemakerHostOverrides,
             filemakerAllowWrites: datasourceFile?.filemaker?.allowWrites ?? Self.isTruthyEnv(env["LASSO_FILEMAKER_ALLOW_WRITES"]),
             sessionDriver: (env["LASSO_SESSION_DRIVER"] ?? "memory").lowercased(),
             crawlReportMode: Self.isTruthyEnv(env["LASSO_CRAWL_REPORT"]),
@@ -329,18 +345,33 @@ struct DatasourceEntry: Decodable {
     /// model). `ServerConfig.load()` falls back to the alias itself when
     /// this is omitted on a `.mysql` entry too.
     var schema: String?
+    /// Per-alias FileMaker host/port override — meaningful only for
+    /// `.filemaker` entries. Every FileMaker alias shares one `filemaker`
+    /// connection block's user/password by default (matching MySQL's
+    /// "every alias shares one connection" model); `host`/`port` here let
+    /// a specific alias point at a *different* FileMaker Server (e.g. a
+    /// dev/backup instance) while still reusing the shared block's
+    /// credentials — there's no per-alias user/password override, since
+    /// the point is testing against the same account, not a different one.
+    /// `nil` (the default) means "use the shared `filemaker` block."
+    var host: String?
+    var port: Int?
 
-    private enum CodingKeys: String, CodingKey { case type, schema }
+    private enum CodingKeys: String, CodingKey { case type, schema, host, port }
 
     init(from decoder: Decoder) throws {
         if let single = try? decoder.singleValueContainer(), let flatSchema = try? single.decode(String.self) {
             type = .mysql
             schema = flatSchema
+            host = nil
+            port = nil
             return
         }
         let container = try decoder.container(keyedBy: CodingKeys.self)
         type = try container.decode(Backend.self, forKey: .type)
         schema = try container.decodeIfPresent(String.self, forKey: .schema)
+        host = try container.decodeIfPresent(String.self, forKey: .host)
+        port = try container.decodeIfPresent(Int.self, forKey: .port)
     }
 }
 
@@ -496,10 +527,28 @@ struct LassoSiteServer: Sendable {
             let filemakerPassword = config.filemakerPassword ?? ""
             let filemakerUseTLS = filemakerPort == 443
             let filemakerScheme = filemakerUseTLS ? "https" : "http"
+            // Container-field URLs (FMPFieldValue.container) are prefixed
+            // with this single baseURL regardless of which alias's records
+            // they came from — known, accepted gap for an alias using a
+            // host override below: its container-field links would point
+            // at the wrong host. Not a concern for the connectivity-testing
+            // use case host overrides exist for; would need a per-alias
+            // baseURL (not just per-alias FileMakerServer) to fix properly.
             let executor = PerfectFileMakerLassoExecutor(
                 allowWrites: config.filemakerAllowWrites,
                 baseURL: "\(filemakerScheme)://\(filemakerHost):\(filemakerPort)"
             ) { query, kind, datasource in
+                // Per-alias host/port override (e.g. a dev/backup FileMaker
+                // Server tested under a second alias) reuses the shared
+                // block's credentials — there's no per-alias user/password,
+                // only host/port. Falls back to the shared connection when
+                // no override exists for this alias. Shares its resolution
+                // logic with LassoAdminDelegate.testDatasource so the admin
+                // console's "Test" button and real query traffic always
+                // agree on which host an alias means.
+                let (host, port) = LassoAdminDelegate.resolveFileMakerHost(for: datasource.lowercased(), config: config)
+                    ?? (filemakerHost, filemakerPort)
+                let useTLS = port == 443
                 // A fresh FileMakerServer per call (matching makeDatabase's
                 // own per-call construction above), even though the
                 // resurrected FileMakerServer is now natively Sendable and
@@ -508,9 +557,9 @@ struct LassoSiteServer: Sendable {
                 // how it looked before the resurrection, when
                 // FileMakerServer wasn't Sendable at all.
                 let server = FileMakerServer(
-                    host: filemakerHost, port: filemakerPort,
+                    host: host, port: port,
                     userName: filemakerUser, password: filemakerPassword,
-                    useTLS: filemakerUseTLS
+                    useTLS: useTLS
                 )
                 // FileMakerServer.query(_:) is genuine async/await (the
                 // resurrected library replaced its blocking PerfectCURL/

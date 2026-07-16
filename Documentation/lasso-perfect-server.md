@@ -75,7 +75,8 @@ Environment variables:
     "datasources": {
       "primary_mysql": {"type": "mysql", "schema": "primary_mysql"},
       "orders_mysql": {"type": "mysql", "schema": "orders_mysql"},
-      "fm_catalog": {"type": "filemaker"}
+      "fm_catalog": {"type": "filemaker"},
+      "fm_catalog_backup": {"type": "filemaker", "host": "192.0.2.5"}
     }
   }
   ```
@@ -90,7 +91,19 @@ Environment variables:
   `filemaker`-typed entry needs no `schema` at all: the alias itself IS
   the FileMaker database-file name (real Lasso's documented FileMaker
   connector model — see "FileMaker Datasource" below), and every
-  FileMaker alias shares the one `filemaker` connection the same way.
+  FileMaker alias shares the one `filemaker` connection's user/password
+  by default. Unlike MySQL, a `filemaker`-typed entry *can* override
+  `host`/`port` (`fm_catalog_backup` above) — e.g. to point a second
+  alias at a dev/backup FileMaker Server while still authenticating with
+  the shared block's credentials, for testing that instance without a
+  separate config file or process. There's no per-alias user/password
+  override — only host/port; the point is testing against the same
+  account on a different box, not a different account. One known,
+  accepted gap: FileMaker container-field (image/file) URLs are still
+  prefixed with the *shared* `filemaker` block's host/port regardless of
+  which alias a record came from, so an override alias's container-field
+  links would point at the wrong host — not a concern for connectivity
+  testing, the use case this exists for.
   Datasource alias keys are case-insensitive (matching Lasso's own
   `-database=` matching) and share one namespace across both backends —
   two keys differing only by case, MySQL vs. MySQL, FileMaker vs.
@@ -1354,7 +1367,13 @@ there's a concrete need, not because of any technical blocker:
   server currently builds every datasource executor once, at
   `LassoSiteServer.init` time, with no reload path — supporting this for
   real would mean making that construction re-runnable at runtime, a
-  meaningfully bigger change than the read-only wiring above.
+  meaningfully bigger change than the read-only wiring above. A simpler,
+  already-implemented alternative for the FileMaker case specifically:
+  `ServerConfig.filemakerHostOverrides` (see "Configuration" above) lets
+  a *second, distinct alias* point at a different FileMaker Server —
+  config-file-level and picked at startup, not a runtime switch on an
+  existing alias, but covers the "test a dev/backup instance from the
+  admin console" need without the bigger reload-path work above.
 - **TLS operations** — this server doesn't terminate TLS itself
   (`AdminConsole`'s `tlsManager`/`acmeResponder` params are both `nil`
   here), so `/api/tls`, `/api/acme`, cert reload/remove are inert;
