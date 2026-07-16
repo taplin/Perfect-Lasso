@@ -137,7 +137,8 @@ Environment variables:
   below. `LASSO_CRAWL_REPORT_PATH` optionally writes the full per-page
   JSON results to a file.
 - `LASSO_ADMIN_CONSOLE=1`: start `PerfectAdminConsole` alongside the main
-  server — see "Admin Console" below. Off by default.
+  server — see "Admin Console" below and `Documentation/admin-console.md`
+  for the full user guide. Off by default.
 - `LASSO_ADMIN_PORT`: admin console port, default `8990`. Always bound to
   `127.0.0.1` only, regardless of what `LASSO_SERVER_PORT` is bound to.
 - `LASSO_ADMIN_TOKEN_PATH`: where the generated bearer token is written
@@ -1325,6 +1326,11 @@ configured to measure how many previously-`inlineNotConfigured` real
 corpus pages now render cleanly.
 
 ## Admin Console — 2026-07-16
+
+**This section is the implementation narrative (what was built, why, and
+how it was verified). For a stable, future-user-facing reference — how to
+enable it, the dashboard walkthrough, the API table, security model — see
+`Documentation/admin-console.md`.**
 
 `PerfectAdminConsole` (a general-purpose, opt-in Perfect-NIO library
 target — bound exclusively to `127.0.0.1`, bearer-token auth, CSRF on
