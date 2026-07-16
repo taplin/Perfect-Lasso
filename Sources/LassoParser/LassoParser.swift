@@ -337,7 +337,7 @@ private struct TemplateScanner {
             if expressions.count > 1,
                case let .call(callee, _) = first,
                case let .identifier(name) = callee,
-               Self.blockTagNames.contains(name.lowercased()) {
+               TagCatalog.isBlock(name, in: .lassoParser) {
                 // A whole block-tag statement — condition, body, `else`,
                 // closing `/name` — embedded in ONE square-bracket span,
                 // e.g. real corpus's `[if($product_subset == 'all')
@@ -363,10 +363,10 @@ private struct TemplateScanner {
             }
             if case let .call(callee, arguments) = first,
                case let .identifier(name) = callee,
-               Self.blockTagNames.contains(name.lowercased()) {
+               TagCatalog.isBlock(name, in: .lassoParser) {
                 nodes.append(.tag(name: name, arguments: arguments, closing: false, dialect: dialect, range: range))
             } else if case let .identifier(name) = first,
-                      Self.bareBlockTagNames.contains(name.lowercased()) {
+                      TagCatalog.allowsBareOpen(name, in: .lassoParser) {
                 nodes.append(.tag(name: name, arguments: [], closing: false, dialect: dialect, range: range))
             } else if expressions.count > 1 {
                 // Multiple ordinary (non-block-tag) statements in one
@@ -376,7 +376,7 @@ private struct TemplateScanner {
                 // sequential calls with no block-tag body/closer among
                 // them, so the `expressions.count > 1` branch above
                 // (which only fires when `first` is itself a
-                // `blockTagNames` call) never triggers. Falling to
+                // `.lassoParser`-scope block call) never triggers. Falling to
                 // `.expression(first, ...)` below kept only the very
                 // first call and silently dropped the rest — the second
                 // and third `include()` calls (and every `define`
@@ -547,24 +547,4 @@ private struct TemplateScanner {
         return SourcePosition(offset: offset, line: line, column: column)
     }
 
-    private static let blockTagNames: Set<String> = [
-        "if", "else", "inline", "records", "rows", "loop", "iterate", "while", "define", "protect",
-        "output_none", "html_comment", "encode_set", "select", "case",
-    ]
-
-    /// `blockTagNames` minus `"if"` — used only for the bare-identifier
-    /// (zero-argument, no-parens) fallback below. A real Lasso `if` requires
-    /// a condition; a bare `[if]`/`[If IE 8]` (no parens at all, so
-    /// `ExpressionParser` can't parse a call and falls back to just the
-    /// leading identifier, silently dropping any trailing tokens) has no
-    /// sensible zero-argument meaning and was never valid Lasso syntax —
-    /// unlike `records`/`rows`/`else`/`case`/etc., which do have legitimate,
-    /// commonly-used bare forms. Matches `ScriptBodyParser.bareBlockNames`,
-    /// which already deliberately excludes `"if"` for the same reason.
-    /// Found via a real corpus page (`templates/koi/master.template.lasso`)
-    /// whose HTML5-Boilerplate-style IE conditional comments
-    /// (`<!--[if IE 8]> ... <![endif]-->`) were being misparsed as a real,
-    /// always-present `if` block, silently swallowing the entire page body
-    /// until an unrelated `[/if]` elsewhere happened to close it.
-    private static let bareBlockTagNames: Set<String> = blockTagNames.subtracting(["if"])
 }

@@ -92,7 +92,7 @@ struct BlockBuilder {
                 continue
             }
 
-            guard Self.blockNames.contains(normalized) else {
+            guard TagCatalog.isBlock(normalized, in: .blockBuilder) else {
                 result.append(node)
                 index += 1
                 continue
@@ -117,15 +117,11 @@ struct BlockBuilder {
         return SequenceResult(nodes: result, alternate: alternate, closingRange: nil)
     }
 
-    private static let blockNames: Set<String> = [
-        "if", "inline", "records", "rows", "loop", "iterate", "while", "define", "protect", "with",
-        "define_tag", "define_type", "output_none", "html_comment", "encode_set",
-    ]
-
     /// Splits a `[Select]...[/Select]` body (already fully block-paired by
     /// `buildSequence` — any nested `if`/`loop`/etc. inside a `Case` branch
     /// is already a real `.block` node by the time this runs, since `case`
-    /// isn't in `blockNames` and so never interrupts that recursion) on its
+    /// isn't recognized as a `.blockBuilder`-scope block and so never
+    /// interrupts that recursion) on its
     /// top-level `case` tag markers. `value == nil` marks a bare `[Case]`
     /// (Lasso 8.5: "a [Case] tag without any value is used as the default
     /// value... the first [Case] tag without any value is returned as the

@@ -4782,3 +4782,82 @@ private final class MapIncludeLoader: LassoIncludeLoader, @unchecked Sendable {
     )
     #expect(output == "beforeno<br>smoking<br>allowedafter")
 }
+
+// Tag-form consolidation, Commit A: TagCatalog replaces five previously
+// hand-synced `Set<String>` tables (ScriptBodyParser.blockNames/
+// bareBlockNames, BlockBuilder.blockNames, LassoParser's blockTagNames/
+// bareBlockTagNames) with one scoped table. This is a pure data refactor —
+// no parsing/dispatch behavior changes — so the parity test below is the
+// safety net: it asserts the catalog reproduces every one of those five
+// sets' membership exactly, both positively (every name that WAS in a set
+// still answers true for that scope) and negatively (every name that was
+// NOT in a set, including names in no set at all, still answers false) —
+// a positive-only check would miss an accidentally-over-broad passthrough
+// entry.
+@Test func tagCatalogReproducesTheFiveReplacedSetsExactlyPerScope() throws {
+    struct Expectation {
+        let name: String
+        let scriptBodyBlock: Bool
+        let scriptBodyBare: Bool
+        let blockBuilderBlock: Bool
+        let lassoParserBlock: Bool
+        let lassoParserBare: Bool
+    }
+
+    let expectations: [Expectation] = [
+        // Ordinary blocks: real everywhere, bare-open everywhere except "if".
+        Expectation(name: "if", scriptBodyBlock: true, scriptBodyBare: false, blockBuilderBlock: true, lassoParserBlock: true, lassoParserBare: false),
+        Expectation(name: "inline", scriptBodyBlock: true, scriptBodyBare: true, blockBuilderBlock: true, lassoParserBlock: true, lassoParserBare: true),
+        Expectation(name: "records", scriptBodyBlock: true, scriptBodyBare: true, blockBuilderBlock: true, lassoParserBlock: true, lassoParserBare: true),
+        Expectation(name: "rows", scriptBodyBlock: true, scriptBodyBare: true, blockBuilderBlock: true, lassoParserBlock: true, lassoParserBare: true),
+        Expectation(name: "loop", scriptBodyBlock: true, scriptBodyBare: false, blockBuilderBlock: true, lassoParserBlock: true, lassoParserBare: true),
+        Expectation(name: "iterate", scriptBodyBlock: true, scriptBodyBare: false, blockBuilderBlock: true, lassoParserBlock: true, lassoParserBare: true),
+        Expectation(name: "while", scriptBodyBlock: true, scriptBodyBare: false, blockBuilderBlock: true, lassoParserBlock: true, lassoParserBare: true),
+        Expectation(name: "protect", scriptBodyBlock: true, scriptBodyBare: false, blockBuilderBlock: true, lassoParserBlock: true, lassoParserBare: true),
+        Expectation(name: "output_none", scriptBodyBlock: true, scriptBodyBare: true, blockBuilderBlock: true, lassoParserBlock: true, lassoParserBare: true),
+        Expectation(name: "html_comment", scriptBodyBlock: true, scriptBodyBare: true, blockBuilderBlock: true, lassoParserBlock: true, lassoParserBare: true),
+        Expectation(name: "encode_set", scriptBodyBlock: true, scriptBodyBare: true, blockBuilderBlock: true, lassoParserBlock: true, lassoParserBare: true),
+
+        // select: scriptBody + lassoParser only (BlockBuilder special-cases it earlier).
+        Expectation(name: "select", scriptBodyBlock: true, scriptBodyBare: false, blockBuilderBlock: false, lassoParserBlock: true, lassoParserBare: true),
+
+        // define_tag/define_type: legacy colon-call form — blockBuilder pairing
+        // + scriptBody bare-open only; never in lassoParser.
+        Expectation(name: "define_tag", scriptBodyBlock: false, scriptBodyBare: true, blockBuilderBlock: true, lassoParserBlock: false, lassoParserBare: false),
+        Expectation(name: "define_type", scriptBodyBlock: false, scriptBodyBare: true, blockBuilderBlock: true, lassoParserBlock: false, lassoParserBare: false),
+
+        // define: own ScriptBodyParser opener (absent from scriptBody's
+        // generic block set here), blockBuilder pairing + lassoParser
+        // span-routing/bare-open.
+        Expectation(name: "define", scriptBodyBlock: false, scriptBodyBare: false, blockBuilderBlock: true, lassoParserBlock: true, lassoParserBare: true),
+
+        // with: own ScriptBodyParser opener, blockBuilder pairing only.
+        Expectation(name: "with", scriptBodyBlock: false, scriptBodyBare: false, blockBuilderBlock: true, lassoParserBlock: false, lassoParserBare: false),
+
+        // else/case: flat separators, own ScriptBodyParser function each,
+        // never a blockBuilder-paired block; only lassoParser's broader
+        // span-routing question includes them.
+        Expectation(name: "else", scriptBodyBlock: false, scriptBodyBare: false, blockBuilderBlock: false, lassoParserBlock: true, lassoParserBare: true),
+        Expectation(name: "case", scriptBodyBlock: false, scriptBodyBare: false, blockBuilderBlock: false, lassoParserBlock: true, lassoParserBare: true),
+
+        // Controls: real Lasso identifiers that are NOT block-tag names at
+        // all, in any of the five original sets — catches an
+        // accidentally-over-broad passthrough entry.
+        Expectation(name: "loop_value", scriptBodyBlock: false, scriptBodyBare: false, blockBuilderBlock: false, lassoParserBlock: false, lassoParserBare: false),
+        Expectation(name: "field", scriptBodyBlock: false, scriptBodyBare: false, blockBuilderBlock: false, lassoParserBlock: false, lassoParserBare: false),
+        Expectation(name: "not_a_real_tag_xyz", scriptBodyBlock: false, scriptBodyBare: false, blockBuilderBlock: false, lassoParserBlock: false, lassoParserBare: false),
+    ]
+
+    for expectation in expectations {
+        #expect(TagCatalog.isBlock(expectation.name, in: .scriptBody) == expectation.scriptBodyBlock, "scriptBody block: \(expectation.name)")
+        #expect(TagCatalog.allowsBareOpen(expectation.name, in: .scriptBody) == expectation.scriptBodyBare, "scriptBody bare: \(expectation.name)")
+        #expect(TagCatalog.isBlock(expectation.name, in: .blockBuilder) == expectation.blockBuilderBlock, "blockBuilder block: \(expectation.name)")
+        #expect(TagCatalog.isBlock(expectation.name, in: .lassoParser) == expectation.lassoParserBlock, "lassoParser block: \(expectation.name)")
+        #expect(TagCatalog.allowsBareOpen(expectation.name, in: .lassoParser) == expectation.lassoParserBare, "lassoParser bare: \(expectation.name)")
+    }
+
+    // Case-insensitivity: the catalog lowercases internally, matching
+    // every one of the five original call sites' `.lowercased()` calls.
+    #expect(TagCatalog.isBlock("IF", in: .scriptBody))
+    #expect(TagCatalog.isBlock("Records", in: .blockBuilder))
+}

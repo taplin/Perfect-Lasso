@@ -116,7 +116,7 @@ struct ScriptBodyParser {
         let name = readIdentifier()
         guard !name.isEmpty else { return false }
         let normalized = name.lowercased()
-        guard Self.blockNames.contains(normalized) else {
+        guard TagCatalog.isBlock(normalized, in: .scriptBody) else {
             index = start
             return false
         }
@@ -401,9 +401,9 @@ struct ScriptBodyParser {
         // ... /inline;`, no parens at all) showed it hitting the exact
         // same gap — see Documentation/outstanding-compatibility-project-plans.md.
         switch expressions[0] {
-        case let .call(.identifier(name), arguments) where Self.bareBlockNames.contains(name.lowercased()):
+        case let .call(.identifier(name), arguments) where TagCatalog.allowsBareOpen(name, in: .scriptBody):
             nodes.append(.tag(name: name, arguments: arguments, closing: false, dialect: .lasso8, range: statementRange))
-        case let .identifier(name) where Self.bareBlockNames.contains(name.lowercased()):
+        case let .identifier(name) where TagCatalog.allowsBareOpen(name, in: .scriptBody):
             nodes.append(.tag(name: name, arguments: [], closing: false, dialect: .lasso8, range: statementRange))
         default:
             nodes.append(.code(expressions, .lasso9, delimiter, statementRange))
@@ -426,21 +426,6 @@ struct ScriptBodyParser {
         return SourcePosition(offset: range.start.offset + clampedOffset, line: line, column: column)
     }
 
-    private static let bareBlockNames: Set<String> = [
-        "define_tag", "define_type", "output_none", "html_comment", "encode_set", "inline",
-        // `records`/`rows` need no arguments at all — real corpus:
-        // includes/detail_a_sku.lasso's bare `records` ... `/records`
-        // (no parens, no colon-call, just the identifier). Without this,
-        // `parseBlockOpening` requires a `(` immediately after the name
-        // and falls through, so `records` became a meaningless bare
-        // top-level `.identifier` statement instead of a real block
-        // opener — its "body" (everything up to `/records`) ran as flat,
-        // un-looped top-level statements exactly once, using whatever
-        // row the search's Field() cursor defaulted to, instead of once
-        // per found row. On a real product detail page this silently
-        // built a one-size dropdown instead of one option per real SKU.
-        "records", "rows",
-    ]
 
     private func normalizeReturn(_ statement: String) -> String {
         guard statement.lowercased().hasPrefix("return ") else { return statement }
@@ -765,9 +750,4 @@ struct ScriptBodyParser {
         guard index + candidate.count <= characters.count else { return false }
         return Array(characters[index..<(index + candidate.count)]) == candidate
     }
-
-    private static let blockNames: Set<String> = [
-        "if", "inline", "records", "rows", "loop", "iterate", "while", "protect",
-        "output_none", "html_comment", "encode_set", "select",
-    ]
 }
