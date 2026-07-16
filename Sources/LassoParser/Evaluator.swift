@@ -591,7 +591,22 @@ struct Evaluator {
     /// identifier. This check is deliberately stricter than MySQL's own
     /// unquoted-identifier grammar; both real corpus values
     /// ('mfr_style_no', 'scrubs_style_color') satisfy it comfortably.
-    private static func validateDynamicFieldLabel(_ label: String) throws {
+    ///
+    /// Not `private`: also called from `Providers.swift`'s
+    /// `LassoInlineRequest.init(arguments:)` to validate `-Table`/
+    /// `-ReturnField`/`-SortField`/`-KeyField` argument VALUES, a second,
+    /// live-confirmed path to the same unescaped identifier sink — real
+    /// corpus: components/inSite/results_navigation.inc builds
+    /// `-sortfield=$sortCol` directly from `action_param('sortfield')`,
+    /// completely unvalidated before this fix.
+    static func validateDynamicFieldLabel(_ label: String) throws {
+        // Empty is "no value provided," not unsafe — real corpus/tests use
+        // `-KeyField=''` as this codebase's existing convention for an
+        // absent key field (e.g. fileMakerExecutorGatesAddUpdateDeleteBehindAllowWrites),
+        // and there's nothing an empty string can inject. The executor's
+        // own missing-field handling (not this check) is what should
+        // reject it as incomplete, same as before this validation existed.
+        guard !label.isEmpty else { return }
         // `\A`/`\z` (absolute string boundaries), not `^`/`$` — ICU/NSRegularExpression's
         // `$` also matches immediately before a single trailing line terminator,
         // which would let a label like "colname\n" slip through unnoticed.

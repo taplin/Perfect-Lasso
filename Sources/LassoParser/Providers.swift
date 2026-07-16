@@ -187,17 +187,30 @@ public struct LassoInlineRequest: Equatable, Sendable {
     public let writeCriteria: [LassoInlineCriterion]
     public let rawArguments: [EvaluatedArgument]
 
-    public init(arguments: [EvaluatedArgument]) {
+    public init(arguments: [EvaluatedArgument]) throws {
         rawArguments = arguments
         database = arguments.lastString(named: "database")
+        // `-Table`/`-ReturnField`/`-SortField`/`-KeyField` values all
+        // eventually become raw SQL identifiers (DynamicQuery/
+        // DynamicMutation.table, DynamicQuery.fields, DynamicOrdering.field,
+        // DynamicPredicate.field via keyField) in PerfectCRUDLassoExecutor.
+        // Validated unconditionally here, regardless of action (including
+        // .rawSQL, where these fields are simply unused) — matching how
+        // they're already parsed unconditionally today, and how
+        // Evaluator.swift's `#var = value` dynamic label already validates
+        // unconditionally rather than branching on action.
         table = arguments.lastString(named: "table")
+        if let table { try Evaluator.validateDynamicFieldLabel(table) }
         sql = arguments.lastString(named: "sql")
         returnFields = arguments.strings(named: "returnfield")
+        try returnFields.forEach { try Evaluator.validateDynamicFieldLabel($0) }
         sortFields = arguments.strings(named: "sortfield")
+        try sortFields.forEach { try Evaluator.validateDynamicFieldLabel($0) }
         sortOrders = arguments.strings(named: "sortorder")
         maxRecords = arguments.lastInt(named: "maxrecords")
         skipRecords = arguments.lastInt(named: "skiprecords")
         keyField = arguments.lastString(named: "keyfield")
+        if let keyField { try Evaluator.validateDynamicFieldLabel(keyField) }
         keyValue = arguments.lastValue(named: "keyvalue")
         statementOnly = arguments.hasTruthyFlag("statementonly")
 
@@ -916,11 +929,11 @@ public struct LassoDynamicInlineProvider: LassoInlineProvider {
         arguments: [EvaluatedArgument],
         context: LassoContext
     ) async throws -> LassoInlineFrame {
-        let request = LassoInlineRequest(arguments: arguments)
+        let request = try LassoInlineRequest(arguments: arguments)
         let mappedRequest: LassoInlineRequest
         if let database = request.database,
            let mappedDatabase = datasourceAliases[database.lowercased()] {
-            mappedRequest = request.replacingDatabase(with: mappedDatabase)
+            mappedRequest = try request.replacingDatabase(with: mappedDatabase)
         } else {
             mappedRequest = request
         }
@@ -936,7 +949,7 @@ public struct LassoInMemoryInlineProvider: LassoInlineProvider {
     }
 
     public func executeInline(arguments: [EvaluatedArgument], context: LassoContext) async throws -> LassoInlineFrame {
-        let request = LassoInlineRequest(arguments: arguments)
+        let request = try LassoInlineRequest(arguments: arguments)
         guard request.action != .nothing else { return LassoInlineFrame(rows: []) }
         guard let table = request.table?.lowercased(), var rows = tables[table] else {
             return LassoInlineFrame(rows: [])
@@ -995,7 +1008,7 @@ public struct LassoInMemoryInlineProvider: LassoInlineProvider {
 }
 
 private extension LassoInlineRequest {
-    func replacingDatabase(with database: String) -> LassoInlineRequest {
+    func replacingDatabase(with database: String) throws -> LassoInlineRequest {
         var arguments = rawArguments
         if let index = arguments.lastIndex(where: {
             $0.label?.caseInsensitiveCompare("database") == .orderedSame
@@ -1004,7 +1017,7 @@ private extension LassoInlineRequest {
         } else {
             arguments.append(EvaluatedArgument(label: "database", value: .string(database)))
         }
-        return LassoInlineRequest(arguments: arguments)
+        return try LassoInlineRequest(arguments: arguments)
     }
 }
 

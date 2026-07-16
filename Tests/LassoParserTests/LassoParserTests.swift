@@ -294,6 +294,80 @@ import PerfectSessionCore
     }
 }
 
+@Test func inlineTableReturnFieldSortFieldKeyFieldArgumentsRejectUnsafeValues() async throws {
+    // -Table/-ReturnField/-SortField/-KeyField argument VALUES reach the
+    // same unescaped SQL-identifier sink (DynamicQuery/DynamicMutation.table,
+    // DynamicQuery.fields, DynamicOrdering.field, DynamicPredicate.field via
+    // keyField) as the #var = value dynamic label fixed above — but they
+    // were never validated at all, since they're ordinary labeled arguments,
+    // not the `.assignment`-shaped case that fix covered. Real corpus:
+    // components/inSite/results_navigation.inc builds `-sortfield=$sortCol`
+    // directly from `action_param('sortfield')`, completely unvalidated.
+    var context = LassoContext(inlineProvider: LassoInMemoryInlineProvider(tables: [:]))
+    let unsafe = "skus`; DROP TABLE skus; --"
+
+    await #expect(throws: LassoRuntimeError.unsafeDynamicFieldName(unsafe)) {
+        _ = try await LassoRenderer().render(
+            "[inline(-database='catalog',-table='\(unsafe)',-search)]",
+            context: &context
+        )
+    }
+    await #expect(throws: LassoRuntimeError.unsafeDynamicFieldName(unsafe)) {
+        _ = try await LassoRenderer().render(
+            "[inline(-database='catalog',-table='skus',-returnfield='\(unsafe)',-search)]",
+            context: &context
+        )
+    }
+    await #expect(throws: LassoRuntimeError.unsafeDynamicFieldName(unsafe)) {
+        _ = try await LassoRenderer().render(
+            "[inline(-database='catalog',-table='skus',-sortfield='\(unsafe)',-search)]",
+            context: &context
+        )
+    }
+    await #expect(throws: LassoRuntimeError.unsafeDynamicFieldName(unsafe)) {
+        _ = try await LassoRenderer().render(
+            "[inline(-database='catalog',-table='skus',-keyfield='\(unsafe)',-keyvalue=1,-update)]",
+            context: &context
+        )
+    }
+}
+
+@Test func inlineTableReturnFieldSortFieldKeyFieldAcceptRealCorpusLiteralShapes() async throws {
+    // Guards against over-tightening the regex — real corpus usage
+    // (pages_internal/categories.lasso and others): plain identifier-shaped
+    // literals must keep working unaffected.
+    var context = LassoContext(inlineProvider: LassoInMemoryInlineProvider(tables: [
+        "ca_web": [
+            LassoDataRow(["id": .integer(1), "category_name": .string("Tops")]),
+        ],
+    ]))
+    let output = try await LassoRenderer().render(
+        "[inline(-database='catalog',-table='CA_web','id'='1',-returnfield='category_name',-sortfield='category_name',-keyfield='id',-search)]" +
+        "[records][field('category_name')][/records][/inline]",
+        context: &context
+    )
+    #expect(output == "Tops")
+}
+
+@Test func inlineSortFieldRejectsTheExactResultsNavigationBacktickInjectionShape() async throws {
+    // Reproduces components/inSite/results_navigation.inc's real shape:
+    // `var('sortCol') = (action_param('sortfield') ? action_param('sortfield') | 'ID')`
+    // then `-sortfield=$sortCol` — a request-parameter-derived value used
+    // directly as a dynamic sort-field argument, with no validation before
+    // this fix. `#sortCol` here stands in for the real `action_param`
+    // read; the vulnerability is in what happens to the resolved STRING
+    // once it reaches -SortField, not in how it got populated.
+    var context = LassoContext(inlineProvider: LassoInMemoryInlineProvider(tables: [:]))
+    let unsafe = "ID`; DROP TABLE skus; --"
+    await #expect(throws: LassoRuntimeError.unsafeDynamicFieldName(unsafe)) {
+        _ = try await LassoRenderer().render(
+            "[var(sortCol::string='\(unsafe)')]" +
+            "[inline(-database='catalog',-table='skus',-sortfield=$sortCol,-search)]",
+            context: &context
+        )
+    }
+}
+
 // Expected values computed independently via Python's stdlib hmac/hashlib
 // (not hand-derived or quoted from memory) for key="key",
 // message="The quick brown fox jumps over the lazy dog" — the standard
@@ -781,7 +855,7 @@ import PerfectSessionCore
 
     struct InlineProvider: LassoInlineProvider {
         func executeInline(arguments: [EvaluatedArgument], context: LassoContext) async throws -> LassoInlineFrame {
-            let request = LassoInlineRequest(arguments: arguments)
+            let request = try LassoInlineRequest(arguments: arguments)
             #expect(request.database == "catalog_mysql")
             #expect(request.table == "skus")
             #expect(request.criteria.first?.field == "store_id")
@@ -834,7 +908,7 @@ import PerfectSessionCore
 
     struct InlineProvider: LassoInlineProvider {
         func executeInline(arguments: [EvaluatedArgument], context: LassoContext) async throws -> LassoInlineFrame {
-            let request = LassoInlineRequest(arguments: arguments)
+            let request = try LassoInlineRequest(arguments: arguments)
             #expect(request.database == "catalog_mysql")
             #expect(request.table == "skus")
             #expect(request.sql == "TRUNCATE TABLE skus;")
@@ -869,7 +943,7 @@ import PerfectSessionCore
 
     struct InlineProvider: LassoInlineProvider {
         func executeInline(arguments: [EvaluatedArgument], context: LassoContext) async throws -> LassoInlineFrame {
-            let request = LassoInlineRequest(arguments: arguments)
+            let request = try LassoInlineRequest(arguments: arguments)
             #expect(request.sql == "TRUNCATE TABLE skus;")
             return LassoInlineFrame(rows: [], actionStatement: "SQL")
         }
@@ -1215,12 +1289,47 @@ import PerfectSessionCore
     #expect(seenQueries[0].limit != nil)
 }
 
+@Test func fieldAfterANestedUpdateInlineStillReadsTheOuterSearchRow() async throws {
+    // Reproduces pages/lost_password.page.lasso's real shape: an outer
+    // -search inline finds a row (with no [records] loop — no `field()`
+    // read is ever inside one), then a SEPARATE, NESTED -update inline
+    // runs and closes, then `field('password')` reads a column from the
+    // OUTER search's row. Investigated as a suspected `field()`-missing-
+    // request-param-fallback bug (per a corpus-crawl finding of
+    // "Encrypt_HMAC requires -Token" failures on this exact call), but
+    // this test proves the inline-frame stack (push/popInlineFrame) is
+    // already correct: the nested inline's own frame is popped before
+    // `field()` runs, restoring the outer frame, whose `rows.first` still
+    // has the real value. No interpreter bug found here — most likely
+    // the crawl's failure was itself an environment artifact (no live
+    // datasource wired for that crawl run, matching this session's
+    // broader finding that the file-by-file crawler needs real context
+    // to produce trustworthy signal).
+    var context = LassoContext(inlineProvider: LassoInMemoryInlineProvider(tables: [
+        "cm_web": [
+            LassoDataRow(["email": .string("user@example.com"), "password": .string("realpass123")], keyValue: .integer(1)),
+        ],
+    ]))
+    let output = try await LassoRenderer().render(
+        "[local(new_email::string = 'user@example.com')]" +
+        "[inline(-database='scrubs_data',-table='CM_web',-eq,'email'=#new_email,-search)]" +
+        "[local(recid = keyfield_value)]" +
+        "[if(Found_Count > 0)]" +
+        "[inline(-database='scrubs_data',-table='CM_web',-keyvalue=#recid,'pass_reset'=12345,-update)][/inline]" +
+        "password=[field('password')]" +
+        "[else]not-found[/if]" +
+        "[/inline]",
+        context: &context
+    )
+    #expect(output == "password=realpass123")
+}
+
 @Test func inlineRequestSplitsFieldAssignmentsFromSearchCriteria() throws {
     // Documentation/inline-write-raw-sql-plan.md's core design point: in
     // -Add/-Update, unlabeled name/value arguments are values to write, not
     // search predicates -- reusing `criteria` for those actions would
     // misinterpret assignment values as WHERE-clause filters.
-    let add = LassoInlineRequest(arguments: [
+    let add = try LassoInlineRequest(arguments: [
         EvaluatedArgument(label: "database", value: .string("catalog")),
         EvaluatedArgument(label: "table", value: .string("skus")),
         EvaluatedArgument(label: "add", value: .boolean(true)),
@@ -1234,7 +1343,7 @@ import PerfectSessionCore
     ])
     #expect(add.writeCriteria == [])
 
-    let update = LassoInlineRequest(arguments: [
+    let update = try LassoInlineRequest(arguments: [
         EvaluatedArgument(label: "database", value: .string("catalog")),
         EvaluatedArgument(label: "table", value: .string("skus")),
         EvaluatedArgument(label: "update", value: .boolean(true)),
@@ -1246,7 +1355,7 @@ import PerfectSessionCore
     #expect(update.fieldAssignments == [LassoInlineAssignment(field: "color", value: .string("blue"))])
     #expect(update.writeCriteria == [LassoInlineCriterion(field: "id", operation: "eq", value: .integer(42))])
 
-    let delete = LassoInlineRequest(arguments: [
+    let delete = try LassoInlineRequest(arguments: [
         EvaluatedArgument(label: "database", value: .string("catalog")),
         EvaluatedArgument(label: "table", value: .string("skus")),
         EvaluatedArgument(label: "delete", value: .boolean(true)),
@@ -1269,7 +1378,7 @@ import PerfectSessionCore
     // into "cust_id = X" (not negated) and "status = 'unchecked'"
     // (negated). Real Lasso's FileMaker connector documents -Not as
     // negating the whole compound query group that follows it.
-    let request = LassoInlineRequest(arguments: [
+    let request = try LassoInlineRequest(arguments: [
         EvaluatedArgument(label: "database", value: .string("fm_catalog")),
         EvaluatedArgument(label: "table", value: .string("storefront")),
         EvaluatedArgument(label: "op", value: .string("Eq")),
@@ -1301,7 +1410,7 @@ import PerfectSessionCore
 }
 
 @Test func inlineRequestWithNoNotProducesOneNonNegatedGroupMatchingFlatCriteria() throws {
-    let request = LassoInlineRequest(arguments: [
+    let request = try LassoInlineRequest(arguments: [
         EvaluatedArgument(label: "database", value: .string("catalog")),
         EvaluatedArgument(label: "table", value: .string("skus")),
         EvaluatedArgument(label: "color", value: .string("red")),
@@ -1348,7 +1457,7 @@ private enum TestFileMakerProbeError: Error {
         Issue.record("queryHandler should not be called before -database is validated")
         throw TestFileMakerProbeError.stopAfterCapture
     }
-    let request = LassoInlineRequest(arguments: [
+    let request = try LassoInlineRequest(arguments: [
         EvaluatedArgument(label: "table", value: .string("storefront")),
         EvaluatedArgument(label: "findall", value: .boolean(true)),
     ])
@@ -1362,7 +1471,7 @@ private enum TestFileMakerProbeError: Error {
         Issue.record("queryHandler should not be called before -table is validated")
         throw TestFileMakerProbeError.stopAfterCapture
     }
-    let request = LassoInlineRequest(arguments: [
+    let request = try LassoInlineRequest(arguments: [
         EvaluatedArgument(label: "database", value: .string("fm_catalog")),
         EvaluatedArgument(label: "findall", value: .boolean(true)),
     ])
@@ -1376,7 +1485,7 @@ private enum TestFileMakerProbeError: Error {
         Issue.record("queryHandler should not be called for an unsupported action")
         throw TestFileMakerProbeError.stopAfterCapture
     }
-    let request = LassoInlineRequest(arguments: [
+    let request = try LassoInlineRequest(arguments: [
         EvaluatedArgument(label: "database", value: .string("fm_catalog")),
         EvaluatedArgument(label: "table", value: .string("storefront")),
         EvaluatedArgument(label: "show", value: .boolean(true)),
@@ -1396,14 +1505,14 @@ private enum TestFileMakerProbeError: Error {
         EvaluatedArgument(label: "table", value: .string("storefront")),
     ]
 
-    let addFrame = try await executor.execute(LassoInlineRequest(arguments: base + [
+    let addFrame = try await executor.execute(try LassoInlineRequest(arguments: base + [
         EvaluatedArgument(label: "add", value: .boolean(true)),
         EvaluatedArgument(label: "status", value: .string("new")),
     ]))
     #expect(addFrame.error != .noError)
     #expect(addFrame.error.kind == "add")
 
-    let updateFrame = try await executor.execute(LassoInlineRequest(arguments: base + [
+    let updateFrame = try await executor.execute(try LassoInlineRequest(arguments: base + [
         EvaluatedArgument(label: "update", value: .boolean(true)),
         EvaluatedArgument(label: "keyfield", value: .string("")),
         EvaluatedArgument(label: "keyvalue", value: .integer(101)),
@@ -1412,7 +1521,7 @@ private enum TestFileMakerProbeError: Error {
     #expect(updateFrame.error != .noError)
     #expect(updateFrame.error.kind == "update")
 
-    let deleteFrame = try await executor.execute(LassoInlineRequest(arguments: base + [
+    let deleteFrame = try await executor.execute(try LassoInlineRequest(arguments: base + [
         EvaluatedArgument(label: "delete", value: .boolean(true)),
         EvaluatedArgument(label: "keyfield", value: .string("")),
         EvaluatedArgument(label: "keyvalue", value: .integer(101)),
@@ -1432,12 +1541,12 @@ private enum TestFileMakerProbeError: Error {
     ]
 
     await #expect(throws: LassoFileMakerLassoError.missingAssignments(.add)) {
-        try await executor.execute(LassoInlineRequest(arguments: base + [
+        try await executor.execute(try LassoInlineRequest(arguments: base + [
             EvaluatedArgument(label: "add", value: .boolean(true)),
         ]))
     }
     await #expect(throws: LassoFileMakerLassoError.missingAssignments(.update)) {
-        try await executor.execute(LassoInlineRequest(arguments: base + [
+        try await executor.execute(try LassoInlineRequest(arguments: base + [
             EvaluatedArgument(label: "update", value: .boolean(true)),
             EvaluatedArgument(label: "keyfield", value: .string("")),
             EvaluatedArgument(label: "keyvalue", value: .integer(101)),
@@ -1456,7 +1565,7 @@ private enum TestFileMakerProbeError: Error {
     ]
 
     // No -KeyValue at all (e.g. a tampered/missing hidden form field).
-    let updateFrame = try await executor.execute(LassoInlineRequest(arguments: base + [
+    let updateFrame = try await executor.execute(try LassoInlineRequest(arguments: base + [
         EvaluatedArgument(label: "update", value: .boolean(true)),
         EvaluatedArgument(label: "status", value: .string("checked")),
     ]))
@@ -1464,7 +1573,7 @@ private enum TestFileMakerProbeError: Error {
     #expect(updateFrame.error.kind == "update")
 
     // A -KeyValue that isn't a valid record id.
-    let deleteFrame = try await executor.execute(LassoInlineRequest(arguments: base + [
+    let deleteFrame = try await executor.execute(try LassoInlineRequest(arguments: base + [
         EvaluatedArgument(label: "delete", value: .boolean(true)),
         EvaluatedArgument(label: "keyfield", value: .string("")),
         EvaluatedArgument(label: "keyvalue", value: .string("not-a-number")),
@@ -1482,7 +1591,7 @@ private enum TestFileMakerProbeError: Error {
         capture.query = query
         throw TestFileMakerProbeError.stopAfterCapture
     }
-    let request = LassoInlineRequest(arguments: [
+    let request = try LassoInlineRequest(arguments: [
         EvaluatedArgument(label: "database", value: .string("fm_catalog")),
         EvaluatedArgument(label: "table", value: .string("storefront")),
         EvaluatedArgument(label: "search", value: .boolean(true)),
@@ -1522,7 +1631,7 @@ private enum TestFileMakerProbeError: Error {
         capture.query = query
         throw TestFileMakerProbeError.stopAfterCapture
     }
-    let request = LassoInlineRequest(arguments: [
+    let request = try LassoInlineRequest(arguments: [
         EvaluatedArgument(label: "database", value: .string("fm_catalog")),
         EvaluatedArgument(label: "table", value: .string("storefront")),
         EvaluatedArgument(label: "search", value: .boolean(true)),
@@ -1545,7 +1654,7 @@ private enum TestFileMakerProbeError: Error {
     }
     // Mirrors the real corpus shape: an unnegated group followed by a
     // bare -Not delimiting a second, negated group.
-    let request = LassoInlineRequest(arguments: [
+    let request = try LassoInlineRequest(arguments: [
         EvaluatedArgument(label: "database", value: .string("fm_catalog")),
         EvaluatedArgument(label: "table", value: .string("storefront")),
         EvaluatedArgument(label: "search", value: .boolean(true)),
@@ -1571,7 +1680,7 @@ private enum TestFileMakerProbeError: Error {
         Issue.record("queryHandler should not be called for an unsupported operator")
         throw TestFileMakerProbeError.stopAfterCapture
     }
-    let request = LassoInlineRequest(arguments: [
+    let request = try LassoInlineRequest(arguments: [
         EvaluatedArgument(label: "database", value: .string("fm_catalog")),
         EvaluatedArgument(label: "table", value: .string("storefront")),
         EvaluatedArgument(label: "search", value: .boolean(true)),
@@ -1595,7 +1704,7 @@ private enum TestFileMakerProbeError: Error {
         capture.query = query
         throw TestFileMakerProbeError.stopAfterCapture
     }
-    let request = LassoInlineRequest(arguments: [
+    let request = try LassoInlineRequest(arguments: [
         EvaluatedArgument(label: "database", value: .string("fm_catalog")),
         EvaluatedArgument(label: "table", value: .string("storefront")),
         EvaluatedArgument(label: "findall", value: .boolean(true)),
@@ -1622,7 +1731,7 @@ private enum TestFileMakerProbeError: Error {
         capture.query = query
         throw TestFileMakerProbeError.stopAfterCapture
     }
-    let request = LassoInlineRequest(arguments: [
+    let request = try LassoInlineRequest(arguments: [
         EvaluatedArgument(label: "database", value: .string("fm_catalog")),
         EvaluatedArgument(label: "table", value: .string("storefront")),
         EvaluatedArgument(label: "add", value: .boolean(true)),
@@ -1643,7 +1752,7 @@ private enum TestFileMakerProbeError: Error {
         capture.query = query
         throw TestFileMakerProbeError.stopAfterCapture
     }
-    let request = LassoInlineRequest(arguments: [
+    let request = try LassoInlineRequest(arguments: [
         EvaluatedArgument(label: "database", value: .string("fm_catalog")),
         EvaluatedArgument(label: "table", value: .string("storefront")),
         EvaluatedArgument(label: "update", value: .boolean(true)),
@@ -1668,7 +1777,7 @@ private enum TestFileMakerProbeError: Error {
         capture.query = query
         throw TestFileMakerProbeError.stopAfterCapture
     }
-    let request = LassoInlineRequest(arguments: [
+    let request = try LassoInlineRequest(arguments: [
         EvaluatedArgument(label: "database", value: .string("fm_catalog")),
         EvaluatedArgument(label: "table", value: .string("storefront")),
         EvaluatedArgument(label: "delete", value: .boolean(true)),
@@ -1692,7 +1801,7 @@ private enum TestFileMakerProbeError: Error {
     let executor = PerfectFileMakerLassoExecutor { _, kind, datasource in
         throw LassoFileMakerDatabaseActionError(kind: kind, datasource: datasource, underlying: FakeServerError())
     }
-    let request = LassoInlineRequest(arguments: [
+    let request = try LassoInlineRequest(arguments: [
         EvaluatedArgument(label: "database", value: .string("fm_catalog")),
         EvaluatedArgument(label: "table", value: .string("storefront")),
         EvaluatedArgument(label: "findall", value: .boolean(true)),
@@ -1717,7 +1826,7 @@ private enum TestFileMakerProbeError: Error {
     let executor = PerfectFileMakerLassoExecutor { _, _, _ in
         throw FakeBugError()
     }
-    let request = LassoInlineRequest(arguments: [
+    let request = try LassoInlineRequest(arguments: [
         EvaluatedArgument(label: "database", value: .string("fm_catalog")),
         EvaluatedArgument(label: "table", value: .string("storefront")),
         EvaluatedArgument(label: "findall", value: .boolean(true)),

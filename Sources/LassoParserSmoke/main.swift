@@ -337,7 +337,7 @@ precondition(scriptBody.count == 1, "Expected return statement inside script inl
 
 struct ScriptInlineProvider: LassoInlineProvider {
     func executeInline(arguments: [EvaluatedArgument], context: LassoContext) async throws -> LassoInlineFrame {
-        let request = LassoInlineRequest(arguments: arguments)
+        let request = try LassoInlineRequest(arguments: arguments)
         precondition(request.database == "catalog_mysql", "Script inline database did not normalize")
         precondition(request.table == "skus", "Script inline table did not normalize")
         precondition(request.criteria.first?.field == "store_id", "String-key criterion did not normalize")

@@ -97,13 +97,19 @@ featured case also verifies that nested queries restore the outer inline row.
   `pages/detail.page.lasso`'s `#product_search = #search_by`), so this
   codebase cannot rely on the connector alone to safely handle an
   arbitrary runtime string as an identifier. `Evaluator.swift`'s
-  `validateDynamicFieldLabel(_:)` validates any dynamically-resolved
-  argument label against `\A[A-Za-z_][A-Za-z0-9_]*\z` before it becomes
-  an `EvaluatedArgument.label` — do not remove or bypass this check when
-  touching that code path, and note that `-Table`/`-ReturnField`/
-  `-SortField`/`-KeyField` argument *values* reach the same unescaped
-  quoting sink through a different, still-unvalidated path (tracked as a
-  follow-up, not yet fixed).
+  `validateDynamicFieldLabel(_:)` (internal, not `private` — also called
+  from `Providers.swift`) validates any dynamically-resolved argument
+  label, and `-Table`/`-ReturnField`/`-SortField`/`-KeyField` argument
+  *values*, against `\A[A-Za-z_][A-Za-z0-9_]*\z` (empty is exempt — an
+  existing convention for "no value provided", e.g. `-KeyField=''`, not
+  unsafe) before they become an `EvaluatedArgument.label` or a
+  `LassoInlineRequest` field. `LassoInlineRequest.init(arguments:)`
+  (`Providers.swift`) is the single choke point for the latter — every
+  constructor of that type validates unconditionally, regardless of
+  action. Real corpus: `components/inSite/results_navigation.inc` builds
+  `-sortfield=$sortCol` directly from `action_param('sortfield')`,
+  previously completely unvalidated. Do not remove or bypass either
+  check when touching these code paths.
 
 ## Current Implementation
 

@@ -36,7 +36,7 @@ struct LassoMultiBackendInlineProvider: LassoInlineProvider {
     }
 
     func executeInline(arguments: [EvaluatedArgument], context: LassoContext) async throws -> LassoInlineFrame {
-        let request = LassoInlineRequest(arguments: arguments)
+        let request = try LassoInlineRequest(arguments: arguments)
         if let database = request.database, fileMakerAliases.contains(database.lowercased()),
            let fileMakerProvider {
             return try await fileMakerProvider.executeInline(arguments: arguments, context: context)

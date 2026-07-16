@@ -88,7 +88,7 @@ private final class HeartbeatMonitor {
         }
     )
 
-    let request = LassoInlineRequest(arguments: [
+    let request = try LassoInlineRequest(arguments: [
         EvaluatedArgument(label: "database", value: .string("offload-check")),
         EvaluatedArgument(label: "table", value: .string("t")),
         EvaluatedArgument(label: "search", value: .boolean(true)),
@@ -137,8 +137,8 @@ private final class HeartbeatMonitor {
         }
     )
 
-    func makeRequest() -> LassoInlineRequest {
-        LassoInlineRequest(arguments: [
+    func makeRequest() throws -> LassoInlineRequest {
+        try LassoInlineRequest(arguments: [
             EvaluatedArgument(label: "database", value: .string("concurrent-load-check")),
             EvaluatedArgument(label: "table", value: .string("t")),
             EvaluatedArgument(label: "search", value: .boolean(true)),
@@ -149,7 +149,7 @@ private final class HeartbeatMonitor {
     try await withThrowingTaskGroup(of: Void.self) { group in
         for _ in 0..<concurrentCallCount {
             group.addTask {
-                _ = try await executor.execute(makeRequest())
+                _ = try await executor.execute(try makeRequest())
             }
         }
         try await group.waitForAll()
