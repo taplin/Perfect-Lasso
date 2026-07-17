@@ -52,6 +52,22 @@ private func write(_ text: String, to root: URL, relativePath: String) throws {
     #expect(excludedCount == 1)
 }
 
+// MARK: - pathMatchesExclude (shared by discoverPaths and LassoSiteServer.shouldRender)
+
+@Test func pathMatchesExcludeIsCaseInsensitive() {
+    #expect(CrawlReport.pathMatchesExclude("assets/Vendor/gmaps/demo.html", excludePaths: ["vendor"]))
+    #expect(CrawlReport.pathMatchesExclude("assets/VENDOR/gmaps/demo.html", excludePaths: ["Vendor"]))
+}
+
+@Test func pathMatchesExcludeMatchesAnySubstringInTheList() {
+    #expect(CrawlReport.pathMatchesExclude("pages/legacy/old.lasso", excludePaths: ["vendor", "legacy"]))
+    #expect(CrawlReport.pathMatchesExclude("pages/home.lasso", excludePaths: ["vendor", "legacy"]) == false)
+}
+
+@Test func pathMatchesExcludeReturnsFalseWithNoExcludesConfigured() {
+    #expect(CrawlReport.pathMatchesExclude("assets/vendor/gmaps/demo.html", excludePaths: []) == false)
+}
+
 @Test func discoverPathsSkipsStaticHTMLButKeepsLassoBearingHTML() throws {
     let root = try makeTempSiteRoot()
     defer { try? FileManager.default.removeItem(at: root) }

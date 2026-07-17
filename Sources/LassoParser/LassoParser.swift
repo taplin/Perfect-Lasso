@@ -62,6 +62,9 @@ private struct TemplateScanner {
             } else if matches("<?=") {
                 emitText(through: index)
                 scanDelimited(openLength: 3, close: "?>", delimiter: .echo)
+            } else if matches("<!--") {
+                emitText(through: index)
+                scanHTMLComment()
             } else if squareBracketsEnabled, characters[index] == "[", startsBracketComment(at: index) {
                 emitText(through: index)
                 scanBracketComment()
@@ -113,6 +116,43 @@ private struct TemplateScanner {
         } else {
             diagnostics.append(Diagnostic(message: "Unterminated square delimiter for block comment", range: range(start, index)))
         }
+        textStart = index
+    }
+
+    /// Real Lasso's *other* documented raw-content escape hatch, distinct
+    /// from `[noprocess]`: Lasso 8.5 Language Guide Chapter 4 ("Escaping
+    /// Lasso Code") lists plain HTML comments (`<!-- ... -->`) as an
+    /// equally valid way to keep square brackets from being interpreted,
+    /// "particularly useful for JavaScript code blocks" — its own worked
+    /// example is exactly `<script>` `<!-- array[1] = array[2]; // -->`
+    /// `</script>`. Chapter 22 repeats the same guidance verbatim ("client-
+    /// side JavaScript... should either be included in [NoProcess]...
+    /// [/NoProcess] tags or HTML comment tags <!-- … --> which ensure that
+    /// no Lasso code within is processed"). Real corpus evidence: 11
+    /// `templates/*/master.template.lasso` files all use exactly this
+    /// pattern for a Bootstrap-style modal-init snippet
+    /// (`$.HSCore.components.HSModalWindow.init('[data-modal-target]');`)
+    /// — `[data-modal-target]` was being scanned as a real Lasso bracket
+    /// tag (`unsupportedExpression("-modal")`) despite already being
+    /// wrapped exactly the documented way; this interpreter simply never
+    /// implemented the HTML-comment half of the documented escape
+    /// mechanism, only the `[noprocess]` half.
+    ///
+    /// Unlike `[noprocess]`, the delimiters here are real HTML syntax a
+    /// browser must actually see to treat the span as a comment — so
+    /// (unlike `scanNoProcess`, which strips its `[noprocess]`/
+    /// `[/noprocess]` markers) the entire `<!--...-->` span, delimiters
+    /// included, is emitted verbatim as one `.text(...)` node.
+    mutating private func scanHTMLComment() {
+        let start = index
+        index += 4 // "<!--"
+        while index < characters.count, !matches("-->") { index += 1 }
+        if index < characters.count {
+            index += 3 // "-->"
+        } else {
+            diagnostics.append(Diagnostic(message: "Unterminated HTML comment", range: range(start, index)))
+        }
+        nodes.append(.text(String(characters[start..<index]), range(start, index)))
         textStart = index
     }
 

@@ -23,6 +23,17 @@ struct ServerConfig: Sendable {
     let siteRoot: URL
     let port: Int
     let lassoExtensions: Set<String>
+    /// `LASSO_RENDER_EXCLUDE_PATHS` — case-insensitive substrings checked
+    /// against a request's site-root-relative path; a match means "serve
+    /// this file as plain static content, never attempt to Lasso-render
+    /// it," regardless of extension. Same matching semantics as
+    /// `crawlExcludePaths` below (`CrawlReport.pathMatchesExclude`) —
+    /// deliberately a separate list, not reused automatically, since what
+    /// you don't want *crawled* (noisy but harmless) isn't necessarily
+    /// what you don't want *served as Lasso* (e.g. vendored JS/HTML that
+    /// happens to match a render extension and gets misparsed as Lasso
+    /// source on a real, non-crawler request too).
+    let renderExcludePaths: [String]
     let startupPath: URL?
     /// Lasso-side datasource alias (e.g. `-database='catalog_mysql'`) ->
     /// real MySQL schema name, one entry per configured datasource.
@@ -192,10 +203,16 @@ struct ServerConfig: Sendable {
             throw ServerConfigError.missingFileMakerHost
         }
 
+        let renderExcludePaths = (env["LASSO_RENDER_EXCLUDE_PATHS"] ?? "")
+            .split(separator: ",")
+            .map { $0.trimmingCharacters(in: .whitespacesAndNewlines) }
+            .filter { $0.isEmpty == false }
+
         return ServerConfig(
             siteRoot: root,
             port: env["LASSO_SERVER_PORT"].flatMap(Int.init) ?? 8181,
             lassoExtensions: Set(extensions),
+            renderExcludePaths: renderExcludePaths,
             startupPath: startupPathValue,
             datasourceMap: datasourceMap,
             mysqlHost: datasourceFile?.mysql?.host ?? env["LASSO_MYSQL_HOST"] ?? "localhost",
@@ -696,7 +713,7 @@ struct LassoSiteServer: Sendable {
             }
             let fileURL = try fileURL(for: path)
             resolvedFileURL = fileURL
-            if shouldRender(fileURL) {
+            if shouldRender(fileURL, path: path) {
                 let postBody = try await readPostBody(request: request)
                 return try await render(fileURL: fileURL, request: request, includePath: path, postBody: postBody)
             }
@@ -871,8 +888,13 @@ struct LassoSiteServer: Sendable {
         return candidate.path == config.siteRoot.path || candidate.path.hasPrefix(rootPath)
     }
 
-    private func shouldRender(_ url: URL) -> Bool {
-        config.lassoExtensions.contains(url.pathExtension.lowercased())
+    /// `path` is the site-root-relative request path (matches
+    /// `CrawlReport.discoverPaths`' `relativePath` shape) — checked against
+    /// `config.renderExcludePaths` with the same case-insensitive substring
+    /// semantics the crawler uses for its own exclude list.
+    private func shouldRender(_ url: URL, path: String) -> Bool {
+        guard config.lassoExtensions.contains(url.pathExtension.lowercased()) else { return false }
+        return CrawlReport.pathMatchesExclude(path, excludePaths: config.renderExcludePaths) == false
     }
 
     private func render(

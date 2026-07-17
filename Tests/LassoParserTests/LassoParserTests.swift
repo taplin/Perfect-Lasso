@@ -117,6 +117,43 @@ import PerfectSessionCore
     #expect(output == "before-<script>var i,j; d.MM_p[j++].src=a[i];</script>-after-outside-still-works")
 }
 
+@Test func htmlCommentPassesThroughRawContentWithoutScanningItAsLasso() async throws {
+    // Real Lasso's *other* documented escape hatch (Lasso 8.5 Language
+    // Guide Chapter 4): plain HTML comments are just as valid as
+    // [noprocess] for keeping square brackets from being interpreted —
+    // its own worked example is exactly this pattern. Real corpus: 11
+    // templates/*/master.template.lasso files wrap a Bootstrap modal-init
+    // snippet this way (`$.HSCore.components.HSModalWindow.init(
+    // '[data-modal-target]');`), which was being scanned as a real Lasso
+    // bracket tag (unsupportedExpression("-modal")) before this fix.
+    // Unlike [noprocess], the `<!--`/`-->` delimiters themselves are real
+    // HTML syntax a browser needs to see — so they stay in the output,
+    // not stripped.
+    var context = LassoContext(globals: ["x": .string("outside-still-works")])
+    let output = try await LassoRenderer().render(
+        """
+        before-<script><!-- $.init('[data-modal-target]'); // --></script>-after-[$x]
+        """,
+        context: &context
+    )
+    #expect(output == "before-<script><!-- $.init('[data-modal-target]'); // --></script>-after-outside-still-works")
+}
+
+@Test func htmlCommentDoesNotSuppressLassoDelimitersOutsideItsSpan() async throws {
+    // The exemption is scoped to the comment span itself — real Lasso
+    // code before/after an HTML comment on the same page still renders
+    // normally, and an unterminated comment doesn't silently eat the
+    // rest of the document without at least a diagnostic.
+    var context = LassoContext()
+    let output = try await LassoRenderer().render(
+        """
+        [$x = 'before'][$x]<!-- [$ignored = 'inside'] -->[$x = 'after'][$x]
+        """,
+        context: &context
+    )
+    #expect(output == "before<!-- [$ignored = 'inside'] -->after")
+}
+
 @Test func rendersGoldenFixtures() async throws {
     let fixtureURL = try #require(Bundle.module.resourceURL?.appendingPathComponent("RenderFixtures"))
     let inputs = try FileManager.default.contentsOfDirectory(
@@ -2532,6 +2569,69 @@ func perfectCRUDConnectorFailuresBecomeInlineErrorFrames(source: String, expecte
     #expect(falseOutput == "else")
 }
 
+@Test func bareColonCallIfOpenerWithNoParensIsRecognizedAsRealControlFlow() async throws {
+    // Lasso 8's classic slash-closed colon-call with a bare (paren-less)
+    // condition — `if: cond; ... /if;` — distinct from both `if(cond)`
+    // and `if:(cond)`. Real corpus: importscripts/ca_web.lasso and 17
+    // other pages (`if: error_currenterror!='No error'; ... /if;`), all
+    // of which fell through to unknownFunction("if") before this fix,
+    // since classifyIfOpen only recognized a bare condition immediately
+    // followed by a brace body, not one terminated by ';' with no braces
+    // at all.
+    var context = LassoContext()
+
+    let trueOutput = try await LassoRenderer().render(
+        """
+        <?lasso
+        if: true;
+            $branch = 'if'
+        else;
+            $branch = 'else'
+        /if;
+        ?>
+        [$branch]
+        """,
+        context: &context
+    ).trimmingCharacters(in: .whitespacesAndNewlines)
+    #expect(trueOutput == "if")
+
+    let falseOutput = try await LassoRenderer().render(
+        """
+        <?lasso
+        if: false;
+            $branch = 'if'
+        else;
+            $branch = 'else'
+        /if;
+        ?>
+        [$branch]
+        """,
+        context: &context
+    ).trimmingCharacters(in: .whitespacesAndNewlines)
+    #expect(falseOutput == "else")
+}
+
+@Test func bareColonCallIfOpenerWithNoElseAndNoTrailingSemicolonStillParses() async throws {
+    // Real corpus shape (importscripts/ca_web.lasso:30): a bare condition
+    // with a comparison operator, no else branch, condition itself ends
+    // the statement with ';' before the block body begins on the next line.
+    var context = LassoContext()
+    let output = try await LassoRenderer().render(
+        """
+        <?lasso
+        #x = 'No error';
+        $branch = 'unset';
+        if: #x!='No error';
+            $branch = 'error'
+        /if;
+        ?>
+        [$branch]
+        """,
+        context: &context
+    ).trimmingCharacters(in: .whitespacesAndNewlines)
+    #expect(output == "unset")
+}
+
 @Test func lassoDelimiterMixesBraceAndSlashStyleNesting() async throws {
     var context = LassoContext()
     let output = try await LassoRenderer().render(
@@ -4902,10 +5002,16 @@ private final class MapIncludeLoader: LassoIncludeLoader, @unchecked Sendable {
 // `.bareColonCall` now characterizes the colon-plus-arguments-no-parens
 // shape `iterate`/`while`/`inline`/`encode_set`/`define_tag`/`define_type`
 // all share (`protect`'s bare zero-arg form reuses `.bareIdentifier`
-// instead, the same shape `records`/`rows` already had).
+// instead, the same shape `records`/`rows` already had). `if` also gained
+// `.bareColonCall` — real corpus's classic slash-closed `if: cond; ...
+// /if;` (importscripts/*.lasso and 6 other pages), a genuine block-
+// pairing bug fix distinct from `.bareCondition` (which requires a
+// brace body, not a `;`-terminated one) — see `parseIfOpening`'s own
+// classifier, not the shared cascade, since "if" stays deliberately
+// isolated from it.
 @Test func openFormsAreCharacterizedForEveryCatalogEntry() throws {
     let expected: [String: [TagOpenForm]] = [
-        "if": [.parenCall, .colonCall, .bareCondition],
+        "if": [.parenCall, .colonCall, .bareCondition, .bareColonCall],
         "inline": [.parenCall, .bareColonCall],
         "records": [.parenCall, .colonCall, .bareIdentifier],
         "rows": [.parenCall, .colonCall, .bareIdentifier],

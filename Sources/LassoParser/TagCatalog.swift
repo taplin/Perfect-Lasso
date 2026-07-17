@@ -222,8 +222,15 @@ enum TagCatalog {
         // style IE conditional comments (`<!--[if IE 8]> ... <![endif]-->`)
         // were being misparsed as a real, always-present `if` block,
         // silently swallowing the entire page body until an unrelated
-        // `[/if]` elsewhere happened to close it.
-        TagEntry(name: "if", blockScopes: [.scriptBody, .blockBuilder, .lassoParser], bareOpenScopes: [], openForms: [.parenCall, .colonCall, .bareCondition]),
+        // `[/if]` elsewhere happened to close it. `.bareColonCall`
+        // (`if: cond; ... /if;`, the classic Lasso 8 slash-closed form —
+        // importscripts/*.lasso and 6 other real pages) and `.bareCondition`
+        // are both dispatched through `parseIfOpening`'s own classifier,
+        // not the shared `bareOpenScopes` cascade — "if" stays deliberately
+        // isolated from that cascade (see `parseBlockOpening`'s comment)
+        // since its else-chaining pairing logic is genuinely more delicate
+        // than any other name here.
+        TagEntry(name: "if", blockScopes: [.scriptBody, .blockBuilder, .lassoParser], bareOpenScopes: [], openForms: [.parenCall, .colonCall, .bareCondition, .bareColonCall]),
         // inline's paren-call form is real corpus (iscrubs/LassoEcho.lasso
         // and throughout). Its bare, paren-less colon-call form
         // (`inline: -database=...;`, pages_internal/categories.lasso) is a

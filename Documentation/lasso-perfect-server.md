@@ -28,6 +28,16 @@ Environment variables:
 - `LASSO_SERVER_PORT`: port, default `8181`.
 - `LASSO_RENDER_EXTENSIONS`: comma-separated extensions rendered through Lasso,
   default `lasso,inc,html,htm`.
+- `LASSO_RENDER_EXCLUDE_PATHS`: comma-separated, case-insensitive path
+  substrings (e.g. `vendor`) — a request whose site-root-relative path
+  matches is always served as plain static content, never Lasso-rendered,
+  regardless of `LASSO_RENDER_EXTENSIONS`. The live-serving sibling of
+  `LASSO_CRAWL_EXCLUDE_PATHS` below (same matching semantics, via the
+  shared `CrawlReport.pathMatchesExclude` helper) — a separate list on
+  purpose, since what you don't want *crawled* isn't necessarily what you
+  don't want *served as Lasso*: vendored JS/HTML that happens to match a
+  render extension can get misparsed as Lasso source on a real request
+  too, not just during a crawl sweep. Off by default (empty).
 - `LASSO_STARTUP_PATH`: filesystem path to a Lasso instance startup folder
   (real Lasso convention: `LassoStartup`, kept entirely outside the site
   webroot). No default — opt-in only. If set, every file in it matching
@@ -1462,6 +1472,83 @@ action was deliberately designed around — both the site server and the
 admin console stayed up and responsive throughout and after the crawl.
 Confirmed `/api/metrics` accurately counts real site requests and
 errors as they're served.
+
+## Back to parsing gaps: `if` bare colon-call + HTML-comment no-process — 2026-07-17
+
+With the admin console/restart tooling done, resumed real-corpus parsing
+work using a fresh crawl-report as the evidence source (the docs above
+had drifted well behind ~25 parser commits since the last crawl). Full
+911-page sweep against the real corpus, before any fix: 776 clean,
+135 failing, grouped by first unsupported construct. Picked the two
+largest buckets.
+
+**`unknownFunction("if")` — 18 pages, all `importscripts/*.lasso` and a
+few includes.** Real corpus form: `if: error_currenterror!='No error';
+... /if;` — Lasso 8's classic slash-closed colon-call with a bare
+(paren-less) condition. `parseIfOpening`'s classifier
+(`ScriptBodyParser.swift`) only recognized two of "if"'s three real
+forms: parenthesized/colon-with-parens, and a bare condition immediately
+followed by a brace body (`if cond { ... }`) — never a bare condition
+terminated by `;` with no braces at all, so it fell through to being
+parsed as an ordinary call to a function named "if". Added
+`readBareConditionBeforeSemicolon` (the mirror image of the existing
+`readBareConditionBeforeBraceBody`) and a new `IfOpenClassification
+.bareColonCall` case, gated on a colon actually being present (every
+real corpus sighting has one) to avoid swallowing unrelated bare
+expressions. Deliberately kept inside `parseIfOpening`'s own isolated
+classifier rather than folded into the shared `bareOpenScopes` cascade
+`iterate`/`while`/`protect` use (see Phase 4 of tag-form consolidation,
+2026-07-16) — "if"'s else-chaining pairing logic is genuinely more
+delicate than any other name in the catalog, and that isolation is
+deliberate architecture, not an oversight.
+
+**`unsupportedExpression("-modal")` / `("Member arguments")` — 18 pages
+combined, all `templates/*/master.template.lasso`.** Root cause turned
+out to be a documented Lasso feature this interpreter never implemented
+at all, not a one-off bug: the Lasso 8.5 Language Guide (Chapter 4,
+"Escaping Lasso Code," repeated in Chapter 22) lists plain HTML comments
+(`<!-- ... -->`) as an equally valid no-process escape hatch alongside
+`[NoProcess]...[/NoProcess]` — its own worked example is exactly
+`<script><!-- array[1] = array[2]; // --></script>`, "particularly
+useful for JavaScript code blocks." This interpreter only ever
+implemented the `[NoProcess]` half (`LassoParser.swift`'s
+`scanNoProcess`); every one of the 18 affected real pages wraps its
+JS exactly the documented way and was still getting misparsed, because
+`<!-- -->` had zero special handling at all. Added `scanHTMLComment`
+(`LassoParser.swift`, modeled directly on `scanNoProcess`) — same "don't
+scan anything inside for `[ ]`/`<?lasso ?>`" behavior, but unlike
+`[NoProcess]` the `<!--`/`-->` delimiters are real HTML syntax a browser
+needs to see, so the whole span (delimiters included) is emitted
+verbatim rather than stripped. This also transparently subsumes the
+earlier IE-conditional-comment-specific workaround (`if`'s empty
+`bareOpenScopes` in the `.lassoParser` scope, 2026-07-09) for any
+`<!--[if IE 8]>...<![endif]-->` that's inside a real HTML comment —
+that older fix stays in place (still correct, still needed for any bare
+`[if ...]` outside a comment), just now redundant-but-harmless for the
+in-comment case.
+
+Both fixes: full test suite green throughout, 306 tests passing (4 new —
+2 per fix), zero regressions — notably the broad HTML-comment change
+touched every fixture with a `<!-- -->` anywhere in it and still didn't
+break a single one. Live-verified against the real corpus: fresh full
+crawl after both
+fixes landed — **793 clean, 118 failing** (up from 776/135), both target
+buckets completely absent from the new report, no new failure bucket
+introduced by either fix (the new top buckets — `unreadableFile`,
+`Encrypt_HMAC` token requirement, `email_send`, `fileNotFound` — are
+pre-existing gaps in the *same* files, previously masked behind the two
+bugs just fixed, the same "fixing one bug exposes the next layer"
+pattern this project has hit repeatedly; not investigated further this
+pass).
+
+**Also added `LASSO_RENDER_EXCLUDE_PATHS`** (see "Configuration" above)
+— the live-serving sibling of `LASSO_CRAWL_EXCLUDE_PATHS`, prompted by
+noticing the crawl's vendor-path noise (16 pages of misidentified
+gmaps/jquery.filer demo JS/HTML) would 500 on a real direct request too,
+not just during a crawl sweep. Live-verified: `LASSO_RENDER_EXCLUDE_PATHS=vendor`
+turns a vendor page that previously 500'd into a clean `200` serving the
+real static file content, while an ordinary Lasso page on the same
+server keeps rendering normally.
 
 ## Next Compatibility Work
 

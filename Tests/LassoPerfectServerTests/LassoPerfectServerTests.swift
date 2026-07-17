@@ -278,12 +278,14 @@ private func sampleServerConfig(
     filemakerHostOverrides: [String: FileMakerHostOverride] = [:],
     sessionDriver: String = "memory",
     startupPath: URL? = nil,
-    adminConsoleEnabled: Bool = false
+    adminConsoleEnabled: Bool = false,
+    renderExcludePaths: [String] = []
 ) -> ServerConfig {
     ServerConfig(
         siteRoot: URL(fileURLWithPath: "/tmp/sample-site"),
         port: 8181,
         lassoExtensions: ["lasso", "inc"],
+        renderExcludePaths: renderExcludePaths,
         startupPath: startupPath,
         datasourceMap: datasourceMap,
         mysqlHost: "localhost",

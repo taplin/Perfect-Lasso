@@ -122,6 +122,20 @@ public enum CrawlReport {
         return (results, excludedCount)
     }
 
+    /// Case-insensitive substring match of `path` against any entry in
+    /// `excludePaths` (e.g. `"vendor"` matches `assetsnew/vendor/gmaps/...`).
+    /// Shared by `discoverPaths` (crawl-report discovery) and
+    /// `LassoSiteServer.shouldRender` (live request serving) so both use
+    /// exactly the same exclusion semantics — `LASSO_CRAWL_EXCLUDE_PATHS`
+    /// and `LASSO_RENDER_EXCLUDE_PATHS` behave identically, just at
+    /// different points (which pages get crawled vs. which get served as
+    /// Lasso at all).
+    public static func pathMatchesExclude(_ path: String, excludePaths: [String]) -> Bool {
+        guard excludePaths.isEmpty == false else { return false }
+        let lowercasedPath = path.lowercased()
+        return excludePaths.contains { lowercasedPath.contains($0.lowercased()) }
+    }
+
     /// Recursively walks `siteRoot` for renderable pages, skipping
     /// underscore-prefixed files — the site's own "include-only, never
     /// request directly" convention (matching every real corpus sweep run
@@ -152,7 +166,6 @@ public enum CrawlReport {
             return ([], 0)
         }
 
-        let lowercasedExcludes = excludePaths.map { $0.lowercased() }
         var paths: [String] = []
         var excludedCount = 0
         for case let relativePath as String in enumerator {
@@ -165,7 +178,7 @@ public enum CrawlReport {
             guard extensions.contains(fileExtension) else { continue }
             guard url.lastPathComponent.hasPrefix("_") == false else { continue }
 
-            if lowercasedExcludes.contains(where: { relativePath.lowercased().contains($0) }) {
+            if pathMatchesExclude(relativePath, excludePaths: excludePaths) {
                 excludedCount += 1
                 continue
             }
