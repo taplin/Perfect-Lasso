@@ -152,9 +152,16 @@ Environment variables:
   datasource backend has been driven to failure by a short, purely
   sequential crawl more than once.
 - `LASSO_CRAWL_CIRCUIT_BREAKER_THRESHOLD`: abort the crawl after this many
-  *consecutive* backend-distress results (a request-level failure/timeout
-  or any `5xx` — ordinary 4xx page errors never count), default `3`. `0`
-  disables the breaker.
+  *consecutive* genuine request-level failures (timeout/connection
+  refused — deliberately not any `5xx`; see "Crawl pacing and a circuit
+  breaker" below for why), default `3`. `0` disables the breaker.
+- `LASSO_CRAWL_DATASOURCE_FAILURE_THRESHOLD`: a *second*, independent
+  circuit breaker — abort the crawl once this many "Datasource action
+  failed" events (FileMaker or MySQL) have happened since the crawl
+  started, regardless of what any individual page's HTTP status looked
+  like. Default `5`. `0` disables it. Exists because a datasource
+  connectivity failure is invisible to the breaker above entirely — see
+  "Crawl pacing and a circuit breaker" below.
 - `LASSO_ADMIN_CONSOLE=1`: start `PerfectAdminConsole` alongside the main
   server — see "Admin Console" below and `Documentation/admin-console.md`
   for the full user guide. Off by default.
@@ -1877,6 +1884,80 @@ entirely, pacing measurably slowing a crawl vs. not) — wrapped in a
 mutable state across test cases, the same pattern `Perfect-FileMaker`'s
 own `MockURLProtocol`-based tests already established. 318 tests
 passing project-wide, zero regressions after the fix.
+
+### The paced crawl still surfaced real degradation — and a real gap in the safety net
+
+With both fixes above live, Tim ran the paced/circuit-breaker-protected
+crawl against the real corpus while watching FileMaker Server's own
+admin console in real time. Both signals were tracked simultaneously —
+his live connection-count readout, and this project's own server log —
+and correlated directly:
+
+- FileMaker Server's admin console showed its client session count
+  climbing steadily throughout the crawl: 2 → 3 → 6 → 8 over roughly
+  four minutes and about twenty FileMaker-touching requests.
+- This project's own server log showed real datasource failures
+  starting to appear around the same point — `serverError(502, "Bad
+  response")` and `serverError(401, "Error from FileMaker server")` —
+  eventually a majority of FileMaker requests (14 of the last 18)
+  before the crawl was manually stopped.
+- **Neither circuit breaker tripped.** Pacing slowed the rate of harm —
+  markedly slower accumulation than the original, unpaced incident —
+  but did not prevent it. This is consistent with (not new evidence
+  against) the earlier finding that the actual WPE exhaustion mechanism
+  isn't understood from outside the HTTP layer; a client-side pacing
+  strategy alone was never going to fully paper over a server-side
+  resource-accounting problem, only reduce its rate.
+
+The reason neither breaker caught it, once traced, was a real
+architectural gap, not just an undertuned threshold: `Perfect-FileMaker`
+Lasso executors (`PerfectFileMakerLassoExecutor`/`PerfectCRUDLassoExecutor`)
+deliberately catch a datasource connectivity failure and convert it
+into a *recoverable* Lasso error frame the page inspects via
+`error_currenterror` — intentional, sensible behavior for a real
+visitor's page load, but it means the page still returns a normal `200`.
+The only place a live FileMaker outage was ever observable was a
+`stderr`/`LogCapture` line (`logDatasourceActionFailure`) a human had to
+be watching — invisible to the crawl-report's own HTTP-level view
+entirely, and to `isBackendDistressSignal` by construction.
+
+Fixed by giving the crawl-report an in-process signal into the same
+event, rather than trying to derive it from anything HTTP-visible:
+`DatasourceFailureTracker` (`Sources/LassoPerfectServer/
+DatasourceFailureTracker.swift`) is a small actor that counts
+`logDatasourceActionFailure` events (FileMaker and MySQL alike — both
+connectors already funnel through the same function) since it was last
+reset. `LassoSiteServer` now owns one always-present instance (unlike
+`logCapture`/`metrics`, which are nil when the admin console is off —
+this needed to work in CLI mode too), threaded into all four
+`logDatasourceActionFailure` call sites and shared with
+`LassoAdminDelegate` so both the CLI crawl mode and the admin console's
+crawl-report action read from the exact same counter real traffic
+writes into.
+
+`CrawlReport.run(...)` gained a second, independent circuit breaker:
+`datasourceFailureThreshold`/`currentDatasourceFailureCount` (a polled
+closure, checked after every request, deliberately not woven into the
+first breaker's "consecutive" bookkeeping — a datasource failure isn't
+naturally 1:1 with a single crawled page). Both call sites reset the
+tracker immediately before starting a run, so unrelated earlier
+browsing (or a previous crawl) doesn't count toward a fresh run's
+threshold. New env var: `LASSO_CRAWL_DATASOURCE_FAILURE_THRESHOLD`,
+default `5` (see "Configuration" above).
+
+Verified via 4 new unit tests: `DatasourceFailureTracker`'s own
+count/reset semantics, plus two `CrawlReport.run(...)` tests proving
+the new signal aborts a crawl even when every single mocked page
+returns a clean `200` — reproducing the exact real-world shape of the
+gap this closes, not just testing the counter in isolation. 322 tests
+passing project-wide, zero regressions.
+
+**Still not fully resolved.** This closes the specific "invisible to
+the crawler" gap, but doesn't answer the deeper open question: why does
+a short, purely sequential, now-paced crawl still measurably degrade a
+FileMaker Server WPE at all. Real next step unchanged from the section
+above — FileMaker Server's own WPE/CWP event log, watched directly
+during a controlled test, is the only remaining source of that answer.
 
 ## Next Compatibility Work
 

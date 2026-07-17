@@ -113,6 +113,31 @@ public enum CrawlReport {
     /// error, ordinary interpreter gaps included — see that function's
     /// own doc comment for why treating any 5xx as distress tripped the
     /// breaker on completely normal crawl output in practice.
+    ///
+    /// `datasourceFailureThreshold`/`currentDatasourceFailureCount` are a
+    /// *second*, independent circuit breaker, because live-verifying the
+    /// first one (2026-07-17) surfaced a real gap: a FileMaker Server
+    /// connectivity failure never reaches this crawler as a `5xx` or a
+    /// request-level failure at all — `PerfectFileMakerLassoExecutor`/
+    /// `PerfectCRUDLassoExecutor` deliberately catch that class of error
+    /// and convert it into a recoverable Lasso error frame the *page*
+    /// inspects via `error_currenterror`, so the page still returns a
+    /// normal `200`. The only place this was ever observable was a
+    /// stderr/`LogCapture` line a human had to be watching — confirmed
+    /// live: FileMaker Server's own admin console showed a climbing
+    /// session count (2 → 3 → 6 → 8) and a majority of datasource actions
+    /// failing while every single crawled page's HTTP status looked
+    /// completely normal to this loop. `currentDatasourceFailureCount`,
+    /// when supplied, is polled after every request; if it reaches
+    /// `datasourceFailureThreshold` the crawl aborts exactly like the
+    /// HTTP-level breaker (same `abortedByCircuitBreaker` flag — from the
+    /// caller's perspective, and in the printed/logged summary, both
+    /// mean the same thing: something-that-isn't-a-normal-page-error
+    /// tripped a safety net). `nil`/unset in every caller except
+    /// `LassoPerfectServer`, which polls its own in-process
+    /// `DatasourceFailureTracker` — see that type's doc comment for why
+    /// this has to be an in-process signal rather than anything derivable
+    /// from a page's own HTTP response.
     public static func run(
         baseURL: String,
         siteRoot: URL,
@@ -121,6 +146,8 @@ public enum CrawlReport {
         pathList: [String]? = nil,
         requestDelayMS: Int = 0,
         circuitBreakerThreshold: Int? = nil,
+        datasourceFailureThreshold: Int? = nil,
+        currentDatasourceFailureCount: (@Sendable () async -> Int)? = nil,
         urlSession: URLSession? = nil,
         onProgress: (@Sendable (_ completed: Int, _ total: Int) -> Void)? = nil
     ) async -> (results: [CrawlPageResult], excludedCount: Int, abortedByCircuitBreaker: Bool) {
@@ -151,6 +178,13 @@ public enum CrawlReport {
             consecutiveBackendFailures = isBackendDistressSignal(result) ? consecutiveBackendFailures + 1 : 0
             if let threshold = circuitBreakerThreshold, consecutiveBackendFailures >= threshold {
                 return (results, excludedCount, true)
+            }
+
+            if let threshold = datasourceFailureThreshold, let currentDatasourceFailureCount {
+                let count = await currentDatasourceFailureCount()
+                if count >= threshold {
+                    return (results, excludedCount, true)
+                }
             }
 
             let isLastPath = index == sortedPaths.count - 1

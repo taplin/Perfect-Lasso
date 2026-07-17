@@ -311,6 +311,7 @@ private func sampleServerConfig(
         crawlOnlyFailure: nil,
         crawlRequestDelayMS: 0,
         crawlCircuitBreakerThreshold: nil,
+        crawlDatasourceFailureThreshold: nil,
         imageProxyPrefix: nil,
         imageProxyTarget: nil,
         tagFormCountersEnabled: false,
@@ -505,6 +506,25 @@ private func sampleDelegate(
     #expect(status.contains("9 clean"))
     // A finished tracker allows starting again.
     #expect(await tracker.tryBegin() == true)
+}
+
+@Test func datasourceFailureTrackerCountsEachRecordedFailure() async {
+    let tracker = DatasourceFailureTracker()
+    #expect(await tracker.currentCount() == 0)
+    await tracker.recordFailure()
+    await tracker.recordFailure()
+    #expect(await tracker.currentCount() == 2)
+}
+
+@Test func datasourceFailureTrackerResetClearsTheCount() async {
+    let tracker = DatasourceFailureTracker()
+    await tracker.recordFailure()
+    await tracker.recordFailure()
+    await tracker.reset()
+    #expect(await tracker.currentCount() == 0)
+    // A reset tracker still counts new failures normally.
+    await tracker.recordFailure()
+    #expect(await tracker.currentCount() == 1)
 }
 
 @Test func crawlRunTrackerStatusDescriptionFallsBackWhenNeverRun() async {

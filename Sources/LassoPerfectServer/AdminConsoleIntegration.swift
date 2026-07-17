@@ -45,6 +45,11 @@ final class LassoAdminDelegate: AdminConsoleDelegate {
     /// Guards against two near-simultaneous restart clicks racing into two
     /// concurrent process spawns. See `RestartCoordinator`.
     private let restartCoordinator: RestartCoordinator
+    /// Must be the *same* instance `LassoSiteServer` records real datasource
+    /// failures into (`main.swift` passes `siteServer.datasourceFailureTracker`
+    /// here) — a separate instance would always read zero, defeating the
+    /// whole point. See `DatasourceFailureTracker`'s own doc comment.
+    private let datasourceFailureTracker: DatasourceFailureTracker
 
     init(
         config: ServerConfig,
@@ -54,7 +59,8 @@ final class LassoAdminDelegate: AdminConsoleDelegate {
         baseURL: String,
         siteServerTask: Task<Void, Error>,
         crawlTracker: CrawlRunTracker = CrawlRunTracker(),
-        restartCoordinator: RestartCoordinator = RestartCoordinator()
+        restartCoordinator: RestartCoordinator = RestartCoordinator(),
+        datasourceFailureTracker: DatasourceFailureTracker = DatasourceFailureTracker()
     ) {
         self.config = config
         self.startTime = startTime
@@ -64,6 +70,7 @@ final class LassoAdminDelegate: AdminConsoleDelegate {
         self.siteServerTask = siteServerTask
         self.crawlTracker = crawlTracker
         self.restartCoordinator = restartCoordinator
+        self.datasourceFailureTracker = datasourceFailureTracker
     }
 
     // MARK: - Phase 1: status display
@@ -155,6 +162,7 @@ final class LassoAdminDelegate: AdminConsoleDelegate {
         let baseURL = self.baseURL
         let logCapture = self.logCapture
         let crawlTracker = self.crawlTracker
+        let datasourceFailureTracker = self.datasourceFailureTracker
         // Fire-and-forget, matching main.swift's own CLI-mode crawl Task —
         // a full crawl (~2,000 real pages, sequential requests) can take
         // minutes; blocking this action's HTTP response for that long
@@ -163,6 +171,7 @@ final class LassoAdminDelegate: AdminConsoleDelegate {
         // server keeps running afterward.
         Task {
             await logCapture?.capture("[crawl-report] started (admin-triggered)")
+            await datasourceFailureTracker.reset()
             let (results, excludedCount, abortedByCircuitBreaker) = await CrawlReport.run(
                 baseURL: baseURL,
                 siteRoot: config.siteRoot,
@@ -170,6 +179,8 @@ final class LassoAdminDelegate: AdminConsoleDelegate {
                 excludePaths: config.crawlExcludePaths,
                 requestDelayMS: config.crawlRequestDelayMS,
                 circuitBreakerThreshold: config.crawlCircuitBreakerThreshold,
+                datasourceFailureThreshold: config.crawlDatasourceFailureThreshold,
+                currentDatasourceFailureCount: { await datasourceFailureTracker.currentCount() },
                 onProgress: { completed, total in
                     Task { await crawlTracker.progress(completed, total) }
                 }

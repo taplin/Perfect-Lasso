@@ -119,12 +119,28 @@ struct ServerConfig: Sendable {
     /// is cheap insurance. `0` disables pacing entirely.
     let crawlRequestDelayMS: Int
     /// `LASSO_CRAWL_CIRCUIT_BREAKER_THRESHOLD` — abort the crawl after this
-    /// many *consecutive* backend-distress results (`statusCode == 0`, a
-    /// request-level failure/timeout, or any `5xx`; ordinary 4xx page
-    /// errors don't count — they're a normal, expected crawl outcome and
-    /// say nothing about backend health). Default 3. `nil`/unset-to-0
-    /// disables the breaker entirely.
+    /// many *consecutive* genuine request-level failures (`statusCode ==
+    /// 0`: timeout, connection refused/reset). Deliberately not any `5xx`
+    /// — this server's own render-error page returns 500 uniformly for
+    /// every kind of Lasso error, ordinary already-cataloged interpreter
+    /// gaps included, so status code alone can't tell a real backend
+    /// failure apart from completely normal crawl output (confirmed live,
+    /// see `CrawlReport.isBackendDistressSignal`'s doc comment). Default
+    /// 3. `nil`/unset-to-0 disables the breaker entirely.
     let crawlCircuitBreakerThreshold: Int?
+    /// `LASSO_CRAWL_DATASOURCE_FAILURE_THRESHOLD` — a second, independent
+    /// circuit breaker: abort the crawl once `datasourceFailureTracker`
+    /// (a real-time count of "Datasource action failed" events — see that
+    /// type's doc comment) reaches this many failures *since the crawl
+    /// started*. Exists because a FileMaker/MySQL connectivity failure
+    /// gets caught and converted into a recoverable Lasso error frame the
+    /// page inspects via `error_currenterror`, so the page still returns
+    /// a normal `200` — invisible to `crawlCircuitBreakerThreshold` above
+    /// entirely. Confirmed live (2026-07-17): FileMaker Server's own
+    /// admin console showed a climbing session count and a majority of
+    /// datasource actions failing while every crawled page's HTTP status
+    /// looked completely normal. Default 5. `nil`/unset-to-0 disables it.
+    let crawlDatasourceFailureThreshold: Int?
     /// `LASSO_IMAGE_PROXY_PREFIX`/`LASSO_IMAGE_PROXY_TARGET` — a temporary
     /// escape hatch for a local site-root copy that's missing a real image
     /// tree: any request whose resolved path starts with `imageProxyPrefix`
@@ -263,6 +279,10 @@ struct ServerConfig: Sendable {
             // default rather than to `nil`.
             crawlCircuitBreakerThreshold: {
                 let configured = env["LASSO_CRAWL_CIRCUIT_BREAKER_THRESHOLD"].flatMap(Int.init) ?? 3
+                return configured > 0 ? configured : nil
+            }(),
+            crawlDatasourceFailureThreshold: {
+                let configured = env["LASSO_CRAWL_DATASOURCE_FAILURE_THRESHOLD"].flatMap(Int.init) ?? 5
                 return configured > 0 ? configured : nil
             }(),
             imageProxyPrefix: env["LASSO_IMAGE_PROXY_PREFIX"]?.trimmingCharacters(in: CharacterSet(charactersIn: "/")),
@@ -474,6 +494,12 @@ struct LassoSiteServer: Sendable {
     let logCapture: LogCapture?
     /// Same nil-when-unused policy as `logCapture`.
     let metrics: AdminMetrics?
+    /// Always present (unlike `logCapture`/`metrics`, both nil-when-unused)
+    /// — cheap to keep running regardless of whether the admin console is
+    /// enabled, and the crawl-report action/CLI mode need it either way.
+    /// See `DatasourceFailureTracker`'s own doc comment for why this
+    /// exists.
+    let datasourceFailureTracker: DatasourceFailureTracker
     /// `nil` when no FileMaker datasource is configured. Owns the *live*,
     /// runtime-mutable host/port each FileMaker alias currently resolves
     /// to — see `FileMakerConnectionRegistry`'s own doc comment. Exposed
@@ -484,13 +510,19 @@ struct LassoSiteServer: Sendable {
     /// action must always agree on which host an alias currently means.
     let fileMakerRegistry: FileMakerConnectionRegistry?
 
-    init(config: ServerConfig, logCapture: LogCapture? = nil, metrics: AdminMetrics? = nil) throws {
+    init(
+        config: ServerConfig,
+        logCapture: LogCapture? = nil,
+        metrics: AdminMetrics? = nil,
+        datasourceFailureTracker: DatasourceFailureTracker = DatasourceFailureTracker()
+    ) throws {
         self.config = config
         tagFormCounters = config.tagFormCountersEnabled
             ? CountingTagOpenFormCounterStore()
             : NoOpTagOpenFormCounterStore()
         self.logCapture = logCapture
         self.metrics = metrics
+        self.datasourceFailureTracker = datasourceFailureTracker
         includeLoader = try LassoFileSystemIncludeLoader(root: config.siteRoot)
         uploadProcessor = try LassoFileSystemUploadProcessor(root: config.siteRoot)
 
@@ -547,7 +579,7 @@ struct LassoSiteServer: Sendable {
                     } catch let error as LassoDatabaseActionError {
                         throw error
                     } catch {
-                        logDatasourceActionFailure(kind: "search", datasource: datasource, error: error, logCapture: logCapture)
+                        logDatasourceActionFailure(kind: "search", datasource: datasource, error: error, logCapture: logCapture, datasourceFailureTracker: datasourceFailureTracker)
                         throw LassoDatabaseActionError(kind: .search, datasource: datasource, underlying: error)
                     }
                 },
@@ -565,7 +597,7 @@ struct LassoSiteServer: Sendable {
                         case .update: .update
                         case .delete: .delete
                         }
-                        logDatasourceActionFailure(kind: kind.rawValue, datasource: datasource, error: error, logCapture: logCapture)
+                        logDatasourceActionFailure(kind: kind.rawValue, datasource: datasource, error: error, logCapture: logCapture, datasourceFailureTracker: datasourceFailureTracker)
                         throw LassoDatabaseActionError(kind: kind, datasource: datasource, underlying: error)
                     }
                 },
@@ -578,7 +610,7 @@ struct LassoSiteServer: Sendable {
                     } catch let error as LassoDatabaseActionError {
                         throw error
                     } catch {
-                        logDatasourceActionFailure(kind: "sql", datasource: datasource, error: error, logCapture: logCapture)
+                        logDatasourceActionFailure(kind: "sql", datasource: datasource, error: error, logCapture: logCapture, datasourceFailureTracker: datasourceFailureTracker)
                         throw LassoDatabaseActionError(kind: .sql, datasource: datasource, underlying: error)
                     }
                 }
@@ -649,7 +681,7 @@ struct LassoSiteServer: Sendable {
                 } catch let error as LassoFileMakerDatabaseActionError {
                     throw error
                 } catch {
-                    logDatasourceActionFailure(kind: "\(kind)", datasource: datasource, error: error, logCapture: logCapture)
+                    logDatasourceActionFailure(kind: "\(kind)", datasource: datasource, error: error, logCapture: logCapture, datasourceFailureTracker: datasourceFailureTracker)
                     throw LassoFileMakerDatabaseActionError(kind: kind, datasource: datasource, underlying: error)
                 }
             }
@@ -1178,11 +1210,20 @@ struct LassoSiteServer: Sendable {
 /// visibility, not something any caller waits on — matching this file's
 /// existing fire-and-forget `Task { }` precedent (crawl-report mode, the
 /// admin console's own startup).
-func logDatasourceActionFailure(kind: String, datasource: String, error: Error, logCapture: LogCapture? = nil) {
+func logDatasourceActionFailure(
+    kind: String,
+    datasource: String,
+    error: Error,
+    logCapture: LogCapture? = nil,
+    datasourceFailureTracker: DatasourceFailureTracker? = nil
+) {
     let line = "Datasource action failed kind=\(kind) datasource=\(datasource) error=\(error)"
     fputs(line + "\n", stderr)
     if let logCapture {
         Task { await logCapture.capture("[datasource] " + line) }
+    }
+    if let datasourceFailureTracker {
+        Task { await datasourceFailureTracker.recordFailure() }
     }
 }
 
@@ -1633,6 +1674,7 @@ if config.crawlReportMode {
             print("Focused rerun: \(pathList?.count ?? 0) page(s) previously matching '\(onlyFailure)'.")
         }
 
+        await siteServer.datasourceFailureTracker.reset()
         let (results, excludedCount, abortedByCircuitBreaker) = await CrawlReport.run(
             baseURL: "http://localhost:\(config.port)",
             siteRoot: config.siteRoot,
@@ -1640,7 +1682,9 @@ if config.crawlReportMode {
             excludePaths: config.crawlExcludePaths,
             pathList: pathList,
             requestDelayMS: config.crawlRequestDelayMS,
-            circuitBreakerThreshold: config.crawlCircuitBreakerThreshold
+            circuitBreakerThreshold: config.crawlCircuitBreakerThreshold,
+            datasourceFailureThreshold: config.crawlDatasourceFailureThreshold,
+            currentDatasourceFailureCount: { await siteServer.datasourceFailureTracker.currentCount() }
         )
         CrawlReport.printAndWrite(
             results,
@@ -1660,7 +1704,8 @@ if config.adminConsoleEnabled {
         fileMakerRegistry: siteServer.fileMakerRegistry,
         logCapture: logCapture,
         baseURL: "http://localhost:\(config.port)",
-        siteServerTask: siteServerTask
+        siteServerTask: siteServerTask,
+        datasourceFailureTracker: siteServer.datasourceFailureTracker
     )
     let admin = try AdminConsole(
         port: config.adminConsolePort,

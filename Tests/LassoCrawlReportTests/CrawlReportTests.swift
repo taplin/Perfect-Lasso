@@ -402,4 +402,71 @@ struct CrawlReportRunTests {
     #expect(elapsed < 0.15)
 }
 
+@Test func runAbortsWhenTheDatasourceFailureCounterCrossesItsThreshold() async throws {
+    // Real corpus symptom (2026-07-17): a FileMaker Server connectivity
+    // failure gets caught and converted into a recoverable Lasso error
+    // frame, so the page still returns a normal 200 — every one of these
+    // mocked pages is a clean 200, exactly matching what the crawler
+    // actually saw live while FileMaker Server was demonstrably failing
+    // most of its requests. This signal has to come from somewhere other
+    // than the page's own HTTP response.
+    let root = try makeTempSiteRoot()
+    defer { try? FileManager.default.removeItem(at: root) }
+    for name in ["a", "b", "c", "d", "e"] {
+        try write("page", to: root, relativePath: "\(name).lasso")
+    }
+    CrawlMockURLProtocol.statusCodesByPath = [
+        "a.lasso": 200, "b.lasso": 200, "c.lasso": 200, "d.lasso": 200, "e.lasso": 200,
+    ]
+    CrawlMockURLProtocol.failingPaths = []
+    CrawlMockURLProtocol.requestedPaths = []
+
+    final class CounterBox: @unchecked Sendable {
+        var count = 0
+    }
+    let box = CounterBox()
+
+    let (results, _, abortedByCircuitBreaker) = await CrawlReport.run(
+        baseURL: "http://mock.example",
+        siteRoot: root,
+        extensions: ["lasso"],
+        datasourceFailureThreshold: 3,
+        currentDatasourceFailureCount: {
+            // Simulates one real datasource failure per crawled page —
+            // by the 3rd page the count has reached the threshold.
+            box.count += 1
+            return box.count
+        },
+        urlSession: mockSession()
+    )
+
+    #expect(abortedByCircuitBreaker)
+    #expect(results.map(\.path) == ["a.lasso", "b.lasso", "c.lasso"])
+    #expect(results.filter(\.isClean).count == results.count)
+}
+
+@Test func runWithNoDatasourceFailureThresholdIgnoresTheCounterEntirely() async throws {
+    let root = try makeTempSiteRoot()
+    defer { try? FileManager.default.removeItem(at: root) }
+    for name in ["a", "b"] {
+        try write("page", to: root, relativePath: "\(name).lasso")
+    }
+    CrawlMockURLProtocol.statusCodesByPath = ["a.lasso": 200, "b.lasso": 200]
+    CrawlMockURLProtocol.failingPaths = []
+    CrawlMockURLProtocol.requestedPaths = []
+
+    let (results, _, abortedByCircuitBreaker) = await CrawlReport.run(
+        baseURL: "http://mock.example",
+        siteRoot: root,
+        extensions: ["lasso"],
+        // No datasourceFailureThreshold — the closure is still supplied,
+        // but must never be consulted since the threshold is nil.
+        currentDatasourceFailureCount: { 999 },
+        urlSession: mockSession()
+    )
+
+    #expect(abortedByCircuitBreaker == false)
+    #expect(results.count == 2)
+}
+
 }
