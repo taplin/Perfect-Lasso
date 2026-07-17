@@ -108,6 +108,23 @@ struct ServerConfig: Sendable {
     /// `LASSO_CRAWL_ONLY_FAILURE` — a substring matched against
     /// `crawlBaselinePath`'s `errorDescription` values.
     let crawlOnlyFailure: String?
+    /// `LASSO_CRAWL_REQUEST_DELAY_MS` — a deliberate pause between every
+    /// crawled request (default 200ms). This project has repeatedly broken
+    /// real FileMaker Server Web Publishing Engine instances by running a
+    /// short, purely sequential crawl against them, for reasons not fully
+    /// understood from outside the HTTP layer (see
+    /// `Documentation/lasso-perfect-server.md`'s FileMaker connectivity
+    /// section) — pacing every request, not just FileMaker-touching ones
+    /// (the crawler can't know in advance which pages hit a datasource),
+    /// is cheap insurance. `0` disables pacing entirely.
+    let crawlRequestDelayMS: Int
+    /// `LASSO_CRAWL_CIRCUIT_BREAKER_THRESHOLD` — abort the crawl after this
+    /// many *consecutive* backend-distress results (`statusCode == 0`, a
+    /// request-level failure/timeout, or any `5xx`; ordinary 4xx page
+    /// errors don't count — they're a normal, expected crawl outcome and
+    /// say nothing about backend health). Default 3. `nil`/unset-to-0
+    /// disables the breaker entirely.
+    let crawlCircuitBreakerThreshold: Int?
     /// `LASSO_IMAGE_PROXY_PREFIX`/`LASSO_IMAGE_PROXY_TARGET` — a temporary
     /// escape hatch for a local site-root copy that's missing a real image
     /// tree: any request whose resolved path starts with `imageProxyPrefix`
@@ -239,6 +256,15 @@ struct ServerConfig: Sendable {
             crawlPathListPath: env["LASSO_CRAWL_PATH_LIST"],
             crawlBaselinePath: env["LASSO_CRAWL_BASELINE"],
             crawlOnlyFailure: env["LASSO_CRAWL_ONLY_FAILURE"],
+            crawlRequestDelayMS: env["LASSO_CRAWL_REQUEST_DELAY_MS"].flatMap(Int.init) ?? 200,
+            // `0` (explicit or default-absent-but-parsed-as-0) disables the
+            // breaker — `Int?` isn't reachable as `nil` through env vars
+            // otherwise, since an unset var already falls back to the `3`
+            // default rather than to `nil`.
+            crawlCircuitBreakerThreshold: {
+                let configured = env["LASSO_CRAWL_CIRCUIT_BREAKER_THRESHOLD"].flatMap(Int.init) ?? 3
+                return configured > 0 ? configured : nil
+            }(),
             imageProxyPrefix: env["LASSO_IMAGE_PROXY_PREFIX"]?.trimmingCharacters(in: CharacterSet(charactersIn: "/")),
             imageProxyTarget: env["LASSO_IMAGE_PROXY_TARGET"]?.trimmingCharacters(in: CharacterSet(charactersIn: "/")),
             tagFormCountersEnabled: Self.isTruthyEnv(env["LASSO_TAG_FORM_COUNTERS"]),
@@ -1607,14 +1633,21 @@ if config.crawlReportMode {
             print("Focused rerun: \(pathList?.count ?? 0) page(s) previously matching '\(onlyFailure)'.")
         }
 
-        let (results, excludedCount) = await CrawlReport.run(
+        let (results, excludedCount, abortedByCircuitBreaker) = await CrawlReport.run(
             baseURL: "http://localhost:\(config.port)",
             siteRoot: config.siteRoot,
             extensions: config.lassoExtensions,
             excludePaths: config.crawlExcludePaths,
-            pathList: pathList
+            pathList: pathList,
+            requestDelayMS: config.crawlRequestDelayMS,
+            circuitBreakerThreshold: config.crawlCircuitBreakerThreshold
         )
-        CrawlReport.printAndWrite(results, outputPath: config.crawlReportOutputPath, excludedCount: excludedCount)
+        CrawlReport.printAndWrite(
+            results,
+            outputPath: config.crawlReportOutputPath,
+            excludedCount: excludedCount,
+            abortedByCircuitBreaker: abortedByCircuitBreaker
+        )
         exit(0)
     }
 }

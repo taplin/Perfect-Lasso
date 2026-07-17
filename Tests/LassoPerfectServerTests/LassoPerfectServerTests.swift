@@ -309,6 +309,8 @@ private func sampleServerConfig(
         crawlPathListPath: nil,
         crawlBaselinePath: nil,
         crawlOnlyFailure: nil,
+        crawlRequestDelayMS: 0,
+        crawlCircuitBreakerThreshold: nil,
         imageProxyPrefix: nil,
         imageProxyTarget: nil,
         tagFormCountersEnabled: false,

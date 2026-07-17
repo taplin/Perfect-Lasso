@@ -146,6 +146,15 @@ Environment variables:
   construct, and exit — see the crawl/report mode implementation note
   below. `LASSO_CRAWL_REPORT_PATH` optionally writes the full per-page
   JSON results to a file.
+- `LASSO_CRAWL_REQUEST_DELAY_MS`: a pause (milliseconds) between every
+  crawled request, default `200`. `0` disables pacing. See "Crawl pacing
+  and a circuit breaker" below for why this exists — a real-corpus
+  datasource backend has been driven to failure by a short, purely
+  sequential crawl more than once.
+- `LASSO_CRAWL_CIRCUIT_BREAKER_THRESHOLD`: abort the crawl after this many
+  *consecutive* backend-distress results (a request-level failure/timeout
+  or any `5xx` — ordinary 4xx page errors never count), default `3`. `0`
+  disables the breaker.
 - `LASSO_ADMIN_CONSOLE=1`: start `PerfectAdminConsole` alongside the main
   server — see "Admin Console" below and `Documentation/admin-console.md`
   for the full user guide. Off by default.
@@ -1775,9 +1784,8 @@ per-session token this project's client behavior could be failing to
 honor. Real next steps: watch FileMaker Server's own WPE/CWP event log
 and admin-console connection count during a slow, deliberately-paced
 test crawl (server-side visibility this project cannot get from outside
-the HTTP layer), and consider adding request pacing plus a circuit
-breaker to `LassoCrawlReport`'s crawl loop itself so a single run cannot
-drive a healthy server to failure regardless of the underlying cause.
+the HTTP layer) — see "Crawl pacing and a circuit breaker" below for the
+client-side mitigation, now implemented.
 
 Live-verified end-to-end through `lasso-perfect-server` while POST was
 confirmed working: a page that had failed all session rendered
@@ -1789,6 +1797,65 @@ add-to-cart action fails with `missingAssignments(LassoInlineAction.
 add)` from `includes/create_new_cust.include.lasso` — confirmed
 unrelated to any of the above (same error throughout) and not yet
 investigated.
+
+### Crawl pacing and a circuit breaker
+
+Tim: "add pacing and a circuit breaker to the crawl loop." Two new
+env vars on `CrawlReport.run(...)` (`Sources/LassoCrawlReport/
+CrawlReport.swift`), wired through both call sites (`main.swift`'s
+`LASSO_CRAWL_REPORT=1` CLI mode and the admin console's `crawl-report`
+action):
+
+- **`LASSO_CRAWL_REQUEST_DELAY_MS`** (default `200`) — a pause between
+  every crawled request, applied uniformly. The crawler can't know in
+  advance which pages hit a datasource, so this can't be scoped to
+  "FileMaker-touching requests only" — it paces the whole crawl.
+  `0` disables pacing entirely.
+- **`LASSO_CRAWL_CIRCUIT_BREAKER_THRESHOLD`** (default `3`) — aborts the
+  crawl immediately after this many *consecutive* backend-distress
+  results (`statusCode == 0`, a request-level failure/timeout, or any
+  `5xx` — exactly the symptom observed live: 502s and timeouts in a
+  row). Ordinary 4xx page errors don't count toward this at all — an
+  unsupported construct on one page is the normal, expected output of a
+  crawl and says nothing about backend health, unlike a run of
+  timeouts/502s. `0` disables the breaker. A tripped breaker stops the
+  crawl outright (no auto-retry/backoff loop — an automated retry could
+  itself contribute more load to a server already in distress); both
+  call sites print/log a clear "ABORTED EARLY" message with however many
+  pages were reached before stopping.
+
+Neither can target FileMaker requests specifically, because — per the
+section above — the actual server-side exhaustion mechanism was never
+pinned down from outside the HTTP layer. This is deliberately a blunt,
+general-purpose safety net (pace everything, stop on any sustained
+backend distress), not a fix for the underlying cause, which still
+needs the server-side visibility only Tim can get by watching FileMaker
+Server's own WPE/CWP event log and admin-console connection count in
+real time during a test crawl.
+
+`CrawlReport.run(...)` gained a third return-tuple element,
+`abortedByCircuitBreaker: Bool`, and an injectable `urlSession`
+parameter (`nil` in every real caller, defaulting to the existing
+no-redirect session — tests inject a `URLProtocol`-mocked session,
+matching `Perfect-FileMaker`'s own established testing pattern, to
+exercise pacing/circuit-breaker timing and abort behavior without a
+live server). The circuit breaker's core predicate is exposed as
+`CrawlReport.isBackendDistressSignal(_:)`, a small pure function, so
+its exact boundary (5xx and 0 count, 4xx doesn't) is unit-tested
+directly rather than only indirectly through the full crawl loop.
+
+Verified via 8 new unit tests (`LassoCrawlReportTests`, all mock-based —
+consecutive vs. non-consecutive failures, ordinary 4xx never tripping
+the breaker, threshold disabled entirely, pacing measurably slowing a
+crawl vs. not) — wrapped in a `.serialized` suite since the mock's
+status-code table is shared mutable state across test cases, the same
+pattern `Perfect-FileMaker`'s own `MockURLProtocol`-based tests already
+established. 318 tests passing project-wide, zero regressions.
+Live-verified: the server starts and serves normally with the new
+defaults active; a real paced/circuit-breaker-protected crawl against
+the live FileMaker-backed corpus, watched against FileMaker Server's
+own admin console in real time, is the natural next step but hadn't
+happened yet as of this section being written.
 
 ## Next Compatibility Work
 

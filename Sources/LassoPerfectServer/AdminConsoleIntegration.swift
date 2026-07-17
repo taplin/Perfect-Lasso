@@ -116,7 +116,7 @@ final class LassoAdminDelegate: AdminConsoleDelegate {
     /// `/api/actions` on every periodic refresh, so this updates live.
     func availableActions() async -> [AdminAction] {
         let description = await crawlTracker.statusDescription(
-            fallback: "Request every discovered site page over real HTTP and log a pass/fail summary. Runs in the background; can take several minutes on a large site."
+            fallback: "Request every discovered site page over real HTTP and log a pass/fail summary. Runs in the background, paced between requests to avoid overloading datasource backends (LASSO_CRAWL_REQUEST_DELAY_MS), and aborts early if the backend starts failing repeatedly (LASSO_CRAWL_CIRCUIT_BREAKER_THRESHOLD) — can take several minutes on a large site."
         )
         var restartDescription = "Spawn a fresh instance, confirm it's healthy, then hand off — the running site keeps serving throughout, no dropped connections. Also how an edited datasource config file gets picked up without a rebuild."
         if config.sessionDriver == "memory" {
@@ -163,11 +163,13 @@ final class LassoAdminDelegate: AdminConsoleDelegate {
         // server keeps running afterward.
         Task {
             await logCapture?.capture("[crawl-report] started (admin-triggered)")
-            let (results, excludedCount) = await CrawlReport.run(
+            let (results, excludedCount, abortedByCircuitBreaker) = await CrawlReport.run(
                 baseURL: baseURL,
                 siteRoot: config.siteRoot,
                 extensions: config.lassoExtensions,
                 excludePaths: config.crawlExcludePaths,
+                requestDelayMS: config.crawlRequestDelayMS,
+                circuitBreakerThreshold: config.crawlCircuitBreakerThreshold,
                 onProgress: { completed, total in
                     Task { await crawlTracker.progress(completed, total) }
                 }
@@ -175,15 +177,21 @@ final class LassoAdminDelegate: AdminConsoleDelegate {
             let cleanCount = results.count { $0.isClean }
             let failingCount = results.count - cleanCount
             let finishedAt = DateFormatter.localizedString(from: Date(), dateStyle: .none, timeStyle: .short)
-            let summary = "Last run: \(results.count) page(s), \(cleanCount) clean, \(failingCount) failing, \(excludedCount) excluded (finished \(finishedAt))."
+            let abortNote = abortedByCircuitBreaker ? " ABORTED EARLY — circuit breaker tripped on repeated backend failures." : ""
+            let summary = "Last run: \(results.count) page(s), \(cleanCount) clean, \(failingCount) failing, \(excludedCount) excluded (finished \(finishedAt)).\(abortNote)"
             await crawlTracker.finish(summary: summary)
             await logCapture?.capture(
-                "[crawl-report] finished: \(results.count) page(s) crawled, \(cleanCount) clean, \(failingCount) failing, \(excludedCount) excluded"
+                "[crawl-report] finished: \(results.count) page(s) crawled, \(cleanCount) clean, \(failingCount) failing, \(excludedCount) excluded\(abortedByCircuitBreaker ? " (ABORTED by circuit breaker)" : "")"
             )
             // Same JSON-output convention as CLI mode, when configured —
             // an admin-triggered run is exactly the kind of run someone
             // would want to diff against a previous baseline afterward.
-            CrawlReport.printAndWrite(results, outputPath: config.crawlReportOutputPath, excludedCount: excludedCount)
+            CrawlReport.printAndWrite(
+                results,
+                outputPath: config.crawlReportOutputPath,
+                excludedCount: excludedCount,
+                abortedByCircuitBreaker: abortedByCircuitBreaker
+            )
         }
         return .ok("Crawl report started in the background — watch the Logs tab for progress and a completion summary.")
     }
