@@ -71,6 +71,7 @@ struct Evaluator {
                 throw LassoRuntimeError.unsupportedExpression("Dynamic call")
             }
             if name.caseInsensitiveCompare("var") == .orderedSame ||
+                name.caseInsensitiveCompare("variable") == .orderedSame ||
                 name.caseInsensitiveCompare("local") == .orderedSame {
                 return try await declare(arguments, local: name.lowercased() == "local")
             }
@@ -630,7 +631,9 @@ struct Evaluator {
 
     private static func isVarOrLocalCallee(_ callee: LassoExpression) -> Bool {
         guard case let .identifier(name) = callee else { return false }
-        return name.caseInsensitiveCompare("var") == .orderedSame || name.caseInsensitiveCompare("local") == .orderedSame
+        return name.caseInsensitiveCompare("var") == .orderedSame
+            || name.caseInsensitiveCompare("variable") == .orderedSame
+            || name.caseInsensitiveCompare("local") == .orderedSame
     }
 
     /// Methods real Lasso mutates the invocant with, rather than returning

@@ -427,7 +427,8 @@ private struct RendererEngine {
             if calleeName.caseInsensitiveCompare("local") == .orderedSame {
                 return (inner.name, .local)
             }
-            if calleeName.caseInsensitiveCompare("var") == .orderedSame {
+            if calleeName.caseInsensitiveCompare("var") == .orderedSame
+                || calleeName.caseInsensitiveCompare("variable") == .orderedSame {
                 return (inner.name, .global)
             }
             return nil

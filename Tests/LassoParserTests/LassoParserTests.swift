@@ -4462,6 +4462,35 @@ private final class MapIncludeLoader: LassoIncludeLoader, @unchecked Sendable {
     #expect(output == "|hello")
 }
 
+@Test func variableIsARealSynonymForVarNotJustAnUnrecognizedIdentifier() async throws {
+    // Lasso 8.5 Language Guide's own synonym table lists [Variable] and
+    // [Var] as exact synonyms ("Var → [Variable] [Var]"). Real corpus:
+    // includes/b2b/*/top_right.lasso's `[variable: 'Season'=
+    // (field:'new_season_number')]` — was unknownFunction("variable")
+    // since only "var"/"local" were recognized as the declare-callee
+    // special case, not "variable".
+    var context = LassoContext()
+    let output = try await LassoRenderer().render(
+        "[variable: 'greeting'='hello']|[$greeting]",
+        context: &context
+    )
+    #expect(output == "|hello")
+}
+
+@Test func emailSendIsARegisteredNoOpNotAnUnknownFunction() async throws {
+    // [Email_Send] (Lasso 8.5 Language Guide, "Process Tags") — no
+    // resurrected SMTP client in this project, so it's a deliberate
+    // no-op (matching the [Cache] precedent) rather than a real send.
+    // Real corpus: importscripts/*.lasso's error-notification
+    // `email_send: -to=..., -from=..., -subject=..., -body=...;`.
+    var context = LassoContext()
+    let output = try await LassoRenderer().render(
+        "before-[email_send: -to='a@example.com', -from='b@example.com', -subject='s', -body='b']-after",
+        context: &context
+    )
+    #expect(output == "before--after")
+}
+
 @Test func decimalConstructorAndAsStringWithPrecisionFormatFixedDecimalPlaces() async throws {
     // `decimal(...)` (a native type constructor, like the already-supported
     // `integer(...)`/`string(...)`) plus `->asString(-precision=N)` — real

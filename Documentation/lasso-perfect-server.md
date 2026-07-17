@@ -1550,6 +1550,74 @@ turns a vendor page that previously 500'd into a clean `200` serving the
 real static file content, while an ordinary Lasso page on the same
 server keeps rendering normally.
 
+## Backlog round 2: `variable`/`Var` synonym, `Email_Send` no-op, three confirmed non-bugs — 2026-07-17
+
+Continued from the fresh crawl above (776 clean before, 793 after the
+`if`/HTML-comment fixes) — took the next 5 buckets by page count. Two
+were real, now-fixed gaps; three turned out to be the same "crawler
+tests pages without their real page's calling context" limitation
+already on record (`crawl-report-filtering-plan.md`'s "Known
+limitation" section), confirmed by tracing each one to its actual
+source, not assumed.
+
+**`unknownFunction("variable")` — 6 pages, `includes/*/top_right.lasso`.
+Real gap, fixed.** Real corpus: `[variable: 'Season'=
+(field:'new_season_number')]`. The Lasso 8.5 Language Guide's own
+synonym table lists `[Variable]`/`[Var]` as exact synonyms, but this
+interpreter only ever special-cased `"var"` (and `"local"`) at the three
+places that matter — `Evaluator.swift`'s dynamic-call declare dispatch,
+its `isVarOrLocalCallee` member-assignment-target check, and
+`Renderer.swift`'s `iterateBinding` loop-variable detection. Added
+`"variable"` alongside `"var"` at all three (case-insensitively,
+matching how every other tag name comparison in this codebase works).
+
+**`unknownFunction("email_send")` — 14 pages,
+`importscripts/*.lasso`. Real gap, fixed as a documented no-op.**
+`[Email_Send]` is a real Lasso 8.5 "process tag" ("does not return a
+value") that queues/sends mail via SMTP. This project has no
+resurrected SMTP client, and real corpus usage here is only ever
+reached on already-degraded error-notification paths (import failures),
+never a real user's success path — registered as a no-op (`register
+("email_send") { _, _ in .void }`), matching the existing `[Cache]`
+no-op precedent exactly: clears the `unknownFunction` gap and lets the
+page finish rendering, without pretending to deliver mail that goes
+nowhere.
+
+**`unreadableFile("")` (21 pages) / `Encrypt_HMAC requires -Token`
+(14 pages) / `fileNotFound("includes/b2b//keywords/...")` (8 pages) —
+all three confirmed non-bugs, not touched.** Traced each to its real
+source rather than assumed:
+- `unreadableFile("")`: `templates/*/master.template.lasso` and
+  `includes/*_header1.lasso` files call `[include($header1)]` /
+  similar — `$header1` etc. are globals the real calling page (a
+  top-level page confirmed already rendering cleanly) sets before
+  including these helpers. Crawled bare, with no caller, the variable
+  is empty and `include('')` correctly throws.
+- `Encrypt_HMAC requires -Token`: a LassoStartup-defined custom tag
+  wrapping `Encrypt_HMAC` is called with `$password` sourced
+  from `action_param('password')` — real form
+  POST data, empty on a bare crawl GET. An empty token being rejected
+  is `Encrypt_HMAC`'s own documented, already-tested required-argument
+  behavior working correctly, not a bug.
+- `fileNotFound(...b2b//keywords...)`: the exact same
+  `includes/b2b/*/*_header1.lasso` files from the `unreadableFile`
+  bucket above — `$store_abbrev` (presumably set via hostname-based
+  site detection somewhere in the real `_begin.lasso` chain) is empty
+  when crawled bare, producing the double-slash path. Same root cause,
+  different line reached first.
+
+All three are direct instances of the already-documented "the crawler
+discovers and tests pages without the session/form/caller-variable
+context a real request would carry" limitation — not three new findings,
+one limitation manifesting three ways. No fix attempted here; the real
+fix is the link-following crawl rework already flagged as not scheduled.
+
+Verification: 308 tests passing (2 new), zero regressions. Live-verified
+against the real corpus: fresh full crawl, **813 clean, 98 failing**
+(up from 793/118) — `variable` and `email_send` buckets completely
+gone, the three non-bug buckets unchanged in count (confirming nothing
+was silently broken by chasing them), no new failure bucket introduced.
+
 ## Next Compatibility Work
 
 1. Implement `[File_ProcessUploads]` (Lasso 8) and any equivalent move/copy
