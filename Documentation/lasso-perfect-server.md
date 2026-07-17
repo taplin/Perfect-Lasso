@@ -1696,55 +1696,98 @@ Both fixes live-verified: `filtered_links.inc` now fails only on
 limitation as other confirmed non-bugs above, not a new gap) —
 `email_instances.inc` renders fully clean.
 
-### The real bug behind every FileMaker-backed page failure this session: POST instead of GET
+### FileMaker connectivity: what's actually understood, and what isn't yet
 
 Every FileMaker-touching page failed all session — 502s, timeouts, and
 (after a FileMaker Server Web Publishing Engine restart) a generic
 "FileMaker Server Administration Console - Error / http.401" HTML page
-instead of a real response, even with verified-correct credentials. The
-investigation initially focused on FileMaker Server health (an admin
-console showing accumulated open connections, suspected overload from
-repeated crawl-report runs) — a real, separate issue, addressed with a
-`Connection: close` header in `Perfect-FileMaker`. But the actual root
-cause was upstream of all of it: confirmed when a real Lasso Server
-installation, same machine, same credentials, same FileMaker Server,
-connected instantly and successfully — ruling out server health,
-credentials, and network entirely.
+instead of a real response, even with verified-correct credentials. This
+turned into a multi-round investigation with one overconfident diagnosis
+along the way — recorded here in full rather than quietly cleaned up,
+since the corrected understanding is the useful part.
 
-A focused research spike (reading `Perfect-FileMaker`'s full source
-against FileMaker's official Custom Web Publishing XML documentation)
-found the divergence: every documented XML CWP example is a **GET**
-request with the query in the URL
-(`/fmi/xml/fmresultset.xml?-db=...&-lay=...&-findall`).
-`Perfect-FileMaker` sent a **POST** with the identical query string
-moved into the request body instead. Live-verified directly against the
-real server: the POST form reliably produced the generic admin-console
-fallback page; an otherwise-identical GET-with-URL-query request
-returned a real, successful `<fmresultset>` response immediately.
-FileMaker Server's front-end web layer (the same layer that also serves
-the Admin Console) very likely pattern-matches CWP requests by their URL
-query string — a POST with an empty URL query string doesn't match that
-route and falls through to the Admin Console's own default error
-handler, which is exactly the observed symptom.
+**Ruled out**: server health, credentials, and network. A real Lasso
+Server installation — same machine, same credentials, same FileMaker
+Server — connected instantly and successfully while every request from
+this project failed, at a time when a raw request built the documented
+way (see below) still failed too. That pointed squarely at something in
+how `Perfect-FileMaker` builds its requests, or a genuinely unstable
+FileMaker Server (a "which one is it" question this project could not
+fully resolve — see below).
 
-Fixed in `Perfect-FileMaker` (`Sources/PerfectFileMaker/
-FileMakerServer.swift`'s `makeURL`/`makeRequest`/`performRequest`):
-query now goes in the URL via `GET`, not the body via `POST`. The
-existing query-string escaping (`String.fmpEscaped`) already
-percent-encodes to the same rules a URL query string requires, so no
-re-encoding was needed — the identical already-built string just moves
-from the body to after the `?`. See that repository's own commit for
-details; this project pulls it in as a local Swift package dependency.
+**A false lead, corrected**: every official FileMaker XML Custom Web
+Publishing example shows a `GET` request with the query in the URL
+(`/fmi/xml/fmresultset.xml?-db=...&-lay=...&-findall`), while
+`Perfect-FileMaker` sent the identical query as a `POST` body. Switching
+to GET immediately returned a real, successful response, and this was
+initially recorded as the fix. Further live testing overturned that:
+the exact original POST-based request, retried later, worked reliably
+too — and this project's own earlier live-verification work (2026-07-14
+through 07-16) had already exercised the original always-POST
+implementation successfully against this same FileMaker infrastructure.
+GET's *own* first live attempt had also failed before succeeding on a
+retry — a detail initially dismissed as a fluke that, in hindsight, fits
+"the server was still stabilizing" much better than "GET is the fix."
+The real explanation for the outage was very likely the WPE being
+unstable/still-recovering at the time, not a client request-shape bug —
+this project simply happened to test GET at a moment when the server
+had also separately recovered.
 
-Live-verified end-to-end through `lasso-perfect-server` once rebuilt
-against the fixed `Perfect-FileMaker`: a page that had 502'd/timed out
-all session rendered in ~0.13s with a real result; the login page (which
-had separately been failing on `Encrypt_HMAC requires -Token`, a symptom
-that turned out to be downstream of the same connectivity failure)
-now renders fully. One genuinely separate bug remains open — an
+**Reverted, because GET has a real cost independent of the above**:
+query values can include credential-adjacent data (a password-derived
+search value from a login flow, for example). Putting the query in the
+URL means it lands in *any* URL-based logging along the way —
+`Perfect-FileMaker`'s own plain-HTTP credential warning (which logs the
+full URL) went from logging just the bare endpoint to logging the
+entire query the moment GET was tried, and FileMaker Server's own
+front-end web server almost certainly logs full request URLs too,
+completely outside this project's control. POST keeps the query out of
+URL-based logging entirely. Given GET was never conclusively proven to
+fix anything, and POST is known to work once the server is healthy,
+`Perfect-FileMaker` now sends POST again — see that repository's own
+commits (`1710fa1` then `0018824`) for the full back-and-forth.
+
+**Still genuinely unresolved**: this project has, on its own account,
+broken multiple distinct FileMaker Server WPE instances this way before
+— a short, *purely sequential* crawl (confirmed via source: one request
+at a time, no concurrency at all) reliably drives a FileMaker Server
+Web Publishing Engine into an unresponsive state, observable first as a
+climbing "open connections" count in FileMaker Server's own admin
+console, later as total unresponsiveness requiring an administrator
+restart. A `Connection: close` header was added to `Perfect-FileMaker`
+as reasonable hygiene (classic XML CWP has no login/logout, so the HTTP
+connection is the only client-side session-lifecycle signal available
+at all), but is not confirmed to fix the underlying resource
+exhaustion — a background research pass found that XML CWP's
+documentation describes no session-reuse mechanism for HTTP clients at
+all (unlike FileMaker's PHP API, which uses cookies the WPE can cache
+against), and that WPE going silently unresponsive under sustained
+Custom Web Publishing load, with no definitive published root cause, is
+an independently-reported pattern across multiple unrelated FileMaker
+installations and versions in the wider FileMaker community — not
+something unique to this project's server. One promising-looking lead
+(FileMaker Server does send an undocumented `Set-Cookie:
+WPCSessionID=...; Path=/fmi/xml; HttpOnly` on every XML CWP response)
+turned out to be a dead end on closer testing — the same session ID was
+returned across multiple fully independent requests with no cookie
+continuity at all, meaning it doesn't appear to function as a real
+per-session token this project's client behavior could be failing to
+honor. Real next steps: watch FileMaker Server's own WPE/CWP event log
+and admin-console connection count during a slow, deliberately-paced
+test crawl (server-side visibility this project cannot get from outside
+the HTTP layer), and consider adding request pacing plus a circuit
+breaker to `LassoCrawlReport`'s crawl loop itself so a single run cannot
+drive a healthy server to failure regardless of the underlying cause.
+
+Live-verified end-to-end through `lasso-perfect-server` while POST was
+confirmed working: a page that had failed all session rendered
+successfully; the login page (which had separately been failing on
+`Encrypt_HMAC requires -Token`, a symptom that turned out to be
+downstream of the connectivity failure, not a bug in its own right) also
+rendered fully. One genuinely separate bug remains open — an
 add-to-cart action fails with `missingAssignments(LassoInlineAction.
 add)` from `includes/create_new_cust.include.lasso` — confirmed
-unrelated to this fix (same error before and after) and not yet
+unrelated to any of the above (same error throughout) and not yet
 investigated.
 
 ## Next Compatibility Work
