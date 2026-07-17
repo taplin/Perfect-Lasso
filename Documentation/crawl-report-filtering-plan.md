@@ -150,6 +150,40 @@ path-list/exclude change between runs, not a render-outcome change.
 - `Documentation/lasso-perfect-server.md` / `compatibility-matrix.md` /
   `outstanding-compatibility-project-plans.md` — narrative updates.
 
+## Known limitation — discovery is a file walk, not a link crawl (2026-07-16, not yet fixed)
+
+`CrawlReport.discoverPaths` finds pages to test by recursively walking
+`siteRoot` on disk (`FileManager.enumerator(atPath:)`), filtered by
+extension/underscore-prefix/excludes/content-marker. It never parses a
+rendered page's HTML for `<a href>` targets and never follows a link —
+so it only ever requests each template file bare, with **no query
+string, no session state, no arguments**. Validation itself (the real
+HTTP GET via `requestPage`) does go through the live render pipeline
+correctly; the gap is entirely in what gets requested.
+
+Consequence: any page only reachable through a dynamically generated
+link — a record-detail page keyed by `?id=123`, search results, or
+anything else the site constructs at runtime rather than serving as a
+1:1 static file — is invisible to this crawler. It also can't tell
+"this page legitimately needs a parameter" apart from "this page is
+broken"; either way the bare-request result doesn't reflect how the
+site is actually navigated by a real visitor. One concrete false
+positive from exactly this cause is on record: see
+`Tests/LassoParserTests/LassoParserTests.swift`'s
+`fieldAfterANestedUpdateInlineStillReadsTheOuterSearchRow` test
+comment ("the file-by-file crawler needs real context to produce
+trustworthy signal").
+
+Flagged by Tim (2026-07-16) specifically so this doesn't get treated
+as a reliable/complete signal going forward — crawl-report results
+should be read as "confirms every *statically discoverable* page
+renders," not "confirms the site works." The real fix is a
+link-following crawl (BFS from the homepage/a seed list, extracting
+real `<a href>`/form-action targets from each response and following
+them — likely as a hybrid alongside the existing file walk, which
+still catches orphaned pages with no inbound links). Not scheduled;
+noted here so it isn't silently forgotten or assumed already handled.
+
 ## Deferred
 
 - Separating parser diagnostics from runtime errors in JSON output — no

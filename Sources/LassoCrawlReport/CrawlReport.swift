@@ -88,12 +88,18 @@ public enum CrawlReport {
     /// reruns) — `excludePaths`/content-sniffing don't apply to an
     /// explicitly supplied list, since the caller already chose exactly
     /// what to crawl.
+    /// `onProgress`, when supplied, is called synchronously after each page
+    /// finishes (`completed`, `total`) — the admin console's crawl-report
+    /// action uses this to show live "N/M pages" status on its action chip
+    /// while a crawl runs (see `LassoPerfectServer`'s `CrawlRunTracker`).
+    /// `nil` by default so every other caller (CLI mode, tests) is unaffected.
     public static func run(
         baseURL: String,
         siteRoot: URL,
         extensions: Set<String>,
         excludePaths: [String] = [],
-        pathList: [String]? = nil
+        pathList: [String]? = nil,
+        onProgress: (@Sendable (_ completed: Int, _ total: Int) -> Void)? = nil
     ) async -> (results: [CrawlPageResult], excludedCount: Int) {
         let paths: [String]
         let excludedCount: Int
@@ -106,9 +112,12 @@ public enum CrawlReport {
             excludedCount = discovered.excludedCount
         }
 
+        let sortedPaths = paths.sorted()
         var results: [CrawlPageResult] = []
-        for path in paths.sorted() {
+        results.reserveCapacity(sortedPaths.count)
+        for path in sortedPaths {
             results.append(await requestPage(baseURL: baseURL, path: path))
+            onProgress?(results.count, sortedPaths.count)
         }
         return (results, excludedCount)
     }

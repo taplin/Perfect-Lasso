@@ -75,7 +75,8 @@ Environment variables:
     "datasources": {
       "primary_mysql": {"type": "mysql", "schema": "primary_mysql"},
       "orders_mysql": {"type": "mysql", "schema": "orders_mysql"},
-      "fm_catalog": {"type": "filemaker"}
+      "fm_catalog": {"type": "filemaker"},
+      "fm_catalog_backup": {"type": "filemaker", "host": "192.0.2.5"}
     }
   }
   ```
@@ -90,7 +91,19 @@ Environment variables:
   `filemaker`-typed entry needs no `schema` at all: the alias itself IS
   the FileMaker database-file name (real Lasso's documented FileMaker
   connector model — see "FileMaker Datasource" below), and every
-  FileMaker alias shares the one `filemaker` connection the same way.
+  FileMaker alias shares the one `filemaker` connection's user/password
+  by default. Unlike MySQL, a `filemaker`-typed entry *can* override
+  `host`/`port` (`fm_catalog_backup` above) — e.g. to point a second
+  alias at a dev/backup FileMaker Server while still authenticating with
+  the shared block's credentials, for testing that instance without a
+  separate config file or process. There's no per-alias user/password
+  override — only host/port; the point is testing against the same
+  account on a different box, not a different account. One known,
+  accepted gap: FileMaker container-field (image/file) URLs are still
+  prefixed with the *shared* `filemaker` block's host/port regardless of
+  which alias a record came from, so an override alias's container-field
+  links would point at the wrong host — not a concern for connectivity
+  testing, the use case this exists for.
   Datasource alias keys are case-insensitive (matching Lasso's own
   `-database=` matching) and share one namespace across both backends —
   two keys differing only by case, MySQL vs. MySQL, FileMaker vs.
@@ -123,6 +136,13 @@ Environment variables:
   construct, and exit — see the crawl/report mode implementation note
   below. `LASSO_CRAWL_REPORT_PATH` optionally writes the full per-page
   JSON results to a file.
+- `LASSO_ADMIN_CONSOLE=1`: start `PerfectAdminConsole` alongside the main
+  server — see "Admin Console" below and `Documentation/admin-console.md`
+  for the full user guide. Off by default.
+- `LASSO_ADMIN_PORT`: admin console port, default `8990`. Always bound to
+  `127.0.0.1` only, regardless of what `LASSO_SERVER_PORT` is bound to.
+- `LASSO_ADMIN_TOKEN_PATH`: where the generated bearer token is written
+  (`chmod 600`). Defaults under `NSTemporaryDirectory()`.
 
 ## Current Behavior
 
@@ -1304,6 +1324,144 @@ read-only `-FindAll` has been live-tested; `allowWrites` was `false` for
 this pass) and a `LASSO_CRAWL_REPORT=1` sweep with both datasources
 configured to measure how many previously-`inlineNotConfigured` real
 corpus pages now render cleanly.
+
+## Admin Console — 2026-07-16
+
+**This section is the implementation narrative (what was built, why, and
+how it was verified). For a stable, future-user-facing reference — how to
+enable it, the dashboard walkthrough, the API table, security model — see
+`Documentation/admin-console.md`.**
+
+`PerfectAdminConsole` (a general-purpose, opt-in Perfect-NIO library
+target — bound exclusively to `127.0.0.1`, bearer-token auth, CSRF on
+mutating routes) is wired into `lasso-perfect-server` via
+`LassoAdminDelegate` (`Sources/LassoPerfectServer/AdminConsoleIntegration.swift`).
+Disabled by default; `LASSO_ADMIN_CONSOLE=1` starts it alongside the main
+server as a background `Task`, matching the existing crawl-report-mode
+pattern for "run something concurrently with the main serve loop without
+blocking it."
+
+What's wired in:
+
+- **Status page**: server port/uptime, plus a "Lasso Site" section (site
+  root, startup folder, render extensions, session driver, image proxy
+  config if set).
+- **Route inspector**: the actual five routes `LassoSiteServer.routes()`
+  registers (`GET/POST /`, `GET/POST /**`, `GET /__lasso_health`) — a
+  literal list, not introspected from `Routes<...>`, since Perfect-NIO's
+  route tree isn't designed to be enumerated after construction. Keep
+  this in sync by hand if `routes()` changes.
+- **Datasource list + on-demand test**: every configured MySQL and
+  FileMaker alias, sanitized (alias/schema/driver only, no credentials),
+  with a real connectivity ping on demand (`Database(configuration:)`'s
+  connect for MySQL, `FileMakerServer.databaseNames()` for FileMaker),
+  latency reported in the toast. Both branches are `@concurrent`
+  (SE-0461), matching `PerfectCRUDLassoExecutor.execute(_:)`'s own
+  established pattern for keeping blocking/network work off whatever
+  executor called in.
+- **Live FileMaker datasource switching** (`GET /api/datasources`'
+  `configs` field, `POST /api/datasources/switch`): each FileMaker alias
+  lists every known connection profile — the shared `filemaker` config
+  block (`id: "primary"`) plus one profile per alias carrying its own
+  `host`/`port` override in the datasources file (see
+  `ServerConfig.filemakerHostOverrides` under "Configuration" above) —
+  with `isActive` marking the one currently in use. `switchDatasource`
+  re-points an alias at any of those already-known profiles live, no
+  restart, confirmed with a real connectivity probe
+  (`FileMakerServer.databaseNames()`) before reporting success.
+  Implementation: `FileMakerConnectionRegistry`
+  (`Sources/LassoPerfectServer/FileMakerConnectionRegistry.swift`), an
+  actor holding a fixed profile set (config-file-level, chmod-600
+  protected — switching never introduces a new, unaudited host at
+  runtime) plus a mutable "which profile is each alias using right now"
+  map. Every FileMaker query resolves through this registry, so a switch
+  takes effect on the very next request. MySQL aliases report an empty
+  `configs` list — there's no equivalent per-alias override concept for
+  that backend yet.
+- **Crawl-report custom action** (`GET /api/actions`, `POST
+  /api/actions` with `{"action":"crawl-report"}`): runs the full
+  `CrawlReport.run(...)` sweep (see "Crawl Report" section below for the
+  crawler itself) as a background `Task`, logging a start line, a
+  finish summary (pages crawled/clean/failing/excluded), and writing
+  the same JSON output file the `LASSO_CRAWL_REPORT=1` CLI mode
+  produces, if `LASSO_CRAWL_REPORT_OUTPUT` is set. Deliberately does
+  **not** reuse the CLI mode's own code path in `main.swift`, which
+  wraps the crawl in a `Task { ... exit(0) }` — that `exit(0)` is a
+  process-level exit that would kill the whole server (admin console
+  included) the moment an admin-triggered crawl finished. This action
+  calls `CrawlReport.run`/`CrawlReport.printAndWrite` directly, with no
+  `exit()` anywhere in its path.
+  - **Known limitation, not yet fixed**: page discovery is a filesystem
+    walk (every on-disk template file, requested bare with no query
+    string/session state), not a link-following crawl — it can't see
+    pages only reachable through a dynamically generated link (e.g. a
+    record-detail page keyed by `?id=123`). Treat a clean crawl-report
+    run as "every statically discoverable page renders," not "the site
+    works." See `Documentation/crawl-report-filtering-plan.md`'s "Known
+    limitation" section for the full writeup.
+  - **Live status on the action's chip**: `CrawlRunTracker`
+    (`Sources/LassoPerfectServer/CrawlRunTracker.swift`), an actor the
+    delegate holds, tracks whether a crawl is currently running, its
+    live progress, and the last completed run's summary.
+    `availableActions()` builds the `crawl-report` action's
+    `description` fresh from the tracker on every call, so instead of a
+    static blurb the dashboard shows "Running now — 340/1,989 pages,
+    started 2m ago" while a crawl is in flight, or "Last run: 1,943
+    page(s), 1,897 clean, 46 failing, 892 excluded (finished 11:04 AM)."
+    once it's idle again. `AdminWebUI`'s dashboard re-fetches
+    `/api/actions` on every periodic refresh (not just once at page
+    load), so this updates live without a reload. `executeAction`
+    rejects a second `crawl-report` trigger while one is already
+    running (`CrawlRunTracker.tryBegin()` is atomic — actor
+    serialization rules out two near-simultaneous `POST /api/actions`
+    calls both starting a crawl) rather than letting two sweeps race
+    against the same site. `CrawlReport.run` gained an optional
+    `onProgress: (Int, Int) -> Void` callback (default `nil`, so the
+    CLI mode and every existing caller/test is unaffected) that this
+    action wires to `crawlTracker.progress(completed:total:)`.
+- **Metrics** (`GET /api/metrics`): `AdminMetrics`, constructed
+  alongside `LogCapture` whenever `LASSO_ADMIN_CONSOLE=1`, is fed from
+  the single choke point every site-serving request passes through
+  (`LassoSiteServer.handle(request:trailingPath:)`) —
+  `recordRequest(route:)` on every request (route key
+  `"METHOD:///path"`), `recordError()` on any thrown/developer-error
+  response. The admin console's own routes (including the health check)
+  aren't counted, only real site traffic.
+- **Log tail** (`GET /api/logs`, `DELETE /api/logs`): `LogCapture`, fed
+  from `logDatasourceActionFailure` (MySQL and FileMaker query/mutation
+  failures) plus the admin-triggered crawl-report and datasource-switch
+  actions' own start/finish/result lines. `logDatasourceActionFailure`
+  itself stays a plain synchronous function — its callers are
+  `PerfectCRUDLassoExecutor`'s synchronous `queryHandler`/
+  `mutationHandler`/`rawSQLHandler` closures, which can't become `async`
+  — and fires a background `Task { await logCapture.capture(...) }` for
+  the actor-isolated write instead.
+
+Tested: `Tests/LassoPerfectServerTests/LassoPerfectServerTests.swift`'s
+`lassoAdminDelegate*` tests (config → `DatasourceInfo` mapping, status
+section content, action listing/execution, unknown-datasource/unknown-
+action failure paths) plus a dedicated `fileMakerConnectionRegistry*`
+suite (default-to-primary resolution, per-alias override resolution,
+profile listing with correct `isActive`, live `switchAlias` mutation,
+unknown-alias/unknown-profile failure paths) — 253 tests passing across
+the full suite, zero failures.
+
+Live-verified against the real corpus server (`LASSO_ADMIN_CONSOLE=1`,
+a real FileMaker primary alias plus its `192.168.1.157` backup
+datasource): curled `/api/status`, `/api/routes`, `/api/datasources`
+(both FileMaker aliases correctly listing both connection profiles
+with accurate `isActive`); switched the primary FileMaker alias live
+to its backup profile and back via `POST /api/datasources/switch`,
+confirming both the returned `DatasourceTestResult` and the subsequent
+`/api/datasources` snapshot reflected the change, and confirming the
+switch is fully reversible; triggered the `crawl-report` action
+against the real ~2,000-page corpus and confirmed via `/api/logs` that
+(a) it logs a start line, real per-page datasource failures as they
+happen, and (b) — the critical check, given the `exit(0)` gotcha this
+action was deliberately designed around — both the site server and the
+admin console stayed up and responsive throughout and after the crawl.
+Confirmed `/api/metrics` accurately counts real site requests and
+errors as they're served.
 
 ## Next Compatibility Work
 

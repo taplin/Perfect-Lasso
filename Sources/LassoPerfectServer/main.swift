@@ -4,6 +4,7 @@ import LassoParser
 import LassoPerfectCRUD
 import LassoPerfectFileMaker
 import LassoPerfectSession
+import PerfectAdminConsole
 import PerfectCRUD
 import PerfectFileMaker
 import PerfectMySQL
@@ -11,6 +12,12 @@ import PerfectNIO
 import NIOHTTP1
 import PerfectSessionCore
 import PerfectSessionMySQL
+
+/// A per-alias FileMaker host/port override — see `ServerConfig.filemakerHostOverrides`.
+struct FileMakerHostOverride: Sendable {
+    let host: String
+    let port: Int?
+}
 
 struct ServerConfig: Sendable {
     let siteRoot: URL
@@ -49,6 +56,11 @@ struct ServerConfig: Sendable {
     let filemakerPort: Int?
     let filemakerUser: String?
     let filemakerPassword: String?
+    /// Per-alias FileMaker host/port overrides, keyed by lowercased alias
+    /// — e.g. a dev/backup FileMaker Server tested under a second alias
+    /// while still using the shared `filemakerUser`/`filemakerPassword`
+    /// above. An alias with no entry here uses `filemakerHost`/`filemakerPort`.
+    let filemakerHostOverrides: [String: FileMakerHostOverride]
     /// Same default-false, explicit-opt-in policy as `mysqlAllowWrites` —
     /// real Lasso documents no raw-SQL concept for FileMaker at all, so
     /// there's no FileMaker analogue of `mysqlAllowRawSQL`.
@@ -104,6 +116,18 @@ struct ServerConfig: Sendable {
     /// enabled for a real-corpus verification sweep. See
     /// `Documentation/` for the design writeup once it lands.
     let tagFormCountersEnabled: Bool
+    /// `LASSO_ADMIN_CONSOLE=1` — start `PerfectAdminConsole` (bound to
+    /// 127.0.0.1 only, separate from the main site port) alongside the
+    /// main server. Off by default: this is an operator tool, not
+    /// something a deployment should run unless it's asked for.
+    let adminConsoleEnabled: Bool
+    /// `LASSO_ADMIN_PORT`, default 8990 — matches `AdminConsole`'s own default.
+    let adminConsolePort: Int
+    /// `LASSO_ADMIN_TOKEN_PATH` — where the generated bearer token is
+    /// written (chmod 600 by `AdminConsole` itself). Defaults under
+    /// `NSTemporaryDirectory()`, matching the pattern
+    /// `PerfectAdminConsole`'s own README documents.
+    let adminConsoleTokenPath: String
 
     static func load() throws -> ServerConfig {
         let env = ProcessInfo.processInfo.environment
@@ -146,6 +170,10 @@ struct ServerConfig: Sendable {
         let filemakerDatasourceAliases = Set(
             datasourceEntries.filter { $0.value.type == .filemaker }.keys
         )
+        let filemakerHostOverrides: [String: FileMakerHostOverride] = datasourceEntries.reduce(into: [:]) { result, entry in
+            guard entry.value.type == .filemaker, let host = entry.value.host else { return }
+            result[entry.key.lowercased()] = FileMakerHostOverride(host: host, port: entry.value.port)
+        }
         // LassoDynamicInlineProvider/LassoMultiBackendInlineProvider both
         // lowercase alias keys themselves (case-insensitive Lasso
         // -database= matching), which traps on a duplicate key — only
@@ -182,6 +210,7 @@ struct ServerConfig: Sendable {
             filemakerPort: datasourceFile?.filemaker?.port ?? env["LASSO_FILEMAKER_PORT"].flatMap(Int.init),
             filemakerUser: datasourceFile?.filemaker?.user ?? env["LASSO_FILEMAKER_USER"],
             filemakerPassword: datasourceFile?.filemaker?.password ?? env["LASSO_FILEMAKER_PASSWORD"],
+            filemakerHostOverrides: filemakerHostOverrides,
             filemakerAllowWrites: datasourceFile?.filemaker?.allowWrites ?? Self.isTruthyEnv(env["LASSO_FILEMAKER_ALLOW_WRITES"]),
             sessionDriver: (env["LASSO_SESSION_DRIVER"] ?? "memory").lowercased(),
             crawlReportMode: Self.isTruthyEnv(env["LASSO_CRAWL_REPORT"]),
@@ -195,7 +224,11 @@ struct ServerConfig: Sendable {
             crawlOnlyFailure: env["LASSO_CRAWL_ONLY_FAILURE"],
             imageProxyPrefix: env["LASSO_IMAGE_PROXY_PREFIX"]?.trimmingCharacters(in: CharacterSet(charactersIn: "/")),
             imageProxyTarget: env["LASSO_IMAGE_PROXY_TARGET"]?.trimmingCharacters(in: CharacterSet(charactersIn: "/")),
-            tagFormCountersEnabled: Self.isTruthyEnv(env["LASSO_TAG_FORM_COUNTERS"])
+            tagFormCountersEnabled: Self.isTruthyEnv(env["LASSO_TAG_FORM_COUNTERS"]),
+            adminConsoleEnabled: Self.isTruthyEnv(env["LASSO_ADMIN_CONSOLE"]),
+            adminConsolePort: env["LASSO_ADMIN_PORT"].flatMap(Int.init) ?? 8990,
+            adminConsoleTokenPath: env["LASSO_ADMIN_TOKEN_PATH"]
+                ?? (NSTemporaryDirectory() + "lasso-perfect-server-admin.token")
         )
     }
 
@@ -321,18 +354,33 @@ struct DatasourceEntry: Decodable {
     /// model). `ServerConfig.load()` falls back to the alias itself when
     /// this is omitted on a `.mysql` entry too.
     var schema: String?
+    /// Per-alias FileMaker host/port override — meaningful only for
+    /// `.filemaker` entries. Every FileMaker alias shares one `filemaker`
+    /// connection block's user/password by default (matching MySQL's
+    /// "every alias shares one connection" model); `host`/`port` here let
+    /// a specific alias point at a *different* FileMaker Server (e.g. a
+    /// dev/backup instance) while still reusing the shared block's
+    /// credentials — there's no per-alias user/password override, since
+    /// the point is testing against the same account, not a different one.
+    /// `nil` (the default) means "use the shared `filemaker` block."
+    var host: String?
+    var port: Int?
 
-    private enum CodingKeys: String, CodingKey { case type, schema }
+    private enum CodingKeys: String, CodingKey { case type, schema, host, port }
 
     init(from decoder: Decoder) throws {
         if let single = try? decoder.singleValueContainer(), let flatSchema = try? single.decode(String.self) {
             type = .mysql
             schema = flatSchema
+            host = nil
+            port = nil
             return
         }
         let container = try decoder.container(keyedBy: CodingKeys.self)
         type = try container.decode(Backend.self, forKey: .type)
         schema = try container.decodeIfPresent(String.self, forKey: .schema)
+        host = try container.decodeIfPresent(String.self, forKey: .host)
+        port = try container.decodeIfPresent(Int.self, forKey: .port)
     }
 }
 
@@ -378,12 +426,28 @@ struct LassoSiteServer: Sendable {
     /// below instead of as a stored-property default (Phase 3 of tag-form
     /// consolidation).
     let tagFormCounters: any TagOpenFormCounterStore
+    /// `nil` unless the admin console is enabled (`LASSO_ADMIN_CONSOLE=1`)
+    /// — no ring buffer to feed when nothing will ever read it.
+    let logCapture: LogCapture?
+    /// Same nil-when-unused policy as `logCapture`.
+    let metrics: AdminMetrics?
+    /// `nil` when no FileMaker datasource is configured. Owns the *live*,
+    /// runtime-mutable host/port each FileMaker alias currently resolves
+    /// to — see `FileMakerConnectionRegistry`'s own doc comment. Exposed
+    /// here (not just captured locally in the FileMaker queryHandler
+    /// closure below) so `LassoAdminDelegate`, constructed separately in
+    /// `main.swift`'s top-level code, can share the exact same instance —
+    /// real query traffic and the admin console's "switch datasource"
+    /// action must always agree on which host an alias currently means.
+    let fileMakerRegistry: FileMakerConnectionRegistry?
 
-    init(config: ServerConfig) throws {
+    init(config: ServerConfig, logCapture: LogCapture? = nil, metrics: AdminMetrics? = nil) throws {
         self.config = config
         tagFormCounters = config.tagFormCountersEnabled
             ? CountingTagOpenFormCounterStore()
             : NoOpTagOpenFormCounterStore()
+        self.logCapture = logCapture
+        self.metrics = metrics
         includeLoader = try LassoFileSystemIncludeLoader(root: config.siteRoot)
         uploadProcessor = try LassoFileSystemUploadProcessor(root: config.siteRoot)
 
@@ -440,7 +504,7 @@ struct LassoSiteServer: Sendable {
                     } catch let error as LassoDatabaseActionError {
                         throw error
                     } catch {
-                        logDatasourceActionFailure(kind: "search", datasource: datasource, error: error)
+                        logDatasourceActionFailure(kind: "search", datasource: datasource, error: error, logCapture: logCapture)
                         throw LassoDatabaseActionError(kind: .search, datasource: datasource, underlying: error)
                     }
                 },
@@ -458,7 +522,7 @@ struct LassoSiteServer: Sendable {
                         case .update: .update
                         case .delete: .delete
                         }
-                        logDatasourceActionFailure(kind: kind.rawValue, datasource: datasource, error: error)
+                        logDatasourceActionFailure(kind: kind.rawValue, datasource: datasource, error: error, logCapture: logCapture)
                         throw LassoDatabaseActionError(kind: kind, datasource: datasource, underlying: error)
                     }
                 },
@@ -471,7 +535,7 @@ struct LassoSiteServer: Sendable {
                     } catch let error as LassoDatabaseActionError {
                         throw error
                     } catch {
-                        logDatasourceActionFailure(kind: "sql", datasource: datasource, error: error)
+                        logDatasourceActionFailure(kind: "sql", datasource: datasource, error: error, logCapture: logCapture)
                         throw LassoDatabaseActionError(kind: .sql, datasource: datasource, underlying: error)
                     }
                 }
@@ -497,10 +561,29 @@ struct LassoSiteServer: Sendable {
             let filemakerPassword = config.filemakerPassword ?? ""
             let filemakerUseTLS = filemakerPort == 443
             let filemakerScheme = filemakerUseTLS ? "https" : "http"
+            let registry = FileMakerConnectionRegistry(config: config)
+            fileMakerRegistry = registry
+            // Container-field URLs (FMPFieldValue.container) are prefixed
+            // with this single baseURL regardless of which alias's records
+            // they came from — known, accepted gap for an alias whose live
+            // resolution (below) currently points somewhere other than the
+            // shared block: its container-field links would point at the
+            // wrong host. Not a concern for the connectivity-testing/dev-
+            // server use case this exists for; would need a per-alias
+            // baseURL (not just per-alias FileMakerServer) to fix properly.
             let executor = PerfectFileMakerLassoExecutor(
                 allowWrites: config.filemakerAllowWrites,
                 baseURL: "\(filemakerScheme)://\(filemakerHost):\(filemakerPort)"
             ) { query, kind, datasource in
+                // Live resolution via the registry, not a value captured
+                // once at startup — this is what makes the admin console's
+                // "switch datasource" action take effect on the very next
+                // query. Falls back to the shared connection if the
+                // registry somehow doesn't recognize this alias (shouldn't
+                // happen for anything in config.filemakerDatasourceAliases,
+                // but a safe default beats a crash).
+                let (host, port) = await registry.resolve(alias: datasource) ?? (filemakerHost, filemakerPort)
+                let useTLS = port == 443
                 // A fresh FileMakerServer per call (matching makeDatabase's
                 // own per-call construction above), even though the
                 // resurrected FileMakerServer is now natively Sendable and
@@ -509,9 +592,9 @@ struct LassoSiteServer: Sendable {
                 // how it looked before the resurrection, when
                 // FileMakerServer wasn't Sendable at all.
                 let server = FileMakerServer(
-                    host: filemakerHost, port: filemakerPort,
+                    host: host, port: port,
                     userName: filemakerUser, password: filemakerPassword,
-                    useTLS: filemakerUseTLS
+                    useTLS: useTLS
                 )
                 // FileMakerServer.query(_:) is genuine async/await (the
                 // resurrected library replaced its blocking PerfectCURL/
@@ -523,7 +606,7 @@ struct LassoSiteServer: Sendable {
                 } catch let error as LassoFileMakerDatabaseActionError {
                     throw error
                 } catch {
-                    logDatasourceActionFailure(kind: "\(kind)", datasource: datasource, error: error)
+                    logDatasourceActionFailure(kind: "\(kind)", datasource: datasource, error: error, logCapture: logCapture)
                     throw LassoFileMakerDatabaseActionError(kind: kind, datasource: datasource, underlying: error)
                 }
             }
@@ -531,6 +614,7 @@ struct LassoSiteServer: Sendable {
             // FileMaker database-file name.
             fileMakerProvider = LassoDynamicInlineProvider(executor: executor, datasourceAliases: [:])
         } else {
+            fileMakerRegistry = nil
             fileMakerProvider = nil
         }
 
@@ -594,6 +678,10 @@ struct LassoSiteServer: Sendable {
     }
 
     private func handle(request: any HTTPRequest, trailingPath: String) async throws -> HTTPOutput {
+        // Route key matches AdminMetrics' own documented convention
+        // ("METHOD:///path", e.g. "GET:///api/posts") so /api/metrics
+        // shows something directly comparable to that example.
+        await metrics?.recordRequest(route: "\(request.method.rawValue):///\(trailingPath)")
         var resolvedPath = trailingPath
         var resolvedFileURL: URL?
         do {
@@ -614,8 +702,10 @@ struct LassoSiteServer: Sendable {
             }
             return try FileOutput(localPath: fileURL.path)
         } catch let error as ErrorOutput {
+            await metrics?.recordError()
             throw error
         } catch {
+            await metrics?.recordError()
             return developerErrorOutput(
                 error,
                 request: request,
@@ -1030,8 +1120,22 @@ struct LassoSiteServer: Sendable {
 /// legitimately finds zero rows and one that silently can't reach the
 /// database at all look identical from inside the page — this stderr
 /// line is what actually distinguishes them operationally.
-func logDatasourceActionFailure(kind: String, datasource: String, error: Error) {
-    fputs("Datasource action failed kind=\(kind) datasource=\(datasource) error=\(error)\n", stderr)
+/// `logCapture` is optional and this function stays synchronous (not
+/// `async`) deliberately — `PerfectCRUDLassoExecutor`'s `queryHandler`/
+/// `mutationHandler`/`rawSQLHandler` closure types are plain synchronous
+/// throwing closures (matching PerfectCRUD's own synchronous connector
+/// API), so an `async` signature here would force those call sites into
+/// an unwanted bridge. A fire-and-forget `Task` for the actor-isolated
+/// `LogCapture` write is safe here — this is best-effort operator
+/// visibility, not something any caller waits on — matching this file's
+/// existing fire-and-forget `Task { }` precedent (crawl-report mode, the
+/// admin console's own startup).
+func logDatasourceActionFailure(kind: String, datasource: String, error: Error, logCapture: LogCapture? = nil) {
+    let line = "Datasource action failed kind=\(kind) datasource=\(datasource) error=\(error)"
+    fputs(line + "\n", stderr)
+    if let logCapture {
+        Task { await logCapture.capture("[datasource] " + line) }
+    }
 }
 
 struct LassoSiteRenderError: Error, CustomStringConvertible {
@@ -1395,7 +1499,37 @@ if let baselinePath = ProcessInfo.processInfo.environment["LASSO_CRAWL_DIFF_BASE
 }
 
 let config = try ServerConfig.load()
-let siteServer = try LassoSiteServer(config: config)
+// Constructed here (not inside the `config.adminConsoleEnabled` block
+// below) so `LassoSiteServer.init` can wire real request/error traffic
+// into them from the start — no ring buffer to feed or counters to
+// increment when the admin console is disabled, though, so both stay
+// `nil` in that case rather than paying for an actor nothing will ever read.
+let logCapture = config.adminConsoleEnabled ? LogCapture() : nil
+let metrics = config.adminConsoleEnabled ? AdminMetrics() : nil
+let siteServer = try LassoSiteServer(config: config, logCapture: logCapture, metrics: metrics)
+// Started below (after the "Listening" print moves inside its ready callback) as a
+// cancellable, awaitable Task rather than a bare blocking call — the admin console's
+// "restart-server" action needs a handle it can `.cancel()` to gracefully hand off to a
+// freshly spawned replacement process before this one exits. See RestartReadiness.swift.
+let siteServerTask = Task.detached {
+    // .detached, not a plain Task { } — top-level code in main.swift is implicitly
+    // MainActor-isolated in Swift 6, and Server.withServer's closure runs from
+    // inside its own internal (non-MainActor) task group; a MainActor-isolated
+    // closure can't safely cross that boundary. Nothing in this closure touches
+    // MainActor-isolated state, so detaching is correct, not just a workaround.
+    try await Server(routes: try siteServer.routes(), port: config.port, alwaysReusePort: true)
+        .withServer { boundPort in
+            print("Listening: http://localhost:\(boundPort)")
+            // stdout becomes block-buffered once redirected to a pipe (not a TTY) — a
+            // restart's spawned-child readiness watcher reads this process's stdout when
+            // *it's* the child, and without an explicit flush this line could sit in libc's
+            // buffer indefinitely instead of ever reaching the parent.
+            fflush(stdout)
+            while !Task.isCancelled {
+                try? await Task.sleep(for: .seconds(3600))
+            }
+        }
+}
 print("Lasso Perfect test server")
 print("Site root: \(config.siteRoot.path)")
 if let startupPath = config.startupPath {
@@ -1411,7 +1545,9 @@ if let startupPath = config.startupPath {
 } else {
     print("Startup folder: none")
 }
-print("Listening: http://localhost:\(config.port)")
+// "Listening: ..." now prints from inside siteServerTask's withServer callback (above),
+// only once the server has genuinely bound and started accepting — not unconditionally
+// here, ahead of the actual bind.
 if config.datasourceMap.isEmpty {
     print("Datasource aliases: none")
 } else {
@@ -1461,4 +1597,68 @@ if config.crawlReportMode {
     }
 }
 
-try await Server(routes: try siteServer.routes(), port: config.port).run()
+if config.adminConsoleEnabled {
+    print("Admin console: enabled on http://127.0.0.1:\(config.adminConsolePort) — token: \(config.adminConsoleTokenPath)")
+    let adminDelegate = LassoAdminDelegate(
+        config: config,
+        startTime: Date(),
+        fileMakerRegistry: siteServer.fileMakerRegistry,
+        logCapture: logCapture,
+        baseURL: "http://localhost:\(config.port)",
+        siteServerTask: siteServerTask
+    )
+    let admin = try AdminConsole(
+        port: config.adminConsolePort,
+        tokenFilePath: config.adminConsoleTokenPath,
+        logCapture: logCapture,
+        metrics: metrics,
+        delegate: adminDelegate
+    )
+    // Runs concurrently with the main server's own blocking .run() below —
+    // matches the existing crawl-report-mode Task above, this project's
+    // established pattern for "start something alongside the main serve
+    // loop without blocking it."
+    //
+    // Retries on bind failure, unlike a bare one-shot attempt: the admin
+    // port deliberately does NOT use `alwaysReusePort` (see
+    // FileMakerConnectionRegistry.swift's sibling doc comment on
+    // AdminConsoleIntegration.swift's restart action for why), so when a
+    // "restart-server" handoff spawns this process, the *previous*
+    // process's admin console can still be bound to the same port for a
+    // little while after this one starts — its own shutdown isn't
+    // synchronized with the site server's readiness handoff, only
+    // triggered by it, with a drain step that can itself take a few
+    // seconds. Found live: without a retry, the very first restart in this
+    // feature's own testing left the new process with no admin console at
+    // all until the *next* restart. 20 attempts, 500ms apart (10s total) —
+    // matches the restart action's own bounded drain fallback, so this
+    // process gives the old one at least as long to actually let go of
+    // the port as that action is willing to wait for a graceful exit.
+    Task {
+        var lastError: Error?
+        for attempt in 1...20 {
+            do {
+                try await admin.run()
+                return // run() only returns after a clean, intentional shutdown
+            } catch {
+                lastError = error
+                if attempt < 20 {
+                    try? await Task.sleep(for: .milliseconds(500))
+                }
+            }
+        }
+        fputs("[AdminConsole] failed to start after repeated attempts: \(lastError.map { "\($0)" } ?? "unknown error")\n", stderr)
+    }
+} else {
+    print("Admin console: disabled (set LASSO_ADMIN_CONSOLE=1 to enable)")
+}
+
+do {
+    try await siteServerTask.value
+} catch is CancellationError {
+    // Expected: the "restart-server" admin action cancelled this deliberately
+    // once a replacement process proved itself healthy.
+} catch {
+    fputs("Site server failed: \(error)\n", stderr)
+    exit(1)
+}
