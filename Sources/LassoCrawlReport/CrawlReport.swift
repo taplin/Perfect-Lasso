@@ -106,10 +106,13 @@ public enum CrawlReport {
     /// theories — GET vs. POST, and a session cookie — both turned out to
     /// be dead ends), so this can't target FileMaker requests specifically;
     /// pacing applies to every request uniformly, and the circuit breaker
-    /// watches for the same backend-distress signature observed live
-    /// (`statusCode == 0` — a request-level failure/timeout — or any
-    /// `5xx`), not page-specific 4xx errors, which are a normal, expected
-    /// crawl outcome and say nothing about backend health.
+    /// watches for `isBackendDistressSignal` below — a genuine request-
+    /// level failure (`statusCode == 0`: timeout, connection refused/
+    /// reset), deliberately *not* any `5xx`, since this server's own
+    /// render-error page returns 500 uniformly for every kind of Lasso
+    /// error, ordinary interpreter gaps included — see that function's
+    /// own doc comment for why treating any 5xx as distress tripped the
+    /// breaker on completely normal crawl output in practice.
     public static func run(
         baseURL: String,
         siteRoot: URL,
@@ -159,14 +162,26 @@ public enum CrawlReport {
     }
 
     /// A single result the circuit breaker in `run(...)` counts toward its
-    /// consecutive-failure threshold — `statusCode == 0` (a request-level
-    /// failure: timeout, connection refused/reset, etc.) or any `5xx`.
-    /// Deliberately excludes ordinary 4xx page errors (an unsupported
-    /// construct on one specific page) — those are the normal, expected
-    /// output of a crawl and say nothing about whether the backend itself
-    /// is in distress, unlike a run of timeouts/502s.
+    /// consecutive-failure threshold — `statusCode == 0` only: a genuine
+    /// request-level failure (timeout, connection refused/reset — the
+    /// crawler couldn't get any response at all).
+    ///
+    /// Deliberately does *not* treat any `5xx` as distress, even though an
+    /// earlier version of this function did — `lasso-perfect-server`'s own
+    /// render-error page (`main.swift`, the `LassoSiteRenderError` handler)
+    /// returns `.internalServerError` (500) for *every* Lasso render
+    /// error uniformly, regardless of cause: an ordinary, already-cataloged
+    /// interpreter gap (`unknownFunction`, `unsupportedExpression`) is
+    /// completely indistinguishable, status-code-wise, from an actual
+    /// FileMaker/MySQL backend failure. Since finding pages that render
+    /// 500 due to interpreter gaps is the crawler's entire purpose, the
+    /// original "any 5xx counts" version tripped the breaker on
+    /// perfectly ordinary crawl output — confirmed live (2026-07-17): a
+    /// real crawl aborted after 3 pages, all three a completely unrelated,
+    /// already-known parser bug (`Test Code/edit_1.lasso`'s
+    /// `unknownFunction("inline")` etc.), not backend distress at all.
     public static func isBackendDistressSignal(_ result: CrawlPageResult) -> Bool {
-        result.statusCode == 0 || result.statusCode >= 500
+        result.statusCode == 0
     }
 
     /// Case-insensitive substring match of `path` against any entry in

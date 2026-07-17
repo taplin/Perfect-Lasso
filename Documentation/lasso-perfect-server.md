@@ -1813,15 +1813,10 @@ action):
   `0` disables pacing entirely.
 - **`LASSO_CRAWL_CIRCUIT_BREAKER_THRESHOLD`** (default `3`) — aborts the
   crawl immediately after this many *consecutive* backend-distress
-  results (`statusCode == 0`, a request-level failure/timeout, or any
-  `5xx` — exactly the symptom observed live: 502s and timeouts in a
-  row). Ordinary 4xx page errors don't count toward this at all — an
-  unsupported construct on one page is the normal, expected output of a
-  crawl and says nothing about backend health, unlike a run of
-  timeouts/502s. `0` disables the breaker. A tripped breaker stops the
-  crawl outright (no auto-retry/backoff loop — an automated retry could
-  itself contribute more load to a server already in distress); both
-  call sites print/log a clear "ABORTED EARLY" message with however many
+  results. `0` disables the breaker. A tripped breaker stops the crawl
+  outright (no auto-retry/backoff loop — an automated retry could itself
+  contribute more load to a server already in distress); both call
+  sites print/log a clear "ABORTED EARLY" message with however many
   pages were reached before stopping.
 
 Neither can target FileMaker requests specifically, because — per the
@@ -1840,22 +1835,48 @@ no-redirect session — tests inject a `URLProtocol`-mocked session,
 matching `Perfect-FileMaker`'s own established testing pattern, to
 exercise pacing/circuit-breaker timing and abort behavior without a
 live server). The circuit breaker's core predicate is exposed as
-`CrawlReport.isBackendDistressSignal(_:)`, a small pure function, so
-its exact boundary (5xx and 0 count, 4xx doesn't) is unit-tested
-directly rather than only indirectly through the full crawl loop.
+`CrawlReport.isBackendDistressSignal(_:)`, a small pure function.
+
+**What "backend distress" means was wrong on the first pass, caught
+immediately by the very first real test.** The original predicate
+counted `statusCode == 0` (a genuine request-level failure/timeout) *or*
+any `5xx`. That's broken for this specific system:
+`lasso-perfect-server`'s own render-error page (`main.swift`'s
+`LassoSiteRenderError` handler) returns `.internalServerError` (500)
+uniformly for *every* kind of Lasso error — an ordinary, already-
+cataloged interpreter gap (`unknownFunction`, `unsupportedExpression`)
+is completely indistinguishable, status-code-wise, from an actual
+FileMaker/MySQL backend failure. Since finding pages that render 500
+due to interpreter gaps is the crawler's entire reason to exist,
+treating any 5xx as distress meant the breaker tripped on perfectly
+normal crawl output — exactly what happened on the first live test
+(2026-07-17): the crawl aborted after 3 pages, all three the same
+already-known `Test Code/` parser bugs (`unknownFunction("inline")`
+etc.), not backend distress at all. `isBackendDistressSignal` now
+checks *only* `statusCode == 0` — the one signal that's unambiguous
+regardless of what kind of Lasso error a page hits, since it means the
+crawler couldn't get a response at all.
+
+A second, unrelated bug surfaced in the same test run: the
+`LASSO_CRAWL_EXCLUDE_PATHS`/`LASSO_CRAWL_ONLY_FAILURE`-adjacent
+`LASSO_CRAWL_EXCLUDE_PATHS` value used to launch that test server had a
+leading-slash typo (`/Test Code/` instead of `Test Code/`) — site-root-
+relative paths never start with a slash, so the substring match
+(`CrawlReport.pathMatchesExclude`) silently never matched, and the
+`Test Code/` scratch directory (deliberately excluded from crawling —
+see the noise-reduction section above) got crawled anyway. Not a code
+bug, a one-off env var mistake when launching that particular test run;
+worth double-checking exclude-path values have no leading slash, since
+the failure mode is silent (no error, the path just isn't excluded).
 
 Verified via 8 new unit tests (`LassoCrawlReportTests`, all mock-based —
-consecutive vs. non-consecutive failures, ordinary 4xx never tripping
-the breaker, threshold disabled entirely, pacing measurably slowing a
-crawl vs. not) — wrapped in a `.serialized` suite since the mock's
-status-code table is shared mutable state across test cases, the same
-pattern `Perfect-FileMaker`'s own `MockURLProtocol`-based tests already
-established. 318 tests passing project-wide, zero regressions.
-Live-verified: the server starts and serves normally with the new
-defaults active; a real paced/circuit-breaker-protected crawl against
-the live FileMaker-backed corpus, watched against FileMaker Server's
-own admin console in real time, is the natural next step but hadn't
-happened yet as of this section being written.
+consecutive vs. non-consecutive request failures, ordinary 4xx *and*
+5xx page errors never tripping the breaker, threshold disabled
+entirely, pacing measurably slowing a crawl vs. not) — wrapped in a
+`.serialized` suite since the mock's status-code table is shared
+mutable state across test cases, the same pattern `Perfect-FileMaker`'s
+own `MockURLProtocol`-based tests already established. 318 tests
+passing project-wide, zero regressions after the fix.
 
 ## Next Compatibility Work
 

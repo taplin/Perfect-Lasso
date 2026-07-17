@@ -177,24 +177,29 @@ private func writeBaseline(_ records: [[String: String]]) throws -> URL {
 
 // MARK: - isBackendDistressSignal (circuit breaker's core predicate)
 
-@Test func isBackendDistressSignalTreatsRequestFailuresAndServerErrorsAsDistress() {
+@Test func isBackendDistressSignalTreatsOnlyRequestFailuresAsDistress() {
     #expect(CrawlReport.isBackendDistressSignal(
         CrawlPageResult(path: "a", statusCode: 0, errorType: "requestFailed", errorDescription: nil, elapsedMS: 0)
     ))
-    #expect(CrawlReport.isBackendDistressSignal(
-        CrawlPageResult(path: "a", statusCode: 500, errorType: "x", errorDescription: nil, elapsedMS: 0)
-    ))
-    #expect(CrawlReport.isBackendDistressSignal(
-        CrawlPageResult(path: "a", statusCode: 502, errorType: "x", errorDescription: nil, elapsedMS: 0)
-    ))
 }
 
-@Test func isBackendDistressSignalDoesNotTreatOrdinaryPageErrorsAsDistress() {
-    // 4xx (an unsupported construct on one specific page) is the normal,
-    // expected output of a crawl — it says nothing about backend health,
-    // unlike a run of timeouts/5xx.
+@Test func isBackendDistressSignalDoesNotTreatAnyHTTPStatusAsDistress() {
+    // Not just 4xx (an unsupported construct on one page, the normal,
+    // expected output of a crawl) — also 5xx. lasso-perfect-server's own
+    // render-error page returns 500 uniformly for *every* kind of Lasso
+    // error, ordinary already-cataloged interpreter gaps included, so a
+    // 500 here is completely indistinguishable from a real backend
+    // failure at the status-code level alone — treating it as distress
+    // tripped the breaker on ordinary crawl output in practice
+    // (live-confirmed 2026-07-17).
     #expect(CrawlReport.isBackendDistressSignal(
         CrawlPageResult(path: "a", statusCode: 404, errorType: "x", errorDescription: nil, elapsedMS: 0)
+    ) == false)
+    #expect(CrawlReport.isBackendDistressSignal(
+        CrawlPageResult(path: "a", statusCode: 500, errorType: "x", errorDescription: "unknownFunction(\"inline\")", elapsedMS: 0)
+    ) == false)
+    #expect(CrawlReport.isBackendDistressSignal(
+        CrawlPageResult(path: "a", statusCode: 502, errorType: "x", errorDescription: nil, elapsedMS: 0)
     ) == false)
     #expect(CrawlReport.isBackendDistressSignal(
         CrawlPageResult(path: "a", statusCode: 200, errorType: nil, errorDescription: nil, elapsedMS: 0)
@@ -205,6 +210,10 @@ private func writeBaseline(_ records: [[String: String]]) throws -> URL {
 
 private final class CrawlMockURLProtocol: URLProtocol {
     nonisolated(unsafe) static var statusCodesByPath: [String: Int] = [:]
+    // Paths that simulate a genuine request-level failure (timeout,
+    // connection lost) rather than any HTTP response at all — the only
+    // real distress signal `isBackendDistressSignal` recognizes.
+    nonisolated(unsafe) static var failingPaths: Set<String> = []
     nonisolated(unsafe) static var requestedPaths: [String] = []
 
     override class func canInit(with request: URLRequest) -> Bool { true }
@@ -213,6 +222,10 @@ private final class CrawlMockURLProtocol: URLProtocol {
     override func startLoading() {
         let path = request.url?.lastPathComponent ?? ""
         Self.requestedPaths.append(path)
+        if Self.failingPaths.contains(path) {
+            client?.urlProtocol(self, didFailWithError: URLError(.timedOut))
+            return
+        }
         let statusCode = Self.statusCodesByPath[path] ?? 200
         let response = HTTPURLResponse(url: request.url!, statusCode: statusCode, httpVersion: nil, headerFields: nil)!
         client?.urlProtocol(self, didReceive: response, cacheStoragePolicy: .notAllowed)
@@ -237,19 +250,18 @@ private func mockSession() -> URLSession {
 @Suite(.serialized)
 struct CrawlReportRunTests {
 
-@Test func runAbortsEarlyWhenConsecutiveBackendFailuresReachTheThreshold() async throws {
+@Test func runAbortsEarlyWhenConsecutiveRequestFailuresReachTheThreshold() async throws {
     let root = try makeTempSiteRoot()
     defer { try? FileManager.default.removeItem(at: root) }
     for name in ["a", "b", "c", "d", "e", "f"] {
         try write("page", to: root, relativePath: "\(name).lasso")
     }
-    CrawlMockURLProtocol.statusCodesByPath = [
-        "a.lasso": 200, "b.lasso": 200,
-        // Three consecutive backend-distress results starting at "c" —
-        // matching the observed live symptom (timeouts/502s in a row).
-        "c.lasso": 502, "d.lasso": 0, "e.lasso": 500,
-        "f.lasso": 200,
-    ]
+    CrawlMockURLProtocol.statusCodesByPath = ["a.lasso": 200, "b.lasso": 200, "f.lasso": 200]
+    // Three consecutive genuine request-level failures starting at "c" —
+    // matching the actual observed live signal (timeouts), not just any
+    // 5xx status (see isBackendDistressSignal's own doc comment for why
+    // that distinction matters).
+    CrawlMockURLProtocol.failingPaths = ["c.lasso", "d.lasso", "e.lasso"]
     CrawlMockURLProtocol.requestedPaths = []
 
     let (results, _, abortedByCircuitBreaker) = await CrawlReport.run(
@@ -267,18 +279,17 @@ struct CrawlReportRunTests {
     #expect(CrawlMockURLProtocol.requestedPaths.contains("f.lasso") == false)
 }
 
-@Test func runDoesNotAbortWhenFailuresAreNotConsecutive() async throws {
+@Test func runDoesNotAbortWhenRequestFailuresAreNotConsecutive() async throws {
     let root = try makeTempSiteRoot()
     defer { try? FileManager.default.removeItem(at: root) }
     for name in ["a", "b", "c", "d"] {
         try write("page", to: root, relativePath: "\(name).lasso")
     }
-    // A 5xx between two clean pages resets the consecutive-failure count —
-    // an isolated backend hiccup shouldn't trip the breaker the same way
-    // a sustained run of failures does.
-    CrawlMockURLProtocol.statusCodesByPath = [
-        "a.lasso": 200, "b.lasso": 500, "c.lasso": 200, "d.lasso": 500,
-    ]
+    // An isolated request failure between two clean pages resets the
+    // consecutive-failure count — a one-off hiccup shouldn't trip the
+    // breaker the same way a sustained run of failures does.
+    CrawlMockURLProtocol.statusCodesByPath = ["a.lasso": 200, "c.lasso": 200]
+    CrawlMockURLProtocol.failingPaths = ["b.lasso", "d.lasso"]
     CrawlMockURLProtocol.requestedPaths = []
 
     let (results, _, abortedByCircuitBreaker) = await CrawlReport.run(
@@ -293,16 +304,20 @@ struct CrawlReportRunTests {
     #expect(results.count == 4)
 }
 
-@Test func runOrdinaryPageErrorsNeverTripTheCircuitBreaker() async throws {
+@Test func runOrdinaryPageErrorsIncludingServerErrorsNeverTripTheCircuitBreaker() async throws {
     let root = try makeTempSiteRoot()
     defer { try? FileManager.default.removeItem(at: root) }
-    for name in ["a", "b", "c"] {
+    for name in ["a", "b", "c", "d"] {
         try write("page", to: root, relativePath: "\(name).lasso")
     }
-    // Three consecutive 404s — an unsupported-construct-style page error,
-    // not backend distress — should crawl through cleanly even with an
-    // aggressive threshold.
-    CrawlMockURLProtocol.statusCodesByPath = ["a.lasso": 404, "b.lasso": 404, "c.lasso": 404]
+    // A mix of 404s and 500s — ordinary Lasso render errors, exactly the
+    // kind a crawl exists to find — should never trip the breaker no
+    // matter how many appear consecutively, since this server's own
+    // render-error page returns 500 uniformly for every kind of error
+    // (ordinary interpreter gaps included), making status code alone
+    // useless as a backend-health signal here.
+    CrawlMockURLProtocol.statusCodesByPath = ["a.lasso": 404, "b.lasso": 500, "c.lasso": 500, "d.lasso": 404]
+    CrawlMockURLProtocol.failingPaths = []
     CrawlMockURLProtocol.requestedPaths = []
 
     let (results, _, abortedByCircuitBreaker) = await CrawlReport.run(
@@ -314,7 +329,7 @@ struct CrawlReportRunTests {
     )
 
     #expect(abortedByCircuitBreaker == false)
-    #expect(results.count == 3)
+    #expect(results.count == 4)
 }
 
 @Test func runWithNoCircuitBreakerThresholdNeverAborts() async throws {
@@ -323,7 +338,7 @@ struct CrawlReportRunTests {
     for name in ["a", "b", "c"] {
         try write("page", to: root, relativePath: "\(name).lasso")
     }
-    CrawlMockURLProtocol.statusCodesByPath = ["a.lasso": 500, "b.lasso": 500, "c.lasso": 500]
+    CrawlMockURLProtocol.failingPaths = ["a.lasso", "b.lasso", "c.lasso"]
     CrawlMockURLProtocol.requestedPaths = []
 
     let (results, _, abortedByCircuitBreaker) = await CrawlReport.run(
@@ -345,6 +360,7 @@ struct CrawlReportRunTests {
         try write("page", to: root, relativePath: "\(name).lasso")
     }
     CrawlMockURLProtocol.statusCodesByPath = ["a.lasso": 200, "b.lasso": 200, "c.lasso": 200]
+    CrawlMockURLProtocol.failingPaths = []
     CrawlMockURLProtocol.requestedPaths = []
 
     let start = Date()
@@ -370,6 +386,7 @@ struct CrawlReportRunTests {
         try write("page", to: root, relativePath: "\(name).lasso")
     }
     CrawlMockURLProtocol.statusCodesByPath = ["a.lasso": 200, "b.lasso": 200, "c.lasso": 200]
+    CrawlMockURLProtocol.failingPaths = []
     CrawlMockURLProtocol.requestedPaths = []
 
     let start = Date()
