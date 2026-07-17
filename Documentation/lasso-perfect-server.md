@@ -1618,6 +1618,135 @@ against the real corpus: fresh full crawl, **813 clean, 98 failing**
 gone, the three non-bug buckets unchanged in count (confirming nothing
 was silently broken by chasing them), no new failure bucket introduced.
 
+## Backlog round 3: juxtaposed concatenation, trailing-comma argument lists, and a real FileMaker connector bug — 2026-07-17
+
+Continued from the same crawl backlog. Two real parser gaps closed, one
+crawl/render noise-reduction change, and — the big one this round — the
+actual root cause of every FileMaker-backed page failure this session
+turned out to be a bug in `Perfect-FileMaker`, not FileMaker Server
+health.
+
+### Crawl/render noise: vendor doc pages and dev scratch files
+
+Two directories were inflating the failure count with content that was
+never really part of the site: a `vendor/` path holding third-party
+library documentation (JSDoc output, icon-font previews) that happens to
+use `.html` and contains CSS/JS bracket syntax the crawler's
+Lasso-content heuristic misreads as real tags, and a scratch-code
+directory containing developer test scripts (one with a hardcoded
+plaintext database password in source).
+
+`LASSO_CRAWL_EXCLUDE_PATHS`/`LASSO_RENDER_EXCLUDE_PATHS` (see the
+"Configuration" section above) now cover the vendor directory in
+**both** — it's genuinely static content, safe to serve raw once
+excluded from Lasso rendering. The scratch-code directory is excluded
+from the **crawl only**, deliberately **not** from rendering: excluding
+it from rendering would flip today's safe failure (a 500, no source
+exposed) into serving that file's raw source — including the hardcoded
+password — as plain text to anyone who requests the URL directly. The
+interpreter error is the correct behavior there, not a bug to route
+around.
+
+### Juxtaposed string/expression concatenation (Lasso 8.5 Language Guide, Ch. 22 "Miscellaneous Shortcuts")
+
+Confirmed via the Lasso 8.5 Language Guide PDF, not inferred from corpus
+alone: `['Showing ' (Shown_Count) ' records of ' (Found_Count) ' found.']`
+— adjacent primary expressions with no operator between them implicitly
+concatenate. This already worked for free at the top level of a script
+body (`ScriptBodyParser` hands one `;`-bounded statement span to a fresh
+`ExpressionParser`; multiple top-level expressions already render as
+concatenated output — the same mechanism a `<?LassoScript String(...);
+Field(...); String(...); ?>` sequence has always relied on). It broke
+specifically *inside* one argument's value: `ExpressionParser.
+parseArguments` called `parseExpression()` exactly once per value, so
+`-SQL='...' #cat_master '...'` only captured the leading string —
+`#cat_master` and the trailing string spilled out as extra top-level
+expressions, which desynced the whole statement (`emitStatement`
+requires exactly one top-level expression to recognize a real tag-opening
+call, so the spillover silently downgraded a real `inline: ...` block
+into an unrecognized function call).
+
+Fixed with `ExpressionParser.parseJuxtaposedValue()` — after parsing an
+argument's leading value, keeps folding subsequent juxtaposed primaries
+(strings, local/variable references, parenthesized sub-expressions —
+deliberately not bare unparenthesized identifiers, since nothing in the
+doc or corpus juxtaposes one and it would risk swallowing what's
+actually the *next* statement) into an implicit-concatenation chain.
+Real corpus: `components/inSite/filtered_links.inc`'s `inline: $dbconn2,
+-table='categories', ..., -SQL='SELECT * FROM categories WHERE
+`cat_masters` LIKE "%' #cat_master '%"'` — previously
+`unknownFunction("inline")`, now parses as a real block.
+
+### Trailing comma before a caller-owned closing paren
+
+A bare-colon-call's own argument list (`inline:`, `Array:`, etc. with no
+parens of its own) has no closing token to watch for — it only knows
+it's done when it runs out of commas. A trailing comma immediately
+before a *caller's* `)` — real corpus: `components/inSite/
+email_instances.inc`'s `(Array: 'a', 'b', // commented-out element
+\n))` — left the parser having just consumed that comma and about to
+try parsing `)` itself as the next argument's value; the catch-all
+expression case turned that into a bogus `.unknown(")")`, surfacing as
+`unsupportedExpression(")")`. Fixed by treating a stray `)` encountered
+by a closing-less argument list as that list's natural end, letting the
+wrapping call's own `consume(")")` claim it instead.
+
+Both fixes live-verified: `filtered_links.inc` now fails only on
+`missingDatasource` (the same "crawled without real caller context"
+limitation as other confirmed non-bugs above, not a new gap) —
+`email_instances.inc` renders fully clean.
+
+### The real bug behind every FileMaker-backed page failure this session: POST instead of GET
+
+Every FileMaker-touching page failed all session — 502s, timeouts, and
+(after a FileMaker Server Web Publishing Engine restart) a generic
+"FileMaker Server Administration Console - Error / http.401" HTML page
+instead of a real response, even with verified-correct credentials. The
+investigation initially focused on FileMaker Server health (an admin
+console showing accumulated open connections, suspected overload from
+repeated crawl-report runs) — a real, separate issue, addressed with a
+`Connection: close` header in `Perfect-FileMaker`. But the actual root
+cause was upstream of all of it: confirmed when a real Lasso Server
+installation, same machine, same credentials, same FileMaker Server,
+connected instantly and successfully — ruling out server health,
+credentials, and network entirely.
+
+A focused research spike (reading `Perfect-FileMaker`'s full source
+against FileMaker's official Custom Web Publishing XML documentation)
+found the divergence: every documented XML CWP example is a **GET**
+request with the query in the URL
+(`/fmi/xml/fmresultset.xml?-db=...&-lay=...&-findall`).
+`Perfect-FileMaker` sent a **POST** with the identical query string
+moved into the request body instead. Live-verified directly against the
+real server: the POST form reliably produced the generic admin-console
+fallback page; an otherwise-identical GET-with-URL-query request
+returned a real, successful `<fmresultset>` response immediately.
+FileMaker Server's front-end web layer (the same layer that also serves
+the Admin Console) very likely pattern-matches CWP requests by their URL
+query string — a POST with an empty URL query string doesn't match that
+route and falls through to the Admin Console's own default error
+handler, which is exactly the observed symptom.
+
+Fixed in `Perfect-FileMaker` (`Sources/PerfectFileMaker/
+FileMakerServer.swift`'s `makeURL`/`makeRequest`/`performRequest`):
+query now goes in the URL via `GET`, not the body via `POST`. The
+existing query-string escaping (`String.fmpEscaped`) already
+percent-encodes to the same rules a URL query string requires, so no
+re-encoding was needed — the identical already-built string just moves
+from the body to after the `?`. See that repository's own commit for
+details; this project pulls it in as a local Swift package dependency.
+
+Live-verified end-to-end through `lasso-perfect-server` once rebuilt
+against the fixed `Perfect-FileMaker`: a page that had 502'd/timed out
+all session rendered in ~0.13s with a real result; the login page (which
+had separately been failing on `Encrypt_HMAC requires -Token`, a symptom
+that turned out to be downstream of the same connectivity failure)
+now renders fully. One genuinely separate bug remains open — an
+add-to-cart action fails with `missingAssignments(LassoInlineAction.
+add)` from `includes/create_new_cust.include.lasso` — confirmed
+unrelated to this fix (same error before and after) and not yet
+investigated.
+
 ## Next Compatibility Work
 
 1. Implement `[File_ProcessUploads]` (Lasso 8) and any equivalent move/copy

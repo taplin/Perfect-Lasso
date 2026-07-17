@@ -303,6 +303,22 @@ struct ExpressionParser {
         var arguments: [LassoArgument] = []
         while peek != .eof {
             if let closing, consume(closing) { break }
+            // A bare-colon-call's argument list (`closing == nil` — no
+            // parens of its own to match) has no way to recognize its own
+            // end other than running out of commas. A *trailing* comma
+            // before a caller-level `)` — real corpus:
+            // components/inSite/email_instances.inc's `(Array: 'a', 'b',
+            // // commented-out element\n))` — leaves this loop having just
+            // consumed that comma and continuing, about to try parsing `)`
+            // itself as the next argument's value; `parsePrefix`'s
+            // catch-all `case let .symbol(value): expression =
+            // .unknown(value)` turns that into a bogus `.unknown(")")`,
+            // surfacing as `unsupportedExpression(")")`. A stray `)` can
+            // never start a real argument either way, so treat it as this
+            // bare list's natural end and let the *caller's* own
+            // `consume(")")` (already established for `(Array: ...)`-style
+            // wraps) claim it instead.
+            if closing == nil, peek == .symbol(")") { break }
             var label: String?
             if case let .named(name) = peek {
                 index += 1
@@ -316,13 +332,59 @@ struct ExpressionParser {
                     continue
                 }
             }
-            arguments.append(LassoArgument(label: label, value: parseExpression()))
+            arguments.append(LassoArgument(label: label, value: parseJuxtaposedValue()))
             if !consume(",") {
                 if let closing { _ = consume(closing) }
                 break
             }
         }
         return arguments
+    }
+
+    /// Lasso 8's documented operator-less string concatenation (Language
+    /// Guide Ch. 22, "Miscellaneous Shortcuts": `['Showing ' (Shown_Count)
+    /// ' records of ' (Found_Count) ' found.']`) — adjacent primary
+    /// expressions with no operator between them implicitly concatenate.
+    /// At the top level this already works for free: `ScriptBodyParser`
+    /// hands one already-`;`-bounded statement span to a fresh
+    /// `ExpressionParser`, whose `parseList()` just returns each juxtaposed
+    /// piece as its own top-level expression, and multiple top-level
+    /// expressions already render as concatenated output (`.code(...)`'s
+    /// existing behavior — the same mechanism a `<?LassoScript
+    /// String(...); Field(...); String(...); ?>` sequence relies on). It
+    /// breaks specifically *inside* one argument's value: `parseArguments`
+    /// used to call `parseExpression()` exactly once per value, so
+    /// `-SQL='...' #cat_master '...'` only captured the leading string —
+    /// `#cat_master` and the trailing string spilled out as extra
+    /// top-level expressions, which desynced the whole surrounding
+    /// statement (`ScriptBodyParser.emitStatement` requires exactly one
+    /// top-level expression to recognize a tag-opening call at all, so the
+    /// spillover silently downgraded a real `inline: ...` block into a
+    /// bare, unrecognized function call). Real corpus:
+    /// components/inSite/filtered_links.inc's `-SQL='SELECT * FROM
+    /// categories WHERE `cat_masters` LIKE "%' #cat_master '%"'`.
+    /// Deliberately narrow about what can start a continuation — only
+    /// strings, local/variable references, and parenthesized
+    /// sub-expressions (covering the PDF's own `(Shown_Count)`-style
+    /// wrapped-tag-call example) match real corpus/documented usage. A
+    /// bare unparenthesized identifier is excluded on purpose: nothing in
+    /// the doc or corpus juxtaposes one, and treating it as a
+    /// continuation would risk swallowing what's actually the *next*
+    /// statement into this argument's value.
+    mutating private func parseJuxtaposedValue() -> LassoExpression {
+        var value = parseExpression()
+        while startsJuxtaposedContinuation() {
+            value = .binary(left: value, operator: "+", right: parseExpression())
+        }
+        return value
+    }
+
+    private func startsJuxtaposedContinuation() -> Bool {
+        switch peek {
+        case .string, .variable: return true
+        case .symbol("("): return true
+        default: return false
+        }
     }
 
     mutating private func readIdentifier() -> String {

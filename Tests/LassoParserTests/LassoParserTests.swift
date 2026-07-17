@@ -1015,38 +1015,86 @@ import PerfectSessionCore
     #expect(output.trimmingCharacters(in: .whitespacesAndNewlines) == "SQL")
 }
 
-@Test func inlineBareColonCallWithJuxtaposedStringConcatenationIsADeferredGap() throws {
-    // Documents a real, deliberately-deferred gap found live-verifying the
+@Test func inlineBareColonCallArgumentFoldsJuxtaposedStringConcatenation() async throws {
+    // Was a deliberately-deferred gap (found live-verifying the
     // bareBlockNames/line-continuation fixes above against the real corpus
-    // (components/inSite/filtered_links.inc — the one file, of 15
-    // originally failing on unknownFunction("inline"), that still fails
-    // after those fixes). Root cause is distinct from both fixes above:
+    // — components/inSite/filtered_links.inc, the one file, of 15
+    // originally failing on unknownFunction("inline"), that still failed
+    // after those fixes), now fixed by `ExpressionParser.parseJuxtaposedValue()`.
     // Lasso 8's operator-less string/variable juxtaposition concatenation
-    // (`'text' #localVar 'more text'`, no `+` between them) inside an
-    // argument's value. `ExpressionParser`'s argument-value parser stops
-    // at the first complete sub-expression (the leading string), so the
-    // rest (`#cat_master`, the trailing string) become separate top-level
-    // expressions rather than being folded into the same -SQL argument —
-    // which makes ScriptBodyParser.emitStatement see more than one
-    // expression for the whole statement and fall back to `.code(...)`
-    // instead of ever reaching the bareBlockNames `.tag(...)` promotion,
-    // so `inline` gets evaluated as an ordinary (unregistered) function
-    // call. Out of scope for the inline block-opening fix — flagged as a
-    // new backlog item, not silently absorbed.
-    let source = """
+    // (Language Guide Ch. 22, "Miscellaneous Shortcuts": `'text' #localVar
+    // 'more text'`, no `+` between them — confirmed via the Lasso 8.5
+    // Language Guide PDF, not just corpus inference) previously broke
+    // specifically *inside* an argument's value: `parseArguments` called
+    // `parseExpression()` exactly once per value, so the leading string
+    // was captured but `#cat_master` and the trailing string spilled out
+    // as extra top-level expressions — which made
+    // `ScriptBodyParser.emitStatement` see more than one top-level
+    // expression and fall back to `.code(...)` instead of the
+    // bareBlockNames `.tag(...)` promotion, so `inline` was evaluated as
+    // an ordinary (unregistered) function call.
+    let scriptInline = """
     <?LassoScript
+    local: 'cat_master' = 'cat_master value';
     inline: -database='catalog_mysql',
         -sql='SELECT * FROM categories WHERE cat = "' #cat_master '"';
         action_statement;
     /inline;
     ?>
     """
-    let document = LassoParser().parse(source)
-    guard case let .code(expressions, _, _, _) = document.nodes.first else {
-        Issue.record("Expected this still-unsupported shape to fall back to .code, not .block — update this test if it's since been fixed")
+
+    let document = LassoParser().parse(scriptInline)
+    #expect(document.diagnostics.isEmpty)
+    guard case let .block(name, arguments, _, _, _, _) = document.nodes.dropFirst().first else {
+        Issue.record("Expected the juxtaposed -sql value to still fold into one real inline block")
         return
     }
-    #expect(expressions.count > 1, "juxtaposed concatenation splits into multiple top-level expressions instead of one inline(...) call")
+    #expect(name.lowercased() == "inline")
+    #expect(arguments.count == 2)
+
+    struct InlineProvider: LassoInlineProvider {
+        func executeInline(arguments: [EvaluatedArgument], context: LassoContext) async throws -> LassoInlineFrame {
+            let request = try LassoInlineRequest(arguments: arguments)
+            #expect(request.sql == "SELECT * FROM categories WHERE cat = \"cat_master value\"")
+            return LassoInlineFrame(rows: [], actionStatement: "SQL")
+        }
+    }
+
+    var context = LassoContext(inlineProvider: InlineProvider())
+    let output = try await LassoRenderer().render(scriptInline, context: &context)
+    #expect(output.trimmingCharacters(in: .whitespacesAndNewlines) == "SQL")
+}
+
+@Test func juxtaposedConcatenationFoldsInAnyParenCallArgumentNotJustInline() async throws {
+    // The fix lives in `ExpressionParser.parseArguments` (shared by every
+    // paren-call and bare-colon-call), not bolted onto "inline"
+    // specifically — proven here with a plain native-function paren call,
+    // matching the Lasso 8.5 Language Guide's own general example
+    // (`['Showing ' (Shown_Count) ' records of ' (Found_Count) ' found.']`).
+    var context = LassoContext()
+    let output = try await LassoRenderer().render(
+        "[String('a' 'b' 'c', -EncodeNone)]",
+        context: &context
+    )
+    #expect(output == "abc")
+}
+
+@Test func trailingCommaBeforeCallerOwnedCloseParenDoesNotProduceUnknownExpression() async throws {
+    // Real corpus: components/inSite/email_instances.inc's
+    // `(Array: 'a', 'b', // commented-out element\n));` — a trailing
+    // comma right before the `)` that belongs to the *outer* wrap, not to
+    // `Array:`'s own (parenless) bare-colon-call argument list.
+    // `parseArguments(closing: nil)` has no closing token of its own to
+    // watch for, so after consuming that trailing comma it used to try
+    // parsing `)` itself as the next argument's value — `parsePrefix`'s
+    // catch-all turned that into `.unknown(")")`, surfacing as
+    // `unsupportedExpression(")")` (this exact file, live-verified).
+    var context = LassoContext()
+    let output = try await LassoRenderer().render(
+        "[(Array: 'a', 'b', )->size]",
+        context: &context
+    )
+    #expect(output == "2")
 }
 
 @Test func rendersCorpusFixtures() async throws {
