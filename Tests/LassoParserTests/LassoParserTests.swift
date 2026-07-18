@@ -510,6 +510,33 @@ import PerfectSessionCore
     #expect(emptyPassword.hasPrefix("0x"))
 }
 
+@Test func logCriticalIsANoOpWhenNoDiagnosticLogSinkIsWired() async throws {
+    // Pre-existing behavior for any host that doesn't wire a sink --
+    // log_critical must never throw or produce output of its own.
+    var context = LassoContext()
+    let output = try await LassoRenderer().render(
+        "BEFORE[log_critical('something happened')]AFTER",
+        context: &context
+    )
+    #expect(output == "BEFOREAFTER")
+}
+
+@Test func logCriticalForwardsItsMessageToTheWiredDiagnosticLogSink() async throws {
+    final class Capture: @unchecked Sendable {
+        var messages: [String] = []
+    }
+    let capture = Capture()
+    var context = LassoContext(diagnosticLogSink: { message in
+        capture.messages.append(message)
+    })
+    let output = try await LassoRenderer().render(
+        "BEFORE[log_critical('something happened')]AFTER",
+        context: &context
+    )
+    #expect(output == "BEFOREAFTER")
+    #expect(capture.messages == ["something happened"])
+}
+
 @Test func currencyDefaultsToEnUSLocale() async throws {
     var context = LassoContext()
     let output = try await LassoRenderer().render("[currency(1234.56)]", context: &context)

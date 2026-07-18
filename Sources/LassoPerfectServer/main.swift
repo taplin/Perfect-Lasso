@@ -1147,6 +1147,10 @@ struct LassoSiteServer: Sendable {
             sessionProvider: sessionBridge,
             responseSink: sink,
             inlineProvider: inlineProvider,
+            diagnosticLogSink: { [logCapture] (message: String) async -> Void in
+                guard let logCapture else { return }
+                await logCapture.capture("[log_critical] " + message)
+            },
             tagRegistry: tagRegistry
         )
         // The render pipeline (`LassoRenderer`, `LassoInlineProvider`,

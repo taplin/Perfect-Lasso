@@ -351,8 +351,12 @@ public struct LassoNativeRegistry: Sendable {
             }
             return .string(string)
         }
-        register("log_critical") { _, _ in
-            .void
+        register("log_critical") { arguments, context in
+            if let sink = context.diagnosticLogSink {
+                let message = arguments.first?.value.outputString ?? ""
+                await sink(message)
+            }
+            return .void
         }
         register("return") { arguments, context in
             context.setReturnSignal(arguments.first?.value ?? .void)
@@ -758,6 +762,13 @@ public struct LassoContext: Sendable {
     public var sessionProvider: (any LassoSessionProvider)?
     public var responseSink: (any LassoResponseSink)?
     public var inlineProvider: (any LassoInlineProvider)?
+    /// Called by `log_critical` with its message text — a hook for the
+    /// host application to surface these into its own logging.
+    /// `LassoParser` has no direct I/O of its own (same convention as
+    /// `requestProvider`/`responseSink`); `nil` (the default) makes
+    /// `log_critical` a no-op, matching its behavior before this hook
+    /// existed, for callers that don't wire anything.
+    public var diagnosticLogSink: (@Sendable (String) async -> Void)?
     public var tagRegistry: LassoTagRegistry
     /// Paths already processed by `library()` for THIS request's render —
     /// deliberately per-`LassoContext`, not on the shared `tagRegistry`.
@@ -815,6 +826,7 @@ public struct LassoContext: Sendable {
         sessionProvider: (any LassoSessionProvider)? = nil,
         responseSink: (any LassoResponseSink)? = nil,
         inlineProvider: (any LassoInlineProvider)? = nil,
+        diagnosticLogSink: (@Sendable (String) async -> Void)? = nil,
         tagRegistry: LassoTagRegistry = LassoTagRegistry()
     ) {
         self.globals = Dictionary(uniqueKeysWithValues: globals.map { ($0.key.lowercased(), $0.value) })
@@ -835,6 +847,7 @@ public struct LassoContext: Sendable {
         self.sessionProvider = sessionProvider
         self.responseSink = responseSink
         self.inlineProvider = inlineProvider
+        self.diagnosticLogSink = diagnosticLogSink
         self.tagRegistry = tagRegistry
         loadedLibraries = []
         libraryStack = []
