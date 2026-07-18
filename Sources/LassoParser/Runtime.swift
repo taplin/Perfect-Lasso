@@ -351,6 +351,12 @@ public struct LassoNativeRegistry: Sendable {
             }
             return .string(string)
         }
+        register("valid_email") { arguments, _ in
+            .boolean(LassoValidation.isValidEmail(arguments.first?.value.outputString ?? ""))
+        }
+        register("valid_creditcard") { arguments, _ in
+            .boolean(LassoValidation.isValidCreditCard(arguments.first?.value.outputString ?? ""))
+        }
         register("log_critical") { arguments, context in
             if let sink = context.diagnosticLogSink {
                 let message = arguments.first?.value.outputString ?? ""

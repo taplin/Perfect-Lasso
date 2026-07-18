@@ -537,6 +537,76 @@ import PerfectSessionCore
     #expect(capture.messages == ["something happened"])
 }
 
+// Lasso 8.5 Language Guide, Chapter 27 "String Operations". Confirmed via
+// LP9Docs grep (zero coverage) and real corpus usage (classic tag-call form
+// only) that no Lasso 9 dot-notation equivalent exists to implement instead.
+@Test func validEmailAcceptsAPlausiblyFormattedAddress() async throws {
+    var context = LassoContext()
+    let output = try await LassoRenderer().render(
+        "[Valid_Email('person@example.com')]",
+        context: &context
+    )
+    #expect(output == "true")
+}
+
+@Test func validEmailRejectsTextWithNoAtSignOrDomain() async throws {
+    var context = LassoContext()
+    let missingAtSign = try await LassoRenderer().render(
+        "[Valid_Email('not-an-email')]",
+        context: &context
+    )
+    let missingDomain = try await LassoRenderer().render(
+        "[Valid_Email('person@')]",
+        context: &context
+    )
+    #expect(missingAtSign == "false")
+    #expect(missingDomain == "false")
+}
+
+// Known-valid/invalid test numbers are the standard Luhn textbook examples,
+// not real card numbers. Guide's own text says "ROT-13 algorithm," almost
+// certainly an OCR/transcription error -- Luhn is the real-world standard
+// this tag is documented to check ("valid... according to the algorithm"
+// alongside every other production credit-card format validator).
+@Test func validCreditCardAcceptsAKnownLuhnValidNumber() async throws {
+    var context = LassoContext()
+    let output = try await LassoRenderer().render(
+        "[Valid_CreditCard('4111111111111111')]",
+        context: &context
+    )
+    #expect(output == "true")
+}
+
+@Test func validCreditCardRejectsAKnownLuhnInvalidNumber() async throws {
+    var context = LassoContext()
+    let output = try await LassoRenderer().render(
+        "[Valid_CreditCard('4111111111111112')]",
+        context: &context
+    )
+    #expect(output == "false")
+}
+
+@Test func validCreditCardAcceptsDashSeparatedDigitGroups() async throws {
+    // Self-caught bug in the first draft: filtering only whitespace (not
+    // dashes) before the all-digit check would reject this real-world
+    // input shape outright.
+    var context = LassoContext()
+    let output = try await LassoRenderer().render(
+        "[Valid_CreditCard('4111-1111-1111-1111')]",
+        context: &context
+    )
+    #expect(output == "true")
+}
+
+@Test func validCreditCardRejectsNonNumericInput() async throws {
+    var context = LassoContext()
+    let output = try await LassoRenderer().render(
+        "[Valid_CreditCard('not-a-card-number')]",
+        context: &context
+    )
+    #expect(output == "false")
+}
+
 @Test func currencyDefaultsToEnUSLocale() async throws {
     var context = LassoContext()
     let output = try await LassoRenderer().render("[currency(1234.56)]", context: &context)
