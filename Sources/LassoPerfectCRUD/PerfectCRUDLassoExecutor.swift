@@ -238,6 +238,12 @@ public struct PerfectCRUDLassoExecutor: LassoDynamicQueryExecutor {
         guard isTableAllowed(table, capabilities: capabilities) else {
             return recoverableFrame(code: .tableNotAllowed, message: "Table '\(table)' is not in the allowed-table list for datasource '\(datasource)'.")
         }
+        // Kept, unlike the FileMaker executor's equivalent check (see its
+        // executeAdd doc comment): Perfect-CRUD's DynamicMutationCompiler
+        // hard-requires at least one value column and throws its own
+        // (less clear, uncaught-fatal) CRUDSQLGenError otherwise — this
+        // guard's real job is surfacing a clearer error before that, not
+        // rejecting something MySQL could otherwise do.
         guard request.fieldAssignments.isEmpty == false else {
             throw PerfectCRUDLassoError.missingAssignments(.add)
         }

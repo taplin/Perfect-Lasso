@@ -1615,7 +1615,7 @@ private enum TestFileMakerProbeError: Error {
     #expect(deleteFrame.error.kind == "delete")
 }
 
-@Test func fileMakerExecutorThrowsMissingAssignmentsForAddAndUpdateWithNoFields() async throws {
+@Test func fileMakerExecutorThrowsMissingAssignmentsForUpdateWithNoFields() async throws {
     let executor = PerfectFileMakerLassoExecutor(allowWrites: true) { _, _, _ in
         Issue.record("queryHandler should not be called with no field assignments")
         throw TestFileMakerProbeError.stopAfterCapture
@@ -1625,11 +1625,6 @@ private enum TestFileMakerProbeError: Error {
         EvaluatedArgument(label: "table", value: .string("storefront")),
     ]
 
-    await #expect(throws: LassoFileMakerLassoError.missingAssignments(.add)) {
-        try await executor.execute(try LassoInlineRequest(arguments: base + [
-            EvaluatedArgument(label: "add", value: .boolean(true)),
-        ]))
-    }
     await #expect(throws: LassoFileMakerLassoError.missingAssignments(.update)) {
         try await executor.execute(try LassoInlineRequest(arguments: base + [
             EvaluatedArgument(label: "update", value: .boolean(true)),
@@ -1637,6 +1632,31 @@ private enum TestFileMakerProbeError: Error {
             EvaluatedArgument(label: "keyvalue", value: .integer(101)),
         ]))
     }
+}
+
+@Test func fileMakerExecutorAllowsAddWithNoFieldsForAutoEntryOnlyTables() async throws {
+    // Confirmed live 2026-07-18: includes/create_new_cust.include.lasso does
+    // exactly this -- `-Add` with zero explicit field assignments, relying
+    // entirely on FileMaker auto-entry (a serial cust_id) to populate the
+    // new record. Real Lasso Server allows this; our executor used to throw
+    // missingAssignments(.add) unconditionally, which this test guards
+    // against regressing.
+    final class Capture: @unchecked Sendable {
+        var query: FMPQuery?
+    }
+    let capture = Capture()
+    let executor = PerfectFileMakerLassoExecutor(allowWrites: true) { query, _, _ in
+        capture.query = query
+        throw TestFileMakerProbeError.stopAfterCapture
+    }
+    let request = try LassoInlineRequest(arguments: [
+        EvaluatedArgument(label: "database", value: .string("fm_catalog")),
+        EvaluatedArgument(label: "table", value: .string("storefront")),
+        EvaluatedArgument(label: "add", value: .boolean(true)),
+    ])
+    _ = try? await executor.execute(request)
+    let queryString = try #require(capture.query?.queryString)
+    #expect(queryString.contains("-new"))
 }
 
 @Test func fileMakerExecutorReturnsRecoverableFrameWhenKeyValueMissingOrInvalid() async throws {
