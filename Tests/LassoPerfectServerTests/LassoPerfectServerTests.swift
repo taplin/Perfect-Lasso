@@ -326,6 +326,7 @@ private func sampleServerConfig(
         adminConsoleEnabled: adminConsoleEnabled,
         adminConsolePort: 8990,
         adminConsoleTokenPath: "/tmp/sample-admin.token",
+        adminConsoleTokenRotate: false,
         cwpJanitorEnabled: cwpJanitorEnabled,
         cwpJanitorDryRun: cwpJanitorDryRun,
         cwpJanitorPollIntervalSeconds: cwpJanitorPollIntervalSeconds,

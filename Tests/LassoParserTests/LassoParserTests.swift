@@ -464,13 +464,13 @@ import PerfectSessionCore
 }
 
 @Test func encryptHmacRequiresPasswordAndToken() async throws {
-    // -Password/-Token are both documented as required, and this tag is
-    // used for password-reset token generation — silently proceeding with
-    // an empty-string password/token would produce a fully deterministic,
-    // publicly-known-key "secret" token with zero signal that something
-    // was misconfigured. Matches File_ProcessUploads's missing
-    // -Destination precedent: throw a recoverable error, catchable by
-    // [protect], not a silent fallback.
+    // -Password/-Token are both documented as required PARAMETERS — the
+    // tag must be called with both specified at all — matching
+    // File_ProcessUploads's missing -Destination precedent: throw a
+    // recoverable error, catchable by [protect], not a silent fallback.
+    // This is about the argument being OMITTED entirely, not about its
+    // value being empty -- see encryptHmacAcceptsExplicitlyEmptyTokenOrPassword
+    // just below for why an empty-but-present value must NOT throw.
     var context = LassoContext()
     let missingPassword = try await LassoRenderer().render(
         "[protect][Encrypt_HMAC(-token='x')][/protect][error_currenterror]",
@@ -483,6 +483,128 @@ import PerfectSessionCore
         context: &context
     )
     #expect(missingToken == "Encrypt_HMAC requires -Token.")
+}
+
+@Test func encryptHmacAcceptsExplicitlyEmptyTokenOrPassword() async throws {
+    // Confirmed live 2026-07-18 against a real site: a login-check include
+    // unconditionally calls Encrypt_HMAC(-token = $password, -password =
+    // 'key', ...) where $password is '' outside a login attempt -- and a
+    // real Lasso site does NOT error on this. The tag's documented
+    // "requires -Password/-Token" means the parameters must be specified
+    // in the call, not that their values must be non-empty; an explicit
+    // empty string is a valid input (the HMAC of an empty message). An
+    // earlier version of this guard incorrectly rejected both cases alike.
+    var context = LassoContext()
+    let emptyToken = try await LassoRenderer().render(
+        "[Encrypt_HMAC(-token='', -password='key', -digest='sha1', -hex)]",
+        context: &context
+    )
+    #expect(emptyToken.isEmpty == false)
+    #expect(emptyToken.hasPrefix("0x"))
+
+    let emptyPassword = try await LassoRenderer().render(
+        "[Encrypt_HMAC(-token='x', -password='', -digest='sha1', -hex)]",
+        context: &context
+    )
+    #expect(emptyPassword.isEmpty == false)
+    #expect(emptyPassword.hasPrefix("0x"))
+}
+
+@Test func logCriticalIsANoOpWhenNoDiagnosticLogSinkIsWired() async throws {
+    // Pre-existing behavior for any host that doesn't wire a sink --
+    // log_critical must never throw or produce output of its own.
+    var context = LassoContext()
+    let output = try await LassoRenderer().render(
+        "BEFORE[log_critical('something happened')]AFTER",
+        context: &context
+    )
+    #expect(output == "BEFOREAFTER")
+}
+
+@Test func logCriticalForwardsItsMessageToTheWiredDiagnosticLogSink() async throws {
+    final class Capture: @unchecked Sendable {
+        var messages: [String] = []
+    }
+    let capture = Capture()
+    var context = LassoContext(diagnosticLogSink: { message in
+        capture.messages.append(message)
+    })
+    let output = try await LassoRenderer().render(
+        "BEFORE[log_critical('something happened')]AFTER",
+        context: &context
+    )
+    #expect(output == "BEFOREAFTER")
+    #expect(capture.messages == ["something happened"])
+}
+
+// Lasso 8.5 Language Guide, Chapter 27 "String Operations". Confirmed via
+// LP9Docs grep (zero coverage) and real corpus usage (classic tag-call form
+// only) that no Lasso 9 dot-notation equivalent exists to implement instead.
+@Test func validEmailAcceptsAPlausiblyFormattedAddress() async throws {
+    var context = LassoContext()
+    let output = try await LassoRenderer().render(
+        "[Valid_Email('person@example.com')]",
+        context: &context
+    )
+    #expect(output == "true")
+}
+
+@Test func validEmailRejectsTextWithNoAtSignOrDomain() async throws {
+    var context = LassoContext()
+    let missingAtSign = try await LassoRenderer().render(
+        "[Valid_Email('not-an-email')]",
+        context: &context
+    )
+    let missingDomain = try await LassoRenderer().render(
+        "[Valid_Email('person@')]",
+        context: &context
+    )
+    #expect(missingAtSign == "false")
+    #expect(missingDomain == "false")
+}
+
+// Known-valid/invalid test numbers are the standard Luhn textbook examples,
+// not real card numbers. Guide's own text says "ROT-13 algorithm," almost
+// certainly an OCR/transcription error -- Luhn is the real-world standard
+// this tag is documented to check ("valid... according to the algorithm"
+// alongside every other production credit-card format validator).
+@Test func validCreditCardAcceptsAKnownLuhnValidNumber() async throws {
+    var context = LassoContext()
+    let output = try await LassoRenderer().render(
+        "[Valid_CreditCard('4111111111111111')]",
+        context: &context
+    )
+    #expect(output == "true")
+}
+
+@Test func validCreditCardRejectsAKnownLuhnInvalidNumber() async throws {
+    var context = LassoContext()
+    let output = try await LassoRenderer().render(
+        "[Valid_CreditCard('4111111111111112')]",
+        context: &context
+    )
+    #expect(output == "false")
+}
+
+@Test func validCreditCardAcceptsDashSeparatedDigitGroups() async throws {
+    // Self-caught bug in the first draft: filtering only whitespace (not
+    // dashes) before the all-digit check would reject this real-world
+    // input shape outright.
+    var context = LassoContext()
+    let output = try await LassoRenderer().render(
+        "[Valid_CreditCard('4111-1111-1111-1111')]",
+        context: &context
+    )
+    #expect(output == "true")
+}
+
+@Test func validCreditCardRejectsNonNumericInput() async throws {
+    var context = LassoContext()
+    let output = try await LassoRenderer().render(
+        "[Valid_CreditCard('not-a-card-number')]",
+        context: &context
+    )
+    #expect(output == "false")
 }
 
 @Test func currencyDefaultsToEnUSLocale() async throws {
@@ -1615,7 +1737,7 @@ private enum TestFileMakerProbeError: Error {
     #expect(deleteFrame.error.kind == "delete")
 }
 
-@Test func fileMakerExecutorThrowsMissingAssignmentsForAddAndUpdateWithNoFields() async throws {
+@Test func fileMakerExecutorThrowsMissingAssignmentsForUpdateWithNoFields() async throws {
     let executor = PerfectFileMakerLassoExecutor(allowWrites: true) { _, _, _ in
         Issue.record("queryHandler should not be called with no field assignments")
         throw TestFileMakerProbeError.stopAfterCapture
@@ -1625,11 +1747,6 @@ private enum TestFileMakerProbeError: Error {
         EvaluatedArgument(label: "table", value: .string("storefront")),
     ]
 
-    await #expect(throws: LassoFileMakerLassoError.missingAssignments(.add)) {
-        try await executor.execute(try LassoInlineRequest(arguments: base + [
-            EvaluatedArgument(label: "add", value: .boolean(true)),
-        ]))
-    }
     await #expect(throws: LassoFileMakerLassoError.missingAssignments(.update)) {
         try await executor.execute(try LassoInlineRequest(arguments: base + [
             EvaluatedArgument(label: "update", value: .boolean(true)),
@@ -1637,6 +1754,31 @@ private enum TestFileMakerProbeError: Error {
             EvaluatedArgument(label: "keyvalue", value: .integer(101)),
         ]))
     }
+}
+
+@Test func fileMakerExecutorAllowsAddWithNoFieldsForAutoEntryOnlyTables() async throws {
+    // Confirmed live 2026-07-18: includes/create_new_cust.include.lasso does
+    // exactly this -- `-Add` with zero explicit field assignments, relying
+    // entirely on FileMaker auto-entry (a serial cust_id) to populate the
+    // new record. Real Lasso Server allows this; our executor used to throw
+    // missingAssignments(.add) unconditionally, which this test guards
+    // against regressing.
+    final class Capture: @unchecked Sendable {
+        var query: FMPQuery?
+    }
+    let capture = Capture()
+    let executor = PerfectFileMakerLassoExecutor(allowWrites: true) { query, _, _ in
+        capture.query = query
+        throw TestFileMakerProbeError.stopAfterCapture
+    }
+    let request = try LassoInlineRequest(arguments: [
+        EvaluatedArgument(label: "database", value: .string("fm_catalog")),
+        EvaluatedArgument(label: "table", value: .string("storefront")),
+        EvaluatedArgument(label: "add", value: .boolean(true)),
+    ])
+    _ = try? await executor.execute(request)
+    let queryString = try #require(capture.query?.queryString)
+    #expect(queryString.contains("-new"))
 }
 
 @Test func fileMakerExecutorReturnsRecoverableFrameWhenKeyValueMissingOrInvalid() async throws {
@@ -4290,6 +4432,72 @@ private final class MapIncludeLoader: LassoIncludeLoader, @unchecked Sendable {
         context: &context
     )
     #expect(output == "-leading")
+}
+
+@Test func stringAppendMutatesTheInvocantInPlaceAndProducesNoOutputAsABareStatement() async throws {
+    // string->append(value) mutates its invocant in place, same as
+    // ->replace above — when the base is a real variable and the call is
+    // the whole bare statement. Real corpus: LassoStartup/hash_test.lasso's
+    // scrubs_hash custom tag, `#hash->append('\r\n')` right after
+    // computing an Encrypt_HMAC hash — confirmed live 2026-07-18 against
+    // koi.scrubs.test's login/checkout flow.
+    var context = LassoContext()
+    let output = try await LassoRenderer().render(
+        "[var(msg::string='hello')][$msg->append(' world')][$msg]",
+        context: &context
+    )
+    #expect(output == "hello world")
+}
+
+@Test func stringAppendOnANonVariableBaseStillReturnsItsComputedValue() async throws {
+    var context = LassoContext()
+    let output = try await LassoRenderer().render(
+        "[('hello')->append(' world')]",
+        context: &context
+    )
+    #expect(output == "hello world")
+}
+
+@Test func stringAppendWithNoArgumentAppendsAnEmptyStringAndProducesNoOutput() async throws {
+    var context = LassoContext()
+    let output = try await LassoRenderer().render(
+        "[var(msg::string='hello')][$msg->append()][$msg]",
+        context: &context
+    )
+    #expect(output == "hello")
+}
+
+@Test func stringTrimMutatesTheInvocantInPlaceAndProducesNoOutputAsABareStatement() async throws {
+    // string->trim mutates its invocant in place, same as ->append/->replace
+    // above — Lasso 8.5 Language Guide: "Removes all white space from the
+    // start and end of the string. Modifies the string in place and
+    // returns no value." Real corpus: login_check_top.lasso's bare
+    // `$email->(trim)` — confirmed live 2026-07-18 against koi.scrubs.test's
+    // login flow, immediately after the Valid_Email fix.
+    var context = LassoContext()
+    let output = try await LassoRenderer().render(
+        "[var(email::string='  test@example.com  ')][$email->(trim)][$email]",
+        context: &context
+    )
+    #expect(output == "test@example.com")
+}
+
+@Test func stringTrimOnANonVariableBaseStillReturnsItsComputedValue() async throws {
+    var context = LassoContext()
+    let output = try await LassoRenderer().render(
+        "[('  hello  ')->trim]",
+        context: &context
+    )
+    #expect(output == "hello")
+}
+
+@Test func stringTrimRemovesTabsAndNewlinesAsWellAsSpaces() async throws {
+    var context = LassoContext()
+    let output = try await LassoRenderer().render(
+        "[var(padded::string='\\t\\r\\n hello \\n\\t')][$padded->(trim)][$padded]",
+        context: &context
+    )
+    #expect(output == "hello")
 }
 
 @Test func chainedStringReplaceCallsBuildASlugWithNoStrayOutput() async throws {

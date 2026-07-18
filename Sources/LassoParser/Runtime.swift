@@ -191,21 +191,30 @@ public struct LassoNativeRegistry: Sendable {
         // as UTF-8 rather than crashing — low-stakes since real usage is
         // always -Base64.
         register("encrypt_hmac") { arguments, _ in
-            // -Password/-Token are both documented as required, and this
-            // tag is used for password-reset token generation — silently
-            // falling back to an empty string (rather than throwing, like
-            // File_ProcessUploads's missing -Destination does elsewhere in
-            // this codebase) would produce a fully deterministic,
-            // publicly-known-key "secret" token with no signal that
-            // anything was misconfigured. Throw instead.
-            guard let password = arguments.lastString(named: "password"), password.isEmpty == false else {
+            // -Password/-Token are documented as required PARAMETERS — the
+            // real tag must be called with both specified — but real Lasso
+            // does NOT require their VALUES to be non-empty: an explicit
+            // empty string is a valid, well-defined input (the HMAC of an
+            // empty message), and real Lasso Server computes it rather
+            // than erroring. Confirmed live 2026-07-18: a real site's
+            // login-check include unconditionally calls this with an
+            // empty -Token on every unauthenticated non-login request
+            // (Encrypt_HMAC(-token = $password, ...) where $password is
+            // '' outside a login attempt) and does not error on a real
+            // Lasso site. An earlier version of this guard incorrectly
+            // conflated "argument omitted" with "argument present but
+            // empty," rejecting both — only the former is actually
+            // invalid. `lastString(named:)` already draws this exact
+            // distinction: nil means the argument wasn't supplied at all,
+            // vs. Optional("") for an explicitly-empty value.
+            guard let password = arguments.lastString(named: "password") else {
                 throw LassoRecoverableError(LassoErrorState(
                     code: 3001,
                     message: "Encrypt_HMAC requires -Password.",
                     kind: "encryption"
                 ))
             }
-            guard let token = arguments.lastString(named: "token"), token.isEmpty == false else {
+            guard let token = arguments.lastString(named: "token") else {
                 throw LassoRecoverableError(LassoErrorState(
                     code: 3002,
                     message: "Encrypt_HMAC requires -Token.",
@@ -342,8 +351,18 @@ public struct LassoNativeRegistry: Sendable {
             }
             return .string(string)
         }
-        register("log_critical") { _, _ in
-            .void
+        register("valid_email") { arguments, _ in
+            .boolean(LassoValidation.isValidEmail(arguments.first?.value.outputString ?? ""))
+        }
+        register("valid_creditcard") { arguments, _ in
+            .boolean(LassoValidation.isValidCreditCard(arguments.first?.value.outputString ?? ""))
+        }
+        register("log_critical") { arguments, context in
+            if let sink = context.diagnosticLogSink {
+                let message = arguments.first?.value.outputString ?? ""
+                await sink(message)
+            }
+            return .void
         }
         register("return") { arguments, context in
             context.setReturnSignal(arguments.first?.value ?? .void)
@@ -749,6 +768,13 @@ public struct LassoContext: Sendable {
     public var sessionProvider: (any LassoSessionProvider)?
     public var responseSink: (any LassoResponseSink)?
     public var inlineProvider: (any LassoInlineProvider)?
+    /// Called by `log_critical` with its message text — a hook for the
+    /// host application to surface these into its own logging.
+    /// `LassoParser` has no direct I/O of its own (same convention as
+    /// `requestProvider`/`responseSink`); `nil` (the default) makes
+    /// `log_critical` a no-op, matching its behavior before this hook
+    /// existed, for callers that don't wire anything.
+    public var diagnosticLogSink: (@Sendable (String) async -> Void)?
     public var tagRegistry: LassoTagRegistry
     /// Paths already processed by `library()` for THIS request's render —
     /// deliberately per-`LassoContext`, not on the shared `tagRegistry`.
@@ -806,6 +832,7 @@ public struct LassoContext: Sendable {
         sessionProvider: (any LassoSessionProvider)? = nil,
         responseSink: (any LassoResponseSink)? = nil,
         inlineProvider: (any LassoInlineProvider)? = nil,
+        diagnosticLogSink: (@Sendable (String) async -> Void)? = nil,
         tagRegistry: LassoTagRegistry = LassoTagRegistry()
     ) {
         self.globals = Dictionary(uniqueKeysWithValues: globals.map { ($0.key.lowercased(), $0.value) })
@@ -826,6 +853,7 @@ public struct LassoContext: Sendable {
         self.sessionProvider = sessionProvider
         self.responseSink = responseSink
         self.inlineProvider = inlineProvider
+        self.diagnosticLogSink = diagnosticLogSink
         self.tagRegistry = tagRegistry
         loadedLibraries = []
         libraryStack = []

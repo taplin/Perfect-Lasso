@@ -505,6 +505,29 @@ struct Evaluator {
             }
             guard find.isEmpty == false else { return .string(value) }
             return .string(value.replacingOccurrences(of: find, with: replacement))
+        case let (.string(value), "append"):
+            // `string->append(value)` — real Lasso 8.5/9: appends value's
+            // string representation to the end, mutating the invocant in
+            // place when called as a bare statement (see
+            // selfMutatingMethods below). Real corpus:
+            // LassoStartup/hash_test.lasso's scrubs_hash custom tag,
+            // `#hash->append('\r\n')` right after computing an
+            // Encrypt_HMAC hash — confirmed live 2026-07-18.
+            let suffix: String
+            if let argument = arguments.first {
+                suffix = try await evaluate(argument.value).outputString
+            } else {
+                suffix = ""
+            }
+            return .string(value + suffix)
+        case let (.string(value), "trim"):
+            // `string->trim` — Lasso 8.5 Language Guide, Chapter on String
+            // Operations: "Removes all white space from the start and end
+            // of the string. Modifies the string in place and returns no
+            // value." Real corpus: login_check_top.lasso's
+            // `$email->(trim)` and lost_password.page.lasso's
+            // `#new_email->(trim)` — confirmed live 2026-07-18.
+            return .string(value.trimmingCharacters(in: .whitespacesAndNewlines))
         case let (.integer(value), "asstring"):
             return .string(try await formattedNumber(Double(value), arguments))
         case let (.decimal(value), "asstring"):
@@ -643,9 +666,15 @@ struct Evaluator {
     /// `$cleaned_product_name->(Replace('(',''))` chain, and the same
     /// shape in templates/*/master.template.lasso's
     /// `$meta_keywords->(Replace('-',','))` — used across every template
-    /// in the site). Only consulted by `evaluateStatement(_:)`, not the
-    /// generic recursive `evaluate(_:)` — see that method's doc for why.
-    static let selfMutatingMethods: Set<String> = ["insert", "replace"]
+    /// in the site). `->append` joins them for the same reason (real
+    /// corpus: LassoStartup/hash_test.lasso's bare `#hash->append('\r\n')`).
+    /// `->trim` joins them too (documented "modifies the string in place
+    /// and returns no value"; real corpus: login_check_top.lasso's bare
+    /// `$email->(trim)` and lost_password.page.lasso's bare
+    /// `#new_email->(trim)`).
+    /// Only consulted by `evaluateStatement(_:)`, not the generic
+    /// recursive `evaluate(_:)` — see that method's doc for why.
+    static let selfMutatingMethods: Set<String> = ["insert", "replace", "append", "trim"]
 
     /// Evaluates the *entire* root expression of a top-level statement —
     /// the whole content of a bare `[...]`/script-mode statement, called

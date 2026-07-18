@@ -1799,11 +1799,63 @@ confirmed working: a page that had failed all session rendered
 successfully; the login page (which had separately been failing on
 `Encrypt_HMAC requires -Token`, a symptom that turned out to be
 downstream of the connectivity failure, not a bug in its own right) also
-rendered fully. One genuinely separate bug remains open — an
-add-to-cart action fails with `missingAssignments(LassoInlineAction.
-add)` from `includes/create_new_cust.include.lasso` — confirmed
-unrelated to any of the above (same error throughout) and not yet
-investigated.
+rendered fully.
+
+**FIXED 2026-07-18**: the add-to-cart bug noted above (`missingAssignments
+(LassoInlineAction.add)` from `includes/create_new_cust.include.lasso`)
+was root-caused via live browser reproduction against `koi.scrubs.test`
+(see "Local browsing setup" below). The include does `inline(-database=,
+-table=, -Add)` with ZERO explicit field assignments — a legitimate,
+common FileMaker pattern where the table's only meaningful field is an
+auto-entry serial (`cust_id`), and the caller's whole intent is to create
+a blank record and read the generated id back afterward. Real Lasso
+Server allows this; `PerfectFileMakerLassoExecutor.executeAdd` was
+unconditionally requiring at least one field assignment before ever
+reaching FileMaker, which is what actually threw. Fixed by removing that
+guard for `-Add` specifically (`-Update`'s identical guard is correct as-is
+and was left alone — a zero-field update has no legitimate use). The
+mirrored guard in `PerfectCRUDLassoExecutor` (MySQL/dynamic path) was
+deliberately NOT relaxed to match: `Perfect-CRUD`'s own
+`DynamicMutationCompiler.compileInsert()` hard-requires at least one value
+column and throws its own less-clear `CRUDSQLGenError` otherwise, so
+removing our guard there would trade a clear error for an uncaught one,
+not actually unlock zero-field inserts — that's a separate, real gap in
+`Perfect-CRUD` itself if a zero-field MySQL insert is ever needed.
+
+## Local browsing setup (2026-07-18)
+
+`koi.scrubs.test` — one of this site's existing `/etc/hosts` entries,
+previously routed through nginx to the real Lasso Server FastCGI backend
+— was repurposed to browse the site through `lasso-perfect-server`
+directly in a real browser, for exactly this kind of bug: reproducing
+interactive-only issues (session/cart state across multiple clicks) that
+a scripted crawl can't easily trigger.
+
+- **nginx**: a new, more-specific `server_name koi.scrubs.test` block was
+  added to `/opt/homebrew/etc/nginx/nginx.conf` (nginx matches the most
+  specific `server_name` over the existing `*.scrubs.test` catch-all), on
+  `listen 8080` (plain HTTP, matching this config's existing convention of
+  non-standard ports) and `listen 8443 ssl` — 8443 rather than the
+  standard 443 because this nginx runs unprivileged (as the normal user,
+  not root) and can't bind sub-1024 ports without `sudo`.
+- **TLS**: an `mkcert` certificate for `koi.scrubs.test`
+  (`.config/lasso-perfect-server/certs/`) — `mkcert -install` (which adds
+  the local CA to the system/browser trust stores) needs to be run
+  interactively once, since it prompts for a `sudo` password.
+- **Site root**: `/Users/timtaplin/scrubsSite` (the copy this project has
+  tested against all along) — NOT `/Library/WebServer/scrubsSite`, which
+  is what `koi.scrubs.test` actually served before this change and has
+  since diverged (its own git repo, an `api`/`api.lasso` addition not
+  present in the other copy).
+- **`lasso-perfect-server`**: run standalone (not launchd-managed) on port
+  8281 with `LASSO_ADMIN_CONSOLE=1`, logging to
+  `.config/lasso-perfect-server/logs/koi-browse.log` — nginx
+  `proxy_pass`es everything for `koi.scrubs.test` straight through, no
+  static-file layer duplicated in nginx.
+- **Known gap surfaced by this setup**: a `HEAD` request to a page that
+  succeeds on `GET` returns 404 — doesn't block normal browsing (browsers
+  navigate via `GET`), but is a real, unexplored gap in the renderer's
+  HTTP-method handling.
 
 ### Crawl pacing and a circuit breaker
 

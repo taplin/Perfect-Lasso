@@ -199,9 +199,12 @@ public struct PerfectFileMakerLassoExecutor: LassoDynamicQueryExecutor {
         guard allowWrites else {
             return recoverableFrame(kind: .add, datasource: datasource, message: "-Add is not enabled for FileMaker datasource '\(datasource)'.")
         }
-        guard request.fieldAssignments.isEmpty == false else {
-            throw LassoFileMakerLassoError.missingAssignments(.add)
-        }
+        // No `fieldAssignments` guard here (unlike `-Update`, just below): a
+        // zero-field `-Add` is legitimate real-world usage for tables whose
+        // only meaningful field is FileMaker auto-entry/auto-increment (e.g.
+        // a serial customer/order id) — the caller's whole intent is to
+        // create a blank record and read the generated id back afterward.
+        // Confirmed live 2026-07-18 via includes/create_new_cust.include.lasso.
         do {
             let query = FMPQuery(database: datasource, layout: table, action: .new)
                 .queryFields(queryFields(request.fieldAssignments))
