@@ -27,6 +27,29 @@ import PerfectNIO
     #expect(quotedStringSafe("plain.pdf") == "plain.pdf")
 }
 
+// reference.lassosoft.com: "[Server_Name] returns the domain name of the
+// current server. If the name ... cannot be determined then the IP
+// address ... is returned instead." ServerRequestProvider previously used
+// `request.localAddress?.ipAddress` unconditionally — this dev server's
+// own fixed loopback bind address (127.0.0.1), not the actual virtual
+// host being browsed — which silently broke every real site's
+// environment-detection logic keyed on `server_name` (confirmed live
+// 2026-07-18: koi.lasso's `if(server_name >> '127.0.0.1' || ...)` always
+// took that branch no matter what domain koi.scrubs.test was actually
+// served from). Fixed to read the `Host` request header first (which
+// nginx's `proxy_set_header Host $host;` already forwards correctly),
+// falling back to the local IP only when no Host header is present,
+// matching the documented fallback behavior.
+@Test func hostNameFromHostHeaderStripsAnyPortSuffix() {
+    #expect(ServerRequestProvider.hostName(fromHostHeader: "koi.scrubs.test:8443") == "koi.scrubs.test")
+    #expect(ServerRequestProvider.hostName(fromHostHeader: "koi.scrubs.test") == "koi.scrubs.test")
+}
+
+@Test func hostNameFromHostHeaderReturnsNilForMissingOrEmptyHeader() {
+    #expect(ServerRequestProvider.hostName(fromHostHeader: nil) == nil)
+    #expect(ServerRequestProvider.hostName(fromHostHeader: "") == nil)
+}
+
 @Test func bytesFileOutputSetsContentTypeAndOmitsDispositionWhenNil() throws {
     let request = LassoFileServeRequest(source: .data(Data("hello".utf8)), contentType: "text/plain")
     let output = bytesFileOutput(data: Data("hello".utf8), request: request)

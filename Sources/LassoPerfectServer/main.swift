@@ -1582,10 +1582,35 @@ struct ServerRequestProvider: LassoRequestProvider {
         isHTTPS = request.headers["x-forwarded-proto"].first?.lowercased() == "https"
         remoteAddress = request.remoteAddress?.ipAddress ?? ""
         remotePort = request.remoteAddress?.port ?? 0
-        serverName = request.localAddress?.ipAddress ?? ""
+        // reference.lassosoft.com: "[Server_Name] returns the domain name
+        // of the current server. If the name ... cannot be determined
+        // then the IP address ... is returned instead" — i.e. the virtual
+        // host from the request (the Host header nginx already forwards
+        // via `proxy_set_header Host $host;`), not this process's own
+        // bind address. The previous `request.localAddress?.ipAddress`
+        // always returned "127.0.0.1" for every request regardless of
+        // the actual browsed domain, since that's this dev server's fixed
+        // loopback bind address — silently breaking every site
+        // environment-detection branch keyed on `server_name` (confirmed
+        // live 2026-07-18: koi.lasso's own
+        // `if(server_name >> 'scrubs.local' || ... || server_name >>
+        // '127.0.0.1' ...)` always took the 127.0.0.1 branch no matter
+        // what domain koi.scrubs.test was actually served from).
+        serverName = Self.hostName(fromHostHeader: request.headers["host"].first) ?? request.localAddress?.ipAddress ?? ""
         serverPort = request.localAddress?.port ?? 0
         contentType = request.contentType ?? ""
         contentLength = request.contentLength
+    }
+
+    /// Strips a trailing `:port` from a raw `Host` header value — real
+    /// Lasso's documented `Server_Name` is the domain name alone (e.g.
+    /// `koi.scrubs.test`, not `koi.scrubs.test:8443`). Internal (not
+    /// private) so `LassoPerfectServerTests` can exercise it directly via
+    /// `@testable import` without needing a full NIO `HTTPRequest` mock.
+    static func hostName(fromHostHeader header: String?) -> String? {
+        guard let header, header.isEmpty == false else { return nil }
+        guard let colonIndex = header.firstIndex(of: ":") else { return header }
+        return String(header[..<colonIndex])
     }
 
     func parameter(named name: String) -> LassoValue {
