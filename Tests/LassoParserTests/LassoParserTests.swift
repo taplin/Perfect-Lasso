@@ -537,9 +537,10 @@ import PerfectSessionCore
     #expect(capture.messages == ["something happened"])
 }
 
-// Lasso 8.5 Language Guide, Chapter 27 "String Operations". Confirmed via
-// LP9Docs grep (zero coverage) and real corpus usage (classic tag-call form
-// only) that no Lasso 9 dot-notation equivalent exists to implement instead.
+// Confirmed against reference.lassosoft.com (LassoSoft's own canonical tag
+// reference) and lassoguide.com, not just the local 8.5 PDF -- confirmed
+// live 2026-07-18 that no Lasso 9 dot-notation equivalent exists (real
+// corpus and LP9Docs both only ever use the classic tag-call form).
 @Test func validEmailAcceptsAPlausiblyFormattedAddress() async throws {
     var context = LassoContext()
     let output = try await LassoRenderer().render(
@@ -563,11 +564,61 @@ import PerfectSessionCore
     #expect(missingDomain == "false")
 }
 
+// reference.lassosoft.com documents -HostName/-Domain/-StandardDomains --
+// real corpus never uses any of these (every call site is a single
+// positional argument), but they're implemented per this project's
+// established convention of matching documented semantics over corpus-only
+// inference.
+@Test func validEmailHostNameRequiresAnExactCaseInsensitiveMatch() async throws {
+    var context = LassoContext()
+    let matching = try await LassoRenderer().render(
+        "[Valid_Email('person@Example.com', -HostName='example.com')]",
+        context: &context
+    )
+    let mismatched = try await LassoRenderer().render(
+        "[Valid_Email('person@example.com', -HostName='other.com')]",
+        context: &context
+    )
+    #expect(matching == "true")
+    #expect(mismatched == "false")
+}
+
+@Test func validEmailDomainRestrictsToACommaSeparatedTLDList() async throws {
+    var context = LassoContext()
+    let allowed = try await LassoRenderer().render(
+        "[Valid_Email('person@example.com', -Domain='com,net')]",
+        context: &context
+    )
+    let disallowed = try await LassoRenderer().render(
+        "[Valid_Email('person@example.io', -Domain='com,net')]",
+        context: &context
+    )
+    #expect(allowed == "true")
+    #expect(disallowed == "false")
+}
+
+@Test func validEmailStandardDomainsAcceptsTheDocumentedTLDSet() async throws {
+    var context = LassoContext()
+    let eduAllowed = try await LassoRenderer().render(
+        "[Valid_Email('person@example.edu', -StandardDomains)]",
+        context: &context
+    )
+    let ioRejected = try await LassoRenderer().render(
+        "[Valid_Email('person@example.io', -StandardDomains)]",
+        context: &context
+    )
+    #expect(eduAllowed == "true")
+    #expect(ioRejected == "false")
+}
+
 // Known-valid/invalid test numbers are the standard Luhn textbook examples,
-// not real card numbers. Guide's own text says "ROT-13 algorithm," almost
-// certainly an OCR/transcription error -- Luhn is the real-world standard
-// this tag is documented to check ("valid... according to the algorithm"
-// alongside every other production credit-card format validator).
+// not real card numbers. reference.lassosoft.com's own page says "ROT-13
+// algorithm" verbatim -- confirmed this isn't an artifact of this
+// project's PDF text extraction, it's the actual published text -- but
+// it's still almost certainly a substantive documentation defect: ROT-13
+// has no defined operation on numeric digits, and the same page's own
+// claimed behavior (validates real Visa/Mastercard/AmEx/Discover numbers)
+// exactly matches Luhn, the real, universal standard for this purpose.
 @Test func validCreditCardAcceptsAKnownLuhnValidNumber() async throws {
     var context = LassoContext()
     let output = try await LassoRenderer().render(
@@ -602,6 +653,21 @@ import PerfectSessionCore
     var context = LassoContext()
     let output = try await LassoRenderer().render(
         "[Valid_CreditCard('not-a-card-number')]",
+        context: &context
+    )
+    #expect(output == "false")
+}
+
+@Test func validCreditCardRejectsAnAllZeroNumberMatchingTheDocumentedExample() async throws {
+    // reference.lassosoft.com's own worked example:
+    // [Valid_CreditCard: '0000000000000000'] => False. A bare Luhn checksum
+    // can't distinguish this from valid (0 is trivially a multiple of 10),
+    // so this needs its own explicit guard beyond the checksum math --
+    // caught by cross-checking the reference site's documented example,
+    // not by any corpus usage (real corpus never submits all-zero input).
+    var context = LassoContext()
+    let output = try await LassoRenderer().render(
+        "[Valid_CreditCard('0000000000000000')]",
         context: &context
     )
     #expect(output == "false")
