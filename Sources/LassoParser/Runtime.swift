@@ -43,7 +43,14 @@ public indirect enum LassoValue: Equatable, Sendable {
         case let .string(value): value
         case let .array(value): value.map(\.outputString).joined()
         case let .map(value): String(describing: value)
-        case let .object(value): value.typeName
+        case let .object(value):
+            // `bytes` is the one native type whose bare output is
+            // meaningful content, not a type-name placeholder (matching
+            // real Lasso's auto-stringification of a byte stream) — every
+            // other native type (web_request/web_response/date) has no
+            // documented bare-output contract, so they keep the existing
+            // type-name fallback.
+            value.typeName == LassoBytesValue.typeName ? LassoBytesValue.string(from: value) : value.typeName
         case let .pair(key, value): "\(key.outputString) = \(value.outputString)"
         }
     }
@@ -122,6 +129,19 @@ public struct LassoNativeRegistry: Sendable {
         }
         register("integer") { arguments, _ in
             .integer(Int(arguments.first?.value.number ?? 0))
+        }
+        // `bytes(...)` constructor — see BytesType.swift. Real corpus never
+        // uses the integer-size-allocation or PDF-conversion constructor
+        // forms lassoguide.com documents, only the string and
+        // bytes-object-copy forms, so only those are implemented.
+        register("bytes") { arguments, _ in
+            guard let first = arguments.first?.value else {
+                return .object(LassoBytesValue.makeObject(rawBytes: []))
+            }
+            if case let .object(existing) = first, existing.typeName == LassoBytesValue.typeName {
+                return .object(LassoBytesValue.makeObject(rawBytes: LassoBytesValue.rawBytes(from: existing)))
+            }
+            return .object(LassoBytesValue.makeObject(rawBytes: Array(first.outputString.utf8)))
         }
         register("decimal") { arguments, _ in
             .decimal(arguments.first?.value.number ?? 0)
