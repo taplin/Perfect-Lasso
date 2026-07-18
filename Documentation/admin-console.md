@@ -141,6 +141,73 @@ A second restart can't be started while one is already in progress — the
 action returns a clear "already in progress" failure instead of racing two
 spawns.
 
+## CWP Session Janitor
+
+An opt-in background poller that lists FileMaker Server Admin API clients
+and force-disconnects stale/excess Custom Web Publishing (CWP) sessions.
+Off by default (`LASSO_CWP_JANITOR_ENABLED=1` to enable). All the actual
+selection/sweep logic lives in a separate, Lasso-independent package,
+`Perfect-FileMaker-AdminAPI` (`CWPSessionSelector`/`CWPSessionJanitor`/
+`CWPSessionJanitorTracker`) — `lasso-perfect-server` only supplies config
+values and a logging sink. Status, config, and last-sweep summary show up
+in the dashboard's "CWP Session Janitor" section; a manual "Run CWP Janitor
+Now" action triggers an immediate sweep instead of waiting for the next
+poll.
+
+**Why this exists**: FileMaker Server's Web Publishing Engine opens a new
+CWP session whenever a client's prior session isn't free yet (bursty or
+concurrent load is the trigger, not request volume or pacing alone), and
+some of those extra sessions don't clear via WPE's own undocumented
+internal reaper (observed live: up to ~30 minutes). Live testing
+(2026-07-17/18) also confirmed this FileMaker Server install is licensed
+for a hard maximum of 200 concurrent connections — once that's exhausted,
+*any* new login attempt gets rejected, not just from the account that
+caused the buildup. The janitor exists to clear stuck sessions proactively
+rather than waiting on FileMaker's own slow/unreliable recovery.
+
+**Selection logic**: being over `LASSO_CWP_JANITOR_MAX_SESSIONS` is the
+ONLY trigger for considering a disconnect at all — a session's age alone
+is never sufficient reason to kill it, even if very old, as long as total
+count is under the limit. Once over the limit, the oldest sessions in that
+excess are candidates, further narrowed by
+`LASSO_CWP_JANITOR_DURATION_THRESHOLD_SECONDS` (only ones ALSO older than
+this get disconnected) and rate-limited by
+`LASSO_CWP_JANITOR_MAX_DISCONNECTS_PER_SWEEP` (drains a large backlog over
+several sweeps instead of all at once). Never disconnects below
+`LASSO_CWP_JANITOR_MIN_FLOOR` surviving sessions.
+
+**Known limitation**: there is no signal available (from FileMaker's Admin
+API or otherwise) for "is this session actively serving a request right
+now" — only connection age and count. Duration is used as a proxy for
+"probably orphaned," calibrated against live observations (well-behaved
+sessions self-clear within ~1-2 minutes normally; a single request even
+under heavy contention topped out around 19 seconds), not a guarantee.
+
+**Config** (env vars, or `adminAPI` block in the datasource JSON config
+file for host/port/user/password — a separate FileMaker Server admin
+account from the CWP `filemaker` credentials):
+
+| Var | Default | Notes |
+|---|---|---|
+| `LASSO_CWP_JANITOR_ENABLED` | `false` | |
+| `LASSO_CWP_JANITOR_DRY_RUN` | `true` | only an explicit `0`/`false`/`no` arms real disconnects |
+| `LASSO_CWP_JANITOR_POLL_INTERVAL_SECONDS` | `60` | |
+| `LASSO_CWP_JANITOR_DURATION_THRESHOLD_SECONDS` | `150` | `0`/unset disables the duration filter (over-limit alone selects) |
+| `LASSO_CWP_JANITOR_MAX_SESSIONS` | disabled | the sole trigger — `0`/unset means the janitor never selects anything |
+| `LASSO_CWP_JANITOR_MIN_FLOOR` | `5` | |
+| `LASSO_CWP_JANITOR_MAX_DISCONNECTS_PER_SWEEP` | unlimited | |
+| `LASSO_FM_ADMIN_HOST` / `_PORT` / `_USER` / `_PASSWORD` | — | falls back to the config file's `adminAPI` block |
+| `LASSO_FM_ADMIN_TRUST_SELF_SIGNED_TLS` | `false` | explicit opt-in to accept FileMaker Server's default self-signed cert on a known dev/test host — never enable this against a server reachable over an untrusted network |
+
+**Tuning status (as of 2026-07-18)**: confirmed working live end-to-end —
+correctly disconnects only over-limit-and-old sessions, respects the
+per-sweep cap, and goes idle once back under the limit. `maxSessions` still
+needs a real production value: the original incident that motivated this
+feature froze at only ~20 open sessions, well below anything reproduced in
+testing (90-200), so `maxSessions` must be set below this site's actual
+normal peak concurrent CWP traffic for a repeat of that incident to ever
+cross the threshold — not yet determined.
+
 ## Security model
 
 - Admin port bound to `127.0.0.1` only.
