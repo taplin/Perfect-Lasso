@@ -977,6 +977,78 @@ import PerfectSessionCore
     #expect(parts.count == 3 && parts[0].count == 2 && parts[1].count == 2 && parts[2].count == 4)
 }
 
+// lassoguide.com "Byte Streams" — `bytes(...)->decodeBase64`/
+// `->encodeBase64`/`->encodeUrl` are the only three members implemented,
+// matching the only three real corpus ever calls (confirmed by grepping
+// every `bytes(` call site across the site). Corpus shape:
+// pages/account.page.lasso's `string((bytes(action_param('site_to_view'))
+// ->decodebase64)))`, and account_info_static.lasso's
+// `bytes(string(field('cust_id')))->encodebase64->encodeurl`.
+@Test func bytesConstructorEncodesAStringAsUTF8BytesAndOutputsItsRawContent() async throws {
+    var context = LassoContext()
+    let output = try await LassoRenderer().render("[bytes('hello')]", context: &context)
+    #expect(output == "hello")
+}
+
+@Test func bytesWithNoArgumentIsEmpty() async throws {
+    var context = LassoContext()
+    let output = try await LassoRenderer().render("[bytes]", context: &context)
+    #expect(output == "")
+}
+
+@Test func bytesEncodeBase64ThenDecodeBase64RoundTripsTheOriginalString() async throws {
+    // account_info_static.lasso's exact shape:
+    // bytes(string(field('cust_id')))->encodebase64->encodeurl generates
+    // the URL; account.page.lasso's bytes(action_param(...))->decodebase64
+    // reads it back once the browser/HTTP layer has already URL-decoded
+    // the query parameter -- only the base64 layer needs an explicit
+    // decode step here, matching that real round trip.
+    var context = LassoContext()
+    let output = try await LassoRenderer().render(
+        "[string(bytes(bytes('12345')->encodebase64)->decodebase64)]",
+        context: &context
+    )
+    #expect(output == "12345")
+}
+
+@Test func bytesDecodeBase64OnAKnownBase64StringProducesTheOriginalText() async throws {
+    // "MTIzNDU=" is the standard base64 encoding of "12345" — computed
+    // independently via Python's stdlib base64, not hand-derived.
+    var context = LassoContext()
+    let output = try await LassoRenderer().render(
+        "[string(bytes('MTIzNDU=')->decodebase64)]",
+        context: &context
+    )
+    #expect(output == "12345")
+}
+
+@Test func bytesDecodeBase64OnInvalidInputReturnsAnEmptyBytesObjectRatherThanThrowing() async throws {
+    var context = LassoContext()
+    let output = try await LassoRenderer().render(
+        "[bytes('not valid base64!!!')->decodebase64]",
+        context: &context
+    )
+    #expect(output == "")
+}
+
+@Test func bytesConstructorCopiesAnExistingBytesObjectRatherThanStringifyingIt() async throws {
+    var context = LassoContext()
+    let output = try await LassoRenderer().render(
+        "[bytes(bytes('hello'))]",
+        context: &context
+    )
+    #expect(output == "hello")
+}
+
+@Test func bytesEncodeUrlPercentEncodesIllegalUrlCharacters() async throws {
+    var context = LassoContext()
+    let output = try await LassoRenderer().render(
+        "[bytes('a b+c')->encodeurl]",
+        context: &context
+    )
+    #expect(output.contains(" ") == false)
+}
+
 @Test func rendersIncludesRequestSessionAndInlineFrames() async throws {
     struct IncludeLoader: LassoIncludeLoader {
         func loadInclude(path: String, from includingPath: String?) throws -> String {

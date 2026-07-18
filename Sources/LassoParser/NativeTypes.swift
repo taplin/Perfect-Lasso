@@ -65,6 +65,7 @@ public struct LassoNativeTypeRegistry: Sendable {
         register(Self.makeWebRequestType())
         register(Self.makeWebResponseType())
         register(Self.makeDateType())
+        register(Self.makeBytesType())
     }
 }
 
@@ -404,6 +405,43 @@ extension LassoNativeTypeRegistry {
             let components = LassoDateParsing.dateComponents(from: receiver) ?? .now()
             let format = arguments.firstValue(named: "format")?.outputString ?? firstArgumentString(arguments)
             return .string(LassoDateFormatting.format(components, using: format))
+        }
+
+        return type
+    }
+
+    // MARK: - bytes
+    //
+    // See BytesType.swift for the storage representation
+    // (`LassoBytesValue`, a base64 string stashed in a private-by-
+    // convention `_base64` field). Only the three members real corpus
+    // actually calls are implemented — decodeBase64/encodeBase64/
+    // encodeUrl, always chained straight off a `bytes(value)` constructor
+    // call, never off a bare `Bytes` identifier — so unlike `date`, this
+    // type has no meaningful "bare identifier" fallback to design for.
+    fileprivate static func makeBytesType() -> LassoNativeType {
+        var type = LassoNativeType(name: "bytes")
+
+        type.register("decodebase64") { receiver, _, _ in
+            // The receiver's own raw bytes ARE the base64 text to decode
+            // (interpreted as ASCII/UTF-8) — e.g. `bytes(param)->decodeBase64`
+            // treats `param`'s literal characters as a base64 string, not
+            // as already-decoded binary.
+            let base64Text = LassoBytesValue.string(from: receiver)
+            guard let decoded = Data(base64Encoded: base64Text) else {
+                return .object(LassoBytesValue.makeObject(rawBytes: []))
+            }
+            return .object(LassoBytesValue.makeObject(rawBytes: Array(decoded)))
+        }
+        type.register("encodebase64") { receiver, _, _ in
+            let rawBytes = LassoBytesValue.rawBytes(from: receiver)
+            let encoded = Data(rawBytes).base64EncodedString()
+            return .object(LassoBytesValue.makeObject(rawBytes: Array(encoded.utf8)))
+        }
+        type.register("encodeurl") { receiver, _, _ in
+            let text = LassoBytesValue.string(from: receiver)
+            let encoded = LassoEncoding.url(text)
+            return .object(LassoBytesValue.makeObject(rawBytes: Array(encoded.utf8)))
         }
 
         return type
