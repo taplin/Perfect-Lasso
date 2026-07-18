@@ -352,10 +352,23 @@ public struct LassoNativeRegistry: Sendable {
             return .string(string)
         }
         register("valid_email") { arguments, _ in
-            .boolean(LassoValidation.isValidEmail(arguments.first?.value.outputString ?? ""))
+            let email = arguments.positionalValue(at: 0)?.outputString ?? ""
+            let domains: [String]?
+            if let domainList = arguments.lastString(named: "domain") {
+                domains = domainList.split(separator: ",").map(String.init)
+            } else if arguments.hasTruthyFlag("standarddomains") {
+                domains = LassoValidation.standardDomains
+            } else {
+                domains = nil
+            }
+            return .boolean(LassoValidation.isValidEmail(
+                email,
+                hostName: arguments.lastString(named: "hostname"),
+                domains: domains
+            ))
         }
         register("valid_creditcard") { arguments, _ in
-            .boolean(LassoValidation.isValidCreditCard(arguments.first?.value.outputString ?? ""))
+            .boolean(LassoValidation.isValidCreditCard(arguments.positionalValue(at: 0)?.outputString ?? ""))
         }
         register("log_critical") { arguments, context in
             if let sink = context.diagnosticLogSink {
