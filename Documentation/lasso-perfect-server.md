@@ -28,6 +28,16 @@ Environment variables:
 - `LASSO_SERVER_PORT`: port, default `8181`.
 - `LASSO_RENDER_EXTENSIONS`: comma-separated extensions rendered through Lasso,
   default `lasso,inc,html,htm`.
+- `LASSO_RENDER_EXCLUDE_PATHS`: comma-separated, case-insensitive path
+  substrings (e.g. `vendor`) — a request whose site-root-relative path
+  matches is always served as plain static content, never Lasso-rendered,
+  regardless of `LASSO_RENDER_EXTENSIONS`. The live-serving sibling of
+  `LASSO_CRAWL_EXCLUDE_PATHS` below (same matching semantics, via the
+  shared `CrawlReport.pathMatchesExclude` helper) — a separate list on
+  purpose, since what you don't want *crawled* isn't necessarily what you
+  don't want *served as Lasso*: vendored JS/HTML that happens to match a
+  render extension can get misparsed as Lasso source on a real request
+  too, not just during a crawl sweep. Off by default (empty).
 - `LASSO_STARTUP_PATH`: filesystem path to a Lasso instance startup folder
   (real Lasso convention: `LassoStartup`, kept entirely outside the site
   webroot). No default — opt-in only. If set, every file in it matching
@@ -136,6 +146,22 @@ Environment variables:
   construct, and exit — see the crawl/report mode implementation note
   below. `LASSO_CRAWL_REPORT_PATH` optionally writes the full per-page
   JSON results to a file.
+- `LASSO_CRAWL_REQUEST_DELAY_MS`: a pause (milliseconds) between every
+  crawled request, default `200`. `0` disables pacing. See "Crawl pacing
+  and a circuit breaker" below for why this exists — a real-corpus
+  datasource backend has been driven to failure by a short, purely
+  sequential crawl more than once.
+- `LASSO_CRAWL_CIRCUIT_BREAKER_THRESHOLD`: abort the crawl after this many
+  *consecutive* genuine request-level failures (timeout/connection
+  refused — deliberately not any `5xx`; see "Crawl pacing and a circuit
+  breaker" below for why), default `3`. `0` disables the breaker.
+- `LASSO_CRAWL_DATASOURCE_FAILURE_THRESHOLD`: a *second*, independent
+  circuit breaker — abort the crawl once this many "Datasource action
+  failed" events (FileMaker or MySQL) have happened since the crawl
+  started, regardless of what any individual page's HTTP status looked
+  like. Default `5`. `0` disables it. Exists because a datasource
+  connectivity failure is invisible to the breaker above entirely — see
+  "Crawl pacing and a circuit breaker" below.
 - `LASSO_ADMIN_CONSOLE=1`: start `PerfectAdminConsole` alongside the main
   server — see "Admin Console" below and `Documentation/admin-console.md`
   for the full user guide. Off by default.
@@ -1462,6 +1488,476 @@ action was deliberately designed around — both the site server and the
 admin console stayed up and responsive throughout and after the crawl.
 Confirmed `/api/metrics` accurately counts real site requests and
 errors as they're served.
+
+## Back to parsing gaps: `if` bare colon-call + HTML-comment no-process — 2026-07-17
+
+With the admin console/restart tooling done, resumed real-corpus parsing
+work using a fresh crawl-report as the evidence source (the docs above
+had drifted well behind ~25 parser commits since the last crawl). Full
+911-page sweep against the real corpus, before any fix: 776 clean,
+135 failing, grouped by first unsupported construct. Picked the two
+largest buckets.
+
+**`unknownFunction("if")` — 18 pages, all `importscripts/*.lasso` and a
+few includes.** Real corpus form: `if: error_currenterror!='No error';
+... /if;` — Lasso 8's classic slash-closed colon-call with a bare
+(paren-less) condition. `parseIfOpening`'s classifier
+(`ScriptBodyParser.swift`) only recognized two of "if"'s three real
+forms: parenthesized/colon-with-parens, and a bare condition immediately
+followed by a brace body (`if cond { ... }`) — never a bare condition
+terminated by `;` with no braces at all, so it fell through to being
+parsed as an ordinary call to a function named "if". Added
+`readBareConditionBeforeSemicolon` (the mirror image of the existing
+`readBareConditionBeforeBraceBody`) and a new `IfOpenClassification
+.bareColonCall` case, gated on a colon actually being present (every
+real corpus sighting has one) to avoid swallowing unrelated bare
+expressions. Deliberately kept inside `parseIfOpening`'s own isolated
+classifier rather than folded into the shared `bareOpenScopes` cascade
+`iterate`/`while`/`protect` use (see Phase 4 of tag-form consolidation,
+2026-07-16) — "if"'s else-chaining pairing logic is genuinely more
+delicate than any other name in the catalog, and that isolation is
+deliberate architecture, not an oversight.
+
+**`unsupportedExpression("-modal")` / `("Member arguments")` — 18 pages
+combined, all `templates/*/master.template.lasso`.** Root cause turned
+out to be a documented Lasso feature this interpreter never implemented
+at all, not a one-off bug: the Lasso 8.5 Language Guide (Chapter 4,
+"Escaping Lasso Code," repeated in Chapter 22) lists plain HTML comments
+(`<!-- ... -->`) as an equally valid no-process escape hatch alongside
+`[NoProcess]...[/NoProcess]` — its own worked example is exactly
+`<script><!-- array[1] = array[2]; // --></script>`, "particularly
+useful for JavaScript code blocks." This interpreter only ever
+implemented the `[NoProcess]` half (`LassoParser.swift`'s
+`scanNoProcess`); every one of the 18 affected real pages wraps its
+JS exactly the documented way and was still getting misparsed, because
+`<!-- -->` had zero special handling at all. Added `scanHTMLComment`
+(`LassoParser.swift`, modeled directly on `scanNoProcess`) — same "don't
+scan anything inside for `[ ]`/`<?lasso ?>`" behavior, but unlike
+`[NoProcess]` the `<!--`/`-->` delimiters are real HTML syntax a browser
+needs to see, so the whole span (delimiters included) is emitted
+verbatim rather than stripped. This also transparently subsumes the
+earlier IE-conditional-comment-specific workaround (`if`'s empty
+`bareOpenScopes` in the `.lassoParser` scope, 2026-07-09) for any
+`<!--[if IE 8]>...<![endif]-->` that's inside a real HTML comment —
+that older fix stays in place (still correct, still needed for any bare
+`[if ...]` outside a comment), just now redundant-but-harmless for the
+in-comment case.
+
+Both fixes: full test suite green throughout, 306 tests passing (4 new —
+2 per fix), zero regressions — notably the broad HTML-comment change
+touched every fixture with a `<!-- -->` anywhere in it and still didn't
+break a single one. Live-verified against the real corpus: fresh full
+crawl after both
+fixes landed — **793 clean, 118 failing** (up from 776/135), both target
+buckets completely absent from the new report, no new failure bucket
+introduced by either fix (the new top buckets — `unreadableFile`,
+`Encrypt_HMAC` token requirement, `email_send`, `fileNotFound` — are
+pre-existing gaps in the *same* files, previously masked behind the two
+bugs just fixed, the same "fixing one bug exposes the next layer"
+pattern this project has hit repeatedly; not investigated further this
+pass).
+
+**Also added `LASSO_RENDER_EXCLUDE_PATHS`** (see "Configuration" above)
+— the live-serving sibling of `LASSO_CRAWL_EXCLUDE_PATHS`, prompted by
+noticing the crawl's vendor-path noise (16 pages of misidentified
+gmaps/jquery.filer demo JS/HTML) would 500 on a real direct request too,
+not just during a crawl sweep. Live-verified: `LASSO_RENDER_EXCLUDE_PATHS=vendor`
+turns a vendor page that previously 500'd into a clean `200` serving the
+real static file content, while an ordinary Lasso page on the same
+server keeps rendering normally.
+
+## Backlog round 2: `variable`/`Var` synonym, `Email_Send` no-op, three confirmed non-bugs — 2026-07-17
+
+Continued from the fresh crawl above (776 clean before, 793 after the
+`if`/HTML-comment fixes) — took the next 5 buckets by page count. Two
+were real, now-fixed gaps; three turned out to be the same "crawler
+tests pages without their real page's calling context" limitation
+already on record (`crawl-report-filtering-plan.md`'s "Known
+limitation" section), confirmed by tracing each one to its actual
+source, not assumed.
+
+**`unknownFunction("variable")` — 6 pages, `includes/*/top_right.lasso`.
+Real gap, fixed.** Real corpus: `[variable: 'Season'=
+(field:'new_season_number')]`. The Lasso 8.5 Language Guide's own
+synonym table lists `[Variable]`/`[Var]` as exact synonyms, but this
+interpreter only ever special-cased `"var"` (and `"local"`) at the three
+places that matter — `Evaluator.swift`'s dynamic-call declare dispatch,
+its `isVarOrLocalCallee` member-assignment-target check, and
+`Renderer.swift`'s `iterateBinding` loop-variable detection. Added
+`"variable"` alongside `"var"` at all three (case-insensitively,
+matching how every other tag name comparison in this codebase works).
+
+**`unknownFunction("email_send")` — 14 pages,
+`importscripts/*.lasso`. Real gap, fixed as a documented no-op.**
+`[Email_Send]` is a real Lasso 8.5 "process tag" ("does not return a
+value") that queues/sends mail via SMTP. This project has no
+resurrected SMTP client, and real corpus usage here is only ever
+reached on already-degraded error-notification paths (import failures),
+never a real user's success path — registered as a no-op (`register
+("email_send") { _, _ in .void }`), matching the existing `[Cache]`
+no-op precedent exactly: clears the `unknownFunction` gap and lets the
+page finish rendering, without pretending to deliver mail that goes
+nowhere.
+
+**`unreadableFile("")` (21 pages) / `Encrypt_HMAC requires -Token`
+(14 pages) / `fileNotFound("includes/b2b//keywords/...")` (8 pages) —
+all three confirmed non-bugs, not touched.** Traced each to its real
+source rather than assumed:
+- `unreadableFile("")`: `templates/*/master.template.lasso` and
+  `includes/*_header1.lasso` files call `[include($header1)]` /
+  similar — `$header1` etc. are globals the real calling page (a
+  top-level page confirmed already rendering cleanly) sets before
+  including these helpers. Crawled bare, with no caller, the variable
+  is empty and `include('')` correctly throws.
+- `Encrypt_HMAC requires -Token`: a LassoStartup-defined custom tag
+  wrapping `Encrypt_HMAC` is called with `$password` sourced
+  from `action_param('password')` — real form
+  POST data, empty on a bare crawl GET. An empty token being rejected
+  is `Encrypt_HMAC`'s own documented, already-tested required-argument
+  behavior working correctly, not a bug.
+- `fileNotFound(...b2b//keywords...)`: the exact same
+  `includes/b2b/*/*_header1.lasso` files from the `unreadableFile`
+  bucket above — `$store_abbrev` (presumably set via hostname-based
+  site detection somewhere in the real `_begin.lasso` chain) is empty
+  when crawled bare, producing the double-slash path. Same root cause,
+  different line reached first.
+
+All three are direct instances of the already-documented "the crawler
+discovers and tests pages without the session/form/caller-variable
+context a real request would carry" limitation — not three new findings,
+one limitation manifesting three ways. No fix attempted here; the real
+fix is the link-following crawl rework already flagged as not scheduled.
+
+Verification: 308 tests passing (2 new), zero regressions. Live-verified
+against the real corpus: fresh full crawl, **813 clean, 98 failing**
+(up from 793/118) — `variable` and `email_send` buckets completely
+gone, the three non-bug buckets unchanged in count (confirming nothing
+was silently broken by chasing them), no new failure bucket introduced.
+
+## Backlog round 3: juxtaposed concatenation, trailing-comma argument lists, and a real FileMaker connector bug — 2026-07-17
+
+Continued from the same crawl backlog. Two real parser gaps closed, one
+crawl/render noise-reduction change, and — the big one this round — the
+actual root cause of every FileMaker-backed page failure this session
+turned out to be a bug in `Perfect-FileMaker`, not FileMaker Server
+health.
+
+### Crawl/render noise: vendor doc pages and dev scratch files
+
+Two directories were inflating the failure count with content that was
+never really part of the site: a `vendor/` path holding third-party
+library documentation (JSDoc output, icon-font previews) that happens to
+use `.html` and contains CSS/JS bracket syntax the crawler's
+Lasso-content heuristic misreads as real tags, and a scratch-code
+directory containing developer test scripts (one with a hardcoded
+plaintext database password in source).
+
+`LASSO_CRAWL_EXCLUDE_PATHS`/`LASSO_RENDER_EXCLUDE_PATHS` (see the
+"Configuration" section above) now cover the vendor directory in
+**both** — it's genuinely static content, safe to serve raw once
+excluded from Lasso rendering. The scratch-code directory is excluded
+from the **crawl only**, deliberately **not** from rendering: excluding
+it from rendering would flip today's safe failure (a 500, no source
+exposed) into serving that file's raw source — including the hardcoded
+password — as plain text to anyone who requests the URL directly. The
+interpreter error is the correct behavior there, not a bug to route
+around.
+
+### Juxtaposed string/expression concatenation (Lasso 8.5 Language Guide, Ch. 22 "Miscellaneous Shortcuts")
+
+Confirmed via the Lasso 8.5 Language Guide PDF, not inferred from corpus
+alone: `['Showing ' (Shown_Count) ' records of ' (Found_Count) ' found.']`
+— adjacent primary expressions with no operator between them implicitly
+concatenate. This already worked for free at the top level of a script
+body (`ScriptBodyParser` hands one `;`-bounded statement span to a fresh
+`ExpressionParser`; multiple top-level expressions already render as
+concatenated output — the same mechanism a `<?LassoScript String(...);
+Field(...); String(...); ?>` sequence has always relied on). It broke
+specifically *inside* one argument's value: `ExpressionParser.
+parseArguments` called `parseExpression()` exactly once per value, so
+`-SQL='...' #cat_master '...'` only captured the leading string —
+`#cat_master` and the trailing string spilled out as extra top-level
+expressions, which desynced the whole statement (`emitStatement`
+requires exactly one top-level expression to recognize a real tag-opening
+call, so the spillover silently downgraded a real `inline: ...` block
+into an unrecognized function call).
+
+Fixed with `ExpressionParser.parseJuxtaposedValue()` — after parsing an
+argument's leading value, keeps folding subsequent juxtaposed primaries
+(strings, local/variable references, parenthesized sub-expressions —
+deliberately not bare unparenthesized identifiers, since nothing in the
+doc or corpus juxtaposes one and it would risk swallowing what's
+actually the *next* statement) into an implicit-concatenation chain.
+Real corpus: `components/inSite/filtered_links.inc`'s `inline: $dbconn2,
+-table='categories', ..., -SQL='SELECT * FROM categories WHERE
+`cat_masters` LIKE "%' #cat_master '%"'` — previously
+`unknownFunction("inline")`, now parses as a real block.
+
+### Trailing comma before a caller-owned closing paren
+
+A bare-colon-call's own argument list (`inline:`, `Array:`, etc. with no
+parens of its own) has no closing token to watch for — it only knows
+it's done when it runs out of commas. A trailing comma immediately
+before a *caller's* `)` — real corpus: `components/inSite/
+email_instances.inc`'s `(Array: 'a', 'b', // commented-out element
+\n))` — left the parser having just consumed that comma and about to
+try parsing `)` itself as the next argument's value; the catch-all
+expression case turned that into a bogus `.unknown(")")`, surfacing as
+`unsupportedExpression(")")`. Fixed by treating a stray `)` encountered
+by a closing-less argument list as that list's natural end, letting the
+wrapping call's own `consume(")")` claim it instead.
+
+Both fixes live-verified: `filtered_links.inc` now fails only on
+`missingDatasource` (the same "crawled without real caller context"
+limitation as other confirmed non-bugs above, not a new gap) —
+`email_instances.inc` renders fully clean.
+
+### FileMaker connectivity: what's actually understood, and what isn't yet
+
+Every FileMaker-touching page failed all session — 502s, timeouts, and
+(after a FileMaker Server Web Publishing Engine restart) a generic
+"FileMaker Server Administration Console - Error / http.401" HTML page
+instead of a real response, even with verified-correct credentials. This
+turned into a multi-round investigation with one overconfident diagnosis
+along the way — recorded here in full rather than quietly cleaned up,
+since the corrected understanding is the useful part.
+
+**Ruled out**: server health, credentials, and network. A real Lasso
+Server installation — same machine, same credentials, same FileMaker
+Server — connected instantly and successfully while every request from
+this project failed, at a time when a raw request built the documented
+way (see below) still failed too. That pointed squarely at something in
+how `Perfect-FileMaker` builds its requests, or a genuinely unstable
+FileMaker Server (a "which one is it" question this project could not
+fully resolve — see below).
+
+**A false lead, corrected**: every official FileMaker XML Custom Web
+Publishing example shows a `GET` request with the query in the URL
+(`/fmi/xml/fmresultset.xml?-db=...&-lay=...&-findall`), while
+`Perfect-FileMaker` sent the identical query as a `POST` body. Switching
+to GET immediately returned a real, successful response, and this was
+initially recorded as the fix. Further live testing overturned that:
+the exact original POST-based request, retried later, worked reliably
+too — and this project's own earlier live-verification work (2026-07-14
+through 07-16) had already exercised the original always-POST
+implementation successfully against this same FileMaker infrastructure.
+GET's *own* first live attempt had also failed before succeeding on a
+retry — a detail initially dismissed as a fluke that, in hindsight, fits
+"the server was still stabilizing" much better than "GET is the fix."
+The real explanation for the outage was very likely the WPE being
+unstable/still-recovering at the time, not a client request-shape bug —
+this project simply happened to test GET at a moment when the server
+had also separately recovered.
+
+**Reverted, because GET has a real cost independent of the above**:
+query values can include credential-adjacent data (a password-derived
+search value from a login flow, for example). Putting the query in the
+URL means it lands in *any* URL-based logging along the way —
+`Perfect-FileMaker`'s own plain-HTTP credential warning (which logs the
+full URL) went from logging just the bare endpoint to logging the
+entire query the moment GET was tried, and FileMaker Server's own
+front-end web server almost certainly logs full request URLs too,
+completely outside this project's control. POST keeps the query out of
+URL-based logging entirely. Given GET was never conclusively proven to
+fix anything, and POST is known to work once the server is healthy,
+`Perfect-FileMaker` now sends POST again — see that repository's own
+commits (`1710fa1` then `0018824`) for the full back-and-forth.
+
+**Still genuinely unresolved**: this project has, on its own account,
+broken multiple distinct FileMaker Server WPE instances this way before
+— a short, *purely sequential* crawl (confirmed via source: one request
+at a time, no concurrency at all) reliably drives a FileMaker Server
+Web Publishing Engine into an unresponsive state, observable first as a
+climbing "open connections" count in FileMaker Server's own admin
+console, later as total unresponsiveness requiring an administrator
+restart. A `Connection: close` header was added to `Perfect-FileMaker`
+as reasonable hygiene (classic XML CWP has no login/logout, so the HTTP
+connection is the only client-side session-lifecycle signal available
+at all), but is not confirmed to fix the underlying resource
+exhaustion — a background research pass found that XML CWP's
+documentation describes no session-reuse mechanism for HTTP clients at
+all (unlike FileMaker's PHP API, which uses cookies the WPE can cache
+against), and that WPE going silently unresponsive under sustained
+Custom Web Publishing load, with no definitive published root cause, is
+an independently-reported pattern across multiple unrelated FileMaker
+installations and versions in the wider FileMaker community — not
+something unique to this project's server. One promising-looking lead
+(FileMaker Server does send an undocumented `Set-Cookie:
+WPCSessionID=...; Path=/fmi/xml; HttpOnly` on every XML CWP response)
+turned out to be a dead end on closer testing — the same session ID was
+returned across multiple fully independent requests with no cookie
+continuity at all, meaning it doesn't appear to function as a real
+per-session token this project's client behavior could be failing to
+honor. Real next steps: watch FileMaker Server's own WPE/CWP event log
+and admin-console connection count during a slow, deliberately-paced
+test crawl (server-side visibility this project cannot get from outside
+the HTTP layer) — see "Crawl pacing and a circuit breaker" below for the
+client-side mitigation, now implemented.
+
+Live-verified end-to-end through `lasso-perfect-server` while POST was
+confirmed working: a page that had failed all session rendered
+successfully; the login page (which had separately been failing on
+`Encrypt_HMAC requires -Token`, a symptom that turned out to be
+downstream of the connectivity failure, not a bug in its own right) also
+rendered fully. One genuinely separate bug remains open — an
+add-to-cart action fails with `missingAssignments(LassoInlineAction.
+add)` from `includes/create_new_cust.include.lasso` — confirmed
+unrelated to any of the above (same error throughout) and not yet
+investigated.
+
+### Crawl pacing and a circuit breaker
+
+Tim: "add pacing and a circuit breaker to the crawl loop." Two new
+env vars on `CrawlReport.run(...)` (`Sources/LassoCrawlReport/
+CrawlReport.swift`), wired through both call sites (`main.swift`'s
+`LASSO_CRAWL_REPORT=1` CLI mode and the admin console's `crawl-report`
+action):
+
+- **`LASSO_CRAWL_REQUEST_DELAY_MS`** (default `200`) — a pause between
+  every crawled request, applied uniformly. The crawler can't know in
+  advance which pages hit a datasource, so this can't be scoped to
+  "FileMaker-touching requests only" — it paces the whole crawl.
+  `0` disables pacing entirely.
+- **`LASSO_CRAWL_CIRCUIT_BREAKER_THRESHOLD`** (default `3`) — aborts the
+  crawl immediately after this many *consecutive* backend-distress
+  results. `0` disables the breaker. A tripped breaker stops the crawl
+  outright (no auto-retry/backoff loop — an automated retry could itself
+  contribute more load to a server already in distress); both call
+  sites print/log a clear "ABORTED EARLY" message with however many
+  pages were reached before stopping.
+
+Neither can target FileMaker requests specifically, because — per the
+section above — the actual server-side exhaustion mechanism was never
+pinned down from outside the HTTP layer. This is deliberately a blunt,
+general-purpose safety net (pace everything, stop on any sustained
+backend distress), not a fix for the underlying cause, which still
+needs the server-side visibility only Tim can get by watching FileMaker
+Server's own WPE/CWP event log and admin-console connection count in
+real time during a test crawl.
+
+`CrawlReport.run(...)` gained a third return-tuple element,
+`abortedByCircuitBreaker: Bool`, and an injectable `urlSession`
+parameter (`nil` in every real caller, defaulting to the existing
+no-redirect session — tests inject a `URLProtocol`-mocked session,
+matching `Perfect-FileMaker`'s own established testing pattern, to
+exercise pacing/circuit-breaker timing and abort behavior without a
+live server). The circuit breaker's core predicate is exposed as
+`CrawlReport.isBackendDistressSignal(_:)`, a small pure function.
+
+**What "backend distress" means was wrong on the first pass, caught
+immediately by the very first real test.** The original predicate
+counted `statusCode == 0` (a genuine request-level failure/timeout) *or*
+any `5xx`. That's broken for this specific system:
+`lasso-perfect-server`'s own render-error page (`main.swift`'s
+`LassoSiteRenderError` handler) returns `.internalServerError` (500)
+uniformly for *every* kind of Lasso error — an ordinary, already-
+cataloged interpreter gap (`unknownFunction`, `unsupportedExpression`)
+is completely indistinguishable, status-code-wise, from an actual
+FileMaker/MySQL backend failure. Since finding pages that render 500
+due to interpreter gaps is the crawler's entire reason to exist,
+treating any 5xx as distress meant the breaker tripped on perfectly
+normal crawl output — exactly what happened on the first live test
+(2026-07-17): the crawl aborted after 3 pages, all three the same
+already-known `Test Code/` parser bugs (`unknownFunction("inline")`
+etc.), not backend distress at all. `isBackendDistressSignal` now
+checks *only* `statusCode == 0` — the one signal that's unambiguous
+regardless of what kind of Lasso error a page hits, since it means the
+crawler couldn't get a response at all.
+
+A second, unrelated bug surfaced in the same test run: the
+`LASSO_CRAWL_EXCLUDE_PATHS`/`LASSO_CRAWL_ONLY_FAILURE`-adjacent
+`LASSO_CRAWL_EXCLUDE_PATHS` value used to launch that test server had a
+leading-slash typo (`/Test Code/` instead of `Test Code/`) — site-root-
+relative paths never start with a slash, so the substring match
+(`CrawlReport.pathMatchesExclude`) silently never matched, and the
+`Test Code/` scratch directory (deliberately excluded from crawling —
+see the noise-reduction section above) got crawled anyway. Not a code
+bug, a one-off env var mistake when launching that particular test run;
+worth double-checking exclude-path values have no leading slash, since
+the failure mode is silent (no error, the path just isn't excluded).
+
+Verified via 8 new unit tests (`LassoCrawlReportTests`, all mock-based —
+consecutive vs. non-consecutive request failures, ordinary 4xx *and*
+5xx page errors never tripping the breaker, threshold disabled
+entirely, pacing measurably slowing a crawl vs. not) — wrapped in a
+`.serialized` suite since the mock's status-code table is shared
+mutable state across test cases, the same pattern `Perfect-FileMaker`'s
+own `MockURLProtocol`-based tests already established. 318 tests
+passing project-wide, zero regressions after the fix.
+
+### The paced crawl still surfaced real degradation — and a real gap in the safety net
+
+With both fixes above live, Tim ran the paced/circuit-breaker-protected
+crawl against the real corpus while watching FileMaker Server's own
+admin console in real time. Both signals were tracked simultaneously —
+his live connection-count readout, and this project's own server log —
+and correlated directly:
+
+- FileMaker Server's admin console showed its client session count
+  climbing steadily throughout the crawl: 2 → 3 → 6 → 8 over roughly
+  four minutes and about twenty FileMaker-touching requests.
+- This project's own server log showed real datasource failures
+  starting to appear around the same point — `serverError(502, "Bad
+  response")` and `serverError(401, "Error from FileMaker server")` —
+  eventually a majority of FileMaker requests (14 of the last 18)
+  before the crawl was manually stopped.
+- **Neither circuit breaker tripped.** Pacing slowed the rate of harm —
+  markedly slower accumulation than the original, unpaced incident —
+  but did not prevent it. This is consistent with (not new evidence
+  against) the earlier finding that the actual WPE exhaustion mechanism
+  isn't understood from outside the HTTP layer; a client-side pacing
+  strategy alone was never going to fully paper over a server-side
+  resource-accounting problem, only reduce its rate.
+
+The reason neither breaker caught it, once traced, was a real
+architectural gap, not just an undertuned threshold: `Perfect-FileMaker`
+Lasso executors (`PerfectFileMakerLassoExecutor`/`PerfectCRUDLassoExecutor`)
+deliberately catch a datasource connectivity failure and convert it
+into a *recoverable* Lasso error frame the page inspects via
+`error_currenterror` — intentional, sensible behavior for a real
+visitor's page load, but it means the page still returns a normal `200`.
+The only place a live FileMaker outage was ever observable was a
+`stderr`/`LogCapture` line (`logDatasourceActionFailure`) a human had to
+be watching — invisible to the crawl-report's own HTTP-level view
+entirely, and to `isBackendDistressSignal` by construction.
+
+Fixed by giving the crawl-report an in-process signal into the same
+event, rather than trying to derive it from anything HTTP-visible:
+`DatasourceFailureTracker` (`Sources/LassoPerfectServer/
+DatasourceFailureTracker.swift`) is a small actor that counts
+`logDatasourceActionFailure` events (FileMaker and MySQL alike — both
+connectors already funnel through the same function) since it was last
+reset. `LassoSiteServer` now owns one always-present instance (unlike
+`logCapture`/`metrics`, which are nil when the admin console is off —
+this needed to work in CLI mode too), threaded into all four
+`logDatasourceActionFailure` call sites and shared with
+`LassoAdminDelegate` so both the CLI crawl mode and the admin console's
+crawl-report action read from the exact same counter real traffic
+writes into.
+
+`CrawlReport.run(...)` gained a second, independent circuit breaker:
+`datasourceFailureThreshold`/`currentDatasourceFailureCount` (a polled
+closure, checked after every request, deliberately not woven into the
+first breaker's "consecutive" bookkeeping — a datasource failure isn't
+naturally 1:1 with a single crawled page). Both call sites reset the
+tracker immediately before starting a run, so unrelated earlier
+browsing (or a previous crawl) doesn't count toward a fresh run's
+threshold. New env var: `LASSO_CRAWL_DATASOURCE_FAILURE_THRESHOLD`,
+default `5` (see "Configuration" above).
+
+Verified via 4 new unit tests: `DatasourceFailureTracker`'s own
+count/reset semantics, plus two `CrawlReport.run(...)` tests proving
+the new signal aborts a crawl even when every single mocked page
+returns a clean `200` — reproducing the exact real-world shape of the
+gap this closes, not just testing the counter in isolation. 322 tests
+passing project-wide, zero regressions.
+
+**Still not fully resolved.** This closes the specific "invisible to
+the crawler" gap, but doesn't answer the deeper open question: why does
+a short, purely sequential, now-paced crawl still measurably degrade a
+FileMaker Server WPE at all. Real next step unchanged from the section
+above — FileMaker Server's own WPE/CWP event log, watched directly
+during a controlled test, is the only remaining source of that answer.
 
 ## Next Compatibility Work
 

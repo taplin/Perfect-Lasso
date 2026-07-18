@@ -40,7 +40,12 @@ entirely rather than relying on unverified assumptions about SwiftPM/Swift
 Implemented:
 
 - **Path excludes** — `LASSO_CRAWL_EXCLUDE_PATHS` (comma-separated,
-  case-insensitive substrings, e.g. `vendor`). Default empty.
+  case-insensitive substrings, e.g. `vendor`). Default empty. Has a
+  live-serving sibling, `LASSO_RENDER_EXCLUDE_PATHS` (2026-07-17,
+  `lasso-perfect-server.md`'s Configuration section) — same matching
+  logic (`CrawlReport.pathMatchesExclude`), separate list, since a real
+  direct request to a vendor-noise path (not just a crawl sweep) can hit
+  the same misparse.
 - **Content heuristic for `.htm`/`.html` only** — `.lasso`/`.inc` behavior
   is completely unchanged.
 - **Focused rerun**, two independent mechanisms: `LASSO_CRAWL_PATH_LIST`

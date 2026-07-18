@@ -93,14 +93,68 @@ public enum CrawlReport {
     /// action uses this to show live "N/M pages" status on its action chip
     /// while a crawl runs (see `LassoPerfectServer`'s `CrawlRunTracker`).
     /// `nil` by default so every other caller (CLI mode, tests) is unaffected.
+    ///
+    /// `requestDelayMS` (default 0, meaning no pacing — callers opt in via
+    /// `LASSO_CRAWL_REQUEST_DELAY_MS`) and `circuitBreakerThreshold`
+    /// (default `nil`, meaning disabled — `LASSO_CRAWL_CIRCUIT_BREAKER_THRESHOLD`)
+    /// exist because this project has, on its own account, broken multiple
+    /// real FileMaker Server Web Publishing Engine instances by running a
+    /// short, purely sequential crawl against them — see
+    /// `Documentation/lasso-perfect-server.md`'s FileMaker connectivity
+    /// section. The actual server-side exhaustion mechanism was never
+    /// pinned down from outside the HTTP layer (two separate live-tested
+    /// theories — GET vs. POST, and a session cookie — both turned out to
+    /// be dead ends), so this can't target FileMaker requests specifically;
+    /// pacing applies to every request uniformly, and the circuit breaker
+    /// watches for `isBackendDistressSignal` below — a genuine request-
+    /// level failure (`statusCode == 0`: timeout, connection refused/
+    /// reset), deliberately *not* any `5xx`, since this server's own
+    /// render-error page returns 500 uniformly for every kind of Lasso
+    /// error, ordinary interpreter gaps included — see that function's
+    /// own doc comment for why treating any 5xx as distress tripped the
+    /// breaker on completely normal crawl output in practice.
+    ///
+    /// `datasourceFailureThreshold`/`currentDatasourceFailureCount` are a
+    /// *second*, independent circuit breaker, because live-verifying the
+    /// first one (2026-07-17) surfaced a real gap: a FileMaker Server
+    /// connectivity failure never reaches this crawler as a `5xx` or a
+    /// request-level failure at all — `PerfectFileMakerLassoExecutor`/
+    /// `PerfectCRUDLassoExecutor` deliberately catch that class of error
+    /// and convert it into a recoverable Lasso error frame the *page*
+    /// inspects via `error_currenterror`, so the page still returns a
+    /// normal `200`. The only place this was ever observable was a
+    /// stderr/`LogCapture` line a human had to be watching — confirmed
+    /// live: FileMaker Server's own admin console showed a climbing
+    /// session count (2 → 3 → 6 → 8) and a majority of datasource actions
+    /// failing while every single crawled page's HTTP status looked
+    /// completely normal to this loop. `currentDatasourceFailureCount`,
+    /// when supplied, is polled after every request; if it reaches
+    /// `datasourceFailureThreshold` the crawl aborts exactly like the
+    /// HTTP-level breaker (same `abortedByCircuitBreaker` flag — from the
+    /// caller's perspective, and in the printed/logged summary, both
+    /// mean the same thing: something-that-isn't-a-normal-page-error
+    /// tripped a safety net). `nil`/unset in every caller except
+    /// `LassoPerfectServer`, which polls its own in-process
+    /// `DatasourceFailureTracker` — see that type's doc comment for why
+    /// this has to be an in-process signal rather than anything derivable
+    /// from a page's own HTTP response.
     public static func run(
         baseURL: String,
         siteRoot: URL,
         extensions: Set<String>,
         excludePaths: [String] = [],
         pathList: [String]? = nil,
+        requestDelayMS: Int = 0,
+        circuitBreakerThreshold: Int? = nil,
+        datasourceFailureThreshold: Int? = nil,
+        currentDatasourceFailureCount: (@Sendable () async -> Int)? = nil,
+        urlSession: URLSession? = nil,
         onProgress: (@Sendable (_ completed: Int, _ total: Int) -> Void)? = nil
-    ) async -> (results: [CrawlPageResult], excludedCount: Int) {
+    ) async -> (results: [CrawlPageResult], excludedCount: Int, abortedByCircuitBreaker: Bool) {
+        // `nil` (the default, every real caller) uses the no-redirect
+        // session below; tests inject a `URLProtocol`-mocked session to
+        // exercise pacing/circuit-breaker behavior without a live server.
+        let session = urlSession ?? noRedirectSession
         let paths: [String]
         let excludedCount: Int
         if let pathList {
@@ -115,11 +169,67 @@ public enum CrawlReport {
         let sortedPaths = paths.sorted()
         var results: [CrawlPageResult] = []
         results.reserveCapacity(sortedPaths.count)
-        for path in sortedPaths {
-            results.append(await requestPage(baseURL: baseURL, path: path))
+        var consecutiveBackendFailures = 0
+        for (index, path) in sortedPaths.enumerated() {
+            let result = await requestPage(baseURL: baseURL, path: path, urlSession: session)
+            results.append(result)
             onProgress?(results.count, sortedPaths.count)
+
+            consecutiveBackendFailures = isBackendDistressSignal(result) ? consecutiveBackendFailures + 1 : 0
+            if let threshold = circuitBreakerThreshold, consecutiveBackendFailures >= threshold {
+                return (results, excludedCount, true)
+            }
+
+            if let threshold = datasourceFailureThreshold, let currentDatasourceFailureCount {
+                let count = await currentDatasourceFailureCount()
+                if count >= threshold {
+                    return (results, excludedCount, true)
+                }
+            }
+
+            let isLastPath = index == sortedPaths.count - 1
+            if requestDelayMS > 0, isLastPath == false {
+                try? await Task.sleep(for: .milliseconds(requestDelayMS))
+            }
         }
-        return (results, excludedCount)
+        return (results, excludedCount, false)
+    }
+
+    /// A single result the circuit breaker in `run(...)` counts toward its
+    /// consecutive-failure threshold — `statusCode == 0` only: a genuine
+    /// request-level failure (timeout, connection refused/reset — the
+    /// crawler couldn't get any response at all).
+    ///
+    /// Deliberately does *not* treat any `5xx` as distress, even though an
+    /// earlier version of this function did — `lasso-perfect-server`'s own
+    /// render-error page (`main.swift`, the `LassoSiteRenderError` handler)
+    /// returns `.internalServerError` (500) for *every* Lasso render
+    /// error uniformly, regardless of cause: an ordinary, already-cataloged
+    /// interpreter gap (`unknownFunction`, `unsupportedExpression`) is
+    /// completely indistinguishable, status-code-wise, from an actual
+    /// FileMaker/MySQL backend failure. Since finding pages that render
+    /// 500 due to interpreter gaps is the crawler's entire purpose, the
+    /// original "any 5xx counts" version tripped the breaker on
+    /// perfectly ordinary crawl output — confirmed live (2026-07-17): a
+    /// real crawl aborted after 3 pages, all three a completely unrelated,
+    /// already-known parser bug (`Test Code/edit_1.lasso`'s
+    /// `unknownFunction("inline")` etc.), not backend distress at all.
+    public static func isBackendDistressSignal(_ result: CrawlPageResult) -> Bool {
+        result.statusCode == 0
+    }
+
+    /// Case-insensitive substring match of `path` against any entry in
+    /// `excludePaths` (e.g. `"vendor"` matches `assetsnew/vendor/gmaps/...`).
+    /// Shared by `discoverPaths` (crawl-report discovery) and
+    /// `LassoSiteServer.shouldRender` (live request serving) so both use
+    /// exactly the same exclusion semantics — `LASSO_CRAWL_EXCLUDE_PATHS`
+    /// and `LASSO_RENDER_EXCLUDE_PATHS` behave identically, just at
+    /// different points (which pages get crawled vs. which get served as
+    /// Lasso at all).
+    public static func pathMatchesExclude(_ path: String, excludePaths: [String]) -> Bool {
+        guard excludePaths.isEmpty == false else { return false }
+        let lowercasedPath = path.lowercased()
+        return excludePaths.contains { lowercasedPath.contains($0.lowercased()) }
     }
 
     /// Recursively walks `siteRoot` for renderable pages, skipping
@@ -152,7 +262,6 @@ public enum CrawlReport {
             return ([], 0)
         }
 
-        let lowercasedExcludes = excludePaths.map { $0.lowercased() }
         var paths: [String] = []
         var excludedCount = 0
         for case let relativePath as String in enumerator {
@@ -165,7 +274,7 @@ public enum CrawlReport {
             guard extensions.contains(fileExtension) else { continue }
             guard url.lastPathComponent.hasPrefix("_") == false else { continue }
 
-            if lowercasedExcludes.contains(where: { relativePath.lowercased().contains($0) }) {
+            if pathMatchesExclude(relativePath, excludePaths: excludePaths) {
                 excludedCount += 1
                 continue
             }
@@ -281,7 +390,7 @@ public enum CrawlReport {
         print("")
     }
 
-    private static func requestPage(baseURL: String, path: String) async -> CrawlPageResult {
+    private static func requestPage(baseURL: String, path: String, urlSession: URLSession) async -> CrawlPageResult {
         guard let encodedPath = path.addingPercentEncoding(withAllowedCharacters: .urlPathAllowed),
               let url = URL(string: "\(baseURL)/\(encodedPath)") else {
             return CrawlPageResult(path: path, statusCode: 0, errorType: "invalidPath", errorDescription: nil, elapsedMS: 0)
@@ -300,7 +409,7 @@ public enum CrawlReport {
             // ("too many HTTP redirects" for any page that ever redirects
             // back toward itself, since the crawler isn't a real browser
             // carrying cookies/session state between hops).
-            let (data, response) = try await noRedirectSession.data(for: request)
+            let (data, response) = try await urlSession.data(for: request)
             let statusCode = (response as? HTTPURLResponse)?.statusCode ?? 0
             guard statusCode >= 400 else {
                 return CrawlPageResult(path: path, statusCode: statusCode, errorType: nil, errorDescription: nil, elapsedMS: elapsedMS())
@@ -340,12 +449,20 @@ public enum CrawlReport {
     /// existing counted-and-grouped report style), prints a summary to
     /// stdout, and — if `outputPath` is set — writes the full per-page
     /// results as JSON for diffing between runs.
-    public static func printAndWrite(_ results: [CrawlPageResult], outputPath: String?, excludedCount: Int = 0) {
+    public static func printAndWrite(
+        _ results: [CrawlPageResult],
+        outputPath: String?,
+        excludedCount: Int = 0,
+        abortedByCircuitBreaker: Bool = false
+    ) {
         let clean = results.filter(\.isClean)
         let failing = results.filter { $0.isClean == false }
 
         print("")
         print("=== Crawl Report ===")
+        if abortedByCircuitBreaker {
+            print("ABORTED EARLY: circuit breaker tripped on repeated backend failures (timeouts/5xx) — the target server may be in distress. Only \(results.count) page(s) were reached before stopping.")
+        }
         print("\(clean.count) of \(results.count) pages render cleanly.")
         if excludedCount > 0 {
             print("\(excludedCount) additional pages excluded (path exclude or no Lasso content signal) — not counted above.")

@@ -117,6 +117,43 @@ import PerfectSessionCore
     #expect(output == "before-<script>var i,j; d.MM_p[j++].src=a[i];</script>-after-outside-still-works")
 }
 
+@Test func htmlCommentPassesThroughRawContentWithoutScanningItAsLasso() async throws {
+    // Real Lasso's *other* documented escape hatch (Lasso 8.5 Language
+    // Guide Chapter 4): plain HTML comments are just as valid as
+    // [noprocess] for keeping square brackets from being interpreted —
+    // its own worked example is exactly this pattern. Real corpus: 11
+    // templates/*/master.template.lasso files wrap a Bootstrap modal-init
+    // snippet this way (`$.HSCore.components.HSModalWindow.init(
+    // '[data-modal-target]');`), which was being scanned as a real Lasso
+    // bracket tag (unsupportedExpression("-modal")) before this fix.
+    // Unlike [noprocess], the `<!--`/`-->` delimiters themselves are real
+    // HTML syntax a browser needs to see — so they stay in the output,
+    // not stripped.
+    var context = LassoContext(globals: ["x": .string("outside-still-works")])
+    let output = try await LassoRenderer().render(
+        """
+        before-<script><!-- $.init('[data-modal-target]'); // --></script>-after-[$x]
+        """,
+        context: &context
+    )
+    #expect(output == "before-<script><!-- $.init('[data-modal-target]'); // --></script>-after-outside-still-works")
+}
+
+@Test func htmlCommentDoesNotSuppressLassoDelimitersOutsideItsSpan() async throws {
+    // The exemption is scoped to the comment span itself — real Lasso
+    // code before/after an HTML comment on the same page still renders
+    // normally, and an unterminated comment doesn't silently eat the
+    // rest of the document without at least a diagnostic.
+    var context = LassoContext()
+    let output = try await LassoRenderer().render(
+        """
+        [$x = 'before'][$x]<!-- [$ignored = 'inside'] -->[$x = 'after'][$x]
+        """,
+        context: &context
+    )
+    #expect(output == "before<!-- [$ignored = 'inside'] -->after")
+}
+
 @Test func rendersGoldenFixtures() async throws {
     let fixtureURL = try #require(Bundle.module.resourceURL?.appendingPathComponent("RenderFixtures"))
     let inputs = try FileManager.default.contentsOfDirectory(
@@ -978,38 +1015,86 @@ import PerfectSessionCore
     #expect(output.trimmingCharacters(in: .whitespacesAndNewlines) == "SQL")
 }
 
-@Test func inlineBareColonCallWithJuxtaposedStringConcatenationIsADeferredGap() throws {
-    // Documents a real, deliberately-deferred gap found live-verifying the
+@Test func inlineBareColonCallArgumentFoldsJuxtaposedStringConcatenation() async throws {
+    // Was a deliberately-deferred gap (found live-verifying the
     // bareBlockNames/line-continuation fixes above against the real corpus
-    // (components/inSite/filtered_links.inc — the one file, of 15
-    // originally failing on unknownFunction("inline"), that still fails
-    // after those fixes). Root cause is distinct from both fixes above:
+    // — components/inSite/filtered_links.inc, the one file, of 15
+    // originally failing on unknownFunction("inline"), that still failed
+    // after those fixes), now fixed by `ExpressionParser.parseJuxtaposedValue()`.
     // Lasso 8's operator-less string/variable juxtaposition concatenation
-    // (`'text' #localVar 'more text'`, no `+` between them) inside an
-    // argument's value. `ExpressionParser`'s argument-value parser stops
-    // at the first complete sub-expression (the leading string), so the
-    // rest (`#cat_master`, the trailing string) become separate top-level
-    // expressions rather than being folded into the same -SQL argument —
-    // which makes ScriptBodyParser.emitStatement see more than one
-    // expression for the whole statement and fall back to `.code(...)`
-    // instead of ever reaching the bareBlockNames `.tag(...)` promotion,
-    // so `inline` gets evaluated as an ordinary (unregistered) function
-    // call. Out of scope for the inline block-opening fix — flagged as a
-    // new backlog item, not silently absorbed.
-    let source = """
+    // (Language Guide Ch. 22, "Miscellaneous Shortcuts": `'text' #localVar
+    // 'more text'`, no `+` between them — confirmed via the Lasso 8.5
+    // Language Guide PDF, not just corpus inference) previously broke
+    // specifically *inside* an argument's value: `parseArguments` called
+    // `parseExpression()` exactly once per value, so the leading string
+    // was captured but `#cat_master` and the trailing string spilled out
+    // as extra top-level expressions — which made
+    // `ScriptBodyParser.emitStatement` see more than one top-level
+    // expression and fall back to `.code(...)` instead of the
+    // bareBlockNames `.tag(...)` promotion, so `inline` was evaluated as
+    // an ordinary (unregistered) function call.
+    let scriptInline = """
     <?LassoScript
+    local: 'cat_master' = 'cat_master value';
     inline: -database='catalog_mysql',
         -sql='SELECT * FROM categories WHERE cat = "' #cat_master '"';
         action_statement;
     /inline;
     ?>
     """
-    let document = LassoParser().parse(source)
-    guard case let .code(expressions, _, _, _) = document.nodes.first else {
-        Issue.record("Expected this still-unsupported shape to fall back to .code, not .block — update this test if it's since been fixed")
+
+    let document = LassoParser().parse(scriptInline)
+    #expect(document.diagnostics.isEmpty)
+    guard case let .block(name, arguments, _, _, _, _) = document.nodes.dropFirst().first else {
+        Issue.record("Expected the juxtaposed -sql value to still fold into one real inline block")
         return
     }
-    #expect(expressions.count > 1, "juxtaposed concatenation splits into multiple top-level expressions instead of one inline(...) call")
+    #expect(name.lowercased() == "inline")
+    #expect(arguments.count == 2)
+
+    struct InlineProvider: LassoInlineProvider {
+        func executeInline(arguments: [EvaluatedArgument], context: LassoContext) async throws -> LassoInlineFrame {
+            let request = try LassoInlineRequest(arguments: arguments)
+            #expect(request.sql == "SELECT * FROM categories WHERE cat = \"cat_master value\"")
+            return LassoInlineFrame(rows: [], actionStatement: "SQL")
+        }
+    }
+
+    var context = LassoContext(inlineProvider: InlineProvider())
+    let output = try await LassoRenderer().render(scriptInline, context: &context)
+    #expect(output.trimmingCharacters(in: .whitespacesAndNewlines) == "SQL")
+}
+
+@Test func juxtaposedConcatenationFoldsInAnyParenCallArgumentNotJustInline() async throws {
+    // The fix lives in `ExpressionParser.parseArguments` (shared by every
+    // paren-call and bare-colon-call), not bolted onto "inline"
+    // specifically — proven here with a plain native-function paren call,
+    // matching the Lasso 8.5 Language Guide's own general example
+    // (`['Showing ' (Shown_Count) ' records of ' (Found_Count) ' found.']`).
+    var context = LassoContext()
+    let output = try await LassoRenderer().render(
+        "[String('a' 'b' 'c', -EncodeNone)]",
+        context: &context
+    )
+    #expect(output == "abc")
+}
+
+@Test func trailingCommaBeforeCallerOwnedCloseParenDoesNotProduceUnknownExpression() async throws {
+    // Real corpus: components/inSite/email_instances.inc's
+    // `(Array: 'a', 'b', // commented-out element\n));` — a trailing
+    // comma right before the `)` that belongs to the *outer* wrap, not to
+    // `Array:`'s own (parenless) bare-colon-call argument list.
+    // `parseArguments(closing: nil)` has no closing token of its own to
+    // watch for, so after consuming that trailing comma it used to try
+    // parsing `)` itself as the next argument's value — `parsePrefix`'s
+    // catch-all turned that into `.unknown(")")`, surfacing as
+    // `unsupportedExpression(")")` (this exact file, live-verified).
+    var context = LassoContext()
+    let output = try await LassoRenderer().render(
+        "[(Array: 'a', 'b', )->size]",
+        context: &context
+    )
+    #expect(output == "2")
 }
 
 @Test func rendersCorpusFixtures() async throws {
@@ -2530,6 +2615,69 @@ func perfectCRUDConnectorFailuresBecomeInlineErrorFrames(source: String, expecte
         context: &context
     ).trimmingCharacters(in: .whitespacesAndNewlines)
     #expect(falseOutput == "else")
+}
+
+@Test func bareColonCallIfOpenerWithNoParensIsRecognizedAsRealControlFlow() async throws {
+    // Lasso 8's classic slash-closed colon-call with a bare (paren-less)
+    // condition — `if: cond; ... /if;` — distinct from both `if(cond)`
+    // and `if:(cond)`. Real corpus: importscripts/ca_web.lasso and 17
+    // other pages (`if: error_currenterror!='No error'; ... /if;`), all
+    // of which fell through to unknownFunction("if") before this fix,
+    // since classifyIfOpen only recognized a bare condition immediately
+    // followed by a brace body, not one terminated by ';' with no braces
+    // at all.
+    var context = LassoContext()
+
+    let trueOutput = try await LassoRenderer().render(
+        """
+        <?lasso
+        if: true;
+            $branch = 'if'
+        else;
+            $branch = 'else'
+        /if;
+        ?>
+        [$branch]
+        """,
+        context: &context
+    ).trimmingCharacters(in: .whitespacesAndNewlines)
+    #expect(trueOutput == "if")
+
+    let falseOutput = try await LassoRenderer().render(
+        """
+        <?lasso
+        if: false;
+            $branch = 'if'
+        else;
+            $branch = 'else'
+        /if;
+        ?>
+        [$branch]
+        """,
+        context: &context
+    ).trimmingCharacters(in: .whitespacesAndNewlines)
+    #expect(falseOutput == "else")
+}
+
+@Test func bareColonCallIfOpenerWithNoElseAndNoTrailingSemicolonStillParses() async throws {
+    // Real corpus shape (importscripts/ca_web.lasso:30): a bare condition
+    // with a comparison operator, no else branch, condition itself ends
+    // the statement with ';' before the block body begins on the next line.
+    var context = LassoContext()
+    let output = try await LassoRenderer().render(
+        """
+        <?lasso
+        #x = 'No error';
+        $branch = 'unset';
+        if: #x!='No error';
+            $branch = 'error'
+        /if;
+        ?>
+        [$branch]
+        """,
+        context: &context
+    ).trimmingCharacters(in: .whitespacesAndNewlines)
+    #expect(output == "unset")
 }
 
 @Test func lassoDelimiterMixesBraceAndSlashStyleNesting() async throws {
@@ -4362,6 +4510,35 @@ private final class MapIncludeLoader: LassoIncludeLoader, @unchecked Sendable {
     #expect(output == "|hello")
 }
 
+@Test func variableIsARealSynonymForVarNotJustAnUnrecognizedIdentifier() async throws {
+    // Lasso 8.5 Language Guide's own synonym table lists [Variable] and
+    // [Var] as exact synonyms ("Var → [Variable] [Var]"). Real corpus:
+    // includes/b2b/*/top_right.lasso's `[variable: 'Season'=
+    // (field:'new_season_number')]` — was unknownFunction("variable")
+    // since only "var"/"local" were recognized as the declare-callee
+    // special case, not "variable".
+    var context = LassoContext()
+    let output = try await LassoRenderer().render(
+        "[variable: 'greeting'='hello']|[$greeting]",
+        context: &context
+    )
+    #expect(output == "|hello")
+}
+
+@Test func emailSendIsARegisteredNoOpNotAnUnknownFunction() async throws {
+    // [Email_Send] (Lasso 8.5 Language Guide, "Process Tags") — no
+    // resurrected SMTP client in this project, so it's a deliberate
+    // no-op (matching the [Cache] precedent) rather than a real send.
+    // Real corpus: importscripts/*.lasso's error-notification
+    // `email_send: -to=..., -from=..., -subject=..., -body=...;`.
+    var context = LassoContext()
+    let output = try await LassoRenderer().render(
+        "before-[email_send: -to='a@example.com', -from='b@example.com', -subject='s', -body='b']-after",
+        context: &context
+    )
+    #expect(output == "before--after")
+}
+
 @Test func decimalConstructorAndAsStringWithPrecisionFormatFixedDecimalPlaces() async throws {
     // `decimal(...)` (a native type constructor, like the already-supported
     // `integer(...)`/`string(...)`) plus `->asString(-precision=N)` — real
@@ -4902,10 +5079,16 @@ private final class MapIncludeLoader: LassoIncludeLoader, @unchecked Sendable {
 // `.bareColonCall` now characterizes the colon-plus-arguments-no-parens
 // shape `iterate`/`while`/`inline`/`encode_set`/`define_tag`/`define_type`
 // all share (`protect`'s bare zero-arg form reuses `.bareIdentifier`
-// instead, the same shape `records`/`rows` already had).
+// instead, the same shape `records`/`rows` already had). `if` also gained
+// `.bareColonCall` — real corpus's classic slash-closed `if: cond; ...
+// /if;` (importscripts/*.lasso and 6 other pages), a genuine block-
+// pairing bug fix distinct from `.bareCondition` (which requires a
+// brace body, not a `;`-terminated one) — see `parseIfOpening`'s own
+// classifier, not the shared cascade, since "if" stays deliberately
+// isolated from it.
 @Test func openFormsAreCharacterizedForEveryCatalogEntry() throws {
     let expected: [String: [TagOpenForm]] = [
-        "if": [.parenCall, .colonCall, .bareCondition],
+        "if": [.parenCall, .colonCall, .bareCondition, .bareColonCall],
         "inline": [.parenCall, .bareColonCall],
         "records": [.parenCall, .colonCall, .bareIdentifier],
         "rows": [.parenCall, .colonCall, .bareIdentifier],

@@ -45,6 +45,11 @@ final class LassoAdminDelegate: AdminConsoleDelegate {
     /// Guards against two near-simultaneous restart clicks racing into two
     /// concurrent process spawns. See `RestartCoordinator`.
     private let restartCoordinator: RestartCoordinator
+    /// Must be the *same* instance `LassoSiteServer` records real datasource
+    /// failures into (`main.swift` passes `siteServer.datasourceFailureTracker`
+    /// here) — a separate instance would always read zero, defeating the
+    /// whole point. See `DatasourceFailureTracker`'s own doc comment.
+    private let datasourceFailureTracker: DatasourceFailureTracker
 
     init(
         config: ServerConfig,
@@ -54,7 +59,8 @@ final class LassoAdminDelegate: AdminConsoleDelegate {
         baseURL: String,
         siteServerTask: Task<Void, Error>,
         crawlTracker: CrawlRunTracker = CrawlRunTracker(),
-        restartCoordinator: RestartCoordinator = RestartCoordinator()
+        restartCoordinator: RestartCoordinator = RestartCoordinator(),
+        datasourceFailureTracker: DatasourceFailureTracker = DatasourceFailureTracker()
     ) {
         self.config = config
         self.startTime = startTime
@@ -64,6 +70,7 @@ final class LassoAdminDelegate: AdminConsoleDelegate {
         self.siteServerTask = siteServerTask
         self.crawlTracker = crawlTracker
         self.restartCoordinator = restartCoordinator
+        self.datasourceFailureTracker = datasourceFailureTracker
     }
 
     // MARK: - Phase 1: status display
@@ -116,7 +123,7 @@ final class LassoAdminDelegate: AdminConsoleDelegate {
     /// `/api/actions` on every periodic refresh, so this updates live.
     func availableActions() async -> [AdminAction] {
         let description = await crawlTracker.statusDescription(
-            fallback: "Request every discovered site page over real HTTP and log a pass/fail summary. Runs in the background; can take several minutes on a large site."
+            fallback: "Request every discovered site page over real HTTP and log a pass/fail summary. Runs in the background, paced between requests to avoid overloading datasource backends (LASSO_CRAWL_REQUEST_DELAY_MS), and aborts early if the backend starts failing repeatedly (LASSO_CRAWL_CIRCUIT_BREAKER_THRESHOLD) — can take several minutes on a large site."
         )
         var restartDescription = "Spawn a fresh instance, confirm it's healthy, then hand off — the running site keeps serving throughout, no dropped connections. Also how an edited datasource config file gets picked up without a rebuild."
         if config.sessionDriver == "memory" {
@@ -155,6 +162,7 @@ final class LassoAdminDelegate: AdminConsoleDelegate {
         let baseURL = self.baseURL
         let logCapture = self.logCapture
         let crawlTracker = self.crawlTracker
+        let datasourceFailureTracker = self.datasourceFailureTracker
         // Fire-and-forget, matching main.swift's own CLI-mode crawl Task —
         // a full crawl (~2,000 real pages, sequential requests) can take
         // minutes; blocking this action's HTTP response for that long
@@ -163,11 +171,16 @@ final class LassoAdminDelegate: AdminConsoleDelegate {
         // server keeps running afterward.
         Task {
             await logCapture?.capture("[crawl-report] started (admin-triggered)")
-            let (results, excludedCount) = await CrawlReport.run(
+            await datasourceFailureTracker.reset()
+            let (results, excludedCount, abortedByCircuitBreaker) = await CrawlReport.run(
                 baseURL: baseURL,
                 siteRoot: config.siteRoot,
                 extensions: config.lassoExtensions,
                 excludePaths: config.crawlExcludePaths,
+                requestDelayMS: config.crawlRequestDelayMS,
+                circuitBreakerThreshold: config.crawlCircuitBreakerThreshold,
+                datasourceFailureThreshold: config.crawlDatasourceFailureThreshold,
+                currentDatasourceFailureCount: { await datasourceFailureTracker.currentCount() },
                 onProgress: { completed, total in
                     Task { await crawlTracker.progress(completed, total) }
                 }
@@ -175,15 +188,21 @@ final class LassoAdminDelegate: AdminConsoleDelegate {
             let cleanCount = results.count { $0.isClean }
             let failingCount = results.count - cleanCount
             let finishedAt = DateFormatter.localizedString(from: Date(), dateStyle: .none, timeStyle: .short)
-            let summary = "Last run: \(results.count) page(s), \(cleanCount) clean, \(failingCount) failing, \(excludedCount) excluded (finished \(finishedAt))."
+            let abortNote = abortedByCircuitBreaker ? " ABORTED EARLY — circuit breaker tripped on repeated backend failures." : ""
+            let summary = "Last run: \(results.count) page(s), \(cleanCount) clean, \(failingCount) failing, \(excludedCount) excluded (finished \(finishedAt)).\(abortNote)"
             await crawlTracker.finish(summary: summary)
             await logCapture?.capture(
-                "[crawl-report] finished: \(results.count) page(s) crawled, \(cleanCount) clean, \(failingCount) failing, \(excludedCount) excluded"
+                "[crawl-report] finished: \(results.count) page(s) crawled, \(cleanCount) clean, \(failingCount) failing, \(excludedCount) excluded\(abortedByCircuitBreaker ? " (ABORTED by circuit breaker)" : "")"
             )
             // Same JSON-output convention as CLI mode, when configured —
             // an admin-triggered run is exactly the kind of run someone
             // would want to diff against a previous baseline afterward.
-            CrawlReport.printAndWrite(results, outputPath: config.crawlReportOutputPath, excludedCount: excludedCount)
+            CrawlReport.printAndWrite(
+                results,
+                outputPath: config.crawlReportOutputPath,
+                excludedCount: excludedCount,
+                abortedByCircuitBreaker: abortedByCircuitBreaker
+            )
         }
         return .ok("Crawl report started in the background — watch the Logs tab for progress and a completion summary.")
     }

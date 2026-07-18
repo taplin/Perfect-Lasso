@@ -207,6 +207,13 @@ struct ScriptBodyParser {
         /// carries the trimmed condition text, since re-deriving it would
         /// mean re-scanning already-consumed input.
         case bareCondition(String)
+        /// Lasso 8's classic slash-closed colon-call with a bare condition
+        /// — `if: cond; ... /if;`, no parens, no braces. Only reachable
+        /// when a colon was consumed (see `readBareConditionBeforeSemicolon`'s
+        /// doc comment) — a real corpus shape distinct from both cases
+        /// above, closed later by `BlockBuilder`'s pairing pass matching
+        /// this opener with a literal `/if`, same as `iterate:`/`while:`.
+        case bareColonCall(String)
     }
 
     /// Classifies which of "if"'s three forms is present at the current
@@ -232,6 +239,21 @@ struct ScriptBodyParser {
             let trimmedCondition = condition.trimmingCharacters(in: .whitespacesAndNewlines)
             if !trimmedCondition.isEmpty, consumeArrowBlockStartIfPresent() {
                 return .bareCondition(trimmedCondition)
+            }
+            index = bareConditionStart
+        }
+
+        // Only after the brace-body form has ruled itself out, and only
+        // when a colon was actually consumed — every real corpus sighting
+        // of this form is `if: cond;`, always colon-prefixed; requiring it
+        // here avoids a bare `if cond` (no colon) with no brace/paren
+        // ever reaching this classification, which would otherwise risk
+        // swallowing unrelated bare expression statements that just
+        // happen to start with the word "if" in some other shape.
+        if colonConsumed, let condition = readBareConditionBeforeSemicolon() {
+            let trimmedCondition = condition.trimmingCharacters(in: .whitespacesAndNewlines)
+            if !trimmedCondition.isEmpty {
+                return .bareColonCall(trimmedCondition)
             }
             index = bareConditionStart
         }
@@ -280,6 +302,25 @@ struct ScriptBodyParser {
                 arguments: [LassoArgument(label: nil, value: conditionExpression)],
                 closing: false,
                 dialect: .lasso9,
+                range: range
+            ))
+            return true
+        case let .bareColonCall(trimmedCondition):
+            // Slash-closed, not brace-closed — deliberately does NOT push
+            // onto openBraceBlockStack (that stack is only for arrow/bare
+            // brace bodies). BlockBuilder's existing pairing pass matches
+            // this .tag(..., closing: false) opener with the real `/if`
+            // closer already in the source, same mechanism iterate:/while:
+            // rely on (Phase 4 of tag-form consolidation).
+            recordFire(name, .bareColonCall)
+            var conditionParser = ExpressionParser(trimmedCondition)
+            let conditionExpression = conditionParser.parseExpression()
+            skipLineRemainder()
+            nodes.append(.tag(
+                name: name,
+                arguments: [LassoArgument(label: nil, value: conditionExpression)],
+                closing: false,
+                dialect: .lasso8,
                 range: range
             ))
             return true
@@ -747,6 +788,59 @@ struct ScriptBodyParser {
             } else if parenDepth == 0, character == "\n" || character == ";" {
                 index = start
                 return nil
+            }
+            index += 1
+        }
+
+        index = start
+        return nil
+    }
+
+    /// The mirror image of `readBareConditionBeforeBraceBody`: real corpus
+    /// Lasso 8 also writes `if` as a classic slash-closed colon-call with a
+    /// bare (paren-less) condition — `if: error_currenterror!='No error';
+    /// ... /if;` (importscripts/ca_web.lasso and 17 other real pages) —
+    /// distinct from both the paren form and the brace-body form above.
+    /// Quote/paren-depth-aware scan identical to that function's, but with
+    /// the termination logic inverted: `;`/newline at depth 0 is the
+    /// expected end of the condition (returns the text), while `{`/`=>`
+    /// means this is actually the brace-body form and this function isn't
+    /// the right match (rewind, return `nil`) — `classifyIfOpen` tries
+    /// `readBareConditionBeforeBraceBody` first for exactly this reason, so
+    /// this one only ever runs once that has already ruled itself out.
+    private mutating func readBareConditionBeforeSemicolon() -> String? {
+        let start = index
+        var parenDepth = 0
+        var quote: Character?
+
+        while index < characters.count {
+            let character = characters[index]
+            if let activeQuote = quote {
+                index += 1
+                if character == "\\" {
+                    index = min(index + 1, characters.count)
+                } else if character == activeQuote {
+                    quote = nil
+                }
+                continue
+            }
+
+            if character == "'" || character == "\"" {
+                quote = character
+            } else if character == "(" {
+                parenDepth += 1
+            } else if character == ")" {
+                parenDepth = max(parenDepth - 1, 0)
+            } else if parenDepth == 0, character == "{" || matches("=>") {
+                index = start
+                return nil
+            } else if parenDepth == 0, character == ";" {
+                let condition = String(characters[start..<index])
+                index += 1
+                return condition
+            } else if parenDepth == 0, character == "\n" {
+                let condition = String(characters[start..<index])
+                return condition
             }
             index += 1
         }

@@ -278,12 +278,14 @@ private func sampleServerConfig(
     filemakerHostOverrides: [String: FileMakerHostOverride] = [:],
     sessionDriver: String = "memory",
     startupPath: URL? = nil,
-    adminConsoleEnabled: Bool = false
+    adminConsoleEnabled: Bool = false,
+    renderExcludePaths: [String] = []
 ) -> ServerConfig {
     ServerConfig(
         siteRoot: URL(fileURLWithPath: "/tmp/sample-site"),
         port: 8181,
         lassoExtensions: ["lasso", "inc"],
+        renderExcludePaths: renderExcludePaths,
         startupPath: startupPath,
         datasourceMap: datasourceMap,
         mysqlHost: "localhost",
@@ -307,6 +309,9 @@ private func sampleServerConfig(
         crawlPathListPath: nil,
         crawlBaselinePath: nil,
         crawlOnlyFailure: nil,
+        crawlRequestDelayMS: 0,
+        crawlCircuitBreakerThreshold: nil,
+        crawlDatasourceFailureThreshold: nil,
         imageProxyPrefix: nil,
         imageProxyTarget: nil,
         tagFormCountersEnabled: false,
@@ -501,6 +506,25 @@ private func sampleDelegate(
     #expect(status.contains("9 clean"))
     // A finished tracker allows starting again.
     #expect(await tracker.tryBegin() == true)
+}
+
+@Test func datasourceFailureTrackerCountsEachRecordedFailure() async {
+    let tracker = DatasourceFailureTracker()
+    #expect(await tracker.currentCount() == 0)
+    await tracker.recordFailure()
+    await tracker.recordFailure()
+    #expect(await tracker.currentCount() == 2)
+}
+
+@Test func datasourceFailureTrackerResetClearsTheCount() async {
+    let tracker = DatasourceFailureTracker()
+    await tracker.recordFailure()
+    await tracker.recordFailure()
+    await tracker.reset()
+    #expect(await tracker.currentCount() == 0)
+    // A reset tracker still counts new failures normally.
+    await tracker.recordFailure()
+    #expect(await tracker.currentCount() == 1)
 }
 
 @Test func crawlRunTrackerStatusDescriptionFallsBackWhenNeverRun() async {

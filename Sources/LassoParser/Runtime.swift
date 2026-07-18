@@ -604,6 +604,19 @@ public struct LassoNativeRegistry: Sendable {
         // `[/Cache]` close needs no handling of its own — it's already
         // covered by the existing generic legacy-closing-tag support.
         register("cache") { _, _ in .void }
+        // [Email_Send] (Lasso 8.5 Language Guide, "Process Tags"): a
+        // process tag — "does not return a value" per its own doc — that
+        // queues/sends a real email via SMTP (-Host/-To/-From/-Subject/
+        // -Body etc.). This project has no resurrected SMTP client, so a
+        // real send isn't possible; real corpus usage (importscripts/*.lasso,
+        // `email_send: -to=..., -from=..., -subject=..., -body=...;`) is
+        // itself only reached on already-degraded/error paths (import
+        // failure notifications), never on the success path a real user
+        // hits. Registered as a no-op, matching the [Cache] precedent
+        // above — clears unknownFunction("email_send") and lets the
+        // surrounding page finish rendering, without pretending to
+        // deliver mail that never actually goes anywhere.
+        register("email_send") { _, _ in .void }
         register("redirect_url") { arguments, context in
             let url = arguments.firstValue(named: "url")?.outputString ??
                 arguments.first?.value.outputString ?? ""
