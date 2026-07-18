@@ -61,61 +61,127 @@ public struct LassoSessionStartCall: Equatable, Sendable {
 /// is a documented limitation of the preflight-scan approach, not a crash;
 /// see the plan's own allowance for "preload lazily requested sessions
 /// before render if the page can be scanned... when feasible."
+///
+/// **`include(...)`/`library(...)` are followed recursively when an
+/// `includeLoader` is supplied.** Real sites overwhelmingly put their
+/// initial `Session_Start` call in a shared header/config include, not
+/// directly in every top-level page — confirmed live 2026-07-18: a real
+/// site's `koi.lasso` only ever calls `include('includes/
+/// siteconfig_cookies.inc')`, and every `Session_Start` call lives inside
+/// that included file. Without following includes, this scanner found
+/// precisely zero session_start calls for that entire site, silently
+/// disabling session tracking altogether — not a narrow edge case, the
+/// standard real-world pattern this whole feature exists to support. Only
+/// a *literal string* path argument can be followed (matching this scan's
+/// existing "only literal args are visible" limitation for session_start
+/// itself) — a dynamically computed include path is invisible here, same
+/// as at any other node type this scanner already can't see through.
 public enum LassoSessionPreflight {
-    public static func scan(_ document: LassoDocument) -> [LassoSessionStartCall] {
+    public static func scan(
+        _ document: LassoDocument,
+        includeLoader: (any LassoIncludeLoader)? = nil,
+        includePath: String? = nil
+    ) -> [LassoSessionStartCall] {
         var found: [LassoSessionStartCall] = []
-        scan(nodes: document.nodes, into: &found)
+        var visitedIncludePaths: Set<String> = []
+        scan(
+            nodes: document.nodes, into: &found,
+            includeLoader: includeLoader, includePath: includePath, visitedIncludePaths: &visitedIncludePaths
+        )
         return found
     }
 
-    private static func scan(nodes: [LassoNode], into found: inout [LassoSessionStartCall]) {
+    private static func scan(
+        nodes: [LassoNode], into found: inout [LassoSessionStartCall],
+        includeLoader: (any LassoIncludeLoader)?, includePath: String?, visitedIncludePaths: inout Set<String>
+    ) {
         for node in nodes {
             switch node {
             case .text:
                 break
             case .expression(let expression, _, _, _):
-                scan(expression: expression, into: &found)
+                scan(expression: expression, into: &found, includeLoader: includeLoader, includePath: includePath, visitedIncludePaths: &visitedIncludePaths)
             case .tag(_, let arguments, _, _, _):
-                for argument in arguments { scan(expression: argument.value, into: &found) }
+                for argument in arguments { scan(expression: argument.value, into: &found, includeLoader: includeLoader, includePath: includePath, visitedIncludePaths: &visitedIncludePaths) }
             case .code(let expressions, _, _, _):
-                for expression in expressions { scan(expression: expression, into: &found) }
+                for expression in expressions { scan(expression: expression, into: &found, includeLoader: includeLoader, includePath: includePath, visitedIncludePaths: &visitedIncludePaths) }
             case .block(_, let arguments, let body, let alternate, _, _):
-                for argument in arguments { scan(expression: argument.value, into: &found) }
-                scan(nodes: body, into: &found)
-                if let alternate { scan(nodes: alternate, into: &found) }
+                for argument in arguments { scan(expression: argument.value, into: &found, includeLoader: includeLoader, includePath: includePath, visitedIncludePaths: &visitedIncludePaths) }
+                scan(nodes: body, into: &found, includeLoader: includeLoader, includePath: includePath, visitedIncludePaths: &visitedIncludePaths)
+                if let alternate { scan(nodes: alternate, into: &found, includeLoader: includeLoader, includePath: includePath, visitedIncludePaths: &visitedIncludePaths) }
             case .typeDefinition(let typeDefinition, _, _):
-                for method in typeDefinition.methods { scan(nodes: method.body, into: &found) }
+                for method in typeDefinition.methods { scan(nodes: method.body, into: &found, includeLoader: includeLoader, includePath: includePath, visitedIncludePaths: &visitedIncludePaths) }
             }
         }
     }
 
-    private static func scan(expression: LassoExpression, into found: inout [LassoSessionStartCall]) {
+    private static func scan(
+        expression: LassoExpression, into found: inout [LassoSessionStartCall],
+        includeLoader: (any LassoIncludeLoader)?, includePath: String?, visitedIncludePaths: inout Set<String>
+    ) {
         switch expression {
         case .call(let callee, let arguments):
-            if case .identifier(let name) = callee, name.caseInsensitiveCompare("session_start") == .orderedSame,
-               let call = makeCall(from: arguments) {
-                found.append(call)
+            if case .identifier(let name) = callee {
+                if name.caseInsensitiveCompare("session_start") == .orderedSame,
+                   let call = makeCall(from: arguments) {
+                    found.append(call)
+                }
+                if let includeLoader,
+                   name.caseInsensitiveCompare("include") == .orderedSame || name.caseInsensitiveCompare("library") == .orderedSame,
+                   let path = literalPathArgument(arguments),
+                   visitedIncludePaths.contains(path) == false {
+                    visitedIncludePaths.insert(path)
+                    if let content = try? includeLoader.loadInclude(path: path, from: includePath) {
+                        let nestedDocument = LassoParser().parse(content)
+                        scan(
+                            nodes: nestedDocument.nodes, into: &found,
+                            includeLoader: includeLoader, includePath: path, visitedIncludePaths: &visitedIncludePaths
+                        )
+                    }
+                }
             }
-            scan(expression: callee, into: &found)
-            for argument in arguments { scan(expression: argument.value, into: &found) }
+            scan(expression: callee, into: &found, includeLoader: includeLoader, includePath: includePath, visitedIncludePaths: &visitedIncludePaths)
+            for argument in arguments { scan(expression: argument.value, into: &found, includeLoader: includeLoader, includePath: includePath, visitedIncludePaths: &visitedIncludePaths) }
         case .member(let base, _, let arguments):
-            scan(expression: base, into: &found)
-            for argument in arguments ?? [] { scan(expression: argument.value, into: &found) }
+            scan(expression: base, into: &found, includeLoader: includeLoader, includePath: includePath, visitedIncludePaths: &visitedIncludePaths)
+            for argument in arguments ?? [] { scan(expression: argument.value, into: &found, includeLoader: includeLoader, includePath: includePath, visitedIncludePaths: &visitedIncludePaths) }
         case .unary(_, let value):
-            scan(expression: value, into: &found)
+            scan(expression: value, into: &found, includeLoader: includeLoader, includePath: includePath, visitedIncludePaths: &visitedIncludePaths)
         case .binary(let left, _, let right):
-            scan(expression: left, into: &found)
-            scan(expression: right, into: &found)
+            scan(expression: left, into: &found, includeLoader: includeLoader, includePath: includePath, visitedIncludePaths: &visitedIncludePaths)
+            scan(expression: right, into: &found, includeLoader: includeLoader, includePath: includePath, visitedIncludePaths: &visitedIncludePaths)
         case .assignment(let target, let value):
-            scan(expression: target, into: &found)
-            scan(expression: value, into: &found)
+            scan(expression: target, into: &found, includeLoader: includeLoader, includePath: includePath, visitedIncludePaths: &visitedIncludePaths)
+            scan(expression: value, into: &found, includeLoader: includeLoader, includePath: includePath, visitedIncludePaths: &visitedIncludePaths)
         case .ternary(let condition, let whenTrue, let whenFalse):
-            scan(expression: condition, into: &found)
-            scan(expression: whenTrue, into: &found)
-            scan(expression: whenFalse, into: &found)
+            scan(expression: condition, into: &found, includeLoader: includeLoader, includePath: includePath, visitedIncludePaths: &visitedIncludePaths)
+            scan(expression: whenTrue, into: &found, includeLoader: includeLoader, includePath: includePath, visitedIncludePaths: &visitedIncludePaths)
+            scan(expression: whenFalse, into: &found, includeLoader: includeLoader, includePath: includePath, visitedIncludePaths: &visitedIncludePaths)
         case .string, .integer, .decimal, .boolean, .null, .void, .variable, .identifier, .unknown:
             break
         }
+    }
+
+    /// Mirrors `Renderer.renderInclude`/`renderLibrary`'s own path
+    /// extraction (`-file=`/`-path=`/first positional), but restricted to
+    /// a literal `.string` argument value — this scan works over raw,
+    /// unevaluated AST, so a dynamically computed path (a variable, a
+    /// concatenation, `action_param(...)`, etc.) can't be resolved here
+    /// and is correctly treated as invisible, same as this scan's existing
+    /// literal-only limitation for session_start's own arguments.
+    private static func literalPathArgument(_ arguments: [LassoArgument]) -> String? {
+        func literalString(_ argument: LassoArgument) -> String? {
+            if case .string(let value) = argument.value { return value }
+            return nil
+        }
+        if let fileArgument = arguments.first(where: { $0.label?.caseInsensitiveCompare("file") == .orderedSame }) {
+            return literalString(fileArgument)
+        }
+        if let pathArgument = arguments.first(where: { $0.label?.caseInsensitiveCompare("path") == .orderedSame }) {
+            return literalString(pathArgument)
+        }
+        guard let firstPositional = arguments.first(where: { $0.label == nil }) else { return nil }
+        return literalString(firstPositional)
     }
 
     private static func makeCall(from arguments: [LassoArgument]) -> LassoSessionStartCall? {

@@ -3883,6 +3883,72 @@ final class FullyRecordingResponseSink: LassoResponseSink, @unchecked Sendable {
     #expect(LassoSessionPreflight.scan(document).isEmpty)
 }
 
+// Real corpus (koi.lasso -> includes/siteconfig_cookies.inc) puts its
+// Session_Start calls inside a shared config include, not directly in the
+// top-level page -- confirmed live 2026-07-18 that without following
+// include(...)/library(...) calls, this scanner found zero session_start
+// calls for the whole real site, silently disabling session tracking
+// altogether (not a narrow edge case -- the standard real-world pattern).
+@Test func sessionPreflightScanFollowsLiteralIncludeCallsWhenALoaderIsSupplied() {
+    let loader = MapIncludeLoader(files: [
+        "includes/siteconfig_cookies.inc": "<?lassoscript session_start('scrubs', -expires=120, -usecookie) ?>",
+    ])
+    let document = LassoParser().parse("<?lassoscript include('includes/siteconfig_cookies.inc') ?>")
+    let calls = LassoSessionPreflight.scan(document, includeLoader: loader, includePath: "koi.lasso")
+    #expect(calls.count == 1)
+    #expect(calls.first?.name == "scrubs")
+    #expect(calls.first?.expiresSeconds == 120)
+}
+
+@Test func sessionPreflightScanFollowsLibraryCallsToo() {
+    let loader = MapIncludeLoader(files: [
+        "includes/siteconfig.lib": "<?lassoscript session_start('cart') ?>",
+    ])
+    let document = LassoParser().parse("<?lassoscript library('includes/siteconfig.lib') ?>")
+    let calls = LassoSessionPreflight.scan(document, includeLoader: loader, includePath: "koi.lasso")
+    #expect(calls.count == 1)
+    #expect(calls.first?.name == "cart")
+}
+
+@Test func sessionPreflightScanFollowsNestedIncludesTransitively() {
+    let loader = MapIncludeLoader(files: [
+        "includes/outer.inc": "<?lassoscript include('includes/inner.inc') ?>",
+        "includes/inner.inc": "<?lassoscript session_start('cart') ?>",
+    ])
+    let document = LassoParser().parse("<?lassoscript include('includes/outer.inc') ?>")
+    let calls = LassoSessionPreflight.scan(document, includeLoader: loader, includePath: "koi.lasso")
+    #expect(calls.count == 1)
+    #expect(calls.first?.name == "cart")
+}
+
+@Test func sessionPreflightScanDoesNotInfiniteLoopOnACircularInclude() {
+    let loader = MapIncludeLoader(files: [
+        "includes/a.inc": "<?lassoscript include('includes/b.inc') ?>",
+        "includes/b.inc": "<?lassoscript session_start('cart') include('includes/a.inc') ?>",
+    ])
+    let document = LassoParser().parse("<?lassoscript include('includes/a.inc') ?>")
+    let calls = LassoSessionPreflight.scan(document, includeLoader: loader, includePath: "koi.lasso")
+    #expect(calls.count == 1)
+    #expect(calls.first?.name == "cart")
+}
+
+@Test func sessionPreflightScanIgnoresIncludesWithNoLoaderSupplied() {
+    // Backward compatible with every existing call site/test that doesn't
+    // pass includeLoader — a plain flat scan, matching prior behavior.
+    let document = LassoParser().parse("<?lassoscript include('includes/siteconfig_cookies.inc') ?>")
+    #expect(LassoSessionPreflight.scan(document).isEmpty)
+}
+
+@Test func sessionPreflightScanIgnoresADynamicIncludePath() {
+    // Same documented literal-only limitation as session_start's own
+    // arguments — a computed include path can't be resolved from raw AST.
+    let loader = MapIncludeLoader(files: [
+        "includes/siteconfig_cookies.inc": "<?lassoscript session_start('cart') ?>",
+    ])
+    let document = LassoParser().parse("<?lassoscript include(var(includePath)) ?>")
+    #expect(LassoSessionPreflight.scan(document, includeLoader: loader, includePath: "koi.lasso").isEmpty)
+}
+
 @Test func sessionAddvarResolvesNameKeywordAndPositionalVarNameCorrectly() async throws {
     // Real corpus shape: Session_Addvar(-Name='cart', 'sort_by') — the
     // session name is the -Name= keyword, the var name is the (only)
