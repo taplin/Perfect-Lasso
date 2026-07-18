@@ -4467,6 +4467,39 @@ private final class MapIncludeLoader: LassoIncludeLoader, @unchecked Sendable {
     #expect(output == "hello")
 }
 
+@Test func stringTrimMutatesTheInvocantInPlaceAndProducesNoOutputAsABareStatement() async throws {
+    // string->trim mutates its invocant in place, same as ->append/->replace
+    // above — Lasso 8.5 Language Guide: "Removes all white space from the
+    // start and end of the string. Modifies the string in place and
+    // returns no value." Real corpus: login_check_top.lasso's bare
+    // `$email->(trim)` — confirmed live 2026-07-18 against koi.scrubs.test's
+    // login flow, immediately after the Valid_Email fix.
+    var context = LassoContext()
+    let output = try await LassoRenderer().render(
+        "[var(email::string='  test@example.com  ')][$email->(trim)][$email]",
+        context: &context
+    )
+    #expect(output == "test@example.com")
+}
+
+@Test func stringTrimOnANonVariableBaseStillReturnsItsComputedValue() async throws {
+    var context = LassoContext()
+    let output = try await LassoRenderer().render(
+        "[('  hello  ')->trim]",
+        context: &context
+    )
+    #expect(output == "hello")
+}
+
+@Test func stringTrimRemovesTabsAndNewlinesAsWellAsSpaces() async throws {
+    var context = LassoContext()
+    let output = try await LassoRenderer().render(
+        "[var(padded::string='\\t\\r\\n hello \\n\\t')][$padded->(trim)][$padded]",
+        context: &context
+    )
+    #expect(output == "hello")
+}
+
 @Test func chainedStringReplaceCallsBuildASlugWithNoStrayOutput() async throws {
     // The exact real-corpus shape from pages/thumbs2.page.lasso (also
     // pages/thumbs.page.lasso, thumbs3.page.lasso, and every
