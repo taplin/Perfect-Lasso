@@ -3,6 +3,7 @@ import Testing
 @testable import LassoPerfectServer
 import LassoParser
 import PerfectAdminConsole
+import PerfectFileMakerAdminAPI
 import PerfectNIO
 
 // See Documentation/web-response-include-plan.md. Covers the pure
@@ -279,7 +280,14 @@ private func sampleServerConfig(
     sessionDriver: String = "memory",
     startupPath: URL? = nil,
     adminConsoleEnabled: Bool = false,
-    renderExcludePaths: [String] = []
+    renderExcludePaths: [String] = [],
+    cwpJanitorEnabled: Bool = false,
+    cwpJanitorDryRun: Bool = true,
+    cwpJanitorPollIntervalSeconds: Int = 60,
+    cwpJanitorDurationThresholdSeconds: Int? = 150,
+    cwpJanitorMaxSessions: Int? = nil,
+    cwpJanitorMinFloor: Int = 5,
+    cwpJanitorMaxDisconnectsPerSweep: Int? = nil
 ) -> ServerConfig {
     ServerConfig(
         siteRoot: URL(fileURLWithPath: "/tmp/sample-site"),
@@ -317,7 +325,19 @@ private func sampleServerConfig(
         tagFormCountersEnabled: false,
         adminConsoleEnabled: adminConsoleEnabled,
         adminConsolePort: 8990,
-        adminConsoleTokenPath: "/tmp/sample-admin.token"
+        adminConsoleTokenPath: "/tmp/sample-admin.token",
+        cwpJanitorEnabled: cwpJanitorEnabled,
+        cwpJanitorDryRun: cwpJanitorDryRun,
+        cwpJanitorPollIntervalSeconds: cwpJanitorPollIntervalSeconds,
+        cwpJanitorDurationThresholdSeconds: cwpJanitorDurationThresholdSeconds,
+        cwpJanitorMaxSessions: cwpJanitorMaxSessions,
+        cwpJanitorMinFloor: cwpJanitorMinFloor,
+        cwpJanitorMaxDisconnectsPerSweep: cwpJanitorMaxDisconnectsPerSweep,
+        fmAdminAPIHost: cwpJanitorEnabled ? "192.0.2.9" : nil,
+        fmAdminAPIPort: 16000,
+        fmAdminAPIUser: cwpJanitorEnabled ? "admin" : nil,
+        fmAdminAPIPassword: cwpJanitorEnabled ? "secret" : nil,
+        fmAdminAPITrustSelfSignedTLS: false
     )
 }
 
@@ -340,7 +360,9 @@ private func sampleDelegate(
     startTime: Date = Date(),
     siteServerTask: Task<Void, Error> = neverCompletingTask(),
     crawlTracker: CrawlRunTracker = CrawlRunTracker(),
-    restartCoordinator: RestartCoordinator = RestartCoordinator()
+    restartCoordinator: RestartCoordinator = RestartCoordinator(),
+    janitorTracker: CWPSessionJanitorTracker = CWPSessionJanitorTracker(),
+    cwpAdminAPIClient: FMAdminClient? = nil
 ) -> LassoAdminDelegate {
     LassoAdminDelegate(
         config: config,
@@ -350,7 +372,9 @@ private func sampleDelegate(
         baseURL: "http://localhost:\(config.port)",
         siteServerTask: siteServerTask,
         crawlTracker: crawlTracker,
-        restartCoordinator: restartCoordinator
+        restartCoordinator: restartCoordinator,
+        janitorTracker: janitorTracker,
+        cwpAdminAPIClient: cwpAdminAPIClient
     )
 }
 
@@ -467,6 +491,66 @@ private func sampleDelegate(
     let result = try await delegate.executeAction("crawl-report")
     #expect(result.success == false)
     #expect(result.message.contains("already running"))
+}
+
+// MARK: - CWP session janitor wiring (thin — the actual selection/sweep
+// logic lives in and is tested by Perfect-FileMaker-AdminAPI itself)
+
+@Test func lassoAdminDelegateJanitorStatusSectionShowsDisabledByDefault() async throws {
+    let delegate = sampleDelegate(config: sampleServerConfig())
+    let sections = await delegate.additionalStatusSections()
+    let janitorSection = try #require(sections.first { $0.title == "CWP Session Janitor" })
+    let items = Dictionary(uniqueKeysWithValues: janitorSection.items)
+    #expect(items["Enabled"] == "no")
+    // Only the "Enabled" row when disabled — no threshold/mode noise.
+    #expect(items.count == 1)
+}
+
+@Test func lassoAdminDelegateJanitorStatusSectionShowsFullConfigWhenEnabled() async throws {
+    let config = sampleServerConfig(
+        cwpJanitorEnabled: true,
+        cwpJanitorDryRun: false,
+        cwpJanitorPollIntervalSeconds: 45,
+        cwpJanitorDurationThresholdSeconds: 200,
+        cwpJanitorMaxSessions: 10,
+        cwpJanitorMinFloor: 3,
+        cwpJanitorMaxDisconnectsPerSweep: 20
+    )
+    let delegate = sampleDelegate(config: config)
+    let sections = await delegate.additionalStatusSections()
+    let janitorSection = try #require(sections.first { $0.title == "CWP Session Janitor" })
+    let items = Dictionary(uniqueKeysWithValues: janitorSection.items)
+    #expect(items["Enabled"] == "yes")
+    #expect(items["Mode"] == "ARMED (real disconnects)")
+    #expect(items["Poll interval"] == "45s")
+    #expect(items["Duration threshold"] == "200s")
+    #expect(items["Count threshold"] == "10")
+    #expect(items["Min floor"] == "3")
+    #expect(items["Max disconnects/sweep"] == "20")
+    #expect(items["Last sweep"] == "none yet")
+}
+
+@Test func lassoAdminDelegateAvailableActionsOmitsJanitorTriggerWhenDisabled() async {
+    let delegate = sampleDelegate(config: sampleServerConfig())
+    let actions = await delegate.availableActions()
+    #expect(actions.contains { $0.name == "cwp-janitor-run-now" } == false)
+}
+
+@Test func lassoAdminDelegateAvailableActionsIncludesJanitorTriggerWhenEnabled() async {
+    let delegate = sampleDelegate(config: sampleServerConfig(cwpJanitorEnabled: true))
+    let actions = await delegate.availableActions()
+    let janitorAction = actions.first { $0.name == "cwp-janitor-run-now" }
+    #expect(janitorAction != nil)
+    #expect(janitorAction?.isDestructive == false)
+}
+
+@Test func lassoAdminDelegateExecuteJanitorRunNowFailsCleanlyWithNoClient() async throws {
+    // cwpJanitorEnabled: true but sampleDelegate's default cwpAdminAPIClient
+    // is nil (matches main.swift's real behavior if config validation were
+    // somehow bypassed) — must fail cleanly with no network attempt, not crash.
+    let delegate = sampleDelegate(config: sampleServerConfig(cwpJanitorEnabled: true))
+    let result = try await delegate.executeAction("cwp-janitor-run-now")
+    #expect(result.success == false)
 }
 
 // MARK: - CrawlRunTracker (crawl-report live status)

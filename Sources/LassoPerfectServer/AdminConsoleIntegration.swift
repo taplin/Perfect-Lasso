@@ -4,6 +4,7 @@ import LassoParser
 import PerfectAdminConsole
 import PerfectCRUD
 import PerfectFileMaker
+import PerfectFileMakerAdminAPI
 import PerfectMySQL
 
 /// `AdminConsoleDelegate` conformer supplying this server's Lasso-specific
@@ -50,6 +51,20 @@ final class LassoAdminDelegate: AdminConsoleDelegate {
     /// here) — a separate instance would always read zero, defeating the
     /// whole point. See `DatasourceFailureTracker`'s own doc comment.
     private let datasourceFailureTracker: DatasourceFailureTracker
+    /// Live/last-run state for the CWP session janitor — see
+    /// `CWPSessionJanitorTracker`'s doc comment (in `Perfect-FileMaker-AdminAPI`,
+    /// generic to any consumer of that package, not Lasso-specific).
+    private let janitorTracker: CWPSessionJanitorTracker
+    /// The same `FMAdminClient` instance `main.swift`'s background poll loop
+    /// uses, shared here so the manual "run now" action hits the same
+    /// cached Admin API session/token rather than authenticating a second
+    /// time. `nil` when `config.cwpJanitorEnabled` is false.
+    private let cwpAdminAPIClient: FMAdminClient?
+    /// Handle to `main.swift`'s background janitor poll `Task`, cancelled
+    /// alongside `siteServerTask` on a successful restart handoff so an
+    /// in-flight Admin API call doesn't linger past it. `nil` when the
+    /// janitor is disabled.
+    private let cwpJanitorTask: Task<Void, Never>?
 
     init(
         config: ServerConfig,
@@ -60,7 +75,10 @@ final class LassoAdminDelegate: AdminConsoleDelegate {
         siteServerTask: Task<Void, Error>,
         crawlTracker: CrawlRunTracker = CrawlRunTracker(),
         restartCoordinator: RestartCoordinator = RestartCoordinator(),
-        datasourceFailureTracker: DatasourceFailureTracker = DatasourceFailureTracker()
+        datasourceFailureTracker: DatasourceFailureTracker = DatasourceFailureTracker(),
+        janitorTracker: CWPSessionJanitorTracker = CWPSessionJanitorTracker(),
+        cwpAdminAPIClient: FMAdminClient? = nil,
+        cwpJanitorTask: Task<Void, Never>? = nil
     ) {
         self.config = config
         self.startTime = startTime
@@ -71,6 +89,9 @@ final class LassoAdminDelegate: AdminConsoleDelegate {
         self.crawlTracker = crawlTracker
         self.restartCoordinator = restartCoordinator
         self.datasourceFailureTracker = datasourceFailureTracker
+        self.janitorTracker = janitorTracker
+        self.cwpAdminAPIClient = cwpAdminAPIClient
+        self.cwpJanitorTask = cwpJanitorTask
     }
 
     // MARK: - Phase 1: status display
@@ -102,7 +123,34 @@ final class LassoAdminDelegate: AdminConsoleDelegate {
         if let prefix = config.imageProxyPrefix, let target = config.imageProxyTarget {
             items.append(("Image proxy", "\(prefix) -> \(target)"))
         }
-        return [AdminStatusSection(title: "Lasso Site", items: items)]
+        return [
+            AdminStatusSection(title: "Lasso Site", items: items),
+            AdminStatusSection(title: "CWP Session Janitor", items: await cwpJanitorStatusItems()),
+        ]
+    }
+
+    private func cwpJanitorStatusItems() async -> [(key: String, value: String)] {
+        var items: [(key: String, value: String)] = [
+            ("Enabled", config.cwpJanitorEnabled ? "yes" : "no"),
+        ]
+        guard config.cwpJanitorEnabled else { return items }
+        items.append(("Mode", config.cwpJanitorDryRun ? "dry-run (no real disconnects)" : "ARMED (real disconnects)"))
+        items.append(("Poll interval", "\(config.cwpJanitorPollIntervalSeconds)s"))
+        items.append(("Duration threshold", config.cwpJanitorDurationThresholdSeconds.map { "\($0)s" } ?? "disabled"))
+        items.append(("Count threshold", config.cwpJanitorMaxSessions.map { "\($0)" } ?? "disabled"))
+        items.append(("Min floor", "\(config.cwpJanitorMinFloor)"))
+        items.append(("Max disconnects/sweep", config.cwpJanitorMaxDisconnectsPerSweep.map { "\($0)" } ?? "unlimited"))
+        let snapshot = await janitorTracker.snapshot()
+        if let lastSweepAt = snapshot.lastSweepAt {
+            let when = DateFormatter.localizedString(from: lastSweepAt, dateStyle: .none, timeStyle: .short)
+            items.append(("Last sweep", "\(when): \(snapshot.considered) considered, \(snapshot.disconnected) disconnected"))
+            if let error = snapshot.error {
+                items.append(("Last error", error))
+            }
+        } else {
+            items.append(("Last sweep", "none yet"))
+        }
+        return items
     }
 
     // MARK: - Phase 2: actions
@@ -129,7 +177,7 @@ final class LassoAdminDelegate: AdminConsoleDelegate {
         if config.sessionDriver == "memory" {
             restartDescription += " Uses the in-memory session driver: every logged-in visitor's session is lost on handoff."
         }
-        return [
+        var actions = [
             AdminAction(
                 name: "crawl-report",
                 label: "Run Crawl Report",
@@ -145,11 +193,33 @@ final class LassoAdminDelegate: AdminConsoleDelegate {
                 isDestructive: true
             ),
         ]
+        if config.cwpJanitorEnabled {
+            // Not `isDestructive` — this runs through the exact same
+            // dry-run/threshold-gated sweep as the automatic poll loop
+            // (see `executeCWPJanitorRunNow`), never a separate,
+            // more-dangerous manual-only path. It's a "run it now instead
+            // of waiting for the next poll" convenience, not its own
+            // distinct destructive action.
+            let janitorDescription = await janitorTracker.statusDescription(
+                fallback: "Force an immediate CWP session sweep instead of waiting for the next scheduled poll (every \(config.cwpJanitorPollIntervalSeconds)s). Runs in \(config.cwpJanitorDryRun ? "DRY-RUN" : "ARMED") mode, same as the automatic loop."
+            )
+            actions.append(AdminAction(
+                name: "cwp-janitor-run-now",
+                label: "Run CWP Janitor Now",
+                description: janitorDescription,
+                category: "maintenance",
+                isDestructive: false
+            ))
+        }
+        return actions
     }
 
     func executeAction(_ name: String) async throws -> AdminActionResult {
         if name == "restart-server" {
             return await executeRestartServer()
+        }
+        if name == "cwp-janitor-run-now" {
+            return await executeCWPJanitorRunNow()
         }
         guard name == "crawl-report" else {
             return .failed("Unknown action: \(name)")
@@ -243,12 +313,16 @@ final class LassoAdminDelegate: AdminConsoleDelegate {
         case .healthy(let pid):
             await logCapture?.capture("[admin] restart-server: new instance (pid \(pid)) confirmed healthy — handing off")
             let siteServerTask = self.siteServerTask
+            let cwpJanitorTask = self.cwpJanitorTask
             let logCapture = self.logCapture
             // Fire-and-forget with a brief delay, matching the crawl-report action's
             // own pattern — this action's HTTP response (below) needs to actually
             // reach the caller before anything disruptive happens.
             Task {
                 try? await Task.sleep(for: .milliseconds(300))
+                // Stop the janitor's poll loop too, so it can't leave an
+                // in-flight Admin API call running past this process's exit.
+                cwpJanitorTask?.cancel()
                 siteServerTask.cancel()
                 // Bounded: an actively-executing request or a WebSocket connection has
                 // no drain deadline of its own (see main.swift's siteServerTask doc
@@ -280,6 +354,39 @@ final class LassoAdminDelegate: AdminConsoleDelegate {
             }
             return .ok(message)
         }
+    }
+
+    /// Forces an immediate CWP session sweep instead of waiting for the
+    /// next scheduled poll. Runs through the exact same
+    /// `CWPSessionJanitor.sweep(...)` call as `main.swift`'s background
+    /// poll loop, respecting whatever `config.cwpJanitorDryRun` is
+    /// currently set to — this is never a separate, more-dangerous manual
+    /// path. `CWPSessionJanitor.sweep` itself calls `janitorTracker.tryBegin()`,
+    /// so this method just checks `isRunning` first to give a clean,
+    /// immediate rejection rather than silently doing nothing.
+    private func executeCWPJanitorRunNow() async -> AdminActionResult {
+        guard let cwpAdminAPIClient else {
+            return .failed("CWP session janitor is not enabled or missing Admin API config.")
+        }
+        if await janitorTracker.isRunning {
+            return .failed("A sweep is already running. \(await janitorTracker.statusDescription(fallback: ""))")
+        }
+        let config = self.config
+        let janitorTracker = self.janitorTracker
+        let logCapture = self.logCapture
+        Task {
+            await CWPSessionJanitor.sweep(
+                client: cwpAdminAPIClient,
+                durationThresholdSeconds: config.cwpJanitorDurationThresholdSeconds,
+                maxSessions: config.cwpJanitorMaxSessions,
+                minFloor: config.cwpJanitorMinFloor,
+                maxDisconnectsPerSweep: config.cwpJanitorMaxDisconnectsPerSweep,
+                dryRun: config.cwpJanitorDryRun,
+                tracker: janitorTracker,
+                log: { line in await logCapture?.capture(line) }
+            )
+        }
+        return .ok("CWP session sweep started in the background (\(config.cwpJanitorDryRun ? "dry-run" : "ARMED")) — watch the Logs tab or status section.")
     }
 
     // MARK: - Phase 3: datasource management

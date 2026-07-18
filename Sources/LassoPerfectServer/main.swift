@@ -7,6 +7,7 @@ import LassoPerfectSession
 import PerfectAdminConsole
 import PerfectCRUD
 import PerfectFileMaker
+import PerfectFileMakerAdminAPI
 import PerfectMySQL
 import PerfectNIO
 import NIOHTTP1
@@ -172,6 +173,87 @@ struct ServerConfig: Sendable {
     /// `NSTemporaryDirectory()`, matching the pattern
     /// `PerfectAdminConsole`'s own README documents.
     let adminConsoleTokenPath: String
+    /// `LASSO_CWP_JANITOR_ENABLED=1` — start a background task that polls
+    /// FileMaker Server's Admin API and disconnects stale/excess Custom
+    /// Web Publishing sessions (see `PerfectFileMakerAdminAPI`'s
+    /// `CWPSessionJanitor`). Off by default: an automated, unattended,
+    /// timer-triggered cleanup action is a deployment-level opt-in, not a
+    /// default. See `Documentation/lasso-perfect-server.md`'s FileMaker
+    /// connectivity section for why this exists — WPE (built on Apache
+    /// Tomcat internally) can leave orphaned CWP sessions that don't clear
+    /// via its own undocumented ~30-minute internal reaper, saturating
+    /// real backend capacity in the meantime.
+    ///
+    /// Confirmed live 2026-07-17 against a real FileMaker Server instance
+    /// (and its own published OpenAPI spec) that `GET /clients` does return
+    /// CWP connections with `appType == "CWP"` — an earlier same-day
+    /// verification pass concluded otherwise because it checked
+    /// immediately after firing a test request; there's a short server-side
+    /// propagation delay (observed: absent immediately, present ~30s
+    /// later) before a new connection appears. Not an issue for this
+    /// feature's actual duration-threshold logic (it only ever targets
+    /// connections older than a threshold), only for anyone re-verifying
+    /// with an immediate post-request check.
+    let cwpJanitorEnabled: Bool
+    /// `LASSO_CWP_JANITOR_DRY_RUN`, default `true` — when true, the janitor
+    /// only logs what it WOULD disconnect and performs zero real
+    /// disconnects. Set to `0`/`false`/`no` to arm real disconnects. This
+    /// is an unattended timer action with no per-run human confirmation,
+    /// so it gets an extra safety gate beyond what a manually-confirmed
+    /// action (like "Restart Server", `isDestructive: true`) already has.
+    let cwpJanitorDryRun: Bool
+    /// `LASSO_CWP_JANITOR_POLL_INTERVAL_SECONDS`, default 60.
+    let cwpJanitorPollIntervalSeconds: Int
+    /// `LASSO_CWP_JANITOR_DURATION_THRESHOLD_SECONDS` — of the sessions over
+    /// `cwpJanitorMaxSessions`, only the ones ALSO open longer than this are
+    /// actual disconnect candidates (`nil`/unset-to-0 disables this filter,
+    /// so every over-the-limit session is a candidate regardless of age).
+    /// A session's age alone, while under the count limit, is never
+    /// sufficient reason to disconnect it — see `cwpJanitorMaxSessions`.
+    let cwpJanitorDurationThresholdSeconds: Int?
+    /// `LASSO_CWP_JANITOR_MAX_SESSIONS` — the ONLY trigger for considering a
+    /// disconnect at all. `nil`/unset-to-0 disables the janitor entirely (it
+    /// never disconnects anything based on duration alone). When total
+    /// active CWP session count exceeds this, the oldest sessions beyond the
+    /// limit become candidates — further narrowed by
+    /// `cwpJanitorDurationThresholdSeconds` and never taken below
+    /// `cwpJanitorMinFloor`.
+    let cwpJanitorMaxSessions: Int?
+    /// `LASSO_CWP_JANITOR_MIN_FLOOR`, default 5 — never disconnect a CWP
+    /// session if doing so would leave fewer than this many CWP sessions
+    /// standing. Safety net against a misconfigured threshold zeroing out
+    /// real production traffic.
+    let cwpJanitorMinFloor: Int
+    /// `LASSO_CWP_JANITOR_MAX_DISCONNECTS_PER_SWEEP` — caps how many
+    /// sessions a single sweep disconnects, oldest-first. A big backlog
+    /// (e.g. after a burst of load) drains gradually over several sweeps
+    /// instead of all at once, so a large batch of real, still-in-use
+    /// sessions can't all get disconnected in the same instant.
+    /// `nil`/unset-to-0 disables the cap (a sweep can disconnect everything
+    /// it selects in one pass).
+    let cwpJanitorMaxDisconnectsPerSweep: Int?
+    /// Admin API host — `datasourceFile?.adminAPI?.host` or
+    /// `LASSO_FM_ADMIN_HOST`. Required (throws
+    /// `ServerConfigError.missingCWPJanitorAdminAPIConfig` at startup) if
+    /// `cwpJanitorEnabled` is true and this is unset. A SEPARATE FileMaker
+    /// Server admin account from `filemakerUser`/`filemakerPassword` — the
+    /// Admin API (port 16000) is a different interface from classic XML
+    /// CWP and needs its own credentials.
+    let fmAdminAPIHost: String?
+    /// `LASSO_FM_ADMIN_PORT`, default 16000.
+    let fmAdminAPIPort: Int
+    /// `LASSO_FM_ADMIN_USER`.
+    let fmAdminAPIUser: String?
+    /// `LASSO_FM_ADMIN_PASSWORD`.
+    let fmAdminAPIPassword: String?
+    /// `LASSO_FM_ADMIN_TRUST_SELF_SIGNED_TLS`, default `false` — when
+    /// `true`, the Admin API client accepts ANY server certificate
+    /// unconditionally (see `FMAdminClient.insecureURLSession()`), for a
+    /// known dev/test FileMaker Server using its default self-signed
+    /// "Claris Self Signed Certificate". Off by default: enabling this
+    /// against a server reachable over an untrusted network defeats TLS's
+    /// whole purpose.
+    let fmAdminAPITrustSelfSignedTLS: Bool
 
     static func load() throws -> ServerConfig {
         let env = ProcessInfo.processInfo.environment
@@ -236,6 +318,15 @@ struct ServerConfig: Sendable {
             throw ServerConfigError.missingFileMakerHost
         }
 
+        let cwpJanitorEnabled = Self.isTruthyEnv(env["LASSO_CWP_JANITOR_ENABLED"])
+        let fmAdminAPIHost = datasourceFile?.adminAPI?.host ?? env["LASSO_FM_ADMIN_HOST"]
+        let fmAdminAPIPort = datasourceFile?.adminAPI?.port ?? env["LASSO_FM_ADMIN_PORT"].flatMap(Int.init) ?? 16000
+        let fmAdminAPIUser = datasourceFile?.adminAPI?.user ?? env["LASSO_FM_ADMIN_USER"]
+        let fmAdminAPIPassword = datasourceFile?.adminAPI?.password ?? env["LASSO_FM_ADMIN_PASSWORD"]
+        if cwpJanitorEnabled, fmAdminAPIHost == nil || fmAdminAPIUser == nil || fmAdminAPIPassword == nil {
+            throw ServerConfigError.missingCWPJanitorAdminAPIConfig
+        }
+
         let renderExcludePaths = (env["LASSO_RENDER_EXCLUDE_PATHS"] ?? "")
             .split(separator: ",")
             .map { $0.trimmingCharacters(in: .whitespacesAndNewlines) }
@@ -291,13 +382,43 @@ struct ServerConfig: Sendable {
             adminConsoleEnabled: Self.isTruthyEnv(env["LASSO_ADMIN_CONSOLE"]),
             adminConsolePort: env["LASSO_ADMIN_PORT"].flatMap(Int.init) ?? 8990,
             adminConsoleTokenPath: env["LASSO_ADMIN_TOKEN_PATH"]
-                ?? (NSTemporaryDirectory() + "lasso-perfect-server-admin.token")
+                ?? (NSTemporaryDirectory() + "lasso-perfect-server-admin.token"),
+            cwpJanitorEnabled: cwpJanitorEnabled,
+            cwpJanitorDryRun: Self.isFalsyEnv(env["LASSO_CWP_JANITOR_DRY_RUN"]) == false,
+            cwpJanitorPollIntervalSeconds: env["LASSO_CWP_JANITOR_POLL_INTERVAL_SECONDS"].flatMap(Int.init) ?? 60,
+            cwpJanitorDurationThresholdSeconds: {
+                let configured = env["LASSO_CWP_JANITOR_DURATION_THRESHOLD_SECONDS"].flatMap(Int.init) ?? 150
+                return configured > 0 ? configured : nil
+            }(),
+            cwpJanitorMaxSessions: {
+                let configured = env["LASSO_CWP_JANITOR_MAX_SESSIONS"].flatMap(Int.init) ?? 0
+                return configured > 0 ? configured : nil
+            }(),
+            cwpJanitorMinFloor: env["LASSO_CWP_JANITOR_MIN_FLOOR"].flatMap(Int.init) ?? 5,
+            cwpJanitorMaxDisconnectsPerSweep: {
+                let configured = env["LASSO_CWP_JANITOR_MAX_DISCONNECTS_PER_SWEEP"].flatMap(Int.init) ?? 0
+                return configured > 0 ? configured : nil
+            }(),
+            fmAdminAPIHost: fmAdminAPIHost,
+            fmAdminAPIPort: fmAdminAPIPort,
+            fmAdminAPIUser: fmAdminAPIUser,
+            fmAdminAPIPassword: fmAdminAPIPassword,
+            fmAdminAPITrustSelfSignedTLS: Self.isTruthyEnv(env["LASSO_FM_ADMIN_TRUST_SELF_SIGNED_TLS"])
         )
     }
 
     private static func isTruthyEnv(_ value: String?) -> Bool {
         guard let value else { return false }
         return ["1", "true", "yes"].contains(value.lowercased())
+    }
+
+    /// Like `isTruthyEnv`, but for flags that default to `true` when unset
+    /// (e.g. `LASSO_CWP_JANITOR_DRY_RUN`, which must default to dry-run-on
+    /// — a `nil` env var means "stay safe," not "stay off"). Only an
+    /// explicit `0`/`false`/`no` value flips it to `false`.
+    private static func isFalsyEnv(_ value: String?) -> Bool {
+        guard let value else { return false }
+        return ["0", "false", "no"].contains(value.lowercased())
     }
 }
 
@@ -319,6 +440,7 @@ struct ServerConfig: Sendable {
 ///             "sessionDatabase": "...", "allowWrites": false, "allowRawSQL": false},
 ///   "filemaker": {"host": "...", "port": 80, "user": "...", "password": "...",
 ///                 "allowWrites": false},
+///   "adminAPI": {"host": "...", "port": 16000, "user": "...", "password": "..."},
 ///   "datasources": {
 ///     "some_mysql_alias": {"type": "mysql", "schema": "some_schema"},
 ///     "some_filemaker_alias": {"type": "filemaker"}
@@ -334,10 +456,11 @@ struct ServerConfig: Sendable {
 struct DatasourceFileConfig: Decodable {
     var mysql: MySQLConnectionFileConfig?
     var filemaker: FileMakerConnectionFileConfig?
+    var adminAPI: FileMakerAdminAPIFileConfig?
     var datasources: [String: DatasourceEntry]
 
     private enum CodingKeys: String, CodingKey {
-        case mysql, filemaker, datasources
+        case mysql, filemaker, adminAPI, datasources
         case host, port, user, password, sessionDatabase, allowWrites, allowRawSQL
     }
 
@@ -345,6 +468,7 @@ struct DatasourceFileConfig: Decodable {
         let container = try decoder.container(keyedBy: CodingKeys.self)
         datasources = try container.decodeIfPresent([String: DatasourceEntry].self, forKey: .datasources) ?? [:]
         filemaker = try container.decodeIfPresent(FileMakerConnectionFileConfig.self, forKey: .filemaker)
+        adminAPI = try container.decodeIfPresent(FileMakerAdminAPIFileConfig.self, forKey: .adminAPI)
         if let nestedMySQL = try container.decodeIfPresent(MySQLConnectionFileConfig.self, forKey: .mysql) {
             mysql = nestedMySQL
         } else {
@@ -397,6 +521,18 @@ struct FileMakerConnectionFileConfig: Decodable {
     var user: String?
     var password: String?
     var allowWrites: Bool?
+}
+
+/// `LASSO_FM_ADMIN_*` config-file block — a SEPARATE FileMaker Server admin
+/// account from `filemaker`'s CWP credentials, used only by the CWP session
+/// janitor to call the Admin API (port 16000, not the CWP port). Credentials
+/// belong here (chmod-600 JSON file), matching this project's established
+/// practice, not on the command line/raw env var.
+struct FileMakerAdminAPIFileConfig: Decodable {
+    var host: String?
+    var port: Int?
+    var user: String?
+    var password: String?
 }
 
 /// One `datasources` entry. Decodes either the current shape
@@ -455,6 +591,10 @@ enum ServerConfigError: Error, CustomStringConvertible {
     /// caught here, at startup, rather than deferred to a confusing
     /// failure the first time a page actually queries that alias.
     case missingFileMakerHost
+    /// The CWP session janitor is enabled but no Admin API host/credentials
+    /// were supplied — caught here at startup rather than deferred to a
+    /// confusing failure on the first poll.
+    case missingCWPJanitorAdminAPIConfig
 
     var description: String {
         switch self {
@@ -463,6 +603,8 @@ enum ServerConfigError: Error, CustomStringConvertible {
             "Datasource aliases differ only by case, which is ambiguous (Lasso datasource names are case-insensitive): \(aliases.joined(separator: ", "))"
         case .missingFileMakerHost:
             "A FileMaker datasource is configured but no FileMaker host was supplied (set \"filemaker\": {\"host\": ...} in the datasource config file, or LASSO_FILEMAKER_HOST)."
+        case .missingCWPJanitorAdminAPIConfig:
+            "LASSO_CWP_JANITOR_ENABLED=1 requires Admin API credentials — set \"adminAPI\": {\"host\": ..., \"user\": ..., \"password\": ...} in the datasource config file, or LASSO_FM_ADMIN_HOST/LASSO_FM_ADMIN_USER/LASSO_FM_ADMIN_PASSWORD."
         }
     }
 }
@@ -1595,6 +1737,10 @@ let config = try ServerConfig.load()
 // `nil` in that case rather than paying for an actor nothing will ever read.
 let logCapture = config.adminConsoleEnabled ? LogCapture() : nil
 let metrics = config.adminConsoleEnabled ? AdminMetrics() : nil
+// Always default-constructed (cheap — an idle actor) so `LassoAdminDelegate.init`
+// always has one to pass, matching `crawlTracker`'s own convention; only actually
+// used when `config.cwpJanitorEnabled` starts the poll loop below.
+let janitorTracker = CWPSessionJanitorTracker()
 let siteServer = try LassoSiteServer(config: config, logCapture: logCapture, metrics: metrics)
 // Started below (after the "Listening" print moves inside its ready callback) as a
 // cancellable, awaitable Task rather than a bare blocking call — the admin console's
@@ -1696,6 +1842,47 @@ if config.crawlReportMode {
     }
 }
 
+// CWP session janitor: an opt-in background poller that lists FileMaker
+// Server Admin API clients and disconnects stale/excess Custom Web
+// Publishing sessions. Off by default — see `ServerConfig.cwpJanitorEnabled`'s
+// doc comment for why this exists. All the actual selection/sweep logic
+// lives in `PerfectFileMakerAdminAPI` (`CWPSessionJanitor`/`CWPSessionSelector`)
+// — this is generic to any Admin API consumer, not Lasso-specific, so
+// `lasso-perfect-server` just supplies its own config values and logging
+// sink and calls into the package. `cwpAdminAPIClient`/`cwpJanitorTask` stay
+// `nil` when disabled, so the admin delegate can cleanly no-op the manual
+// trigger action and skip restart cancellation.
+var cwpAdminAPIClient: FMAdminClient?
+var cwpJanitorTask: Task<Void, Never>?
+if config.cwpJanitorEnabled {
+    print("CWP session janitor: enabled (dry-run: \(config.cwpJanitorDryRun), poll every \(config.cwpJanitorPollIntervalSeconds)s)")
+    let adminAPIClient = FMAdminClient(
+        host: config.fmAdminAPIHost!, // validated non-nil in ServerConfig.load()
+        port: config.fmAdminAPIPort,
+        username: config.fmAdminAPIUser!,
+        password: config.fmAdminAPIPassword!,
+        urlSession: config.fmAdminAPITrustSelfSignedTLS ? FMAdminClient.insecureURLSession() : .shared
+    )
+    cwpAdminAPIClient = adminAPIClient
+    cwpJanitorTask = Task {
+        while !Task.isCancelled {
+            await CWPSessionJanitor.sweep(
+                client: adminAPIClient,
+                durationThresholdSeconds: config.cwpJanitorDurationThresholdSeconds,
+                maxSessions: config.cwpJanitorMaxSessions,
+                minFloor: config.cwpJanitorMinFloor,
+                maxDisconnectsPerSweep: config.cwpJanitorMaxDisconnectsPerSweep,
+                dryRun: config.cwpJanitorDryRun,
+                tracker: janitorTracker,
+                log: { line in await logCapture?.capture(line) }
+            )
+            try? await Task.sleep(for: .seconds(config.cwpJanitorPollIntervalSeconds))
+        }
+    }
+} else {
+    print("CWP session janitor: disabled (set LASSO_CWP_JANITOR_ENABLED=1 to enable)")
+}
+
 if config.adminConsoleEnabled {
     print("Admin console: enabled on http://127.0.0.1:\(config.adminConsolePort) — token: \(config.adminConsoleTokenPath)")
     let adminDelegate = LassoAdminDelegate(
@@ -1705,7 +1892,10 @@ if config.adminConsoleEnabled {
         logCapture: logCapture,
         baseURL: "http://localhost:\(config.port)",
         siteServerTask: siteServerTask,
-        datasourceFailureTracker: siteServer.datasourceFailureTracker
+        datasourceFailureTracker: siteServer.datasourceFailureTracker,
+        janitorTracker: janitorTracker,
+        cwpAdminAPIClient: cwpAdminAPIClient,
+        cwpJanitorTask: cwpJanitorTask
     )
     let admin = try AdminConsole(
         port: config.adminConsolePort,

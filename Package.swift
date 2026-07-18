@@ -24,6 +24,7 @@ let package = Package(
         .package(path: "../Perfect-Resurrection/Perfect-NIO"),
         .package(path: "../Perfect-Resurrection/Perfect-Session"),
         .package(path: "../Perfect-Resurrection/Perfect-FileMaker"),
+        .package(path: "../Perfect-Resurrection/Perfect-FileMaker-AdminAPI"),
         .package(url: "https://github.com/apple/swift-crypto.git", from: "4.5.0"),
     ],
     targets: [
@@ -91,6 +92,7 @@ let package = Package(
                 .product(name: "PerfectSessionMySQL", package: "Perfect-Session"),
                 .product(name: "PerfectFileMaker", package: "Perfect-FileMaker"),
                 .product(name: "PerfectAdminConsole", package: "Perfect-NIO"),
+                .product(name: "PerfectFileMakerAdminAPI", package: "Perfect-FileMaker-AdminAPI"),
             ]
         ),
         // Targets are the basic building blocks of a package, defining a module or a test suite.
@@ -119,6 +121,7 @@ let package = Package(
                 "LassoParser",
                 .product(name: "PerfectNIO", package: "Perfect-NIO"),
                 .product(name: "PerfectAdminConsole", package: "Perfect-NIO"),
+                .product(name: "PerfectFileMakerAdminAPI", package: "Perfect-FileMaker-AdminAPI"),
             ]
         ),
         .testTarget(
