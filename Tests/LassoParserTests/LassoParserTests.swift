@@ -464,13 +464,13 @@ import PerfectSessionCore
 }
 
 @Test func encryptHmacRequiresPasswordAndToken() async throws {
-    // -Password/-Token are both documented as required, and this tag is
-    // used for password-reset token generation — silently proceeding with
-    // an empty-string password/token would produce a fully deterministic,
-    // publicly-known-key "secret" token with zero signal that something
-    // was misconfigured. Matches File_ProcessUploads's missing
-    // -Destination precedent: throw a recoverable error, catchable by
-    // [protect], not a silent fallback.
+    // -Password/-Token are both documented as required PARAMETERS — the
+    // tag must be called with both specified at all — matching
+    // File_ProcessUploads's missing -Destination precedent: throw a
+    // recoverable error, catchable by [protect], not a silent fallback.
+    // This is about the argument being OMITTED entirely, not about its
+    // value being empty -- see encryptHmacAcceptsExplicitlyEmptyTokenOrPassword
+    // just below for why an empty-but-present value must NOT throw.
     var context = LassoContext()
     let missingPassword = try await LassoRenderer().render(
         "[protect][Encrypt_HMAC(-token='x')][/protect][error_currenterror]",
@@ -483,6 +483,31 @@ import PerfectSessionCore
         context: &context
     )
     #expect(missingToken == "Encrypt_HMAC requires -Token.")
+}
+
+@Test func encryptHmacAcceptsExplicitlyEmptyTokenOrPassword() async throws {
+    // Confirmed live 2026-07-18 against a real site: a login-check include
+    // unconditionally calls Encrypt_HMAC(-token = $password, -password =
+    // 'key', ...) where $password is '' outside a login attempt -- and a
+    // real Lasso site does NOT error on this. The tag's documented
+    // "requires -Password/-Token" means the parameters must be specified
+    // in the call, not that their values must be non-empty; an explicit
+    // empty string is a valid input (the HMAC of an empty message). An
+    // earlier version of this guard incorrectly rejected both cases alike.
+    var context = LassoContext()
+    let emptyToken = try await LassoRenderer().render(
+        "[Encrypt_HMAC(-token='', -password='key', -digest='sha1', -hex)]",
+        context: &context
+    )
+    #expect(emptyToken.isEmpty == false)
+    #expect(emptyToken.hasPrefix("0x"))
+
+    let emptyPassword = try await LassoRenderer().render(
+        "[Encrypt_HMAC(-token='x', -password='', -digest='sha1', -hex)]",
+        context: &context
+    )
+    #expect(emptyPassword.isEmpty == false)
+    #expect(emptyPassword.hasPrefix("0x"))
 }
 
 @Test func currencyDefaultsToEnUSLocale() async throws {

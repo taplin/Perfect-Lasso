@@ -191,21 +191,30 @@ public struct LassoNativeRegistry: Sendable {
         // as UTF-8 rather than crashing — low-stakes since real usage is
         // always -Base64.
         register("encrypt_hmac") { arguments, _ in
-            // -Password/-Token are both documented as required, and this
-            // tag is used for password-reset token generation — silently
-            // falling back to an empty string (rather than throwing, like
-            // File_ProcessUploads's missing -Destination does elsewhere in
-            // this codebase) would produce a fully deterministic,
-            // publicly-known-key "secret" token with no signal that
-            // anything was misconfigured. Throw instead.
-            guard let password = arguments.lastString(named: "password"), password.isEmpty == false else {
+            // -Password/-Token are documented as required PARAMETERS — the
+            // real tag must be called with both specified — but real Lasso
+            // does NOT require their VALUES to be non-empty: an explicit
+            // empty string is a valid, well-defined input (the HMAC of an
+            // empty message), and real Lasso Server computes it rather
+            // than erroring. Confirmed live 2026-07-18: a real site's
+            // login-check include unconditionally calls this with an
+            // empty -Token on every unauthenticated non-login request
+            // (Encrypt_HMAC(-token = $password, ...) where $password is
+            // '' outside a login attempt) and does not error on a real
+            // Lasso site. An earlier version of this guard incorrectly
+            // conflated "argument omitted" with "argument present but
+            // empty," rejecting both — only the former is actually
+            // invalid. `lastString(named:)` already draws this exact
+            // distinction: nil means the argument wasn't supplied at all,
+            // vs. Optional("") for an explicitly-empty value.
+            guard let password = arguments.lastString(named: "password") else {
                 throw LassoRecoverableError(LassoErrorState(
                     code: 3001,
                     message: "Encrypt_HMAC requires -Password.",
                     kind: "encryption"
                 ))
             }
-            guard let token = arguments.lastString(named: "token"), token.isEmpty == false else {
+            guard let token = arguments.lastString(named: "token") else {
                 throw LassoRecoverableError(LassoErrorState(
                     code: 3002,
                     message: "Encrypt_HMAC requires -Token.",
