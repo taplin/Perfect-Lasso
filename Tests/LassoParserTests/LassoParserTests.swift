@@ -4364,6 +4364,39 @@ private final class MapIncludeLoader: LassoIncludeLoader, @unchecked Sendable {
     #expect(output == "-leading")
 }
 
+@Test func stringAppendMutatesTheInvocantInPlaceAndProducesNoOutputAsABareStatement() async throws {
+    // string->append(value) mutates its invocant in place, same as
+    // ->replace above — when the base is a real variable and the call is
+    // the whole bare statement. Real corpus: LassoStartup/hash_test.lasso's
+    // scrubs_hash custom tag, `#hash->append('\r\n')` right after
+    // computing an Encrypt_HMAC hash — confirmed live 2026-07-18 against
+    // koi.scrubs.test's login/checkout flow.
+    var context = LassoContext()
+    let output = try await LassoRenderer().render(
+        "[var(msg::string='hello')][$msg->append(' world')][$msg]",
+        context: &context
+    )
+    #expect(output == "hello world")
+}
+
+@Test func stringAppendOnANonVariableBaseStillReturnsItsComputedValue() async throws {
+    var context = LassoContext()
+    let output = try await LassoRenderer().render(
+        "[('hello')->append(' world')]",
+        context: &context
+    )
+    #expect(output == "hello world")
+}
+
+@Test func stringAppendWithNoArgumentAppendsAnEmptyStringAndProducesNoOutput() async throws {
+    var context = LassoContext()
+    let output = try await LassoRenderer().render(
+        "[var(msg::string='hello')][$msg->append()][$msg]",
+        context: &context
+    )
+    #expect(output == "hello")
+}
+
 @Test func chainedStringReplaceCallsBuildASlugWithNoStrayOutput() async throws {
     // The exact real-corpus shape from pages/thumbs2.page.lasso (also
     // pages/thumbs.page.lasso, thumbs3.page.lasso, and every
