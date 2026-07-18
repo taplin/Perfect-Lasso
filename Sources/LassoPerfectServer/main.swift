@@ -173,6 +173,13 @@ struct ServerConfig: Sendable {
     /// `NSTemporaryDirectory()`, matching the pattern
     /// `PerfectAdminConsole`'s own README documents.
     let adminConsoleTokenPath: String
+    /// `LASSO_ADMIN_TOKEN_ROTATE=1` — force a fresh bearer token on this
+    /// launch, overwriting whatever's at `adminConsoleTokenPath`. Default
+    /// `false`: the token persists across restarts (reused from the
+    /// existing file if present and well-formed) so the dashboard doesn't
+    /// need re-pasting after every restart — see `AdminTokenStore`'s doc
+    /// comment for why that's safe (the file is already chmod 600).
+    let adminConsoleTokenRotate: Bool
     /// `LASSO_CWP_JANITOR_ENABLED=1` — start a background task that polls
     /// FileMaker Server's Admin API and disconnects stale/excess Custom
     /// Web Publishing sessions (see `PerfectFileMakerAdminAPI`'s
@@ -383,6 +390,7 @@ struct ServerConfig: Sendable {
             adminConsolePort: env["LASSO_ADMIN_PORT"].flatMap(Int.init) ?? 8990,
             adminConsoleTokenPath: env["LASSO_ADMIN_TOKEN_PATH"]
                 ?? (NSTemporaryDirectory() + "lasso-perfect-server-admin.token"),
+            adminConsoleTokenRotate: Self.isTruthyEnv(env["LASSO_ADMIN_TOKEN_ROTATE"]),
             cwpJanitorEnabled: cwpJanitorEnabled,
             cwpJanitorDryRun: Self.isFalsyEnv(env["LASSO_CWP_JANITOR_DRY_RUN"]) == false,
             cwpJanitorPollIntervalSeconds: env["LASSO_CWP_JANITOR_POLL_INTERVAL_SECONDS"].flatMap(Int.init) ?? 60,
@@ -1265,6 +1273,9 @@ struct LassoSiteServer: Sendable {
             filePath: fileURL?.path
         )
         fputs(details.logLine + "\n", stderr)
+        if let logCapture {
+            Task { await logCapture.capture("[render-error] " + details.logLine) }
+        }
 
         // The crawl/report mode (LASSO_CRAWL_REPORT=1, see CrawlReport.swift)
         // requests every page with Accept: application/json so it can read
@@ -1900,6 +1911,7 @@ if config.adminConsoleEnabled {
     let admin = try AdminConsole(
         port: config.adminConsolePort,
         tokenFilePath: config.adminConsoleTokenPath,
+        forceNewToken: config.adminConsoleTokenRotate,
         logCapture: logCapture,
         metrics: metrics,
         delegate: adminDelegate
