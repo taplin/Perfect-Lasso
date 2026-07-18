@@ -1126,7 +1126,7 @@ struct LassoSiteServer: Sendable {
         // session_start(...) calls and load them now, before the sync
         // render runs. See Documentation/session-upload-support-plan.md
         // and Sources/LassoPerfectSession/PerfectBackedLassoSessionProvider.swift.
-        let sessionCalls = LassoSessionPreflight.scan(document)
+        let sessionCalls = LassoSessionPreflight.scan(document, includeLoader: includeLoader, includePath: includePath)
         let sessionBridge: PerfectBackedLassoSessionProvider? = sessionCalls.isEmpty ? nil : PerfectBackedLassoSessionProvider()
         if let sessionBridge {
             await sessionBridge.prepare(
