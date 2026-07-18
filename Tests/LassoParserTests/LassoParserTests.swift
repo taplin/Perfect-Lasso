@@ -3698,6 +3698,87 @@ func perfectCRUDConnectorFailuresBecomeInlineErrorFrames(source: String, expecte
     #expect(sink.cookiePairs.first?.httpOnly == true)
 }
 
+// Real Lasso's Cookie_Set/web_response->setCookie pass name/value as a
+// SINGLE argument whose LABEL is the cookie name and VALUE is the cookie
+// value ('Cookie Name'='Cookie Value' per reference.lassosoft.com) --
+// confirmed live 2026-07-18 against koi.scrubs.test's exact real corpus
+// shape (includes/siteconfig_cookies.inc):
+// `Cookie_Set('verify_cookies_active'='active', -Domain='iscrubs.com',
+// -Path='/')` was producing `Set-Cookie: active=iscrubs.com` -- the real
+// name was discarded, the value became the pair's own value, and THAT got
+// overwritten by the next argument's (-Domain) value, because the
+// previous implementation only checked -Name=/-Value= labeled arguments
+// (never used anywhere in real corpus) and otherwise blindly took
+// `arguments.first`/`arguments.dropFirst().first` regardless of label.
+final class FullyRecordingResponseSink: LassoResponseSink, @unchecked Sendable {
+    private(set) var cookies: [(name: String, value: String, domain: String?, expires: String?, path: String?, secure: Bool, httpOnly: Bool)] = []
+    func setStatus(_ status: Int) throws {}
+    func getStatus() -> Int { 200 }
+    func redirect(to url: String) throws {}
+    func setHeader(name: String, value: String) throws {}
+    func setCookie(name: String, value: String) throws {
+        try setCookie(name: name, value: value, domain: nil, expires: nil, path: nil, secure: false, httpOnly: false)
+    }
+    func setCookie(
+        name: String, value: String, domain: String?, expires: String?,
+        path: String?, secure: Bool, httpOnly: Bool
+    ) throws {
+        cookies.append((name, value, domain, expires, path, secure, httpOnly))
+    }
+}
+
+@Test func cookieSetParsesTheRealNameEqualsValueArgumentForm() async throws {
+    let sink = FullyRecordingResponseSink()
+    var context = LassoContext(responseSink: sink)
+    _ = try await LassoRenderer().render(
+        "[Cookie_Set('verify_cookies_active'='active', -Domain='iscrubs.com', -Path='/')]",
+        context: &context
+    )
+    #expect(sink.cookies.count == 1)
+    #expect(sink.cookies.first?.name == "verify_cookies_active")
+    #expect(sink.cookies.first?.value == "active")
+    #expect(sink.cookies.first?.domain == "iscrubs.com")
+    #expect(sink.cookies.first?.path == "/")
+    #expect(sink.cookies.first?.expires == nil)
+}
+
+@Test func cookieSetStillSupportsTheExplicitNameValueLabeledForm() async throws {
+    let sink = FullyRecordingResponseSink()
+    var context = LassoContext(responseSink: sink)
+    _ = try await LassoRenderer().render(
+        "[Cookie_Set(-Name='sid', -Value='xyz')]",
+        context: &context
+    )
+    #expect(sink.cookies.first?.name == "sid")
+    #expect(sink.cookies.first?.value == "xyz")
+}
+
+@Test func cookieSetExpiresMinusOneProducesAnAlreadyExpiredHttpDate() async throws {
+    // Real corpus (log_out.page.lasso, not_me.page.lasso,
+    // process.page.lasso(.backup)) always uses -Expires='-1' to delete a
+    // cookie -- documented as "expire immediately". The raw string "-1"
+    // written verbatim into a Set-Cookie Expires= attribute is not a valid
+    // HTTP-date and browsers won't reliably treat it as already-expired,
+    // so this must convert to a real past date.
+    let sink = FullyRecordingResponseSink()
+    var context = LassoContext(responseSink: sink)
+    _ = try await LassoRenderer().render(
+        "[Cookie_Set('_LassoSessionTracker_scrubs_login'='', -Domain='koi.scrubs.test', -Expires='-1', -Path='/')]",
+        context: &context
+    )
+    #expect(sink.cookies.first?.expires == "Thu, 01 Jan 1970 00:00:00 GMT")
+}
+
+@Test func cookieSetWithNoExpiresProducesASessionCookie() async throws {
+    let sink = FullyRecordingResponseSink()
+    var context = LassoContext(responseSink: sink)
+    _ = try await LassoRenderer().render(
+        "[Cookie_Set('a'='b')]",
+        context: &context
+    )
+    #expect(sink.cookies.first?.expires == nil)
+}
+
 @Test func webResponseAbortStopsRenderingLikeReturn() async throws {
     // abort() rides the existing return-signal short-circuit mechanism —
     // no new control-flow needed. Verified the same way return's

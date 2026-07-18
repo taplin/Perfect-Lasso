@@ -681,11 +681,21 @@ public struct LassoNativeRegistry: Sendable {
             return .void
         }
         register("cookie_set") { arguments, context in
-            let name = arguments.firstValue(named: "name")?.outputString ??
-                arguments.first?.value.outputString ?? ""
-            let value = arguments.firstValue(named: "value")?.outputString ??
-                arguments.dropFirst().first?.value.outputString ?? ""
-            try context.responseSink?.setCookie(name: name, value: value)
+            // See CookieHandling.swift — real Lasso's
+            // `Cookie_Set('Name'='Value', -Domain=..., ...)` passes name/
+            // value as a single labeled argument, not `-Name=`/`-Value=`.
+            guard let (name, value) = LassoCookieArguments.nameAndValue(from: arguments) else {
+                return .void
+            }
+            try context.responseSink?.setCookie(
+                name: name,
+                value: value,
+                domain: arguments.lastString(named: "domain"),
+                expires: LassoCookieArguments.httpDateExpires(fromMinutesString: arguments.lastString(named: "expires")),
+                path: arguments.lastString(named: "path"),
+                secure: arguments.hasTruthyFlag("secure"),
+                httpOnly: arguments.hasTruthyFlag("httponly")
+            )
             return .void
         }
     }

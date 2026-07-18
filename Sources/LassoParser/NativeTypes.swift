@@ -263,13 +263,17 @@ extension LassoNativeTypeRegistry {
         }
 
         type.register("setcookie") { _, arguments, context in
-            let name = arguments.firstValue(named: "name")?.outputString ?? arguments.first?.value.outputString ?? ""
-            let value = arguments.firstValue(named: "value")?.outputString ?? arguments.dropFirst().first?.value.outputString ?? ""
+            // See CookieHandling.swift — shares the exact fix
+            // Runtime.swift's `cookie_set` free-tag registration needed
+            // for the same real `'Name'='Value'` labeled-argument syntax.
+            guard let (name, value) = LassoCookieArguments.nameAndValue(from: arguments) else {
+                return .void
+            }
             try context.responseSink?.setCookie(
                 name: name,
                 value: value,
                 domain: arguments.lastString(named: "domain"),
-                expires: arguments.lastString(named: "expires"),
+                expires: LassoCookieArguments.httpDateExpires(fromMinutesString: arguments.lastString(named: "expires")),
                 path: arguments.lastString(named: "path"),
                 secure: arguments.hasTruthyFlag("secure"),
                 httpOnly: arguments.hasTruthyFlag("httponly")
