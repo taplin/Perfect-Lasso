@@ -5782,17 +5782,15 @@ struct IncludeURLTests {
 
     // `with`'s body uses the non-arrow `if(...) ... /if` script-mode form
     // rather than `if(...) => { ... }` — bisecting a surprising failure
-    // here surfaced a real, pre-existing, unrelated parser quirk: an
-    // arrow-block `if` statement followed by (or combined with) certain
-    // other constructs at top-level script scope doesn't reliably gate
-    // execution the way the identical construct does when nested inside
-    // a `define`d tag body (see `withInDoIteratesOverBareZeroArgTagCallResult`,
-    // which nests an arrow-block `if` inside `with...do` successfully,
-    // but only inside a `define`). Flagged separately for investigation —
-    // not a regression from this change, and the non-arrow form here
-    // exercises the exact same `consumeLoopControlSignal()` code path in
-    // the "with" block case, so it's an equally valid check of this
-    // stage's actual change.
+    // here originally surfaced a real, pre-existing, unrelated parser bug:
+    // a single-line arrow-block `if(...) => { ... }` at top-level script
+    // scope silently swallowed its own body and closing `}` (see
+    // `ScriptBodyParser.parseBlockOpening`/`parseIfOpening`'s
+    // `skipLineRemainder()` fix and the `arrowBlockIf*` regression tests
+    // below — now fixed, both forms behave identically). The non-arrow
+    // form here still exercises the exact same `consumeLoopControlSignal()`
+    // code path in the "with" block case, so it remains an equally valid
+    // check of this stage's actual change.
     var withContext = LassoContext()
     _ = try await LassoRenderer().render(
         """
@@ -5807,6 +5805,100 @@ struct IncludeURLTests {
         context: &withContext
     )
     #expect(withContext.value(for: "x", scope: .local) == .integer(30))
+}
+
+// The three tests below pin down a real, pre-existing parser bug found
+// while writing the test above: `ScriptBodyParser.parseBlockOpening` and
+// `parseIfOpening` both called `skipLineRemainder()` unconditionally right
+// after `consumeArrowBlockStartIfPresent()`, regardless of whether that
+// call had just consumed a brace body's opening `{`. For a *multi-line*
+// arrow body (`if(...) => {\n ... \n}`) this was harmless — the character
+// immediately after `{` is already a newline, so "skip to the next line"
+// is a no-op. But for a *single-line* arrow body (`if(...) => { ... }`,
+// everything between `{` and `}` on one line), `skipLineRemainder()`
+// blindly discarded every character up to the next newline — silently
+// deleting the block's real body AND its own closing `}`, since neither
+// `skipLineRemainder` nor its caller has any brace-depth awareness. With
+// the closing `}` gone, `BlockBuilder`'s pairing search for that `if`'s
+// close never finds one and keeps consuming whatever sibling nodes follow
+// (in top-level script scope) as if they belonged to the `if`'s own body —
+// exactly the "identical construct works nested in a `define`d tag body
+// but not at top-level script scope" asymmetry this was originally
+// reported as, even though the real bug has nothing to do with `define`
+// vs. top-level scope specifically: `withInDoIteratesOverBareZeroArgTagCallResult`
+// (nested in a `define`) only happened to dodge it because its arrow body
+// is written multi-line, not because nesting inside `define` changes how
+// the arrow body is parsed. Fixed by only calling `skipLineRemainder()`
+// when no brace body was actually opened.
+@Test func arrowBlockIfAtTopLevelScriptScopeDoesNotSwallowItsOwnBodyOrClose() async throws {
+    // The minimal repro: a single-line arrow-block `if` directly in
+    // top-level `<?lasso ?>` script scope, nothing else inside it. Before
+    // the fix, `return 'yes'` and the `if`'s own closing `}` were both
+    // silently discarded by `skipLineRemainder()`, so `BlockBuilder` never
+    // found a close for the `if` and instead swallowed the trailing text
+    // node and `[$canary]` expression that follow `?>` into the `if`'s
+    // body — `return` never fired and the whole document's real output
+    // vanished (rendered as empty string).
+    var context = LassoContext()
+    let output = try await LassoRenderer().render(
+        """
+        <?lasso
+        if(true) => { return 'yes' }
+        ?>
+        [$canary]
+        """,
+        context: &context
+    )
+    #expect(output.trimmingCharacters(in: .whitespacesAndNewlines) == "yes")
+}
+
+@Test func arrowBlockIfInsideATopLevelWithLoopAbortsTheLoopJustLikeTheSlashClosedForm() async throws {
+    // Same scenario as `loopAbortWorksInsideWhileIterateAndWithBlocksToo`'s
+    // `with` check above, but using the arrow-block `if` form instead of
+    // `if(...) ... /if` — these two forms must behave identically, and
+    // before the fix they did not: `loop_abort` was silently deleted along
+    // with the arrow `if`'s closing `}`, so the loop never aborted and `x`
+    // ended up `40` (ran to completion) instead of `30`.
+    var context = LassoContext()
+    _ = try await LassoRenderer().render(
+        """
+        <?lasso
+        with x in array(10, 20, 30, 40) do {
+            if(#x == 30) => { loop_abort }
+        }
+        ?>
+        """,
+        context: &context
+    )
+    #expect(context.value(for: "x", scope: .local) == .integer(30))
+}
+
+@Test func singleLineArrowBlockIfDoesNotCorruptSiblingBlockPairingOrDuplicateOutput() async throws {
+    // The most subtle symptom: a single-line arrow-block `if` as the
+    // SECOND statement in a top-level `with` body (whether or not its
+    // condition is ever true). Before the fix, the arrow `if`'s swallowed
+    // closing `}` made `BlockBuilder`'s pairing search consume the `with`
+    // block's own closing `}` as if it belonged to the `if` instead —
+    // leaving the `with` block itself unclosed, which `BlockBuilder`
+    // resolved by treating the *rest of the top-level document* (the
+    // `?>` delimiter's trailing text and the `[$collected]` output) as
+    // the `with` block's body, so it was re-rendered once per loop
+    // iteration.
+    var context = LassoContext()
+    let output = try await LassoRenderer().render(
+        """
+        <?lasso
+        $collected = ''
+        with x in array(10, 20, 30) do {
+            $collected = $collected + #x + '|'
+            if(#x == 999) => { local(dummy = 1) }
+        }
+        ?>
+        [$collected]
+        """,
+        context: &context
+    ).trimmingCharacters(in: .whitespacesAndNewlines)
+    #expect(output == "10|20|30|")
 }
 
 @Test func loopAbortInANestedLoopOnlyStopsTheInnermostLoop() async throws {
@@ -6693,66 +6785,3 @@ struct IncludeURLTests {
     }
 }
 
-@Test func bisectBareArrowIfAtTopLevel() async throws {
-    var context = LassoContext()
-    let output = try await LassoRenderer().render(
-        """
-        <?lasso
-        if(true) => { return 'yes' }
-        ?>
-        [$canary]
-        """,
-        context: &context
-    )
-    #expect(output.trimmingCharacters(in: .whitespacesAndNewlines) == "yes")
-}
-
-@Test func bisectArrowIfInsideTopLevelWithLoopAbortsLoop() async throws {
-    var context = LassoContext()
-    _ = try await LassoRenderer().render(
-        """
-        <?lasso
-        with x in array(10, 20, 30, 40) do {
-            if(#x == 30) => { loop_abort }
-        }
-        ?>
-        """,
-        context: &context
-    )
-    #expect(context.value(for: "x", scope: .local) == .integer(30))
-}
-
-@Test func bisectPlainIfInsideTopLevelWithLoopAbortsLoop() async throws {
-    var context = LassoContext()
-    _ = try await LassoRenderer().render(
-        """
-        <?lasso
-        with x in array(10, 20, 30, 40) do {
-            if(#x == 30)
-                loop_abort
-            /if
-        }
-        ?>
-        """,
-        context: &context
-    )
-    #expect(context.value(for: "x", scope: .local) == .integer(30))
-}
-
-@Test func bisectTrailingOutputAfterArrowIfInTopLevelWithLoop() async throws {
-    var context = LassoContext()
-    let output = try await LassoRenderer().render(
-        """
-        <?lasso
-        $collected = ''
-        with x in array(10, 20, 30) do {
-            $collected = $collected + #x + '|'
-            if(#x == 999) => { local(dummy = 1) }
-        }
-        ?>
-        [$collected]
-        """,
-        context: &context
-    ).trimmingCharacters(in: .whitespacesAndNewlines)
-    #expect(output == "10|20|30|")
-}
