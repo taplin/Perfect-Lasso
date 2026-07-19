@@ -600,6 +600,17 @@ public struct LassoNativeRegistry: Sendable {
             guard let call = makeSessionStartCall(from: arguments) else { return .void }
             if let result = await context.sessionProvider?.start(session: call.name, call: call) {
                 context.sessionStartResults[call.name.lowercased()] = result
+                // Real Lasso restores every variable ever added to this
+                // session the moment session_start runs — session_addVar
+                // does not need to be re-called on each page for a name
+                // already added on an earlier one. See
+                // LassoSessionProvider.restoredVariables's doc comment.
+                for (varName, value) in context.sessionProvider?.restoredVariables(session: call.name) ?? [:] {
+                    context.set(value, for: varName, scope: .global)
+                    if context.trackedSessionVariables.contains(where: { $0.session == call.name && $0.varName == varName }) == false {
+                        context.trackedSessionVariables.append((session: call.name, varName: varName))
+                    }
+                }
             }
             return .void
         }

@@ -880,6 +880,16 @@ public protocol LassoSessionProvider: Sendable {
     /// The value restored from a resumed session for `varName`, or `nil` for
     /// a new session, an ended/aborted one, or a name never persisted before.
     func restoredValue(for varName: String, session name: String) -> LassoValue?
+    /// Every variable ever persisted into `name`'s session (from this
+    /// resume or any earlier one) — real Lasso restores all of these the
+    /// moment `session_start` runs, without requiring `session_addVar` to
+    /// be called again for each one on every subsequent page (per
+    /// LassoGuide: "The variable does not need to be added to the session
+    /// on each request, though it is safe to do so"). `session_start`'s
+    /// native registration uses this to auto-populate scope; defaults to
+    /// empty so existing conformers that only ever answer one variable at
+    /// a time via `restoredValue(for:session:)` don't need updating.
+    func restoredVariables(session name: String) -> [String: LassoValue]
     /// Records the current value of `varName` to persist into `name`'s
     /// session data when the request ends (skipped if `abort`/`end` was
     /// called for that session this request).
@@ -891,6 +901,10 @@ public protocol LassoSessionProvider: Sendable {
     /// does not destroy already-stored state, matching the documented
     /// difference between `session_abort` and `session_end`.
     func abort(session name: String)
+}
+
+public extension LassoSessionProvider {
+    func restoredVariables(session name: String) -> [String: LassoValue] { [:] }
 }
 
 /// Real Lasso's `web_response` exposes ~20 documented members; same
