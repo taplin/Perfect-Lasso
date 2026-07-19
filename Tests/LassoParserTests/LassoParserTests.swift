@@ -4948,6 +4948,166 @@ private final class MapIncludeLoader: LassoIncludeLoader, @unchecked Sendable {
     #expect(output == "3=4|x_login=abc|a=b|")
 }
 
+// MARK: - include_url (mocked network layer)
+
+/// Captures the outgoing request and returns a canned response — same
+/// pattern as `Perfect-FileMaker`'s own `MockURLProtocol`.
+private final class MockURLProtocol: URLProtocol, @unchecked Sendable {
+    nonisolated(unsafe) static var requestHandler: (@Sendable (URLRequest, Data?) throws -> (HTTPURLResponse, Data))?
+    nonisolated(unsafe) static var lastRequest: URLRequest?
+    nonisolated(unsafe) static var lastBody: Data?
+
+    override class func canInit(with request: URLRequest) -> Bool { true }
+    override class func canonicalRequest(for request: URLRequest) -> URLRequest { request }
+
+    override func startLoading() {
+        let body = Self.bodyData(from: request)
+        Self.lastRequest = request
+        Self.lastBody = body
+        guard let handler = Self.requestHandler else {
+            client?.urlProtocol(self, didFailWithError: URLError(.badServerResponse))
+            return
+        }
+        do {
+            let (response, data) = try handler(request, body)
+            client?.urlProtocol(self, didReceive: response, cacheStoragePolicy: .notAllowed)
+            client?.urlProtocol(self, didLoad: data)
+            client?.urlProtocolDidFinishLoading(self)
+        } catch {
+            client?.urlProtocol(self, didFailWithError: error)
+        }
+    }
+
+    override func stopLoading() {}
+
+    static func bodyData(from request: URLRequest) -> Data? {
+        if let body = request.httpBody { return body }
+        guard let stream = request.httpBodyStream else { return nil }
+        stream.open()
+        defer { stream.close() }
+        var data = Data()
+        var buffer = [UInt8](repeating: 0, count: 4096)
+        while stream.hasBytesAvailable {
+            let read = stream.read(&buffer, maxLength: buffer.count)
+            if read <= 0 { break }
+            data.append(buffer, count: read)
+        }
+        return data
+    }
+}
+
+private func withMockedIncludeURL<T>(
+    handler: @escaping @Sendable (URLRequest, Data?) throws -> (HTTPURLResponse, Data),
+    _ body: () async throws -> T
+) async throws -> T {
+    let config = URLSessionConfiguration.ephemeral
+    config.protocolClasses = [MockURLProtocol.self]
+    MockURLProtocol.requestHandler = handler
+    MockURLProtocol.lastRequest = nil
+    MockURLProtocol.lastBody = nil
+    LassoIncludeURL.testSessionOverride = URLSession(configuration: config)
+    defer { LassoIncludeURL.testSessionOverride = nil }
+    return try await body()
+}
+
+private func okResponse(_ body: String, headers: [String: String]? = nil) -> @Sendable (URLRequest, Data?) -> (HTTPURLResponse, Data) {
+    { req, _ in
+        let http = HTTPURLResponse(url: req.url!, statusCode: 200, httpVersion: nil, headerFields: headers)!
+        return (http, Data(body.utf8))
+    }
+}
+
+@Suite(.serialized)
+struct IncludeURLTests {
+    @Test func getRequestReturnsBodyAsABytesObjectByDefault() async throws {
+        // Default return is a `bytes` object (LassoGuide: "By default,
+        // this method returns the HTML body result... as a bytes object"),
+        // not a string -- confirmed via its bare-output fallback, matching
+        // how every other bytes-returning native in this codebase is
+        // tested (e.g. decodeBase64), since `->size` is deliberately
+        // unimplemented for `bytes` (see BytesType.swift).
+        try await withMockedIncludeURL(handler: okResponse("hello")) {
+            var context = LassoContext()
+            let output = try await LassoRenderer().render("[include_url('http://mock.example/')]", context: &context)
+            #expect(output == "hello")
+        }
+    }
+
+    @Test func stringFlagReturnsAStringNotABytesObject() async throws {
+        try await withMockedIncludeURL(handler: okResponse("hello")) {
+            var context = LassoContext()
+            let output = try await LassoRenderer().render(
+                "[include_url('http://mock.example/', -string)]",
+                context: &context
+            )
+            #expect(output == "hello")
+        }
+    }
+
+    @Test func postParamsArrayOfPairsFormEncodesTheBody() async throws {
+        // Exact real-corpus shape: includes/efs_process.lasso builds its
+        // entire gateway request as an array of Pair(...) calls.
+        try await withMockedIncludeURL(handler: okResponse("ok")) {
+            var context = LassoContext()
+            _ = try await LassoRenderer().render(
+                """
+                [include_url('http://mock.example/gateway',
+                    -postParams=array(Pair('x_login'='4h5jXQ57kAK'), Pair('x_amount'='19.99'), Pair('note'='a b+c')))]
+                """,
+                context: &context
+            )
+            let body = MockURLProtocol.lastBody.map { String(decoding: $0, as: UTF8.self) }
+            #expect(body == "x_login=4h5jXQ57kAK&x_amount=19.99&note=a+b%2Bc")
+            #expect(MockURLProtocol.lastRequest?.httpMethod == "POST")
+            #expect(MockURLProtocol.lastRequest?.value(forHTTPHeaderField: "Content-Type") == "application/x-www-form-urlencoded")
+        }
+    }
+
+    @Test func sendMimeHeadersSetsCustomRequestHeaders() async throws {
+        try await withMockedIncludeURL(handler: okResponse("ok")) {
+            var context = LassoContext()
+            _ = try await LassoRenderer().render(
+                "[include_url('http://mock.example/', -sendMimeHeaders=array(Pair('X-Custom'='abc')))]",
+                context: &context
+            )
+            #expect(MockURLProtocol.lastRequest?.value(forHTTPHeaderField: "X-Custom") == "abc")
+        }
+    }
+
+    @Test func retrieveMimeHeadersStoresResponseHeadersIntoTheNamedVariable() async throws {
+        try await withMockedIncludeURL(handler: okResponse("ok", headers: ["ReplyStatus": "yes"])) {
+            var context = LassoContext()
+            let output = try await LassoRenderer().render(
+                "[var(x = include_url('http://mock.example/', -retrieveMimeHeaders='resp_headers'))][$resp_headers->replystatus]",
+                context: &context
+            )
+            #expect(output == "yes")
+        }
+    }
+
+    @Test func noDataReturnsVoidInsteadOfTheResponseBody() async throws {
+        try await withMockedIncludeURL(handler: okResponse("should not appear")) {
+            var context = LassoContext()
+            let output = try await LassoRenderer().render(
+                "before[include_url('http://mock.example/', -noData)]after",
+                context: &context
+            )
+            #expect(output == "beforeafter")
+        }
+    }
+
+    @Test func aGenuineNetworkFailureIsRecoverableAndCatchableByProtect() async throws {
+        try await withMockedIncludeURL(handler: { _, _ in throw URLError(.cannotConnectToHost) }) {
+            var context = LassoContext()
+            let output = try await LassoRenderer().render(
+                "before-[protect]during-[include_url('http://mock.example/unreachable')]-unreached[/protect]-after-[error_currenterror]",
+                context: &context
+            )
+            #expect(output == "before--after-Include_URL request failed.")
+        }
+    }
+}
+
 @Test func chainedStringReplaceCallsBuildASlugWithNoStrayOutput() async throws {
     // The exact real-corpus shape from pages/thumbs2.page.lasso (also
     // pages/thumbs.page.lasso, thumbs3.page.lasso, and every
