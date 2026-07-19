@@ -5693,6 +5693,69 @@ struct IncludeURLTests {
     #expect(output.contains("plain=x,y"))
 }
 
+@Test func arrayConstructorBuildsPairsFromLabeledArguments() async throws {
+    // Lasso 8.5 Language Guide p.389 "Creating Arrays", worked example:
+    // "[Array: 'Name_One'='Value_One', 'Name_Two'='Value_Two']" — "Each
+    // name/value pair becomes a single pair within the array returned by
+    // the tag." Previously `array(...)` silently discarded the label and
+    // built `.array([.string("Value_One"), .string("Value_Two")])`.
+    var context = LassoContext()
+    let output = try await LassoRenderer().render(
+        """
+        [var(pairs::array = array('Name_One' = 'Value_One', 'Name_Two' = 'Value_Two'))]
+        size=[$pairs->size]|k1=[$pairs->first->first]|v1=[$pairs->first->second]|k2=[$pairs->get(2)->first]|v2=[$pairs->get(2)->second]
+        """,
+        context: &context
+    )
+    #expect(output.contains("size=2"))
+    #expect(output.contains("k1=Name_One"))
+    #expect(output.contains("v1=Value_One"))
+    #expect(output.contains("k2=Name_Two"))
+    #expect(output.contains("v2=Value_Two"))
+}
+
+@Test func arrayConstructorPairArraySupportsMixedDuplicateKeysAndNonStringValues() async throws {
+    // Lasso 8.5 Language Guide p.396 "Pair Arrays" worked example:
+    // "[Variable: 'Pair_Array' = (Array: 'Alpha'='One', 'Beta'='Two',
+    // 'Alpha'=1, 'Beta'=2)]" — a pair array can hold duplicate keys and
+    // non-string pair values in the same array.
+    var context = LassoContext()
+    let output = try await LassoRenderer().render(
+        """
+        [var(pair_array::array = array('Alpha' = 'One', 'Beta' = 'Two', 'Alpha' = 1, 'Beta' = 2))]
+        size=[$pair_array->size]|k1=[$pair_array->get(1)->first]|v1=[$pair_array->get(1)->second]\
+        |k3=[$pair_array->get(3)->first]|v3=[$pair_array->get(3)->second]
+        """,
+        context: &context
+    )
+    #expect(output.contains("size=4"))
+    #expect(output.contains("k1=Alpha"))
+    #expect(output.contains("v1=One"))
+    #expect(output.contains("k3=Alpha"))
+    #expect(output.contains("v3=1"))
+}
+
+@Test func mapConstructorAcceptsIntegerLiteralKeys() async throws {
+    // Lasso 8.5 Language Guide p.400 "To create a map", worked example:
+    // "[Map: 1='Sunday', 2='Monday', 3='Tuesday', ...]" — "a map with
+    // integer literals as keys." Previously `1='Sunday'` fell through to
+    // the generic `.assignment` evaluation path (only `.string`/
+    // `.identifier`/`.variable` assignment targets produced a label),
+    // which tried to write back to an unassignable `.integer` target and
+    // threw `invalidAssignment` before the map was ever built.
+    var context = LassoContext()
+    let output = try await LassoRenderer().render(
+        """
+        [var(days::map = map(1 = 'Sunday', 2 = 'Monday', 7 = 'Saturday'))]
+        one=[$days->'1']|two=[$days->'2']|seven=[$days->'7']
+        """,
+        context: &context
+    )
+    #expect(output.contains("one=Sunday"))
+    #expect(output.contains("two=Monday"))
+    #expect(output.contains("seven=Saturday"))
+}
+
 @Test func mapInsertAddsAKeyedEntryMutatingTheInvocantInPlace() async throws {
     // Real corpus: includes/detail_by_size.lasso's
     // `var(skuArrayItem = map)` followed by

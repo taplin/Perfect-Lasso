@@ -870,6 +870,16 @@ struct Evaluator {
             return name
         case let .variable(name, _):
             return name
+        // Lasso 8.5 Language Guide p.400: "[Map: 1='Sunday', 2='Monday', ...]"
+        // — a map key written as an integer literal, coerced to a string
+        // ("The name or key is always a string value"). Without this case
+        // `1='Sunday'` fell through to the default `.assignment` evaluation
+        // path, which tried to write-back to an `.integer` target and threw
+        // `invalidAssignment`.
+        case let .integer(value):
+            return String(value)
+        case let .decimal(value):
+            return String(value)
         case let .binary(left, "::", _):
             return assignmentLabel(left)
         default:
