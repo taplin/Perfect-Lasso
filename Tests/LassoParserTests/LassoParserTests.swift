@@ -5377,6 +5377,183 @@ private final class MapIncludeLoader: LassoIncludeLoader, @unchecked Sendable {
     #expect(output == "14|14|true")
 }
 
+@Test func regExpConstructorAndAccessorsMatchTheLanguageGuidesOwnWorkedExample() async throws {
+    // Lasso 8.5 Language Guide Ch. 26 Table 7/8 (pp. 350-351), verified
+    // directly against the PDF including its own worked example
+    // (`$MyRegExp` built from `-Find='[aeiou]', -Replace='x', -IgnoreCase`).
+    // `->FindPattern`/`->ReplacePattern`/`->Input`/`->IgnoreCase` are
+    // implemented as read-only getters here (see NativeTypes.swift's own
+    // doc comment on `makeRegExpType()` for why a setter needs the same
+    // treatment `Date->Add`/`->Subtract` required after their aliasing
+    // bug, deferred to a follow-up).
+    var context = LassoContext()
+    let output = try await LassoRenderer().render(
+        """
+        [var(re = RegExp(-Find='[aeiou]', -Replace='x', -IgnoreCase))]
+        FindPattern: [$re->findPattern]
+        ReplacePattern: [$re->replacePattern]
+        IgnoreCase: [$re->ignoreCase]
+        GroupCount: [$re->groupCount]
+        """,
+        context: &context
+    )
+    #expect(output.contains("FindPattern: [aeiou]"))
+    #expect(output.contains("ReplacePattern: x"))
+    #expect(output.contains("IgnoreCase: true"))
+    #expect(output.contains("GroupCount: 0"))
+}
+
+@Test func regExpReplaceAllMatchesTheLanguageGuidesOwnVowelReplacementWorkedExample() async throws {
+    // Ch. 26 p.352, exact worked example (vowel-to-x substitution).
+    var context = LassoContext()
+    let output = try await LassoRenderer().render(
+        """
+        [var(re = RegExp(-Find='[aeiou]', -Replace='x', -IgnoreCase))]
+        [$re->replaceAll(-Input='The quick brown fox jumped over the lazy dog.')]
+        """,
+        context: &context
+    )
+    #expect(output.trimmingCharacters(in: .whitespacesAndNewlines) == "Thx qxxck brxwn fxx jxmpxd xvxr thx lxzy dxg.")
+}
+
+@Test func regExpReplaceAllSupportsGroupPlaceholders() async throws {
+    // Ch. 26 p.352: "The replacement pattern can reference groups from
+    // the input using \\1 through \\9." Uses a simpler pattern than the
+    // Guide's own phone-number example (which needs several `\d`/`\(`
+    // escapes) purely to keep the Swift-literal -> Lasso-source-literal
+    // -> regex-template escaping chain in this test legible, but
+    // exercises the identical group-reference mechanism: two groups,
+    // swapped in the replacement.
+    var context = LassoContext()
+    let output = try await LassoRenderer().render(
+        "[var(re = RegExp(-Find='(a+)(b+)', -Replace='\\\\2\\\\1'))][$re->replaceAll(-Input='xxaaabbbyy')]",
+        context: &context
+    )
+    #expect(output == "xxbbbaaayy")
+}
+
+@Test func regExpReplaceAllSupportsTheDollarSignGroupPlaceholderAlternateForm() async throws {
+    // Ch. 26 Table 5, p.349, second Note: "The [RegExp] type also
+    // supports $0 and $1 through $9 as replacement symbols" — an
+    // alternate to `\1`-`\9`, so it must produce identical output to
+    // `regExpReplaceAllSupportsGroupPlaceholders`'s `\2\1` case above.
+    var context = LassoContext()
+    let output = try await LassoRenderer().render(
+        "[var(re = RegExp(-Find='(a+)(b+)', -Replace='$2$1'))][$re->replaceAll(-Input='xxaaabbbyy')]",
+        context: &context
+    )
+    #expect(output == "xxbbbaaayy")
+}
+
+@Test func regExpReplaceAllSupportsTheDollarSignLiteralEscapeEvenWhenFollowedByADigit() async throws {
+    // Ch. 26 Table 5, p.349, second Note: "In order to place a literal
+    // $ in a replacement string it is necessary to escape it as \$."
+    // Regression test for a real bug: the escaped `$` was previously
+    // emitted raw into the NSRegularExpression template, so a digit
+    // immediately following it (a realistic case, e.g. escaping a
+    // dollar amount) was misread as a `$<digit>` group reference
+    // instead of literal text. `\\$5.00` here is the Lasso source
+    // text's own `\$` escape (see the Swift-literal -> Lasso-source
+    // -> lexer chain documented on `regExpReplaceAllSupportsGroupPlaceholders`
+    // above) producing a literal `$5.00`, not a group-1 reference.
+    var context = LassoContext()
+    let output = try await LassoRenderer().render(
+        "[var(re = RegExp(-Find='[aeiou]', -Replace='\\\\$5.00'))][$re->replaceFirst(-Input='banana')]",
+        context: &context
+    )
+    #expect(output == "b$5.00nana")
+}
+
+@Test func regExpReplaceFirstOnlyReplacesTheFirstMatch() async throws {
+    // Ch. 26 Table 9: "[RegExp->ReplaceFirst] Replaces the first
+    // occurence of the current find pattern... Uses the same parameters
+    // as [RegExp->ReplaceAll]."
+    var context = LassoContext()
+    let output = try await LassoRenderer().render(
+        "[var(re = RegExp(-Find='[aeiou]', -Replace='x', -IgnoreCase))][$re->replaceFirst(-Input='banana')]",
+        context: &context
+    )
+    #expect(output == "bxnana")
+}
+
+@Test func regExpSplitMatchesTheLanguageGuidesOwnWordSplittingWorkedExample() async throws {
+    // Ch. 26 p.353, exact worked example: splitting on runs of
+    // non-word characters yields just the words, no empty/punctuation
+    // elements.
+    var context = LassoContext()
+    let output = try await LassoRenderer().render(
+        "[var(re = RegExp(-Find='[aeiou]'))][$re->split(-Find='\\\\W+', -Input='The quick brown fox jumped over the lazy dog.')->join(',')]",
+        context: &context
+    )
+    #expect(output == "The,quick,brown,fox,jumped,over,the,lazy,dog")
+}
+
+@Test func regExpSplitInterleavesCaptureGroupsBetweenSegmentsWhenTheFindPatternHasGroups() async throws {
+    // Ch. 26 p.353, exact worked example: wrapping the split pattern in
+    // parentheses interleaves the matched delimiter text itself into the
+    // result array between each pair of word segments.
+    var context = LassoContext()
+    let output = try await LassoRenderer().render(
+        "[var(re = RegExp(-Find='[aeiou]'))][$re->split(-Find='(\\\\W+)', -Input='ab cd')->join('|')]",
+        context: &context
+    )
+    #expect(output == "ab| |cd")
+}
+
+@Test func stringFindRegExpReturnsAFlatArrayOfFullMatchThenEachCaptureGroupPerMatch() async throws {
+    // Ch. 26 Table 11 / p.356, exact worked example: a 2-group pattern
+    // matching one email address in the source text yields a 3-element
+    // flat array (full match, then each group) -- not a nested
+    // array-of-arrays-per-match.
+    var context = LassoContext()
+    let output = try await LassoRenderer().render(
+        "[String_FindRegExp('Send email to documentation@lassosoft.com.', " +
+            "-Find='([A-Za-z0-9_]+)@([A-Za-z0-9_]+\\\\.[A-Za-z0-9_]+)')->join('|')]",
+        context: &context
+    )
+    #expect(output == "documentation@lassosoft.com|documentation|lassosoft.com")
+}
+
+@Test func stringFindRegExpFlattensMultipleMatchesIntoOneArrayInOrder() async throws {
+    // Ch. 26 p.356, exact worked example: a 1-group pattern ("first
+    // character of each word") matching 9 words in the source yields an
+    // 18-element flat array (full+group1, full+group1, ... per match, in
+    // order) -- confirms the "flat, not nested" contract holds across
+    // multiple matches, not just one.
+    var context = LassoContext()
+    let output = try await LassoRenderer().render(
+        "[String_FindRegExp('The quick brown fox jumped over a lazy dog.', -Find='([A-Za-z])[A-Za-z]*')->join('|')]",
+        context: &context
+    )
+    #expect(output == "The|T|quick|q|brown|b|fox|f|jumped|j|over|o|a|a|lazy|l|dog|d")
+}
+
+@Test func stringReplaceRegExpReturnsAStringMatchingTheLanguageGuidesOwnWorkedExampleNotAnArray() async throws {
+    // Ch. 26 Table 11's own description text says this tag "Returns an
+    // array..." -- almost certainly a copy-paste artifact from the
+    // FindRegExp row just above it (see the registration's own doc
+    // comment), since the Guide's own worked example output (p.357) is
+    // unambiguously a plain string.
+    var context = LassoContext()
+    let output = try await LassoRenderer().render(
+        "[String_ReplaceRegExp('Blue Lake sure is blue today.', " +
+            "-Find='[Bb]lue', -Replace='<b>x</b>')]",
+        context: &context
+    )
+    #expect(output == "<b>x</b> Lake sure is <b>x</b> today.")
+}
+
+@Test func stringReplaceRegExpOnlyOneFlagLimitsToTheFirstMatch() async throws {
+    // Ch. 26 Table 11: "Optional -ReplaceOnlyOne parameter replaces only
+    // the first pattern match."
+    var context = LassoContext()
+    let output = try await LassoRenderer().render(
+        "[String_ReplaceRegExp('aaa', -Find='a', -Replace='b', -ReplaceOnlyOne)]",
+        context: &context
+    )
+    #expect(output == "baa")
+}
+
 @Test func pairConstructorSupportsAllFourRealLassoForms() async throws {
     // LassoGuide, "Collections": pair() -> both null; pair(anotherPair) ->
     // copies first/second; pair(value, value) -> two positional elements;

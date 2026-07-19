@@ -66,6 +66,7 @@ public struct LassoNativeTypeRegistry: Sendable {
         register(Self.makeWebResponseType())
         register(Self.makeDateType())
         register(Self.makeBytesType())
+        register(Self.makeRegExpType())
     }
 }
 
@@ -524,4 +525,71 @@ extension LassoNativeTypeRegistry {
         return type
     }
 
+    // MARK: - regexp
+    //
+    // See RegularExpressions.swift for the `NSRegularExpression`-backed
+    // implementation. Stored fields ("find"/"replace"/"input"/
+    // "ignorecase") mirror `RegExp`'s constructor keywords (Ch. 26 Table 7)
+    // exactly. `->FindPattern`/`->ReplacePattern`/`->Input`/`->IgnoreCase`
+    // are documented as getter/setter (a parameter sets a new value) —
+    // deliberately implemented here as READ-ONLY getters that ignore any
+    // argument, not setters. Real Lasso `date` objects taught this
+    // codebase a real lesson (see `Date->Add`'s own doc comment above,
+    // and the aliasing bug that fix resolved): a setter that mutates
+    // `receiver`'s stored fields directly would corrupt any OTHER
+    // variable referencing the same shared `LassoObjectInstance` after a
+    // plain assignment, since assignment here copies the `LassoValue`
+    // enum case but not the class instance it wraps. A correct setter
+    // needs the same build-a-new-instance + `selfMutatingMethods` write-
+    // back treatment `Date->Add`/`->Subtract` use — deferred to a
+    // follow-up along with Table 10's interactive tags, which depend on
+    // genuinely mutable per-call state (`->Find` advancing a match
+    // position) in a way the convenience tags below don't.
+    fileprivate static func makeRegExpType() -> LassoNativeType {
+        var type = LassoNativeType(name: "regexp")
+
+        type.register("findpattern") { receiver, _, _ in .string(regexpStringField("find", receiver)) }
+        type.register("replacepattern") { receiver, _, _ in .string(regexpStringField("replace", receiver)) }
+        type.register("input") { receiver, _, _ in .string(regexpStringField("input", receiver)) }
+        type.register("ignorecase") { receiver, _, _ in receiver.value(for: "ignorecase") }
+        type.register("groupcount") { receiver, _, _ in
+            let regex = LassoRegularExpressions.makeRegex(pattern: regexpStringField("find", receiver), ignoreCase: false)
+            return .integer(regex?.numberOfCaptureGroups ?? 0)
+        }
+        type.register("replaceall") { receiver, arguments, _ in
+            let pattern = arguments.lastString(named: "find") ?? regexpStringField("find", receiver)
+            let replacement = arguments.lastString(named: "replace") ?? regexpStringField("replace", receiver)
+            let input = arguments.lastString(named: "input") ?? regexpStringField("input", receiver)
+            let ignoreCase = receiver.value(for: "ignorecase").isTruthy
+            return .string(LassoRegularExpressions.replaceAll(
+                in: input, pattern: pattern, replacement: replacement, ignoreCase: ignoreCase
+            ))
+        }
+        type.register("replacefirst") { receiver, arguments, _ in
+            let pattern = arguments.lastString(named: "find") ?? regexpStringField("find", receiver)
+            let replacement = arguments.lastString(named: "replace") ?? regexpStringField("replace", receiver)
+            let input = arguments.lastString(named: "input") ?? regexpStringField("input", receiver)
+            let ignoreCase = receiver.value(for: "ignorecase").isTruthy
+            return .string(LassoRegularExpressions.replaceFirst(
+                in: input, pattern: pattern, replacement: replacement, ignoreCase: ignoreCase
+            ))
+        }
+        type.register("split") { receiver, arguments, _ in
+            let pattern = arguments.lastString(named: "find") ?? regexpStringField("find", receiver)
+            let input = arguments.lastString(named: "input") ?? regexpStringField("input", receiver)
+            let ignoreCase = receiver.value(for: "ignorecase").isTruthy
+            return .array(LassoRegularExpressions.split(input, pattern: pattern, ignoreCase: ignoreCase))
+        }
+
+        return type
+    }
+}
+
+/// Reads one of a `regexp` object's stored string fields — a top-level
+/// function (not a local closure) so it can be captured by the
+/// `@Sendable` `type.register(...)` closures above without a
+/// Sendable-capture compile error (the same fix already applied to
+/// `isEveryCharacter` in Runtime.swift).
+private func regexpStringField(_ name: String, _ receiver: LassoObjectInstance) -> String {
+    receiver.value(for: name).outputString
 }

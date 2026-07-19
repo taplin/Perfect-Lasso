@@ -439,6 +439,50 @@ public struct LassoNativeRegistry: Sendable {
         // Time Operations". See Documentation/date-format-plan.md for the
         // native "date" object representation and the DateFormatter/ICU
         // rendering approach.
+        // `RegExp(...)` constructor (Ch. 26 Table 7) — `-Find` is
+        // documented as required; defaulting to an empty pattern rather
+        // than throwing when omitted matches this codebase's general
+        // "missing argument degrades gracefully" convention elsewhere
+        // (e.g. `->replace`/`->contains` defaulting to `""`).
+        register("regexp") { arguments, _ in
+            .object(LassoObjectInstance(typeName: "regexp", data: [
+                "find": .string(arguments.lastString(named: "find") ?? ""),
+                "replace": .string(arguments.lastString(named: "replace") ?? ""),
+                "input": .string(arguments.lastString(named: "input") ?? ""),
+                "ignorecase": .boolean(arguments.hasTruthyFlag("ignorecase")),
+            ]))
+        }
+        register("string_findregexp") { arguments, _ in
+            // Ch. 26 Table 11 — returns a single FLAT array across every
+            // match: full match text then each capture group's text, per
+            // match, concatenated (see LassoRegularExpressions.findAll's
+            // own doc comment for the worked-example evidence).
+            let text = arguments.positionalValue(at: 0)?.outputString ?? ""
+            let pattern = arguments.lastString(named: "find") ?? ""
+            let ignoreCase = arguments.hasTruthyFlag("ignorecase")
+            return .array(LassoRegularExpressions.findAll(in: text, pattern: pattern, ignoreCase: ignoreCase))
+        }
+        register("string_replaceregexp") { arguments, _ in
+            // Table 11's own description text says this "Returns an
+            // array with each instance... replaced" — almost certainly a
+            // copy-paste artifact from the FindRegExp row just above it,
+            // since every one of the Guide's own worked examples for
+            // this exact tag shows a plain STRING result (e.g.
+            // `<font color="blue">Blue</font> lake...`), never an array
+            // representation. Implemented against the worked examples.
+            let text = arguments.positionalValue(at: 0)?.outputString ?? ""
+            let pattern = arguments.lastString(named: "find") ?? ""
+            let replacement = arguments.lastString(named: "replace") ?? ""
+            let ignoreCase = arguments.hasTruthyFlag("ignorecase")
+            if arguments.hasTruthyFlag("replaceonlyone") {
+                return .string(LassoRegularExpressions.replaceFirst(
+                    in: text, pattern: pattern, replacement: replacement, ignoreCase: ignoreCase
+                ))
+            }
+            return .string(LassoRegularExpressions.replaceAll(
+                in: text, pattern: pattern, replacement: replacement, ignoreCase: ignoreCase
+            ))
+        }
         register("date") { arguments, _ in
             // -Year/-Month/-Day/-Hour/-Minute/-Second construction keywords
             // (Chapter 29 Table 1) take priority when present — cheap to
