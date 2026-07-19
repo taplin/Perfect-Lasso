@@ -858,6 +858,21 @@ public struct LassoNativeRegistry: Sendable {
             }
             return .object(LassoTreeMapValue.makeObject(kind: kind, entries: entries))
         }
+        // `Iterator`/`ReverseIterator` (Ch. 30 Table 23) — "Requires a
+        // compound data type as a parameter... A second optional
+        // parameter allows a matcher to be specified" — the matcher
+        // parameter is deferred (Stage 5, Matcher values don't exist
+        // yet) and silently ignored if given, rather than erroring,
+        // matching this project's general "unrecognized flag ignored,
+        // not fatal" convention.
+        register("iterator") { arguments, _ in
+            guard let source = arguments.first?.value else { return .null }
+            return LassoIteratorValue.build(from: source, reverse: false) ?? .null
+        }
+        register("reverseiterator") { arguments, _ in
+            guard let source = arguments.first?.value else { return .null }
+            return LassoIteratorValue.build(from: source, reverse: true) ?? .null
+        }
         register("json_serialize") { arguments, _ in
             let value = arguments.first?.value ?? .null
             let object = value.jsonObject

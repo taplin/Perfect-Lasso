@@ -1077,6 +1077,13 @@ struct Evaluator {
                 return .array(values)
             }
             return .array(values.sorted { LassoComparatorValue.isOrderedBefore(kind: kind, $0, $1) })
+        case let (.array(values), "iterator"):
+            // Table 23: array is one of the explicitly-named built-in
+            // `->Iterator`-supporting types — verified against the
+            // p.423 worked example's own `Array->Iterator` call.
+            return LassoIteratorValue.build(from: .array(values), reverse: false) ?? .null
+        case let (.array(values), "reverseiterator"):
+            return LassoIteratorValue.build(from: .array(values), reverse: true) ?? .null
         case let (.array(values), "join"):
             // `array->join(separator)` — real corpus need: comma/CSV-list
             // and breadcrumb-trail building, previously requiring a manual
@@ -1207,6 +1214,14 @@ struct Evaluator {
             guard sortedKeys.indices.contains(index) else { return .null }
             let key = sortedKeys[index]
             return .pair(.string(key), values[key] ?? .null)
+        case let (.map(values), "iterator"):
+            // Table 23: map is one of the explicitly-named built-in
+            // `->Iterator`-supporting types — verified against the
+            // p.424 worked example's own key+value `While` loop
+            // (`$myIterator->Key + ' = ' + $myIterator->Value`).
+            return LassoIteratorValue.build(from: .map(values), reverse: false) ?? .null
+        case let (.map(values), "reverseiterator"):
+            return LassoIteratorValue.build(from: .map(values), reverse: true) ?? .null
         case let (.map(values), "contains"):
             let key = arguments.first != nil ? try await evaluate(arguments[0].value).outputString : ""
             return .boolean(values[key] != nil)

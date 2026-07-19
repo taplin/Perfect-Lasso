@@ -451,6 +451,12 @@ extension LassoNativeTypeRegistry {
                 .sorted { LassoComparatorValue.isOrderedBefore(kind: kind, $0, $1) }
             return .object(LassoCollectionValue.makeObject(typeName: "list", elements: sorted))
         }
+        type.register("iterator") { receiver, _, _ in
+            LassoIteratorValue.build(from: .object(receiver), reverse: false) ?? .null
+        }
+        type.register("reverseiterator") { receiver, _, _ in
+            LassoIteratorValue.build(from: .object(receiver), reverse: true) ?? .null
+        }
 
         return type
     }
@@ -504,6 +510,12 @@ extension LassoNativeTypeRegistry {
                 stored = .array(elements)
                 return popped
             }
+        }
+        type.register("iterator") { receiver, _, _ in
+            LassoIteratorValue.build(from: .object(receiver), reverse: false) ?? .null
+        }
+        type.register("reverseiterator") { receiver, _, _ in
+            LassoIteratorValue.build(from: .object(receiver), reverse: true) ?? .null
         }
 
         return type
@@ -561,6 +573,12 @@ extension LassoNativeTypeRegistry {
                 stored = .array(elements)
                 return popped
             }
+        }
+        type.register("iterator") { receiver, _, _ in
+            LassoIteratorValue.build(from: .object(receiver), reverse: false) ?? .null
+        }
+        type.register("reverseiterator") { receiver, _, _ in
+            LassoIteratorValue.build(from: .object(receiver), reverse: true) ?? .null
         }
 
         return type
@@ -677,6 +695,12 @@ extension LassoNativeTypeRegistry {
             elements = LassoCollectionValue.naturalSort(elements)
             return .object(LassoCollectionValue.makeObject(typeName: "set", elements: elements))
         }
+        type.register("iterator") { receiver, _, _ in
+            LassoIteratorValue.build(from: .object(receiver), reverse: false) ?? .null
+        }
+        type.register("reverseiterator") { receiver, _, _ in
+            LassoIteratorValue.build(from: .object(receiver), reverse: true) ?? .null
+        }
 
         return type
     }
@@ -750,6 +774,12 @@ extension LassoNativeTypeRegistry {
                 return popped
             }
         }
+        type.register("iterator") { receiver, _, _ in
+            LassoIteratorValue.build(from: .object(receiver), reverse: false) ?? .null
+        }
+        type.register("reverseiterator") { receiver, _, _ in
+            LassoIteratorValue.build(from: .object(receiver), reverse: true) ?? .null
+        }
 
         return type
     }
@@ -821,6 +851,12 @@ extension LassoNativeTypeRegistry {
             let index = position - 1
             guard entries.indices.contains(index) else { return .null }
             return entries[index]
+        }
+        type.register("iterator") { receiver, _, _ in
+            LassoIteratorValue.build(from: .object(receiver), reverse: false) ?? .null
+        }
+        type.register("reverseiterator") { receiver, _, _ in
+            LassoIteratorValue.build(from: .object(receiver), reverse: true) ?? .null
         }
 
         return type

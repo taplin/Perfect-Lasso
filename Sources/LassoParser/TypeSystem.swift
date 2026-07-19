@@ -50,6 +50,21 @@ public final class LassoObjectInstance: @unchecked Sendable, Equatable {
         data[key] = current
         return result
     }
+
+    /// Same atomicity guarantee as `withLock(_:_:)` above, but across
+    /// the WHOLE data dictionary rather than a single named key — for
+    /// callers whose read-modify-write genuinely spans more than one
+    /// key at once (e.g. Iterator's `->Forward`/`->RemoveCurrent`,
+    /// which must read both `_elements` and `_position` and write a
+    /// derived value back to one or both under a single critical
+    /// section; composing per-key `withLock(_:_:)` calls would just
+    /// reintroduce the same lost-update race window it exists to
+    /// close, one level up).
+    public func withLock<T>(_ body: (inout [String: LassoValue]) -> T) -> T {
+        lock.lock()
+        defer { lock.unlock() }
+        return body(&data)
+    }
 }
 
 struct LassoResolvedMethod {

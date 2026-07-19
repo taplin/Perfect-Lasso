@@ -8784,3 +8784,174 @@ struct IncludeURLTests {
     #expect(output == "1=One|2=Two|3=Three")
 }
 
+@Test func iteratorWalksAnArrayForwardMatchingTheGuidesOwnWhileLoopWorkedExample() async throws {
+    // Ch. 30 p.423: `Var('myIterator' = Iterator($myArray))` then a
+    // `While($myIterator->atEnd == False)` loop outputting `->Value`
+    // and advancing via `->Forward` — reproduction of the Guide's own
+    // four-element example. The Guide's own idiom is `Null:
+    // $myIterator->Forward` to suppress `->Forward`'s own boolean
+    // return value — found, while writing this test, to be completely
+    // unreachable in this codebase (`"null"` is hardcoded as the
+    // literal `.null` VALUE token at parse time, never as a callable
+    // identifier — confirmed via a minimal repro, flagged as a
+    // separate out-of-scope follow-up). `[var('_' = ...)]` is used
+    // instead — an assignment's own return is already void/undisplayed
+    // via this codebase's existing, unrelated `Var` handling, achieving
+    // the identical suppression effect through a mechanism that
+    // actually works.
+    var context = LassoContext()
+    let output = try await LassoRenderer().render(
+        """
+        [var('myArray' = array('One', 'Two', 'Three', 'Four'))]\
+        [var('myIterator' = iterator($myArray))]\
+        [while($myIterator->atEnd == false)]\
+        [$myIterator->Value] [var('_' = $myIterator->Forward)][/while]
+        """,
+        context: &context
+    )
+    #expect(output == "One Two Three Four ")
+}
+
+@Test func reverseIteratorWalksAnArrayBackwardMatchingTheGuidesOwnWorkedExample() async throws {
+    // Ch. 30 pp.424-425: identical loop, but `ReverseIterator` instead
+    // of `Iterator` — outputs Four, Three, Two, One.
+    var context = LassoContext()
+    let output = try await LassoRenderer().render(
+        """
+        [var('myArray' = array('One', 'Two', 'Three', 'Four'))]\
+        [var('myIterator' = reverseiterator($myArray))]\
+        [while($myIterator->atEnd == false)]\
+        [$myIterator->Value] [var('_' = $myIterator->Forward)][/while]
+        """,
+        context: &context
+    )
+    #expect(output == "Four Three Two One ")
+}
+
+@Test func iteratorOverAMapExposesBothKeyAndValueMatchingTheGuidesOwnWorkedExample() async throws {
+    // Ch. 30 p.425: same `While`/`atEnd`/`Forward` shape, but reads
+    // `->Key` alongside `->Value` — "1 = Sunday", "2 = Monday", etc.
+    var context = LassoContext()
+    let output = try await LassoRenderer().render(
+        """
+        [var('myMap' = map(1='Sunday', 2='Monday', 3='Tuesday'))]\
+        [var('myIterator' = iterator($myMap))]\
+        [while($myIterator->atEnd == false)]\
+        [$myIterator->Key] = [$myIterator->Value] [var('_' = $myIterator->Forward)][/while]
+        """,
+        context: &context
+    )
+    #expect(output == "1 = Sunday 2 = Monday 3 = Tuesday ")
+}
+
+@Test func iteratorKeyIsNullForNonMapSourcesSinceThereIsNoKeyDefined() async throws {
+    // Table 24: "[Iterator->Key] Returns the key for the current
+    // element IF DEFINED" — array-sourced iterators have no keys.
+    var context = LassoContext()
+    let output = try await LassoRenderer().render(
+        "[var('it' = iterator(array('a', 'b')))][$it->Key]",
+        context: &context
+    )
+    #expect(output == "")
+}
+
+@Test func iteratorAtBeginBackwardAndResetTrackPositionCorrectly() async throws {
+    var context = LassoContext()
+    let output = try await LassoRenderer().render(
+        """
+        [var('it' = iterator(array('a', 'b', 'c')))]\
+        [$it->AtBegin]|[var('_' = $it->Forward)][$it->AtBegin]|[var('_' = $it->Backward)][$it->AtBegin]|\
+        [var('_' = $it->Forward)][var('_' = $it->Forward)][var('_' = $it->Forward)][$it->AtEnd]|\
+        [var('_' = $it->Reset)][$it->AtBegin][$it->Value]
+        """,
+        context: &context
+    )
+    #expect(output == "true|false|true|true|truea")
+}
+
+@Test func iteratorLeftRightUpDownAlwaysNoOpAndTheirAtTagsAlwaysReportTrue() async throws {
+    // Ch. 30 p.424, verbatim: "The left/right and up/down tags will
+    // return False if a move is attempted and the test tags will
+    // return True since moving in that dimension is not possible" —
+    // the documented terminal behavior for every built-in type, not a
+    // stub pending future work.
+    var context = LassoContext()
+    let output = try await LassoRenderer().render(
+        """
+        [var('it' = iterator(array('a')))]\
+        [$it->Left]|[$it->Right]|[$it->Up]|[$it->Down]|\
+        [$it->AtFarLeft]|[$it->AtFarRight]|[$it->AtTop]|[$it->AtBottom]
+        """,
+        context: &context
+    )
+    #expect(output == "false|false|false|false|true|true|true|true")
+}
+
+@Test func iteratorRemoveCurrentDeletesTheCurrentElementFromItsOwnSnapshot() async throws {
+    // No worked example exists for `->RemoveCurrent` (see
+    // `Iterator.swift`'s own doc comment) — this test verifies the
+    // implemented behavior (remove, then advance) rather than a
+    // primary-source citation.
+    var context = LassoContext()
+    let output = try await LassoRenderer().render(
+        """
+        [var('it' = iterator(array('a', 'b', 'c')))]\
+        [var('_' = $it->RemoveCurrent)][$it->Value]
+        """,
+        context: &context
+    )
+    #expect(output == "c")
+}
+
+@Test func iteratorInsertAtCurrentInsertsAtTheCurrentPositionInItsOwnSnapshot() async throws {
+    // Same "no worked example" caveat as `->RemoveCurrent` above.
+    var context = LassoContext()
+    let output = try await LassoRenderer().render(
+        """
+        [var('it' = iterator(array('a', 'b', 'c')))]\
+        [var('_' = $it->Forward)][var('_' = $it->InsertAtCurrent('X'))][$it->Value]
+        """,
+        context: &context
+    )
+    #expect(output == "X")
+}
+
+@Test func listSetTreeMapIteratorsMatchTheirOwnCollectionsTraversalOrder() async throws {
+    // Table 23's own "e.g." list names array/list/map/set/treemap as
+    // built-in `->Iterator`-supporting types — this codebase
+    // implements it uniformly across every collection type from
+    // Stages 1-2 instead (see `Iterator.swift`'s own doc comment for
+    // why), but this test focuses on the three Table-23-named compound
+    // types specifically. Set/TreeMap both iterate in their own
+    // natural sorted order (never insertion order).
+    var context = LassoContext()
+    let output = try await LassoRenderer().render(
+        """
+        [var('l' = (list: 'x', 'y'))][var('li' = $l->Iterator)]\
+        [$li->Value][var('_' = $li->Forward)][$li->Value]|\
+        [var('s' = set)][$s->Insert('Beta')][$s->Insert('Alpha')][var('si' = $s->Iterator)]\
+        [$si->Value][var('_' = $si->Forward)][$si->Value]|\
+        [var('tm' = (treemap: 2='Two', 1='One'))][var('tmi' = $tm->Iterator)]\
+        [$tmi->Key]=[$tmi->Value]
+        """,
+        context: &context
+    )
+    #expect(output == "xy|AlphaBeta|1=One")
+}
+
+@Test func queueAndStackIteratorsWalkTheirOwnStoredOrderWithoutMutatingTheSource() async throws {
+    // Not among Table 23's own "e.g." list, but implemented uniformly
+    // (disclosed design choice, see `Iterator.swift`'s own doc
+    // comment) — importantly, unlike `->Get`, obtaining an iterator
+    // must NOT drain the queue/stack (`->Size` stays 2 afterward).
+    var context = LassoContext()
+    let output = try await LassoRenderer().render(
+        """
+        [var('q' = queue)][$q->Insert('One')][$q->Insert('Two')][var('qi' = $q->Iterator)]\
+        [$qi->Value][var('_' = $qi->Forward)][$qi->Value]|[$q->Size]
+        """,
+        context: &context
+    )
+    #expect(output == "OneTwo|2")
+}
+
