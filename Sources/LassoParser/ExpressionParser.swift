@@ -141,6 +141,22 @@ struct ExpressionParser {
     private let tokens: [Token]
     private var index = 0
 
+    /// True while parsing the value of a bare colon-call argument (`closing
+    /// == nil` in `parseArguments`) — real Lasso's colon syntax has no
+    /// closing delimiter of its own, so per the Lasso 8.5 Language Guide's
+    /// "Colon Syntax" section, an unparenthesized nested/trailing construct
+    /// binds to the *outermost* call, not to the argument being parsed.
+    /// Concretely: `$arr->get:2->first` must parse as `($arr->get:2)->first`
+    /// (`->first` targets the call's result), not `$arr->get:(2->first)`
+    /// (which crashes — `2` has no `first` member). Suppressing `->` here
+    /// stops `parsePostfix` from greedily absorbing that trailing member
+    /// access into the argument value; it's lifted again the moment we
+    /// enter any parenthesized (unambiguously bounded) sub-expression. Real
+    /// corpus (`->get:1`-style calls, 70+ sites) never puts a `->` inside a
+    /// bare colon-call's own argument, so this never suppresses anything
+    /// real code relies on.
+    private var suppressArrowPostfix = false
+
     init(_ source: String) {
         var lexer = ExpressionLexer(source)
         tokens = lexer.lex()
@@ -229,7 +245,10 @@ struct ExpressionParser {
         case .symbol("."):
             expression = .member(base: .identifier("self"), name: readMemberName(), arguments: nil)
         case .symbol("("):
+            let previousSuppression = suppressArrowPostfix
+            suppressArrowPostfix = false
             expression = parseExpression()
+            suppressArrowPostfix = previousSuppression
             _ = consume(")")
         case let .named(name): expression = .unknown("-\(name)")
         case let .symbol(value): expression = .unknown(value)
@@ -245,7 +264,7 @@ struct ExpressionParser {
                 expression = .call(callee: expression, arguments: parseArguments(closing: ")"))
             } else if consume(":") {
                 expression = .call(callee: expression, arguments: parseArguments(closing: nil))
-            } else if consume("->") {
+            } else if !suppressArrowPostfix, consume("->") {
                 let wrapped = consume("(")
                 let name = readMemberName()
                 let arguments: [LassoArgument]?
@@ -301,6 +320,9 @@ struct ExpressionParser {
 
     mutating private func parseArguments(closing: String?) -> [LassoArgument] {
         var arguments: [LassoArgument] = []
+        let previousSuppression = suppressArrowPostfix
+        suppressArrowPostfix = (closing == nil)
+        defer { suppressArrowPostfix = previousSuppression }
         while peek != .eof {
             if let closing, consume(closing) { break }
             // A bare-colon-call's argument list (`closing == nil` — no
