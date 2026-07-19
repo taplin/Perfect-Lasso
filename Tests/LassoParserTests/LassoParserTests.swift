@@ -510,6 +510,200 @@ import PerfectSessionCore
     #expect(emptyPassword.hasPrefix("0x"))
 }
 
+@Test func encryptMd5MatchesKnownVectors() async throws {
+    // Independently-verifiable cryptographic test vectors (RFC 1321's
+    // own test suite), not something requiring Lasso doc confirmation:
+    // md5("") and md5("abc").
+    var context = LassoContext()
+    let output = try await LassoRenderer().render(
+        "[Encrypt_MD5('')]|[Encrypt_MD5('abc')]",
+        context: &context
+    )
+    #expect(output == "d41d8cd98f00b204e9800998ecf8427e|900150983cd24fb0d6963f7d28e17f72")
+}
+
+@Test func encryptMd5AndCipherDigestOperateOnRawBytesNotALossyStringDecodeOfABytesObject() async throws {
+    // Regression test (found by architect review): an earlier version
+    // extracted the input via `.outputString`, which for a `.object`
+    // bytes value routes through `LassoBytesValue.string(from:)` — an
+    // explicitly-documented LOSSY UTF-8 decode — silently hashing
+    // mangled data instead of the real bytes. `->decodeHex` builds
+    // genuinely non-UTF-8-safe binary (bytes 0x00/0xFF aren't valid
+    // standalone UTF-8), so hashing it must match hashing those exact
+    // raw bytes directly, not a lossy re-decode of them.
+    // Independently computed (Python hashlib, not this codebase) for
+    // the raw two-byte sequence 0x00 0xFF.
+    var context = LassoContext()
+    let output = try await LassoRenderer().render(
+        "[Encrypt_MD5(bytes('00ff')->decodeHex)]|[Cipher_Digest(bytes('00ff')->decodeHex, -digest='sha256', -hex)]",
+        context: &context
+    )
+    #expect(output == "d07d34efac6328007ad67c7e0a985e00|06eb7d6a69ee19e5fbdf749018d3d2abfa04bcbd1365db312eb86dc7169389b8")
+}
+
+@Test func cipherDigestMatchesKnownVectorsForEachSupportedAlgorithm() async throws {
+    // lassoguide.com "Calculate a Digest Value": `cipher_digest(field('message'), -digest='DSA')`
+    // — DSA itself isn't implemented (see Hashing.swift's own scope
+    // disclosure), but this exercises the same -Digest keyword shape
+    // against algorithms this codebase does support, verified against
+    // independently-known SHA1/SHA256 test vectors.
+    var context = LassoContext()
+    let output = try await LassoRenderer().render(
+        "[Cipher_Digest('abc', -digest='sha1', -hex)]|[Cipher_Digest('abc', -digest='sha256', -hex)]",
+        context: &context
+    )
+    #expect(output == "a9993e364706816aba3e25717850c26c9cd0d89d|ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad")
+}
+
+@Test func cipherDigestReturnsABytesObjectByDefaultWithoutHex() async throws {
+    // "Returns... bytes" (lassoguide.com's own signature) — -Hex is an
+    // explicit opt-in to a string encoding, not the default shape.
+    var context = LassoContext()
+    let output = try await LassoRenderer().render(
+        "[Cipher_Digest('abc', -digest='md5')->type]",
+        context: &context
+    )
+    #expect(output == "bytes")
+}
+
+@Test func cipherDigestWithAnUnsupportedAlgorithmFailsGracefullyRatherThanCrashing() async throws {
+    // DSA/MD2/MD4/RIPEMD160 etc. are real, documented cipher_list(-digest)
+    // entries this codebase doesn't implement (see Hashing.swift's own
+    // disclosed scope) — must degrade to a recoverable error, not throw
+    // an unrelated fatal error or silently return a wrong value.
+    var context = LassoContext()
+    let output = try await LassoRenderer().render(
+        "[protect][Cipher_Digest('abc', -digest='dsa')][/protect][error_currenterror(-errorcode)]",
+        context: &context
+    )
+    #expect(output == "\(LassoErrorHandling.Code.invalidParameter)")
+}
+
+@Test func cipherEncryptAndCipherDecryptRoundTripWithAesAndFailWithAWrongKey() async throws {
+    // Real Lasso's own AES worked example uses `-cipher='DES-EDE3-CBC'`
+    // (3DES, not AES) — this codebase's cipher_encrypt/decrypt only
+    // implements AES via swift-crypto's AES-GCM (disclosed scope, see
+    // Hashing.swift), so this exercises the actual supported algorithm
+    // rather than the Guide's own specific worked example. Round-trip
+    // correctness plus a wrong-key failure are both independently
+    // verifiable properties, not something needing doc confirmation.
+    var context = LassoContext()
+    let roundTrip = try await LassoRenderer().render(
+        "[var(enc = Cipher_Encrypt('a secret message', -cipher='AES', -key='correct horse'))]" +
+        "[Cipher_Decrypt($enc, -cipher='AES', -key='correct horse')->asString]",
+        context: &context
+    )
+    #expect(roundTrip == "a secret message")
+
+    var wrongKeyContext = LassoContext()
+    let wrongKeyOutput = try await LassoRenderer().render(
+        "[var(enc = Cipher_Encrypt('a secret message', -cipher='AES', -key='correct horse'))]" +
+        "[protect][Cipher_Decrypt($enc, -cipher='AES', -key='wrong key')][/protect][error_currenterror(-errorcode)]",
+        context: &wrongKeyContext
+    )
+    #expect(wrongKeyOutput == "\(LassoErrorHandling.Code.invalidParameter)")
+}
+
+@Test func cipherEncryptUsesAFreshRandomNonceEachCallRatherThanAFixedOrReusedOne() async throws {
+    // A real cryptographic property worth locking in with a test, not
+    // just trusting AES.GCM.seal's documented behavior: encrypting the
+    // identical plaintext with the identical key twice must produce
+    // DIFFERENT ciphertext each time. A fixed/reused nonce would be a
+    // real vulnerability (AES-GCM catastrophically leaks the XOR of two
+    // plaintexts encrypted under the same key+nonce), so this isn't a
+    // cosmetic check.
+    var context = LassoContext()
+    let output = try await LassoRenderer().render(
+        "[var(first = Cipher_Encrypt('same message', -cipher='AES', -key='same key'))]" +
+        "[var(second = Cipher_Encrypt('same message', -cipher='AES', -key='same key'))]" +
+        "[$first->encodeHex->asString == $second->encodeHex->asString]",
+        context: &context
+    )
+    #expect(output == "false")
+}
+
+@Test func cipherEncryptAndDecryptRoundTripAnEmptyPlaintext() async throws {
+    // Regression test (caught by architect review): AES-GCM ciphertext
+    // length equals plaintext length exactly (no padding), so
+    // encrypting an empty string produces exactly `nonce + 0 +
+    // tag` bytes — an earlier version's bounds check in
+    // `cipherDecrypt` (`data.count > nonceSize + tagSize`) incorrectly
+    // rejected exactly this valid, minimum-length ciphertext.
+    var context = LassoContext()
+    let output = try await LassoRenderer().render(
+        "[var(enc = Cipher_Encrypt('', -cipher='AES', -key='a key'))]" +
+        "[Cipher_Decrypt($enc, -cipher='AES', -key='a key')->asString]",
+        context: &context
+    )
+    #expect(output == "")
+}
+
+@Test func cipherListReturnsTheActuallySupportedAlgorithmsNotTheFullRealLassoList() async throws {
+    // Deliberately does NOT claim real Lasso's full OpenSSL-backed list
+    // (DES/3DES/RC4/RC2/CAST5/RC5/etc.) — only what Hashing.swift's
+    // digest()/cipherEncrypt() functions actually support, so a script
+    // checking `cipher_list->contains(...)` before calling a cipher
+    // never gets a false positive.
+    var context = LassoContext()
+    let output = try await LassoRenderer().render(
+        "[(Cipher_List)->join(',')]|[(Cipher_List(-digest))->join(',')]",
+        context: &context
+    )
+    #expect(output == "MD5,SHA1,SHA256,SHA384,SHA512,AES|MD5,SHA1,SHA256,SHA384,SHA512")
+}
+
+@Test func jsonDeserializeInvertsJsonSerializeForEveryDocumentedVariableType() async throws {
+    // Documentation/session-upload-support-plan.md's own "Variable
+    // strategy" list — string/integer/decimal/boolean/array/map/null —
+    // is exactly what json_serialize/LassoValue.from(json:) already
+    // round-trip for session persistence; this exercises the same
+    // round trip through the new free tag.
+    // 'f'=0/'g'=1 alongside 'd'=true are the exact combination that
+    // regresses the `LassoValue.from(json:)` fix below if it's ever
+    // reintroduced: `NSNumber as? Bool` only succeeds for a value of
+    // exactly 0 or 1 (per SE-0170), so those two specific integers —
+    // not 42/3.14/-5 — are what a naive `Bool`-checked-first `switch`
+    // would misclassify as booleans instead of integers.
+    var context = LassoContext()
+    let output = try await LassoRenderer().render(
+        "[var(m = Map('a'=1, 'b'='two', 'c'=(Array(1,2,3)), 'd'=true, 'e'=null, 'f'=0, 'g'=1.5))]" +
+        "[var(roundTripped = Json_Deserialize(Json_Serialize($m)))]" +
+        "[$roundTripped->find('a')]/[$roundTripped->find('a')->type]|" +
+        "[$roundTripped->find('b')]|[$roundTripped->find('c')->join(',')]|" +
+        "[$roundTripped->find('d')]/[$roundTripped->find('d')->type]|" +
+        "[$roundTripped->find('e')->isA('null')]|" +
+        "[$roundTripped->find('f')]/[$roundTripped->find('f')->type]|" +
+        "[$roundTripped->find('g')]/[$roundTripped->find('g')->type]",
+        context: &context
+    )
+    #expect(output == "1/Integer|two|1,2,3|true/Boolean|true|0/Integer|1.5/Decimal")
+}
+
+@Test func lassoValueFromJsonDirectlyDistinguishesBooleansFromZeroAndOneValuedNumbers() async throws {
+    // A direct, isolated unit test on `LassoValue.from(json:)` itself
+    // (not just indirectly via `Json_Deserialize`'s full round trip
+    // through `JSONSerialization`) — a future refactor of this exact
+    // function, or of the session-restore call site that also depends
+    // on it, has a regression guard even if it stops going through
+    // `JSONSerialization` at all.
+    #expect(LassoValue.from(json: NSNumber(value: true)) == .boolean(true))
+    #expect(LassoValue.from(json: NSNumber(value: false)) == .boolean(false))
+    #expect(LassoValue.from(json: NSNumber(value: 0)) == .integer(0))
+    #expect(LassoValue.from(json: NSNumber(value: 1)) == .integer(1))
+    #expect(LassoValue.from(json: NSNumber(value: 42)) == .integer(42))
+    #expect(LassoValue.from(json: NSNumber(value: 3.14)) == .decimal(3.14))
+    #expect(LassoValue.from(json: NSNull()) == .null)
+}
+
+@Test func jsonDeserializeOfMalformedJsonReturnsNullRatherThanThrowing() async throws {
+    var context = LassoContext()
+    let output = try await LassoRenderer().render(
+        "[Json_Deserialize('not valid json{{{')->type]",
+        context: &context
+    )
+    #expect(output == "Null")
+}
+
 @Test func logCriticalIsANoOpWhenNoDiagnosticLogSinkIsWired() async throws {
     // Pre-existing behavior for any host that doesn't wire a sink --
     // log_critical must never throw or produce output of its own.

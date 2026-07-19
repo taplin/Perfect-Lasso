@@ -274,6 +274,91 @@ public struct LassoNativeRegistry: Sendable {
             }
             return .string(String(decoding: raw, as: UTF8.self))
         }
+        // `Encrypt_MD5`/`Cipher_Digest`/`Cipher_Encrypt`/`Cipher_Decrypt`/
+        // `Cipher_List` — lassoguide.com `operations/encryption.html`.
+        // See `Hashing.swift`'s own doc comments for exactly which
+        // algorithms are supported and why (swift-crypto's real,
+        // available surface — not real Lasso's much larger OpenSSL-
+        // backed list) and the AES-GCM/SHA-256-key-derivation design
+        // decisions `Cipher_Encrypt`/`Cipher_Decrypt` make.
+        register("encrypt_md5") { arguments, _ in
+            let data = LassoBytesValue.rawBytes(from: arguments.positionalValue(at: 0) ?? .string(""))
+            return .string(LassoHashing.md5Hex(Data(data)))
+        }
+        register("cipher_digest") { arguments, _ in
+            let data = Data(LassoBytesValue.rawBytes(from: arguments.positionalValue(at: 0) ?? .string("")))
+            let algorithm = arguments.lastString(named: "digest") ?? ""
+            guard let digest = LassoHashing.digest(data, algorithm: algorithm) else {
+                throw LassoRecoverableError(LassoErrorState(
+                    code: LassoErrorHandling.Code.invalidParameter,
+                    message: "Invalid parameter",
+                    kind: "encryption"
+                ))
+            }
+            if arguments.hasTruthyFlag("hex") {
+                return .string(digest.map { String(format: "%02x", $0) }.joined())
+            }
+            return .object(LassoBytesValue.makeObject(rawBytes: Array(digest)))
+        }
+        register("cipher_encrypt") { arguments, _ in
+            let data = Data(LassoBytesValue.rawBytes(from: arguments.positionalValue(at: 0) ?? .string("")))
+            let cipher = arguments.lastString(named: "cipher") ?? ""
+            let key = Data((arguments.lastString(named: "key") ?? "").utf8)
+            guard let encrypted = LassoHashing.cipherEncrypt(data, cipher: cipher, keyMaterial: key) else {
+                throw LassoRecoverableError(LassoErrorState(
+                    code: LassoErrorHandling.Code.invalidParameter,
+                    message: "Invalid parameter",
+                    kind: "encryption"
+                ))
+            }
+            return .object(LassoBytesValue.makeObject(rawBytes: Array(encrypted)))
+        }
+        register("cipher_decrypt") { arguments, _ in
+            let data = LassoBytesValue.rawBytes(from: arguments.positionalValue(at: 0) ?? .string(""))
+            let cipher = arguments.lastString(named: "cipher") ?? ""
+            let key = Data((arguments.lastString(named: "key") ?? "").utf8)
+            guard let decrypted = LassoHashing.cipherDecrypt(Data(data), cipher: cipher, keyMaterial: key) else {
+                throw LassoRecoverableError(LassoErrorState(
+                    code: LassoErrorHandling.Code.invalidParameter,
+                    message: "Invalid parameter",
+                    kind: "encryption"
+                ))
+            }
+            return .object(LassoBytesValue.makeObject(rawBytes: Array(decrypted)))
+        }
+        register("cipher_list") { arguments, _ in
+            // Real Lasso returns a `staticarray` (this codebase's
+            // `Array` is the closest existing equivalent — `StaticArray`
+            // itself is a separate, already-tracked gap). With
+            // `-digest`, real Lasso limits the list to digest
+            // algorithms specifically — this adapter's own cipher
+            // support IS entirely digest algorithms plus AES, so
+            // `-digest` here just excludes "AES".
+            if arguments.hasTruthyFlag("digest") {
+                return .array(LassoHashing.cipherDigestNames.map(LassoValue.string))
+            }
+            return .array((LassoHashing.cipherDigestNames + ["AES"]).map(LassoValue.string))
+        }
+        // `Json_Deserialize` — the natural inverse of the pre-existing
+        // `Json_Serialize` above, reusing its exact underlying
+        // machinery (`JSONSerialization` + `LassoValue.from(json:)`,
+        // already used elsewhere to restore JSON-safe session
+        // variables). Unlike every other tag added this batch, this
+        // one's real-Lasso documentation couldn't be independently
+        // re-verified against lassoguide.com's public reference (no
+        // `json_deserialize`/`json_serialize` hits found anywhere on
+        // the site) — implemented as the obvious, standard inverse of
+        // the already-implemented `Json_Serialize` instead, which this
+        // exact name/shape was already presumably verified against
+        // when it was first added.
+        register("json_deserialize") { arguments, _ in
+            let jsonString = arguments.first?.value.outputString ?? ""
+            guard let data = jsonString.data(using: .utf8),
+                  let object = try? JSONSerialization.jsonObject(with: data, options: [.fragmentsAllowed]) else {
+                return .null
+            }
+            return LassoValue.from(json: object)
+        }
         // [Currency]/[Percent] — Lasso 8.5 Chapter 28 "Math Operations",
         // Table 13. Positional (not -flag=) language/country parameters,
         // matching the documented signature exactly. See
@@ -1123,12 +1208,41 @@ extension LassoValue {
         switch value {
         case is NSNull:
             .null
-        case let value as Bool:
-            .boolean(value)
-        case let value as Int:
-            .integer(value)
-        case let value as Double:
-            .decimal(value)
+        // `JSONSerialization` boxes every JSON boolean AND every JSON
+        // number as `NSNumber` — a real, previously-undiscovered bug
+        // here matched `Bool` FIRST via a plain `as?` cast. Per SE-0170
+        // (the Swift proposal governing `NSNumber` bridging, in effect
+        // since Swift 4), `NSNumber as? Bool` only succeeds for a value
+        // of EXACTLY 0 or 1 — converting to `false`/`true` respectively
+        // and failing (`nil`) for any other value — confirmed
+        // empirically, not just from the proposal text. So the real,
+        // narrower bug: any JSON integer/decimal valued exactly 0 or 1
+        // (a very plausible real value — flags, counts, ids) was
+        // silently misclassified as `.boolean` instead of `.integer`/
+        // `.decimal` by this function the whole time it's existed;
+        // other values (42, 3.14, -5, ...) were already routed
+        // correctly by the old code, since the `as? Bool` cast failed
+        // for them and fell through to the `Int`/`Double` cases below.
+        // `CFGetTypeID(_:) == CFBooleanGetTypeID()` is the standard,
+        // reliable way to tell a real JSON boolean apart from a real
+        // JSON number that merely also bridges to `NSNumber` — both are
+        // backed by different underlying CoreFoundation types
+        // (`CFBoolean` vs `CFNumber`) despite Swift's `as? Bool`/`as?
+        // Int`/`as? Double` casts not respecting that distinction for
+        // the 0/1 case. `CFNumberIsFloatType(_:)` is the equally
+        // standard way to tell whether a JSON number literal had a
+        // decimal point (found by testing this exact function's new
+        // `json_deserialize` caller — a Map containing both an integer
+        // valued 1 and a boolean `true` together surfaced the
+        // corruption immediately).
+        case let value as NSNumber:
+            if CFGetTypeID(value) == CFBooleanGetTypeID() {
+                .boolean(value.boolValue)
+            } else if CFNumberIsFloatType(value) {
+                .decimal(value.doubleValue)
+            } else {
+                .integer(value.intValue)
+            }
         case let value as String:
             .string(value)
         case let value as [Any]:
