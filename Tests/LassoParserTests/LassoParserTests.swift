@@ -4898,6 +4898,36 @@ private final class MapIncludeLoader: LassoIncludeLoader, @unchecked Sendable {
     #expect(output == "hello")
 }
 
+@Test func stringSubstringReturnsAOneBasedRangeMatchingTheDocsWorkedExample() async throws {
+    // LassoGuide's own worked example: 'The String'->sub(5, 6) == 'String'
+    // -- confirms 1-based start (position 5 is the 5th character).
+    var context = LassoContext()
+    let output = try await LassoRenderer().render("[('The String')->sub(5, 6)]", context: &context)
+    #expect(output == "String")
+}
+
+@Test func stringSubstringWithOnlyAStartReturnsTheRestOfTheString() async throws {
+    var context = LassoContext()
+    let output = try await LassoRenderer().render("[('Hello World')->substring(7)]", context: &context)
+    #expect(output == "World")
+}
+
+@Test func stringSubstringMasksACreditCardNumberLikeTheRealCorpusDoes() async throws {
+    // Exact real-corpus shape: pages/checkout.page.lasso masks a card
+    // number via string(field('card_number'))->(Substring: 1, 1) to test
+    // the leading digit, and ->(Substring: 13, 4) for the last 4 digits
+    // -- both via the older arrow-paren call syntax. Previously crashed
+    // with unsupportedExpression("Member substring") since .string had no
+    // "substring"/"sub" case at all.
+    var context = LassoContext()
+    let output = try await LassoRenderer().render(
+        "[var(card::string = '4111111111111111')]" +
+        "[$card->(Substring: 1, 1)]|[$card->(Substring: 13, 4)]",
+        context: &context
+    )
+    #expect(output == "4|1111")
+}
+
 @Test func chainedStringReplaceCallsBuildASlugWithNoStrayOutput() async throws {
     // The exact real-corpus shape from pages/thumbs2.page.lasso (also
     // pages/thumbs.page.lasso, thumbs3.page.lasso, and every

@@ -528,6 +528,37 @@ struct Evaluator {
             // `$email->(trim)` and lost_password.page.lasso's
             // `#new_email->(trim)` — confirmed live 2026-07-18.
             return .string(value.trimmingCharacters(in: .whitespacesAndNewlines))
+        case let (.string(value), member) where member == "substring" || member == "sub":
+            // `string->substring(start::integer, size::integer=?)` --
+            // LassoGuide: "The starting point is specified by the first
+            // parameter ... If the second parameter is not specified, all
+            // characters from the specified starting position to the end
+            // of the string are returned." 1-based start (confirmed via
+            // the docs' own worked example: 'The String'->sub(5, 6) ==
+            // 'String', where position 5 is the 5th character). `->sub`
+            // is a real documented alias. Real corpus:
+            // pages/checkout.page.lasso's
+            // `string(field('card_number'))->(Substring: 1, 1)` (credit
+            // card masking).
+            let characters = Array(value)
+            let start: Int
+            if let first = arguments.first {
+                let startValue = try await evaluate(first.value).number
+                start = max(Int(startValue ?? 1) - 1, 0)
+            } else {
+                start = 0
+            }
+            guard start < characters.count else { return .string("") }
+            let length: Int
+            if arguments.count > 1 {
+                let sizeNumber = try await evaluate(arguments[1].value).number
+                length = max(Int(sizeNumber ?? 0), 0)
+            } else {
+                length = characters.count - start
+            }
+            let end = min(start + length, characters.count)
+            guard end > start else { return .string("") }
+            return .string(String(characters[start..<end]))
         case let (.integer(value), "asstring"):
             return .string(try await formattedNumber(Double(value), arguments))
         case let (.decimal(value), "asstring"):
