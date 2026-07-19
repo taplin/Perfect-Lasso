@@ -5619,18 +5619,64 @@ struct IncludeURLTests {
     #expect(output == "|hello")
 }
 
-@Test func emailSendIsARegisteredNoOpNotAnUnknownFunction() async throws {
-    // [Email_Send] (Lasso 8.5 Language Guide, "Process Tags") — no
-    // resurrected SMTP client in this project, so it's a deliberate
-    // no-op (matching the [Cache] precedent) rather than a real send.
-    // Real corpus: importscripts/*.lasso's error-notification
+@Test func emailSendThrowsEmailNotConfiguredWhenNoEmailProviderIsWired() async throws {
+    // [Email_Send] (Lasso 8.5 Language Guide, "Process Tags") — dispatches
+    // through `context.emailProvider`
+    // (Documentation/lasso-perfect-smtp-integration-plan.md §4.0's new
+    // dispatch-registration seam). No provider is configured on a plain
+    // `LassoContext()`, so this must throw
+    // `LassoRuntimeError.emailNotConfigured` rather than silently
+    // no-op'ing to `.void` — a deliberate behavior change from the old
+    // stub (superseding `emailSendIsARegisteredNoOpNotAnUnknownFunction`,
+    // which asserted the no-op behavior this replaces), mirroring how
+    // `[inline]` throws `.inlineNotConfigured` when `inlineProvider` is
+    // unset. Real corpus: importscripts/*.lasso's error-notification
     // `email_send: -to=..., -from=..., -subject=..., -body=...;`.
     var context = LassoContext()
+    await #expect(throws: LassoRuntimeError.emailNotConfigured) {
+        try await LassoRenderer().render(
+            "before-[email_send: -to='a@example.com', -from='b@example.com', -subject='s', -body='b']-after",
+            context: &context
+        )
+    }
+}
+
+@Test func emailSendDispatchesToTheConfiguredEmailProviderAndReturnsItsResult() async throws {
+    // Proves the §4.0 dispatch seam actually reaches a configured
+    // `LassoEmailProvider` end to end -- arguments evaluated by
+    // `email_send`'s bare colon-call form arrive at the provider intact,
+    // and `email_send`'s own evaluated value is whatever the provider
+    // returns. Uses a test-double conformer (not the real
+    // `LassoPerfectSMTP` target, which doesn't exist yet -- that's the
+    // next implementation step, §4.0 point 2) the same way
+    // `InlineProvider` test doubles exercise `LassoInlineProvider`
+    // elsewhere in this file.
+    final class EmailProviderRecorder: @unchecked Sendable {
+        private(set) var calls: [[EvaluatedArgument]] = []
+        func record(_ arguments: [EvaluatedArgument]) { calls.append(arguments) }
+    }
+    struct EmailProvider: LassoEmailProvider {
+        let recorder: EmailProviderRecorder
+        func send(_ arguments: [EvaluatedArgument]) async throws -> LassoValue {
+            recorder.record(arguments)
+            return .string("queued")
+        }
+    }
+    let recorder = EmailProviderRecorder()
+    var context = LassoContext(emailProvider: EmailProvider(recorder: recorder))
+
     let output = try await LassoRenderer().render(
-        "before-[email_send: -to='a@example.com', -from='b@example.com', -subject='s', -body='b']-after",
+        "[email_send: -to='a@example.com', -from='b@example.com', -subject='s', -body='b']",
         context: &context
     )
-    #expect(output == "before--after")
+
+    #expect(output == "queued")
+    #expect(recorder.calls.count == 1)
+    let seen = recorder.calls[0]
+    #expect(seen.firstValue(named: "to") == .string("a@example.com"))
+    #expect(seen.firstValue(named: "from") == .string("b@example.com"))
+    #expect(seen.firstValue(named: "subject") == .string("s"))
+    #expect(seen.firstValue(named: "body") == .string("b"))
 }
 
 @Test func decimalConstructorAndAsStringWithPrecisionFormatFixedDecimalPlaces() async throws {

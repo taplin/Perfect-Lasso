@@ -918,16 +918,29 @@ public struct LassoNativeRegistry: Sendable {
         // [Email_Send] (Lasso 8.5 Language Guide, "Process Tags"): a
         // process tag — "does not return a value" per its own doc — that
         // queues/sends a real email via SMTP (-Host/-To/-From/-Subject/
-        // -Body etc.). This project has no resurrected SMTP client, so a
-        // real send isn't possible; real corpus usage (importscripts/*.lasso,
-        // `email_send: -to=..., -from=..., -subject=..., -body=...;`) is
-        // itself only reached on already-degraded/error paths (import
-        // failure notifications), never on the success path a real user
-        // hits. Registered as a no-op, matching the [Cache] precedent
-        // above — clears unknownFunction("email_send") and lets the
-        // surrounding page finish rendering, without pretending to
-        // deliver mail that never actually goes anywhere.
-        register("email_send") { _, _ in .void }
+        // -Body etc.). Dispatches through `context.emailProvider`
+        // (`Documentation/lasso-perfect-smtp-integration-plan.md` §4.0's
+        // dispatch-registration seam), the same "protocol-typed context
+        // slot populated per-request from a host application" shape
+        // `[inline]`/`context.inlineProvider` already uses in
+        // Renderer.swift — `LassoParser` never imports a specific
+        // resurrected library (e.g. `LassoPerfectSMTP`), it only knows
+        // about the generic `LassoEmailProvider` protocol. When no
+        // provider is configured this throws
+        // `LassoRuntimeError.emailNotConfigured` rather than silently
+        // no-op'ing, mirroring `[inline]`'s own `.inlineNotConfigured`
+        // behavior for an unset `inlineProvider` — a deliberate behavior
+        // change from this function's original no-op stub (§4.0). Real
+        // corpus usage (importscripts/*.lasso, `email_send: -to=...,
+        // -from=..., -subject=..., -body=...;`) is itself only reached on
+        // already-degraded/error paths (import failure notifications),
+        // never on the success path a real user hits.
+        register("email_send") { arguments, context in
+            guard let emailProvider = context.emailProvider else {
+                throw LassoRuntimeError.emailNotConfigured
+            }
+            return try await emailProvider.send(arguments)
+        }
         register("redirect_url") { arguments, context in
             let url = arguments.firstValue(named: "url")?.outputString ??
                 arguments.first?.value.outputString ?? ""
@@ -1077,6 +1090,14 @@ public struct LassoContext: Sendable {
     public var sessionProvider: (any LassoSessionProvider)?
     public var responseSink: (any LassoResponseSink)?
     public var inlineProvider: (any LassoInlineProvider)?
+    /// The `email_send` dispatch seam (`Documentation/lasso-perfect-smtp-integration-plan.md`
+    /// §4.0) — `nil` (the default) makes `email_send` throw
+    /// `LassoRuntimeError.emailNotConfigured` rather than silently
+    /// no-op'ing, matching how `[inline]` throws `.inlineNotConfigured`
+    /// when `inlineProvider` is unset. Populated per-request from a host
+    /// application (e.g. `LassoPerfectSMTP`'s conformer, wired in from
+    /// `main.swift`) exactly like `inlineProvider`/`sessionProvider`.
+    public var emailProvider: (any LassoEmailProvider)?
     /// Called by `log_critical` with its message text — a hook for the
     /// host application to surface these into its own logging.
     /// `LassoParser` has no direct I/O of its own (same convention as
@@ -1170,6 +1191,7 @@ public struct LassoContext: Sendable {
         sessionProvider: (any LassoSessionProvider)? = nil,
         responseSink: (any LassoResponseSink)? = nil,
         inlineProvider: (any LassoInlineProvider)? = nil,
+        emailProvider: (any LassoEmailProvider)? = nil,
         diagnosticLogSink: (@Sendable (String) async -> Void)? = nil,
         tagRegistry: LassoTagRegistry = LassoTagRegistry()
     ) {
@@ -1191,6 +1213,7 @@ public struct LassoContext: Sendable {
         self.sessionProvider = sessionProvider
         self.responseSink = responseSink
         self.inlineProvider = inlineProvider
+        self.emailProvider = emailProvider
         self.diagnosticLogSink = diagnosticLogSink
         self.tagRegistry = tagRegistry
         loadedLibraries = []
@@ -1442,6 +1465,12 @@ public enum LassoRuntimeError: Error, Equatable {
     case includeCycle(String)
     case includeDepthExceeded
     case inlineNotConfigured
+    /// Thrown by `email_send` (and any future email-family native function
+    /// dispatching through `LassoContext.emailProvider`) when no
+    /// `LassoEmailProvider` is configured — mirrors `.inlineNotConfigured`'s
+    /// role for `[inline]`/`inlineProvider`. See
+    /// `Documentation/lasso-perfect-smtp-integration-plan.md` §4.0.
+    case emailNotConfigured
     case tagCallDepthExceeded
     case unsafeDynamicFieldName(String)
 }
