@@ -6692,3 +6692,67 @@ struct IncludeURLTests {
         #expect(TagCatalog.entry(name)?.openForms == forms, "\(name) openForms mismatch")
     }
 }
+
+@Test func bisectBareArrowIfAtTopLevel() async throws {
+    var context = LassoContext()
+    let output = try await LassoRenderer().render(
+        """
+        <?lasso
+        if(true) => { return 'yes' }
+        ?>
+        [$canary]
+        """,
+        context: &context
+    )
+    #expect(output.trimmingCharacters(in: .whitespacesAndNewlines) == "yes")
+}
+
+@Test func bisectArrowIfInsideTopLevelWithLoopAbortsLoop() async throws {
+    var context = LassoContext()
+    _ = try await LassoRenderer().render(
+        """
+        <?lasso
+        with x in array(10, 20, 30, 40) do {
+            if(#x == 30) => { loop_abort }
+        }
+        ?>
+        """,
+        context: &context
+    )
+    #expect(context.value(for: "x", scope: .local) == .integer(30))
+}
+
+@Test func bisectPlainIfInsideTopLevelWithLoopAbortsLoop() async throws {
+    var context = LassoContext()
+    _ = try await LassoRenderer().render(
+        """
+        <?lasso
+        with x in array(10, 20, 30, 40) do {
+            if(#x == 30)
+                loop_abort
+            /if
+        }
+        ?>
+        """,
+        context: &context
+    )
+    #expect(context.value(for: "x", scope: .local) == .integer(30))
+}
+
+@Test func bisectTrailingOutputAfterArrowIfInTopLevelWithLoop() async throws {
+    var context = LassoContext()
+    let output = try await LassoRenderer().render(
+        """
+        <?lasso
+        $collected = ''
+        with x in array(10, 20, 30) do {
+            $collected = $collected + #x + '|'
+            if(#x == 999) => { local(dummy = 1) }
+        }
+        ?>
+        [$collected]
+        """,
+        context: &context
+    ).trimmingCharacters(in: .whitespacesAndNewlines)
+    #expect(output == "10|20|30|")
+}
