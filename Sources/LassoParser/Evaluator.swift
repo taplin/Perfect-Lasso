@@ -624,6 +624,28 @@ struct Evaluator {
             var updated = values
             updated[try await evaluate(target).outputString] = try await evaluate(value)
             return .map(updated)
+        case let (.map(values), "remove"):
+            // Ch. 30 p.401: "[Map->Remove] ... Removes a value from the
+            // map by key." Placed here, unconditionally ahead of the
+            // key-first fallback further down, mirroring `->insert`
+            // right above — NOT key-first like `->size`/`->keys`/etc.
+            // `->remove`/`->removeall` are also in `selfMutatingMethods`,
+            // so a key-first miss here wouldn't just misread a value (the
+            // `->size` case's risk) — `evaluateStatement` would silently
+            // overwrite the whole map variable with whatever was stored
+            // under a literal "remove"/"removeall" key. Caught by
+            // architect review.
+            guard let argument = arguments.first else { return .map(values) }
+            let key = try await evaluate(argument.value).outputString
+            var updated = values
+            updated.removeValue(forKey: key)
+            return .map(updated)
+        case (.map, "removeall"):
+            // Not a documented Lasso 8.5 Map tag (only Array has a
+            // documented `RemoveAll`) — this is a reasonable, low-risk
+            // extension (clear the whole map), kept unconditional for the
+            // same corruption-avoidance reason as `->remove` above.
+            return .map([:])
         case let (.array(values), "get"):
             let requested: Double?
             if let argument = arguments.first {
@@ -633,7 +655,148 @@ struct Evaluator {
             }
             let index = max(Int(requested ?? 1) - 1, 0)
             return values.indices.contains(index) ? values[index] : .null
-        case let (.map(values), _): return values[normalized] ?? .null
+        case let (.array(values), "last"): return values.last ?? .null
+        case let (.array(values), "second"): return values.count > 1 ? values[1] : .null
+        case let (.array(values), "reverse"): return .array(values.reversed())
+        case let (.array(values), "sort"):
+            // Lasso 8.5 Language Guide Ch. 30 p.391/397: "Accepts a single
+            // boolean parameter. Sorts in ascending order by default or if
+            // the parameter is True and in descending order if the
+            // parameter is False." An earlier version of this ignored the
+            // parameter entirely — caught reading the doc's own worked
+            // example (`$DaysOfWeek->(Sort: False)`) during architect
+            // review of this change.
+            let ascending = arguments.first != nil ? try await evaluate(arguments[0].value).isTruthy : true
+            let sorted = values.sorted(by: Self.lassoLessThan)
+            return .array(ascending ? sorted : sorted.reversed())
+        case let (.array(values), "join"):
+            // `array->join(separator)` — real corpus need: comma/CSV-list
+            // and breadcrumb-trail building, previously requiring a manual
+            // `loop`/`iterate` accumulator since no equivalent existed.
+            let separator = arguments.first != nil ? try await evaluate(arguments[0].value).outputString : ""
+            return .string(values.map(\.outputString).joined(separator: separator))
+        case let (.array(values), "contains"):
+            // Ch. 30 p.389: "Returns True if the specified element is
+            // contained in the array." Boolean existence test — distinct
+            // from `->Find`/`->FindPosition` below, which both return
+            // whole arrays of matches, not a boolean. An earlier version
+            // of this conflated `->Find` with `->Contains` — caught by
+            // architect review reading the doc's own text directly (p.390:
+            // "[Array->Find] ... Returns an array of elements that match
+            // the parameter").
+            let needle = arguments.first != nil ? try await evaluate(arguments[0].value) : .null
+            return .boolean(values.contains { lassoEquals($0, needle) })
+        case let (.array(values), "find"):
+            // Ch. 30 p.390/395-396: returns an ARRAY of every element that
+            // matches the parameter, not a boolean and not a position. A
+            // Pair-array (real corpus: Action_Params/Params results)
+            // compares the parameter only against each pair's `->First`
+            // half, per the doc's own worked example (p.396,
+            // `$Pair_Array->(Find: 'Alpha')`) — confirmed by reading that
+            // section directly, not inferred.
+            let needle = arguments.first != nil ? try await evaluate(arguments[0].value) : .null
+            return .array(values.filter { element in
+                if case let .pair(key, _) = element { return lassoEquals(key, needle) }
+                return lassoEquals(element, needle)
+            })
+        case let (.array(values), "findposition"):
+            // Ch. 30 p.390 (previously named `->FindIndex`): returns an
+            // array of the 1-based indices for EVERY match, not just the
+            // first (confirmed by the worked example p.395-396: searching
+            // `(6,1,4,1,5,1,2,3,1)` for `1` returns all four positions
+            // `(2),(4),(6),(9)`, not just position 2).
+            let needle = arguments.first != nil ? try await evaluate(arguments[0].value) : .null
+            let positions = values.enumerated()
+                .filter { lassoEquals($0.element, needle) }
+                .map { LassoValue.integer($0.offset + 1) }
+            return .array(positions)
+        case let (.array(values), "remove"):
+            // Ch. 30 p.390/393: position-based (1-based), defaults to
+            // removing the LAST item when no argument is given — real
+            // Lasso's `Remove` and `RemoveAll` are opposite-shaped from
+            // what an earlier version of this had them do (that version
+            // had `->remove` doing value-based removal, which is actually
+            // `->RemoveAll`'s documented job, and `->removeAll` clearing
+            // unconditionally with no documented basis at all) — caught
+            // by architect review checking both against the Guide's own
+            // worked examples directly.
+            let position: Int
+            if let argument = arguments.first {
+                position = Int(try await evaluate(argument.value).number ?? 0)
+            } else {
+                position = values.count
+            }
+            let index = position - 1
+            guard values.indices.contains(index) else { return .array(values) }
+            var updated = values
+            updated.remove(at: index)
+            return .array(updated)
+        case let (.array(values), "removeall"):
+            // Ch. 30 p.390/396: value-based — removes every element that
+            // matches the parameter (confirmed by the worked example:
+            // `$Delete_Array->(RemoveAll: 1)` drops every `1` from
+            // `(6,1,4,1,5,1,2,3,1)`, leaving `(6,4,5,2,3)`).
+            guard let argument = arguments.first else { return .array(values) }
+            let target = try await evaluate(argument.value)
+            return .array(values.filter { !lassoEquals($0, target) })
+        // `.map` dispatch tries a literal key match FIRST, falling back to
+        // these documented methods only on a miss — NOT the other way
+        // around. This codebase already uses `.map` for two different
+        // things: a real Lasso `Map` value, and (via the file-upload/
+        // request-metadata providers) plain field-name-keyed records —
+        // e.g. `file_uploads->get(1)->size` reads a real `"size"` KEY
+        // (the upload's byte count), not an entry count. An earlier
+        // version of this fix gave `->size`/`->keys`/etc. unconditional
+        // priority over key lookup (matching how real Lasso's own
+        // documented Map methods always win) and broke that real,
+        // already-tested upload-metadata path — caught by the existing
+        // `fileUploadsExposeMetadataUnderBothLasso9And8KeyNames` test
+        // failing. Key-first with a fallback keeps that working here for
+        // the pure-read methods below (worst case on a collision: reads
+        // the wrong value) — but NOT for `->remove`/`->removeall`, which
+        // stay unconditional (see the cases right after `->insert`
+        // above): those two are in `selfMutatingMethods`, so a key-first
+        // miss there wouldn't just misread a value, it would let
+        // `evaluateStatement` silently overwrite the whole map variable
+        // with whatever was under a literal "remove"/"removeall" key —
+        // caught by architect review. This still fixes the original bug:
+        // a map with NO key named "size" previously fell all the way
+        // through to `.null` instead of returning a real count (see
+        // Documentation/lasso9-lassoguide-gap-analysis-plan.md Section 2).
+        case let (.map(values), _) where values[normalized] != nil:
+            return values[normalized] ?? .null
+        case let (.map(values), "size"): return .integer(values.count)
+        // `.map`'s backing `[String: LassoValue]` is a Swift Dictionary —
+        // it has no stable, meaningful insertion order to preserve, so
+        // `->keys`/`->values` iterate in sorted-by-key order instead of
+        // raw (effectively arbitrary) Dictionary order. That's chosen
+        // specifically so the two stay in lockstep with each other
+        // (`values[i]` really is the value for `keys[i]`) and so output
+        // is deterministic/testable, not because it's confirmed to match
+        // real Lasso's own Map key ordering. Note this means `->keys`/
+        // `->values` can disagree with `iterate`/`with`'s own raw
+        // (undefined) Dictionary order over the same map — acceptable
+        // since neither order is "more correct" per real Lasso (Ch. 30
+        // p.400: "the order of elements in a map is not defined").
+        case let (.map(values), "keys"): return .array(values.keys.sorted().map(LassoValue.string))
+        case let (.map(values), "values"): return .array(values.keys.sorted().map { values[$0] ?? .null })
+        case let (.map(values), "contains"):
+            let key = arguments.first != nil ? try await evaluate(arguments[0].value).outputString : ""
+            return .boolean(values[key] != nil)
+        case let (.map(values), "find"):
+            // An explicit, argument-taking spelling of the same miss-safe
+            // lookup the key-first case above already performs for a
+            // literal `->keyName` call — useful when the key itself is a
+            // dynamic/computed value rather than a fixed member name.
+            let key = arguments.first != nil ? try await evaluate(arguments[0].value).outputString : ""
+            return values[key] ?? .null
+        // A genuinely unknown `.map` member falls through to `.null`
+        // (not a throw, unlike `.array`'s `default: throw` further
+        // below) — mirrors `.object`'s own miss behavior
+        // (`TypeSystem.swift`'s `data[name.lowercased()] ?? .null`),
+        // the more relevant precedent given `.map`'s dual use as a
+        // record/object-like container for request/upload metadata.
+        case (.map, _): return .null
         case let (.object(object), _):
             if let nativeMethod = context.nativeTypes.type(named: object.typeName)?.method(named: name) {
                 let evaluatedArguments = try await evaluate(arguments)
@@ -719,7 +882,62 @@ struct Evaluator {
     /// `#new_email->(trim)`).
     /// Only consulted by `evaluateStatement(_:)`, not the generic
     /// recursive `evaluate(_:)` — see that method's doc for why.
-    static let selfMutatingMethods: Set<String> = ["insert", "replace", "append", "trim"]
+    static let selfMutatingMethods: Set<String> = [
+        "insert", "replace", "append", "trim",
+        // `Array->Sort`/`->Reverse`/`->Remove`/`->RemoveAll` are documented
+        // (Lasso 8.5 Language Guide Ch. 30) as invocant-mutating, exactly
+        // like `->Insert` above — real corpus need: sorted product/category
+        // lists (`->Sort`) and building a list from search results while
+        // dropping already-seen SKUs (`->Remove`).
+        "sort", "reverse", "remove", "removeall",
+    ]
+
+    /// Best-effort ordering for `Array->Sort` — every numeric-parseable
+    /// element sorts before every non-numeric one, numeric elements
+    /// compare by value (not lexicographically, where `"10"` < `"9"` as
+    /// strings but not as numbers), non-numeric elements compare by their
+    /// string form. Deriving a fixed per-element sort key up front (rather
+    /// than branching per-*pair* on whether both sides happen to be
+    /// numeric) is what actually guarantees a valid strict weak ordering
+    /// across a mixed array — a per-pair branch can otherwise violate
+    /// transitivity: e.g. with elements `9`, `10`, and the non-numeric
+    /// string `"5apple"`, a per-pair rule compares `9 < 10` numerically
+    /// (true) and `10 < "5apple"` as strings via `"10" < "5apple"` (true,
+    /// since `'1' < '5'`), but `9 < "5apple"` as strings via `"9" <
+    /// "5apple"` is FALSE (`'9' > '5'`) — `9 < 10 < "5apple"` yet NOT
+    /// `9 < "5apple"`, a transitivity violation Swift's `sorted(by:)`
+    /// doesn't validate and would silently mis-sort on.
+    private static func lassoSortKey(_ value: LassoValue) -> (Int, Double, String) {
+        // `.isFinite` guards against Swift's `Double(String)` parsing
+        // tokens like `"nan"`/`"inf"`/`"infinity"` (matching C's `strtod`)
+        // into real IEEE 754 NaN/infinity rather than returning `nil` —
+        // `Double.nan`'s `<` never returns true in either direction, which
+        // would silently reintroduce the exact strict-weak-ordering
+        // violation this whole key-based design exists to prevent, if a
+        // Lasso array ever contained a literal string like `'NaN'`.
+        // Flagged in architect review; low real-world likelihood on this
+        // project's corpus, but cheap enough to close outright.
+        if let number = value.number, number.isFinite { return (0, number, "") }
+        return (1, 0, value.outputString)
+    }
+
+    private static func lassoLessThan(_ lhs: LassoValue, _ rhs: LassoValue) -> Bool {
+        lassoSortKey(lhs) < lassoSortKey(rhs)
+    }
+
+    /// Lasso element equality for array/map membership tests (`->Contains`/
+    /// `->Find`/`->FindPosition`/`->RemoveAll`) — routes through the same
+    /// case-insensitive `==` this interpreter already uses everywhere else
+    /// (`binary(_:"==",_:)`, `Evaluator.swift:396-406`) rather than Swift's
+    /// raw auto-synthesized `LassoValue: Equatable`, which is case-
+    /// sensitive for `.string`. Using the raw form here would have
+    /// reintroduced the exact bug class `==`'s own doc comment cites a
+    /// real production incident for (`thumbs2.page.lasso`'s ribbon check
+    /// silently breaking on `'Yes'` vs `'yes'`) — flagged in architect
+    /// review before it shipped.
+    private func lassoEquals(_ lhs: LassoValue, _ rhs: LassoValue) -> Bool {
+        (try? binary(lhs, "==", rhs))?.isTruthy ?? false
+    }
 
     /// Evaluates the *entire* root expression of a top-level statement —
     /// the whole content of a bare `[...]`/script-mode statement, called

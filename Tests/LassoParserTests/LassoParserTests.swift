@@ -5689,6 +5689,268 @@ private final class MapIncludeLoader: LassoIncludeLoader, @unchecked Sendable {
     #expect(output == "beforeafter")
 }
 
+@Test func arraySortReverseJoinLastSecondAndContainsWork() async throws {
+    // `array->sort`/`->reverse` mutate the invocant in place exactly like
+    // `->insert` (LassoGuide Ch. 30) — confirmed here via the same bare-
+    // statement write-back mechanism
+    // `arrayInsertReturnsVoidNotTheMutatedContainerAsAStatementValue`
+    // exercises for `->insert`. `->join`/`->last`/`->second`/`->contains`
+    // are pure reads that never existed at all before this — sort/join/
+    // remove were the single largest confirmed gap in the top-down
+    // language review (Documentation/lasso85-gap-analysis-plan.md,
+    // Section 4). `->find`/`->findPosition` are covered separately
+    // (`arrayFindAndFindPositionReturnArraysOfAllMatchesNotABooleanOrFirstIndex`)
+    // — an earlier version of this test conflated them with `->Contains`,
+    // caught by architect review reading the Guide directly.
+    var context = LassoContext()
+    let output = try await LassoRenderer().render(
+        """
+        [var(nums::array = array(30, 10, 20))]
+        [$nums->sort]sorted=[$nums->join(',')]|
+        [$nums->reverse]reversed=[$nums->join(',')]|
+        last=[$nums->last]|second=[$nums->second]|
+        contains10=[$nums->contains(10)]|contains99=[$nums->contains(99)]
+        """,
+        context: &context
+    )
+    // Numeric-aware sort (not lexicographic, where "10" < "9"): 10, 20, 30.
+    #expect(output.contains("sorted=10,20,30"))
+    // ->reverse operates on the already-sorted array, not the original.
+    #expect(output.contains("reversed=30,20,10"))
+    #expect(output.contains("last=10"))
+    #expect(output.contains("second=20"))
+    #expect(output.contains("contains10=true"))
+    #expect(output.contains("contains99=false"))
+}
+
+@Test func arraySortDescendingWhenGivenAFalseArgument() async throws {
+    // Ch. 30 p.391/397: `[Array->Sort]` "Accepts a single boolean
+    // parameter. Sorts in ascending order by default or if the parameter
+    // is True and in descending order if the parameter is False." An
+    // earlier version of this ignored the argument entirely.
+    var context = LassoContext()
+    let output = try await LassoRenderer().render(
+        "[var(nums::array = array(3, 1, 2))][$nums->sort(false)]result=[$nums->join(',')]",
+        context: &context
+    )
+    #expect(output.contains("result=3,2,1"))
+}
+
+@Test func arrayFindAndFindPositionReturnArraysOfAllMatchesNotABooleanOrFirstIndex() async throws {
+    // Ch. 30 p.390/395-396, confirmed by reading the Guide's own worked
+    // examples: `->Find` returns an ARRAY of every matching element
+    // (`(6,1,4,1,5,1,2,3,1)->Find(1)` -> four 1s), `->FindPosition`
+    // (previously `->FindIndex`) returns an array of the 1-based position
+    // of every match, not just the first (`->FindPosition(1)` on the same
+    // array -> `(2),(4),(6),(9)`). `->Contains` alone is the boolean form.
+    var context = LassoContext()
+    let output = try await LassoRenderer().render(
+        """
+        [var(nums::array = array(6, 1, 4, 1, 5, 1, 2, 3, 1))]
+        found=[$nums->find(1)->join(',')]|
+        positions=[$nums->findPosition(1)->join(',')]|
+        missing=[$nums->find(99)->size]
+        """,
+        context: &context
+    )
+    #expect(output.contains("found=1,1,1,1"))
+    #expect(output.contains("positions=2,4,6,9"))
+    // A miss returns an empty array, not null/void/a crash.
+    #expect(output.contains("missing=0"))
+}
+
+@Test func arrayFindOnAPairArrayComparesOnlyThePairsFirstHalf() async throws {
+    // Ch. 30 p.396 ("Pair Arrays" -> "To find pairs within a pair array"):
+    // "The parameter passed to the [Array->Find] tag is only compared to
+    // the [Pair->First] element of each pair" — confirmed by the Guide's
+    // own worked example (`Pair_Array->(Find: 'Alpha')` on an array of
+    // `Alpha=One, Beta=Two, Alpha=1, Beta=2` pairs returns both Alpha
+    // pairs). Real corpus relevance: `Action_Params`/`Params` both return
+    // pair arrays. Built via explicit `pair(...)` calls, not
+    // `array('Alpha'='One', ...)` name/value syntax — this interpreter's
+    // `array(...)` constructor treats a `key = value` call argument as a
+    // labeled argument (discarding the label) rather than a Pair literal
+    // the way `Lasso 8.5 Language Guide` Ch. 30 p.389 documents; that's a
+    // separate, real gap, flagged for follow-up rather than fixed here.
+    var context = LassoContext()
+    let output = try await LassoRenderer().render(
+        """
+        [var(pairs::array = array(pair('Alpha', 'One'), pair('Beta', 'Two'), pair('Alpha', 1), pair('Beta', 2)))]
+        [iterate($pairs->find('Alpha'), var(p))][$p->first]=[$p->second];[/iterate]
+        """,
+        context: &context
+    )
+    #expect(output.contains("Alpha=One;Alpha=1;"))
+}
+
+@Test func arraySortOnAMixedNumericAndStringArrayIsAValidStrictWeakOrdering() async throws {
+    // Regression for a real transitivity bug caught in self-review before
+    // this ever reached a reviewer: a naive per-*pair* "both sides
+    // numeric? compare numerically, else compare as strings" comparator
+    // is inconsistent across a three-element mixed array (9 < 10
+    // numerically, 10 < "5apple" as strings, but NOT 9 < "5apple" as
+    // strings) — Swift's `sorted(by:)` doesn't validate strict weak
+    // ordering, so this would have silently produced a wrong, order-
+    // dependent result rather than crashing. The fix derives a single,
+    // fixed per-element sort key up front instead of branching per pair.
+    // This test only asserts the result is *a* valid total order (every
+    // numeric element before every non-numeric one, each group correctly
+    // internally ordered) — not a specific brittle character-by-character
+    // output, since the exact non-numeric-group ordering is incidental.
+    var context = LassoContext()
+    let output = try await LassoRenderer().render(
+        "[var(mixed::array = array(10, '5apple', 9))][$mixed->sort]result=[$mixed->join(',')]",
+        context: &context
+    )
+    #expect(output.contains("result=9,10,5apple"))
+}
+
+@Test func arrayRemoveIsPositionBasedDefaultingToTheLastElement() async throws {
+    // Ch. 30 p.390/393: "[Array->Remove] ... Accepts a single integer
+    // parameter identifying the position of the item to be removed.
+    // Defaults to the last item in the array." An earlier version of this
+    // had `->remove` do VALUE-based removal (that's actually
+    // `->RemoveAll`'s documented job — see the sibling test below) —
+    // caught by architect review reading the Guide's own worked examples
+    // (`$DaysOfWeek->(Remove)` removes the last item; `->(Remove: 4)`
+    // removes position 4) directly, not by inference.
+    var context = LassoContext()
+    let output = try await LassoRenderer().render(
+        """
+        [var(days::array = array('Sunday', 'Monday', 'Tuesday', 'Wednesday'))]
+        [$days->remove(4)]afterRemovePos4=[$days->join(',')]|
+        [$days->remove]afterBareRemove=[$days->join(',')]
+        """,
+        context: &context
+    )
+    #expect(output.contains("afterRemovePos4=Sunday,Monday,Tuesday"))
+    // Position 4 (Wednesday) is already gone; a bare `->remove` with no
+    // argument now removes the new last item, Tuesday.
+    #expect(output.contains("afterBareRemove=Sunday,Monday"))
+}
+
+@Test func arrayRemoveAllIsValueBasedDroppingEveryMatch() async throws {
+    // Ch. 30 p.390/396: "[Array->RemoveAll] ... Removes any elements
+    // that match the parameter from the array" — confirmed by the
+    // Guide's own worked example: `$Delete_Array->(RemoveAll: 1)` on
+    // `(6,1,4,1,5,1,2,3,1)` drops every `1`, leaving `(6,4,5,2,3)`.
+    var context = LassoContext()
+    let output = try await LassoRenderer().render(
+        "[var(nums::array = array(6, 1, 4, 1, 5, 1, 2, 3, 1))][$nums->removeAll(1)]result=[$nums->join(',')]",
+        context: &context
+    )
+    #expect(output.contains("result=6,4,5,2,3"))
+}
+
+@Test func arrayContainsFindAndRemoveAllMatchCaseInsensitivelyLikeTheRestOfTheInterpreter() async throws {
+    // `->Contains`/`->Find`/`->RemoveAll` route element comparison through
+    // the same case-insensitive `==` this interpreter already uses
+    // everywhere else (see `doubleGreaterThanOperatorMeansStringContainsNotGreaterThan`'s
+    // neighbor and `Evaluator.binary`'s own doc comment, which cites a
+    // real production bug: thumbs2.page.lasso's ribbon check silently
+    // breaking because `'Yes' != 'yes'` under case-sensitive comparison)
+    // rather than Swift's raw case-sensitive `Equatable`. Caught by
+    // architect review before this shipped.
+    var context = LassoContext()
+    let output = try await LassoRenderer().render(
+        """
+        [var(items::array = array('Yes', 'No', 'Yes'))]
+        containsLower=[$items->contains('yes')]|
+        foundCount=[$items->find('yes')->size]|
+        [$items->removeAll('yes')]afterRemoveAll=[$items->join(',')]
+        """,
+        context: &context
+    )
+    #expect(output.contains("containsLower=true"))
+    #expect(output.contains("foundCount=2"))
+    #expect(output.contains("afterRemoveAll=No"))
+}
+
+@Test func mapSizeReturnsACountNotFallingThroughToTheBareKeyLookupCatchAll() async throws {
+    // Real, silent bug caught by the top-down gap analysis (Documentation/
+    // lasso9-lassoguide-gap-analysis-plan.md Section 2): before this
+    // change, `.map`'s member dispatch had NO cases beyond `->insert` and
+    // a bare-key-lookup catch-all (`values[normalized] ?? .null`) — so
+    // `$myMap->size` on a map with no key literally named "size" silently
+    // returned `.null` instead of the entry count, a genuine correctness
+    // bug, not just a missing feature. `->size`/`->keys`/`->values`/
+    // `->contains`/`->remove`/`->removeAll` now have explicit cases ahead
+    // of that catch-all so they always mean the real method, never a key
+    // lookup — matching real Lasso, where a map with an actual key named
+    // "size" needs `->find('size')` to reach it instead.
+    var context = LassoContext()
+    let output = try await LassoRenderer().render(
+        """
+        [var(m::map = map)]
+        [$m->insert('a' = 1)]
+        [$m->insert('b' = 2)]
+        size=[$m->size]|find_size=[$m->find('size')]
+        """,
+        context: &context
+    )
+    #expect(output.contains("size=2"))
+    // No key literally named "size" was ever inserted -- confirms `->find`
+    // still falls back to null for a genuine miss, distinct from `->size`.
+    #expect(output.contains("find_size="))
+    #expect(!output.contains("find_size=2"))
+}
+
+@Test func mapKeysValuesContainsFindRemoveAndRemoveAllWork() async throws {
+    var context = LassoContext()
+    let output = try await LassoRenderer().render(
+        """
+        [var(m::map = map)]
+        [$m->insert('a' = 1)]
+        [$m->insert('b' = 2)]
+        keys=[$m->keys->join(',')]|
+        values=[$m->values->join(',')]|
+        containsA=[$m->contains('a')]|containsZ=[$m->contains('z')]|
+        findA=[$m->find('a')]|findZ=[$m->find('z')]|
+        [$m->remove('a')]afterRemove=[$m->size]|
+        [$m->removeAll]afterRemoveAll=[$m->size]
+        """,
+        context: &context
+    )
+    #expect(output.contains("keys=a,b"))
+    #expect(output.contains("values=1,2"))
+    #expect(output.contains("containsA=true"))
+    #expect(output.contains("containsZ=false"))
+    #expect(output.contains("findA=1"))
+    // A miss returns void/empty, not a crash or a stray "z" key value.
+    #expect(output.contains("findZ=|"))
+    #expect(output.contains("afterRemove=1"))
+    #expect(output.contains("afterRemoveAll=0"))
+}
+
+@Test func mapRemoveStaysAMethodEvenWhenTheMapHasALiteralRemoveKey() async throws {
+    // Real bug caught by architect review: `->remove`/`->removeall` are
+    // in `selfMutatingMethods`, so if they were key-first like `->size`/
+    // `->keys`/etc., a map with a literal key named "remove" would hit
+    // the key-first fallback (misreading a value) AND THEN
+    // `evaluateStatement`'s self-mutating write-back would silently
+    // overwrite the ENTIRE map variable with that key's raw value —
+    // strictly worse than the original `->size` bug (a corrupting write,
+    // not just a wrong read). Fixed by giving `.map`'s `->remove`/
+    // `->removeall` the same unconditional priority `->insert` already
+    // has, ahead of the key-first fallback, rather than key-first.
+    var context = LassoContext()
+    let output = try await LassoRenderer().render(
+        """
+        [var(m::map = map)]
+        [$m->insert('remove' = 'a literal value, not a method call')]
+        [$m->insert('other' = 'still here')]
+        [$m->remove('other')]
+        stillAMap=[$m->size]|removeValue=[$m->find('remove')]
+        """,
+        context: &context
+    )
+    // If ->remove had been mistakenly made key-first, $m would have been
+    // overwritten with the string "a literal value, not a method call"
+    // entirely, and ->size on a non-map would misbehave/crash.
+    #expect(output.contains("stillAMap=1"))
+    #expect(output.contains("removeValue=a literal value, not a method call"))
+}
+
 @Test func doubleGreaterThanOperatorMeansStringContainsNotGreaterThan() async throws {
     // Real Lasso 8/9's documented `>>` operator is string-contains
     // ("left contains right"), not a synonym for `>`. It was previously
