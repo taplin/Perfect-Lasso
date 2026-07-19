@@ -114,8 +114,25 @@ public struct LassoTypeDefinition: Equatable, Sendable {
 
 public enum VariableScope: Equatable, Sendable {
     case unscoped
+    // Despite the name, this is PAGE-scoped storage — what `[Variable]`/
+    // `[Var]`/`$name` read and write (Lasso 8.5 Language Guide Ch. 15
+    // Table 1 "Page Variable Tags"). The naming predates `.trueGlobal`
+    // below and is kept as-is rather than renamed, to avoid an
+    // unrelated blast-radius change across every existing call site.
     case global
     case local
+    // A genuinely separate namespace from `.global` above — Ch. 15
+    // Table 3 "Global Tags": "The globals tags allow direct access to
+    // global variables from any environment." Backed by its own
+    // dictionary (`LassoContext.trueGlobals`), not `.global`'s, so a
+    // page `Variable` and a true `Global` can share the same NAME
+    // without colliding, matching real Lasso keeping the two
+    // namespaces separate. Scoped to the lifetime of one `LassoContext`
+    // (one page render) rather than truly persisting server-wide
+    // across requests — this interpreter has no cross-request process
+    // state anywhere else either, so that part of the real semantics is
+    // knowingly out of scope here.
+    case trueGlobal
 }
 
 public struct LassoArgument: Equatable, Sendable {

@@ -167,6 +167,22 @@ public struct LassoNativeRegistry: Sendable {
             default: return .boolean(true)
             }
         }
+        // `[Global_Defined]`/`[Global_Remove]`/`[Globals]` (Ch. 15 Table
+        // 3) — the read/write `[Global]`/`[Global_Reset]` tags are
+        // special-cased alongside `Var`/`Local` in `Evaluator.evaluate`
+        // (see `declarationScope(for:)`) since, like them, they need
+        // assignment-target-aware argument handling a plain
+        // evaluated-arguments free function can't provide.
+        register("global_defined") { arguments, context in
+            .boolean(context.trueGlobalDefined(arguments.first?.value.outputString ?? ""))
+        }
+        register("global_remove") { arguments, context in
+            context.removeTrueGlobal(arguments.first?.value.outputString ?? "")
+            return .void
+        }
+        register("globals") { _, context in
+            .map(context.trueGlobalsSnapshot())
+        }
         let tagExists: LassoNativeFunction = { arguments, context in
             let name = arguments.first?.value.outputString ?? ""
             guard name.isEmpty == false else { return .boolean(false) }
@@ -1143,6 +1159,9 @@ enum LoopControlSignal: Sendable, Equatable {
 public struct LassoContext: Sendable {
     private var globals: [String: LassoValue]
     private var locals: [String: LassoValue]
+    // Genuinely separate namespace from `globals` above — see
+    // `VariableScope.trueGlobal`'s own doc comment for why.
+    private var trueGlobals: [String: LassoValue] = [:]
     private var inlineFrames: [ActiveInlineFrame]
     public var natives: LassoNativeRegistry
     public var nativeTypes: LassoNativeTypeRegistry
@@ -1353,15 +1372,66 @@ public struct LassoContext: Sendable {
         switch scope {
         case .local: locals[name.lowercased()] = value
         case .global, .unscoped: globals[name.lowercased()] = value
+        case .trueGlobal: trueGlobals[name.lowercased()] = value
         }
     }
 
+    // Ch. 15 p.227: "The $ symbol will return a global variable if no
+    // page variable of the same name has been created" — `$name` parses
+    // straight to `.variable(name, .global)` (ExpressionParser.swift),
+    // not `.unscoped`, so the fallback belongs on `.global` itself: a
+    // page variable of the same name still wins (checked first), true-
+    // global is the fallback. `[Variable: 'name']`'s own read form maps
+    // to this same `.global` scope (see `Evaluator.declarationScope(for:)`),
+    // so it gets this fallback too — matching the Guide's parallel
+    // wording for both: "use the [Variable] tag to retrieve the value
+    // of the global variable" when no page variable overrides it.
+    // `.unscoped` deliberately does NOT get this fallback: p.225 scopes
+    // `Variable_Defined`/`Var_Defined` to "the current Lasso page", and
+    // `var_defined`'s free-function registration (this file, above)
+    // reads through the `.unscoped` default — an earlier version of
+    // this fallback lived on `.unscoped` too and silently made
+    // `Var_Defined('x')` report true whenever an unrelated true Global
+    // named "x" existed, even with no page variable ever created
+    // (caught by architect review, no test previously exercised this).
     public func value(for name: String, scope: VariableScope = .unscoped) -> LassoValue {
         switch scope {
         case .local: locals[name.lowercased()] ?? .null
-        case .global: globals[name.lowercased()] ?? .null
+        case .global: globals[name.lowercased()] ?? trueGlobals[name.lowercased()] ?? .null
+        case .trueGlobal: trueGlobals[name.lowercased()] ?? .null
         case .unscoped: locals[name.lowercased()] ?? globals[name.lowercased()] ?? .null
         }
+    }
+
+    /// `[Global_Remove]` (Ch. 15 Table 3): "Removes the specified
+    /// variable from the globals."
+    public mutating func removeTrueGlobal(_ name: String) {
+        trueGlobals.removeValue(forKey: name.lowercased())
+    }
+
+    /// `[Global_Defined]` (Ch. 15 Table 3): "Returns True if the global
+    /// variable has been defined or False otherwise." Mirrors
+    /// `var_defined`/`local_defined`'s existing (Runtime.swift,
+    /// `registerDefaultFunctions`) treatment of a variable holding
+    /// `.null` as "not defined" — the Guide's prose for the page-
+    /// variable sibling `[Variable_Defined]` says a Null-valued
+    /// variable should still count as defined, but this codebase's
+    /// storage can't currently distinguish "never created" from
+    /// "created and set to Null" (both collapse to `.null` in
+    /// `value(for:)`), and `var_defined`/`local_defined` already made
+    /// this same simplification — kept consistent here rather than
+    /// introducing a third, differently-behaved variant.
+    public func trueGlobalDefined(_ name: String) -> Bool {
+        switch trueGlobals[name.lowercased()] {
+        case nil, .void, .null: false
+        default: true
+        }
+    }
+
+    /// `[Globals]` (Ch. 15 Table 3): "Returns a map of all global
+    /// variables that are currently defined."
+    public func trueGlobalsSnapshot() -> [String: LassoValue] {
+        trueGlobals
     }
 
     public var currentInlineFrame: LassoInlineFrame? {

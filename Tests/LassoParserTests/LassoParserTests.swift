@@ -7363,3 +7363,93 @@ struct IncludeURLTests {
     #expect(output == "String|true")
 }
 
+@Test func varResetAndLocalResetSetAVariableMatchingTheLanguageGuidesOwnWorkedExample() async throws {
+    // Lasso 8.5 Language Guide Ch. 15 p.226, exact worked example:
+    // `Var_Reset: 'VariableName'='New Value'; $VariableName;` -> "New
+    // Value". This codebase has no `@`/`[Reference]` variable-aliasing
+    // system (deferred — see `Evaluator.declarationScope(for:)`'s own
+    // doc comment), so "detaching any references" has nothing to do;
+    // `Var_Reset`/`Local_Reset` are implemented as plain synonyms for
+    // `Var`/`Local`, verified here to at least match the documented
+    // set-and-read behavior.
+    var context = LassoContext()
+    let output = try await LassoRenderer().render(
+        "[Var_Reset: 'VariableName'='New Value'][$VariableName][Local('l' = 1)][Local_Reset('l' = 2)][#l]",
+        context: &context
+    )
+    #expect(output == "New Value2")
+}
+
+@Test func globalSetAndGetMatchesTheLanguageGuidesOwnWorkedExample() async throws {
+    // Ch. 15 p.227, exact worked example:
+    // `[Global: 'Administrator_Email' = 'administrator@example.com']`
+    // then `[Global: 'Administrator_Email']` ->
+    // "administrator@example.com".
+    var context = LassoContext()
+    let output = try await LassoRenderer().render(
+        "[Global: 'Administrator_Email' = 'administrator@example.com'][Global: 'Administrator_Email']",
+        context: &context
+    )
+    #expect(output == "administrator@example.com")
+}
+
+@Test func dollarSymbolFallsBackToAGlobalOnlyWhenNoPageVariableOfTheSameNameExists() async throws {
+    // Ch. 15 p.227: "The $ symbol will return a global variable if no
+    // page variable of the same name has been created." Also verifies
+    // the two namespaces stay genuinely separate (a page `Variable` and
+    // a true `Global` sharing a name are different variables, matching
+    // real Lasso) rather than colliding in shared storage.
+    var context = LassoContext()
+    let fallbackOutput = try await LassoRenderer().render(
+        "[Global: 'g_only' = 'from global'][$g_only]",
+        context: &context
+    )
+    #expect(fallbackOutput == "from global")
+
+    var shadowedContext = LassoContext()
+    let shadowedOutput = try await LassoRenderer().render(
+        "[Global: 'shared' = 'global value'][Variable: 'shared' = 'page value'][$shared]|[Global: 'shared']",
+        context: &shadowedContext
+    )
+    #expect(shadowedOutput == "page value|global value")
+}
+
+@Test func globalResetGlobalDefinedGlobalRemoveAndGlobalsMap() async throws {
+    var context = LassoContext()
+    let output = try await LassoRenderer().render(
+        """
+        [Global_Reset: 'g' = 1]
+        [Global_Defined: 'g']|[Global_Defined: 'never_set']
+        [Global: 'g2' = 2]
+        [(Globals)->size]
+        [Global_Remove: 'g']
+        [Global_Defined: 'g']|[(Globals)->size]
+        """,
+        context: &context
+    )
+    let lines = output
+        .split(separator: "\n")
+        .map { $0.trimmingCharacters(in: .whitespaces) }
+        .filter { !$0.isEmpty }
+    #expect(lines == ["true|false", "2", "false|1"])
+}
+
+@Test func varDefinedStaysScopedToThePageAndIsNotFooledByAnUnrelatedTrueGlobal() async throws {
+    // Ch. 15 p.225: "The [Variable_Defined] tag can be used to check if
+    // a variable has been created and used in THE CURRENT LASSO PAGE."
+    // Regression test for a real bug caught by architect review: an
+    // earlier version of the `$name`-falls-back-to-a-global fix
+    // (`LassoContext.value(for:scope:)`'s `.global` case, see its own
+    // doc comment) mistakenly also placed the fallback on `.unscoped`
+    // — which `var_defined`'s free-function registration reads through
+    // — making `Var_Defined('x')` silently report `true` whenever an
+    // unrelated true Global named "x" existed, even with no page
+    // variable ever created.
+    var context = LassoContext()
+    let output = try await LassoRenderer().render(
+        "[Global: 'onlyglobal' = 'g'][Var_Defined: 'onlyglobal']",
+        context: &context
+    )
+    #expect(output == "false")
+}
+

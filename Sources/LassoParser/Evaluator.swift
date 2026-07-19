@@ -70,10 +70,8 @@ struct Evaluator {
             guard case let .identifier(name) = callee else {
                 throw LassoRuntimeError.unsupportedExpression("Dynamic call")
             }
-            if name.caseInsensitiveCompare("var") == .orderedSame ||
-                name.caseInsensitiveCompare("variable") == .orderedSame ||
-                name.caseInsensitiveCompare("local") == .orderedSame {
-                return try await declare(arguments, local: name.lowercased() == "local")
+            if let scope = Self.declarationScope(for: name) {
+                return try await declare(arguments, scope: scope)
             }
             if let function = context.natives.function(named: name) {
                 return try await function(try await evaluate(arguments), &context)
@@ -403,8 +401,28 @@ struct Evaluator {
         return context.consumeReturnSignal() ?? .void
     }
 
-    private mutating func declare(_ arguments: [LassoArgument], local: Bool) async throws -> LassoValue {
-        let scope: VariableScope = local ? .local : .global
+    /// `Var`/`Variable` and `Global` are read/write tags (Ch. 15 Tables 1
+    /// and 3); `Var_Reset`/`Local_Reset`/`Global_Reset` are documented as
+    /// their "detach any references, then set" siblings. This codebase
+    /// doesn't implement Lasso's `@`/`[Reference]` variable-aliasing
+    /// system (deferred — see Documentation/lasso9-lassoguide-gap-analysis-plan.md's
+    /// Stage 4 note: it needs new `@`-operator parser support and a
+    /// variable-storage indirection layer neither of which exist today,
+    /// a materially bigger and riskier change than every other gap
+    /// closed this batch), so "detaching references" has nothing to do
+    /// here — the `_Reset` variants are implemented as plain synonyms
+    /// for their base tag, which is the correct, honest behavior for a
+    /// codebase with no references to detach in the first place.
+    private static func declarationScope(for name: String) -> VariableScope? {
+        switch name.lowercased() {
+        case "var", "variable", "var_reset": .global
+        case "local", "local_reset": .local
+        case "global", "global_reset": .trueGlobal
+        default: nil
+        }
+    }
+
+    private mutating func declare(_ arguments: [LassoArgument], scope: VariableScope) async throws -> LassoValue {
         // Assignment-form calls (`local('x' = 1)`) keep returning `.void` —
         // real corpus code commonly uses this as a bare statement inside a
         // `[...]` template span and relies on it producing no output.
