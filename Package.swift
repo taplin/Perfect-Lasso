@@ -13,6 +13,7 @@ let package = Package(
         .library(name: "LassoPerfectCRUD", targets: ["LassoPerfectCRUD"]),
         .library(name: "LassoPerfectSession", targets: ["LassoPerfectSession"]),
         .library(name: "LassoPerfectFileMaker", targets: ["LassoPerfectFileMaker"]),
+        .library(name: "LassoPerfectSMTP", targets: ["LassoPerfectSMTP"]),
         .executable(name: "lasso-subset-crawler", targets: ["LassoSubsetCrawler"]),
         .executable(name: "lasso-mysql-smoke", targets: ["LassoMySQLSmoke"]),
         .executable(name: "lasso-session-mysql-smoke", targets: ["LassoSessionMySQLSmoke"]),
@@ -26,7 +27,9 @@ let package = Package(
         .package(path: "../Perfect-Resurrection/Perfect-Session"),
         .package(path: "../Perfect-Resurrection/Perfect-FileMaker"),
         .package(path: "../Perfect-Resurrection/Perfect-FileMaker-AdminAPI"),
+        .package(path: "../Perfect-Resurrection/Perfect-SMTP"),
         .package(url: "https://github.com/apple/swift-crypto.git", from: "4.5.0"),
+        .package(url: "https://github.com/apple/swift-nio.git", from: "2.65.0"),
     ],
     targets: [
         .target(
@@ -55,6 +58,15 @@ let package = Package(
             dependencies: [
                 "LassoParser",
                 .product(name: "PerfectFileMaker", package: "Perfect-FileMaker"),
+            ]
+        ),
+        .target(
+            name: "LassoPerfectSMTP",
+            dependencies: [
+                "LassoParser",
+                .product(name: "PerfectSMTP", package: "Perfect-SMTP"),
+                .product(name: "NIOCore", package: "swift-nio"),
+                .product(name: "NIOPosix", package: "swift-nio"),
             ]
         ),
         .executableTarget(
@@ -95,6 +107,7 @@ let package = Package(
                 "LassoPerfectCRUD",
                 "LassoPerfectSession",
                 "LassoPerfectFileMaker",
+                "LassoPerfectSMTP",
                 .product(name: "PerfectCRUD", package: "Perfect-CRUD"),
                 .product(name: "PerfectMySQL", package: "Perfect-MySQL"),
                 .product(name: "PerfectNIO", package: "Perfect-NIO"),
@@ -103,6 +116,9 @@ let package = Package(
                 .product(name: "PerfectFileMaker", package: "Perfect-FileMaker"),
                 .product(name: "PerfectAdminConsole", package: "Perfect-NIO"),
                 .product(name: "PerfectFileMakerAdminAPI", package: "Perfect-FileMaker-AdminAPI"),
+                .product(name: "PerfectSMTP", package: "Perfect-SMTP"),
+                .product(name: "NIOCore", package: "swift-nio"),
+                .product(name: "NIOPosix", package: "swift-nio"),
             ]
         ),
         // Targets are the basic building blocks of a package, defining a module or a test suite.
@@ -147,6 +163,16 @@ let package = Package(
             swiftSettings: [
                 .enableUpcomingFeature("ApproachableConcurrency"),
             ],
+        ),
+        .testTarget(
+            name: "LassoPerfectSMTPTests",
+            dependencies: [
+                "LassoParser",
+                "LassoPerfectSMTP",
+                .product(name: "PerfectSMTP", package: "Perfect-SMTP"),
+                .product(name: "NIOCore", package: "swift-nio"),
+                .product(name: "NIOPosix", package: "swift-nio"),
+            ]
         ),
     ],
     swiftLanguageModes: [.v6]

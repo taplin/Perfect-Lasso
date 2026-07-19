@@ -990,6 +990,36 @@ public protocol LassoInlineProvider: Sendable {
     func executeInline(arguments: [EvaluatedArgument], context: LassoContext) async throws -> LassoInlineFrame
 }
 
+/// The dispatch-registration seam for `email_send` (and any future
+/// email-family native functions cheap enough to add alongside it, e.g.
+/// `email_compose`/`email_mxlookup`) — see
+/// `Documentation/lasso-perfect-smtp-integration-plan.md` §4.0. `email_send`
+/// is registered inside `LassoNativeRegistry.registerDefaultFunctions()`,
+/// which lives in `LassoParser` itself and must never import a specific
+/// resurrected library (`LassoParser`'s `Package.swift` depends on `Crypto`
+/// only). This protocol lets a host application (e.g.
+/// `LassoPerfectSMTP`/`lasso-perfect-server`'s `main.swift`) wire a real
+/// conformer into `LassoContext.emailProvider` from the outside, exactly
+/// the same shape as `LassoInlineProvider`/`inlineProvider` above and
+/// `LassoSessionProvider`/`sessionProvider` — `LassoParser` dispatches
+/// through the protocol without ever knowing which concrete library
+/// implements it. `email_smtp` deliberately is NOT covered by this
+/// protocol (§4.0 point 3): it needs a native *type*, not a free function,
+/// and has no side-channel-slot equivalent yet — a harder, separately
+/// scoped problem.
+public protocol LassoEmailProvider: Sendable {
+    /// `context` is currently unused by any shipped conformer (mirroring
+    /// `LassoInlineProvider.executeInline`'s own `context` parameter,
+    /// which neither of its two conformers touch either) -- included now,
+    /// at zero cost, for family-shape consistency with `inlineProvider`/
+    /// `sessionProvider` and so a future conformer needing request-scoped
+    /// state (e.g. attributing an `email_result`/`email_status` job to the
+    /// requesting page) doesn't require a breaking protocol change once
+    /// `LassoPerfectSMTP`'s real conformer ships (milestone review,
+    /// architecture pass, finding #1).
+    func send(_ arguments: [EvaluatedArgument], context: LassoContext) async throws -> LassoValue
+}
+
 public protocol LassoDynamicQueryExecutor: Sendable {
     func execute(_ request: LassoInlineRequest) async throws -> LassoInlineFrame
 }
