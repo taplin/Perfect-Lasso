@@ -52,6 +52,12 @@ struct ServerConfig: Sendable {
     let mysqlDatabase: String
     let mysqlUser: String?
     let mysqlPassword: String?
+    /// `LASSO_SESSION_DRIVER=mysql`'s session table name — see
+    /// `MySQLConnectionFileConfig.sessionTable`'s doc comment for why this
+    /// needs to be overridable (the default "sessions" can collide with an
+    /// unrelated table already in `mysqlDatabase`). Default "sessions",
+    /// matching `MySQLSessionConnector.table`'s own default.
+    let mysqlSessionTable: String
     /// Both default false — see Documentation/inline-write-raw-sql-plan.md's
     /// "Capability Policy": reads enabled by default, writes and raw SQL
     /// disabled until a deployment explicitly opts in.
@@ -351,6 +357,7 @@ struct ServerConfig: Sendable {
             mysqlDatabase: datasourceFile?.mysql?.sessionDatabase ?? env["LASSO_MYSQL_DATABASE"] ?? "",
             mysqlUser: datasourceFile?.mysql?.user ?? env["LASSO_MYSQL_USER"],
             mysqlPassword: datasourceFile?.mysql?.password ?? env["LASSO_MYSQL_PASSWORD"],
+            mysqlSessionTable: datasourceFile?.mysql?.sessionTable ?? env["LASSO_MYSQL_SESSION_TABLE"] ?? "sessions",
             mysqlAllowWrites: datasourceFile?.mysql?.allowWrites ?? Self.isTruthyEnv(env["LASSO_MYSQL_ALLOW_WRITES"]),
             mysqlAllowRawSQL: datasourceFile?.mysql?.allowRawSQL ?? Self.isTruthyEnv(env["LASSO_MYSQL_ALLOW_RAW_SQL"]),
             filemakerDatasourceAliases: filemakerDatasourceAliases,
@@ -445,7 +452,8 @@ struct ServerConfig: Sendable {
 /// ```json
 /// {
 ///   "mysql": {"host": "...", "port": 3306, "user": "...", "password": "...",
-///             "sessionDatabase": "...", "allowWrites": false, "allowRawSQL": false},
+///             "sessionDatabase": "...", "sessionTable": "...",
+///             "allowWrites": false, "allowRawSQL": false},
 ///   "filemaker": {"host": "...", "port": 80, "user": "...", "password": "...",
 ///                 "allowWrites": false},
 ///   "adminAPI": {"host": "...", "port": 16000, "user": "...", "password": "..."},
@@ -457,7 +465,7 @@ struct ServerConfig: Sendable {
 /// ```
 /// Back-compat: a config file written before FileMaker support — flat
 /// top-level `host`/`port`/`user`/`password`/`sessionDatabase`/
-/// `allowWrites`/`allowRawSQL` fields (read as the `mysql` block when no
+/// `sessionTable`/`allowWrites`/`allowRawSQL` fields (read as the `mysql` block when no
 /// nested `mysql` key is present) and a `datasources` map of bare
 /// `"alias": "schemaName"` strings (read as `{type: "mysql", schema:
 /// "schemaName"}`) — still decodes and behaves identically.
@@ -469,7 +477,7 @@ struct DatasourceFileConfig: Decodable {
 
     private enum CodingKeys: String, CodingKey {
         case mysql, filemaker, adminAPI, datasources
-        case host, port, user, password, sessionDatabase, allowWrites, allowRawSQL
+        case host, port, user, password, sessionDatabase, sessionTable, allowWrites, allowRawSQL
     }
 
     init(from decoder: Decoder) throws {
@@ -485,16 +493,19 @@ struct DatasourceFileConfig: Decodable {
             let flatUser = try container.decodeIfPresent(String.self, forKey: .user)
             let flatPassword = try container.decodeIfPresent(String.self, forKey: .password)
             let flatSessionDatabase = try container.decodeIfPresent(String.self, forKey: .sessionDatabase)
+            let flatSessionTable = try container.decodeIfPresent(String.self, forKey: .sessionTable)
             let flatAllowWrites = try container.decodeIfPresent(Bool.self, forKey: .allowWrites)
             let flatAllowRawSQL = try container.decodeIfPresent(Bool.self, forKey: .allowRawSQL)
             let anyFlatFieldPresent = flatHost != nil || flatPort != nil || flatUser != nil ||
-                flatPassword != nil || flatSessionDatabase != nil || flatAllowWrites != nil || flatAllowRawSQL != nil
+                flatPassword != nil || flatSessionDatabase != nil || flatSessionTable != nil ||
+                flatAllowWrites != nil || flatAllowRawSQL != nil
             mysql = anyFlatFieldPresent ? MySQLConnectionFileConfig(
                 host: flatHost,
                 port: flatPort,
                 user: flatUser,
                 password: flatPassword,
                 sessionDatabase: flatSessionDatabase,
+                sessionTable: flatSessionTable,
                 allowWrites: flatAllowWrites,
                 allowRawSQL: flatAllowRawSQL
             ) : nil
@@ -519,6 +530,15 @@ struct MySQLConnectionFileConfig: Decodable {
     /// isn't itself an inline-queryable Lasso datasource. Falls back to
     /// `LASSO_MYSQL_DATABASE` when omitted.
     var sessionDatabase: String?
+    /// Table `LASSO_SESSION_DRIVER=mysql` stores session rows in, within
+    /// `sessionDatabase`. Defaults to "sessions" (matching
+    /// `MySQLSessionConnector.table`'s own default) when omitted — override
+    /// this if `sessionDatabase` already has an unrelated "sessions" table
+    /// (e.g. another application's own session/user table in the same
+    /// schema), since Perfect-Lasso's MySQL session driver otherwise throws
+    /// against the wrong columns on every read/write and silently falls
+    /// back to creating a fresh session each time.
+    var sessionTable: String?
     var allowWrites: Bool?
     var allowRawSQL: Bool?
 }
@@ -686,6 +706,7 @@ struct LassoSiteServer: Sendable {
             MySQLSessionConnector.database = config.mysqlDatabase
             MySQLSessionConnector.username = config.mysqlUser ?? ""
             MySQLSessionConnector.password = config.mysqlPassword ?? ""
+            MySQLSessionConnector.table = config.mysqlSessionTable
             sessionDriver = MySQLSessionDriver()
         default:
             sessionDriver = MemorySessionDriver()
