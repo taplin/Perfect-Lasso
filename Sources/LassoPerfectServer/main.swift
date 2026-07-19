@@ -1121,22 +1121,17 @@ struct LassoSiteServer: Sendable {
         // correctly mutating this same (reference-type) sink instance.
         let sink = ServerResponseSink()
 
-        // Session preflight: real create/resume against SessionDriver is
-        // async, the renderer/evaluator is not — scan for literal
-        // session_start(...) calls and load them now, before the sync
-        // render runs. See Documentation/session-upload-support-plan.md
-        // and Sources/LassoPerfectSession/PerfectBackedLassoSessionProvider.swift.
-        let sessionCalls = LassoSessionPreflight.scan(document, includeLoader: includeLoader, includePath: includePath)
-        let sessionBridge: PerfectBackedLassoSessionProvider? = sessionCalls.isEmpty ? nil : PerfectBackedLassoSessionProvider()
-        if let sessionBridge {
-            await sessionBridge.prepare(
-                calls: sessionCalls,
-                driver: sessionDriver,
-                cookies: request.cookies,
-                remoteAddress: request.remoteAddress?.ipAddress ?? "",
-                userAgent: request.headers["user-agent"].first ?? ""
-            )
-        }
+        // Session bridge: cheap to construct unconditionally (no I/O until
+        // a session_start(...) is actually evaluated) — see
+        // Sources/LassoPerfectSession/PerfectBackedLassoSessionProvider.swift
+        // and LassoSessionProvider's 2026-07-18 doc comment for why there's
+        // no more parse-time preflight scan here.
+        let sessionBridge = PerfectBackedLassoSessionProvider(
+            driver: sessionDriver,
+            cookies: request.cookies,
+            remoteAddress: request.remoteAddress?.ipAddress ?? "",
+            userAgent: request.headers["user-agent"].first ?? ""
+        )
 
         let context = LassoContext(
             globals: baseGlobals(for: request),
@@ -1189,23 +1184,21 @@ struct LassoSiteServer: Sendable {
         // line. A no-op when counters aren't enabled (`NoOpTagOpenFormCounterStore`).
         tagFormCounters.merge(localContext.openFormFires)
 
-        if let sessionBridge {
-            let actions = await sessionBridge.finalize(driver: sessionDriver)
-            for action in actions {
-                let cookieName = "_LassoSessionTracker_\(action.call.name)"
-                if action.shouldClearCookie {
-                    try? sink.setCookie(
-                        name: cookieName, value: "",
-                        domain: action.call.domain, expires: "Thu, 01 Jan 1970 00:00:00 GMT",
-                        path: action.call.path ?? "/", secure: action.call.secure, httpOnly: action.call.httpOnly
-                    )
-                } else if let token = action.token {
-                    try? sink.setCookie(
-                        name: cookieName, value: token,
-                        domain: action.call.domain, expires: action.call.cookieExpires,
-                        path: action.call.path ?? "/", secure: action.call.secure, httpOnly: action.call.httpOnly
-                    )
-                }
+        let sessionActions = await sessionBridge.finalize()
+        for action in sessionActions {
+            let cookieName = "_LassoSessionTracker_\(action.call.name)"
+            if action.shouldClearCookie {
+                try? sink.setCookie(
+                    name: cookieName, value: "",
+                    domain: action.call.domain, expires: "Thu, 01 Jan 1970 00:00:00 GMT",
+                    path: action.call.path ?? "/", secure: action.call.secure, httpOnly: action.call.httpOnly
+                )
+            } else if let token = action.token {
+                try? sink.setCookie(
+                    name: cookieName, value: token,
+                    domain: action.call.domain, expires: action.call.cookieExpires,
+                    path: action.call.path ?? "/", secure: action.call.secure, httpOnly: action.call.httpOnly
+                )
             }
         }
 

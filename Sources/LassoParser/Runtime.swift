@@ -590,16 +590,16 @@ public struct LassoNativeRegistry: Sendable {
         // Real session semantics: sessions are NAMED (session_start(name,
         // ...)), and session_addVar(sessionName, varName) registers an
         // existing thread/local variable for end-of-request persistence —
-        // it does not take a value directly. The actual create/resume/save
-        // work against PerfectSessionCore happens at the server boundary
-        // (see LassoPerfectSession); these natives only read/write the
-        // already-loaded, synchronous state LassoSessionProvider exposes.
-        // See Documentation/session-upload-support-plan.md.
+        // it does not take a value directly. session_start creates/resumes
+        // the real session (against PerfectSessionCore, via
+        // LassoSessionProvider.start — see LassoPerfectSession) directly,
+        // in place, right here — not via a parse-time preflight scan; see
+        // LassoSessionProvider's 2026-07-18 doc comment for why. See also
+        // Documentation/session-upload-support-plan.md.
         register("session_start") { arguments, context in
-            guard let resolved = resolveSessionName(in: arguments, stringValue: { $0.value.outputString }) else { return .void }
-            let name = resolved.name
-            if let result = context.sessionProvider?.start(session: name) {
-                context.sessionStartResults[name.lowercased()] = result
+            guard let call = makeSessionStartCall(from: arguments) else { return .void }
+            if let result = await context.sessionProvider?.start(session: call.name, call: call) {
+                context.sessionStartResults[call.name.lowercased()] = result
             }
             return .void
         }
