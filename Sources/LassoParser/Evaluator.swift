@@ -70,10 +70,8 @@ struct Evaluator {
             guard case let .identifier(name) = callee else {
                 throw LassoRuntimeError.unsupportedExpression("Dynamic call")
             }
-            if name.caseInsensitiveCompare("var") == .orderedSame ||
-                name.caseInsensitiveCompare("variable") == .orderedSame ||
-                name.caseInsensitiveCompare("local") == .orderedSame {
-                return try await declare(arguments, local: name.lowercased() == "local")
+            if let scope = Self.declarationScope(for: name) {
+                return try await declare(arguments, scope: scope)
             }
             if let function = context.natives.function(named: name) {
                 return try await function(try await evaluate(arguments), &context)
@@ -260,6 +258,114 @@ struct Evaluator {
         return .object(object)
     }
 
+    /// `.object`'s own `typeName` (e.g. "regexp", "date", or a custom
+    /// user-defined type's name) is returned exactly as registered/
+    /// defined — lassoguide.com's own doc says `null->type()` "Returns...
+    /// the name that was used when the type was defined." Every other
+    /// case is capitalized to match the Lasso 8.5 Language Guide's own
+    /// worked examples verbatim (Ch. 43 p.560: `[123->Type] → Integer`,
+    /// `[123.456->Type] → Decimal`, `['String'->Type] → String`,
+    /// `[Null->Type] → Null`, `[(Array: 1,2,3)->Type] → Array`) —
+    /// `.boolean`/`.map`/`.pair` have no worked example in the Guide but
+    /// follow the same capitalization convention.
+    static func introspectionTypeName(for value: LassoValue) -> String {
+        if case .object = value { return value.typeName }
+        return value.typeName.prefix(1).uppercased() + value.typeName.dropFirst()
+    }
+
+    /// `Null->Type`/`->IsA`/`->IsNotA`/`->HasMethod` (Lasso 8.5 Language
+    /// Guide Ch. 43 Table 6 "Null Member Tags", pp.559-560; `->IsNotA`
+    /// and `->HasMethod` verified against lassoguide.com's Lasso 9
+    /// "Type/Object Introspection Methods" section, since 8.5's table
+    /// doesn't list them). Returns `nil` when `normalized` isn't one of
+    /// these four names, so every call site below treats it as a
+    /// LOW-PRIORITY fallback — checked only after real data/methods have
+    /// already had a chance to match: `.map`'s existing key-first design
+    /// (a literal `"type"` key, e.g. a file upload's content type, must
+    /// still win — an earlier version that checked this unconditionally
+    /// broke exactly that, caught by
+    /// `fileUploadsExposeMetadataUnderBothLasso9And8KeyNames` failing)
+    /// and `.object`'s existing native-method-then-custom-method chain
+    /// (a real user-defined `type`/`isA` method, however unlikely, wins
+    /// too). This codebase has no type-inheritance/trait model at all (a
+    /// custom `define_type`'s parent/base names are parsed but not yet
+    /// acted on — see Renderer.swift's own "define_type" case), so
+    /// `->IsA` here matches Lasso 8.5's simpler documented semantics
+    /// ("Returns true if the object is of that type... or inherits from
+    /// that type") as a flat, case-insensitive exact-type-name match —
+    /// NOT Lasso 9's richer integer 0-3 trait/parent-aware return value.
+    private mutating func introspectionResult(
+        _ normalized: String,
+        _ value: LassoValue,
+        _ arguments: [LassoArgument]
+    ) async throws -> LassoValue? {
+        switch normalized {
+        case "type":
+            return .string(Self.introspectionTypeName(for: value))
+        case "isa", "isnota":
+            let requested = arguments.first != nil ? try await evaluate(arguments[0].value).outputString : ""
+            let matches = value.typeName.caseInsensitiveCompare(requested) == .orderedSame
+            return .boolean(normalized == "isa" ? matches : !matches)
+        case "hasmethod":
+            let requested = (arguments.first != nil ? try await evaluate(arguments[0].value).outputString : "").lowercased()
+            return .boolean(hasMethod(named: requested, on: value))
+        default:
+            return nil
+        }
+    }
+
+    /// `.object`: consults the SAME two registries the `.object` case
+    /// further below checks when actually dispatching a call (native
+    /// type methods, then a user-defined `define_type`'s methods) —
+    /// existence-only, no argument/overload matching. Primitives: no
+    /// unified per-type method registry exists here (each is a
+    /// hand-written `case` in `member()`'s own switch above), so this
+    /// consults a hand-maintained mirror of those case labels instead —
+    /// verified complete against `member()`'s switch as of this writing,
+    /// but NOT auto-derived from it, so a future member-case addition
+    /// needs a matching update here or `->HasMethod` will under-report.
+    /// `type`/`isA`/`isNotA`/`hasMethod` themselves are always reported
+    /// present, matching the Guide's own framing of these as base tags
+    /// "available for use with values of any data type" — every OTHER
+    /// Table 6 tag (`->Serialize`, `->Properties`, etc.) is intentionally
+    /// excluded since this stage doesn't implement them; claiming one
+    /// exists via `->HasMethod` while `->Serialize` itself still throws
+    /// would be worse than not answering at all.
+    private func hasMethod(named requested: String, on value: LassoValue) -> Bool {
+        if Self.introspectionMethodNames.contains(requested) { return true }
+        if case let .object(object) = value {
+            if context.nativeTypes.type(named: object.typeName)?.method(named: requested) != nil {
+                return true
+            }
+            if let type = context.tagRegistry.type(named: object.typeName) {
+                return type.methods.contains { $0.name.lowercased() == requested }
+            }
+            return false
+        }
+        return Self.primitiveMethodNames[value.typeName]?.contains(requested) ?? false
+    }
+
+    private static let introspectionMethodNames: Set<String> = ["type", "isa", "isnota", "hasmethod"]
+
+    private static let primitiveMethodNames: [String: Set<String>] = [
+        "string": [
+            "size", "uppercase", "lowercase", "asstring", "encodehtml", "encodeurl",
+            "encodesmart", "encodebreak", "encodexml", "encodestricturl", "encodesql",
+            "encodebase64", "decodebase64", "contains", "beginswith", "endswith",
+            "equals", "compare", "comparecodepointorder", "find", "get", "split",
+            "replace", "append", "trim", "padleading", "padtrailing", "removeleading",
+            "removetrailing", "reverse", "titlecase", "substring", "sub",
+        ],
+        "integer": ["asstring", "ceil"],
+        "decimal": ["asstring", "ceil"],
+        "pair": ["first", "second"],
+        "array": [
+            "size", "first", "insert", "get", "last", "second", "reverse", "sort",
+            "join", "contains", "find", "findposition", "remove", "removeall",
+        ],
+        "map": ["insert", "remove", "removeall", "size", "keys", "values", "contains", "find"],
+    ]
+
     private mutating func invokeMemberMethod(
         named name: String,
         on object: LassoObjectInstance,
@@ -295,8 +401,28 @@ struct Evaluator {
         return context.consumeReturnSignal() ?? .void
     }
 
-    private mutating func declare(_ arguments: [LassoArgument], local: Bool) async throws -> LassoValue {
-        let scope: VariableScope = local ? .local : .global
+    /// `Var`/`Variable` and `Global` are read/write tags (Ch. 15 Tables 1
+    /// and 3); `Var_Reset`/`Local_Reset`/`Global_Reset` are documented as
+    /// their "detach any references, then set" siblings. This codebase
+    /// doesn't implement Lasso's `@`/`[Reference]` variable-aliasing
+    /// system (deferred — see Documentation/lasso9-lassoguide-gap-analysis-plan.md's
+    /// Stage 4 note: it needs new `@`-operator parser support and a
+    /// variable-storage indirection layer neither of which exist today,
+    /// a materially bigger and riskier change than every other gap
+    /// closed this batch), so "detaching references" has nothing to do
+    /// here — the `_Reset` variants are implemented as plain synonyms
+    /// for their base tag, which is the correct, honest behavior for a
+    /// codebase with no references to detach in the first place.
+    private static func declarationScope(for name: String) -> VariableScope? {
+        switch name.lowercased() {
+        case "var", "variable", "var_reset": .global
+        case "local", "local_reset": .local
+        case "global", "global_reset": .trueGlobal
+        default: nil
+        }
+    }
+
+    private mutating func declare(_ arguments: [LassoArgument], scope: VariableScope) async throws -> LassoValue {
         // Assignment-form calls (`local('x' = 1)`) keep returning `.void` —
         // real corpus code commonly uses this as a bare statement inside a
         // `[...]` template span and relies on it producing no output.
@@ -478,7 +604,13 @@ struct Evaluator {
             // Lasso 8-style graceful degradation actually lives: treat it
             // as an empty string for member access, matching how it
             // already behaves for truthiness (`false`) and string output
-            // (`""`) elsewhere in this runtime.
+            // (`""`) elsewhere in this runtime. This redirect means
+            // `void->Type`/`->IsA`/`->HasMethod` report `"String"`/
+            // string-typed answers rather than surfacing "this was a
+            // lookup miss" — a deliberate extension of the same
+            // graceful-degradation tradeoff already made above, not a
+            // new one introduced by `introspectionResult` (flagged and
+            // confirmed intentional by architect review).
             return try await member(.string(""), name, arguments)
         case let (.string(value), "size"): return .integer(value.count)
         case let (.string(value), "uppercase"): return .string(value.uppercased())
@@ -497,13 +629,74 @@ struct Evaluator {
             guard let decoded = LassoEncoding.decodeBase64(value) else { return .void }
             return .string(decoded)
         case let (.string(value), "contains"):
+            // Lasso 8.5 Language Guide Ch. 25 Table 7: "[String->Contains]
+            // Returns True if the string contains the parameter as a
+            // substring. Comparison is case insensitive." An earlier
+            // version used Swift's raw case-SENSITIVE `String.contains`,
+            // contradicting the documented behavior — caught while
+            // verifying `->BeginsWith`/`->EndsWith`/`->Equals` (the same
+            // table's siblings, all explicitly documented case-
+            // insensitive too) directly against this same page.
             let needle: String
             if let argument = arguments.first {
                 needle = try await evaluate(argument.value).outputString
             } else {
                 needle = ""
             }
-            return .boolean(value.contains(needle))
+            return .boolean(needle.isEmpty || value.range(of: needle, options: .caseInsensitive) != nil)
+        case let (.string(value), "beginswith"):
+            // Ch. 25 Table 7: case insensitive.
+            let needle = arguments.first != nil ? try await evaluate(arguments[0].value).outputString : ""
+            return .boolean(value.range(of: needle, options: [.caseInsensitive, .anchored]) != nil || needle.isEmpty)
+        case let (.string(value), "endswith"):
+            let needle = arguments.first != nil ? try await evaluate(arguments[0].value).outputString : ""
+            return .boolean(needle.isEmpty || value.range(of: needle, options: [.caseInsensitive, .backwards, .anchored]) != nil)
+        case let (.string(value), "equals"):
+            // "Equivalent to the == symbol" — reuses the same
+            // case-insensitive comparison `binary(_:"==",_:)` already
+            // uses elsewhere (Evaluator.swift's own `==` doc comment
+            // cites a real production bug this exact rule was needed to
+            // fix: 'Yes' vs 'yes').
+            let other = arguments.first != nil ? try await evaluate(arguments[0].value).outputString : ""
+            return .boolean(value.caseInsensitiveCompare(other) == .orderedSame)
+        case let (.string(value), member) where member == "compare" || member == "comparecodepointorder":
+            // Ch. 25 Table 7: three-way compare — 0 if equal, 1 if the
+            // base string is bitwise greater, -1 if less. Case
+            // insensitive by default; a bare `-Case` flag makes it case
+            // sensitive. Only the single-parameter whole-string form is
+            // implemented — the documented substring-offset/-length
+            // overloads (comparing a slice of either string) are out of
+            // scope here. `->CompareCodePointOrder` is documented as
+            // accepting the same parameters with Unicode-code-point-
+            // accurate ordering for characters above U+10000 — Swift's
+            // native `String` comparison is already Unicode-scalar-aware
+            // by default, so it shares this exact implementation rather
+            // than needing a separate one.
+            let evaluatedArguments = try await evaluate(arguments)
+            let other = evaluatedArguments.positionalValue(at: 0)?.outputString ?? ""
+            let caseSensitive = evaluatedArguments.hasTruthyFlag("case")
+            let ordering = caseSensitive ? value.compare(other) : value.compare(other, options: .caseInsensitive)
+            switch ordering {
+            case .orderedSame: return .integer(0)
+            case .orderedDescending: return .integer(1)
+            case .orderedAscending: return .integer(-1)
+            }
+        case let (.string(value), "find"):
+            // Ch. 25 Table 9: "Returns the position at which the first
+            // parameter is found within the string or 0 if the first
+            // parameter is not found." 1-based, matching `->substring`'s
+            // own established 1-based convention (confirmed by that
+            // member's own doc comment/tests).
+            let needle = arguments.first != nil ? try await evaluate(arguments[0].value).outputString : ""
+            guard !needle.isEmpty, let range = value.range(of: needle) else { return .integer(0) }
+            return .integer(value.distance(from: value.startIndex, to: range.lowerBound) + 1)
+        case let (.string(value), "get"):
+            // Ch. 25 Table 9: a single character at a 1-based position.
+            let position = arguments.first != nil ? Int(try await evaluate(arguments[0].value).number ?? 0) : 0
+            let characters = Array(value)
+            let index = position - 1
+            guard characters.indices.contains(index) else { return .string("") }
+            return .string(String(characters[index]))
         case let (.string(value), "split"):
             let separator: String
             if let argument = arguments.first {
@@ -559,6 +752,59 @@ struct Evaluator {
             // `$email->(trim)` and lost_password.page.lasso's
             // `#new_email->(trim)` — confirmed live 2026-07-18.
             return .string(value.trimmingCharacters(in: .whitespacesAndNewlines))
+        case let (.string(value), "padleading"):
+            // Ch. 25 Table 3: pads the FRONT to a specified length
+            // (default pad character space). A string already at or past
+            // the target length is returned unchanged.
+            let length = arguments.first != nil ? Int(try await evaluate(arguments[0].value).number ?? 0) : 0
+            let padCharacter = arguments.count > 1 ? try await evaluate(arguments[1].value).outputString : " "
+            let padCount = max(length - value.count, 0)
+            let pad = padCharacter.isEmpty ? "" : String(repeating: padCharacter, count: padCount)
+            return .string(String(pad.suffix(padCount)) + value)
+        case let (.string(value), "padtrailing"):
+            let length = arguments.first != nil ? Int(try await evaluate(arguments[0].value).number ?? 0) : 0
+            let padCharacter = arguments.count > 1 ? try await evaluate(arguments[1].value).outputString : " "
+            let padCount = max(length - value.count, 0)
+            let pad = padCharacter.isEmpty ? "" : String(repeating: padCharacter, count: padCount)
+            return .string(value + String(pad.prefix(padCount)))
+        case let (.string(value), "removeleading"):
+            // Ch. 25 Table 3: "Removes all instances of the parameter
+            // from the beginning of the string" — repeated, not just one
+            // occurrence (distinct from `->Trim`, which strips
+            // whitespace specifically).
+            let target = arguments.first != nil ? try await evaluate(arguments[0].value).outputString : ""
+            guard !target.isEmpty else { return .string(value) }
+            var remaining = Substring(value)
+            while remaining.hasPrefix(target) { remaining = remaining.dropFirst(target.count) }
+            return .string(String(remaining))
+        case let (.string(value), "removetrailing"):
+            let target = arguments.first != nil ? try await evaluate(arguments[0].value).outputString : ""
+            guard !target.isEmpty else { return .string(value) }
+            var remaining = Substring(value)
+            while remaining.hasSuffix(target) { remaining = remaining.dropLast(target.count) }
+            return .string(String(remaining))
+        case let (.string(value), "reverse"):
+            // Ch. 25 Table 3 documents optional offset/length parameters
+            // to reverse only a substring range — only the default
+            // (reverse the entire string) is implemented here.
+            return .string(String(value.reversed()))
+        case let (.string(value), "titlecase"):
+            // Ch. 25 Table 5: "Converts the string to titlecase with the
+            // first character of each word capitalized." Word boundaries
+            // here are literal single spaces only, not general
+            // whitespace (tabs/newlines) — low real-corpus risk, but a
+            // real scope limitation, matching this file's own convention
+            // of disclosing narrower-than-documented scope (see
+            // `->reverse`/`->compare` just above and below) rather than
+            // silently under-delivering. No locale parameter support
+            // either.
+            let titled = value.split(separator: " ", omittingEmptySubsequences: false)
+                .map { word -> String in
+                    guard let first = word.first else { return String(word) }
+                    return first.uppercased() + word.dropFirst().lowercased()
+                }
+                .joined(separator: " ")
+            return .string(titled)
         case let (.string(value), member) where member == "substring" || member == "sub":
             // `string->substring(start::integer, size::integer=?)` --
             // LassoGuide: "The starting point is specified by the first
@@ -813,20 +1059,37 @@ struct Evaluator {
         // (`TypeSystem.swift`'s `data[name.lowercased()] ?? .null`),
         // the more relevant precedent given `.map`'s dual use as a
         // record/object-like container for request/upload metadata.
-        case (.map, _): return .null
+        // `introspectionResult` is checked first so `->Type`/`->IsA`/
+        // `->HasMethod` still work on a map — but only after the
+        // key-first case above has already had first refusal, so a real
+        // key named "type" (e.g. a file upload's content type) keeps
+        // winning exactly as it did before this fallback existed.
+        case (.map, _):
+            if let introspected = try await introspectionResult(normalized, base, arguments) { return introspected }
+            return .null
         case let (.object(object), _):
             if let nativeMethod = context.nativeTypes.type(named: object.typeName)?.method(named: name) {
                 let evaluatedArguments = try await evaluate(arguments)
                 return try await nativeMethod(object, evaluatedArguments, &context)
             }
-            guard let type = context.tagRegistry.type(named: object.typeName) else {
-                return object.value(for: name)
-            }
-            if let value = try await invokeMemberMethod(named: name, on: object, type: type, arguments: arguments) {
+            if let type = context.tagRegistry.type(named: object.typeName),
+               let value = try await invokeMemberMethod(named: name, on: object, type: type, arguments: arguments) {
                 return value
             }
+            // A real native/custom-defined method (checked above) wins
+            // over the synthetic introspection tags, which in turn win
+            // over a plain data-field fallback — matching this case's
+            // existing method-before-field priority (native method, then
+            // custom method, then raw field) rather than `.map`'s
+            // key-first design: unlike `.map`, `.object` already treats
+            // methods as taking priority over generic field access, and
+            // no real corpus type defines a data member literally named
+            // "type"/"isa"/"isnota"/"hasmethod".
+            if let introspected = try await introspectionResult(normalized, base, arguments) { return introspected }
             return object.value(for: name)
-        default: throw LassoRuntimeError.unsupportedExpression("Member \(name)")
+        default:
+            if let introspected = try await introspectionResult(normalized, base, arguments) { return introspected }
+            throw LassoRuntimeError.unsupportedExpression("Member \(name)")
         }
     }
 
@@ -917,6 +1180,11 @@ struct Evaluator {
         // lists (`->Sort`) and building a list from search results while
         // dropping already-seen SKUs (`->Remove`).
         "sort", "reverse", "remove", "removeall",
+        // `String->PadLeading`/`->PadTrailing`/`->RemoveLeading`/
+        // `->RemoveTrailing`/`->Titlecase` (Ch. 25 Tables 3/5) —
+        // documented "Modifies the string and returns no value",
+        // exactly like `->Trim`/`->Append` above.
+        "padleading", "padtrailing", "removeleading", "removetrailing", "titlecase",
         // `Date->Add`/`Date->Subtract` (Lasso 8.5 Language Guide Ch. 29
         // Table 7) — documented as changing "the values of variables
         // that contain date... data types" when called as a bare

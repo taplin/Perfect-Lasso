@@ -1,5 +1,12 @@
 import Foundation
 
+/// Shared by the `String_Is*` free-tag family below — a top-level
+/// function (not a local closure) so it can be captured by the
+/// `@Sendable` `register(...)` closures without a Sendable-capture error.
+private func isEveryCharacter(_ text: String, _ predicate: (Character) -> Bool) -> Bool {
+    !text.isEmpty && text.allSatisfy(predicate)
+}
+
 public indirect enum LassoValue: Equatable, Sendable {
     case void
     case null
@@ -159,6 +166,22 @@ public struct LassoNativeRegistry: Sendable {
             case .void, .null: return .boolean(false)
             default: return .boolean(true)
             }
+        }
+        // `[Global_Defined]`/`[Global_Remove]`/`[Globals]` (Ch. 15 Table
+        // 3) — the read/write `[Global]`/`[Global_Reset]` tags are
+        // special-cased alongside `Var`/`Local` in `Evaluator.evaluate`
+        // (see `declarationScope(for:)`) since, like them, they need
+        // assignment-target-aware argument handling a plain
+        // evaluated-arguments free function can't provide.
+        register("global_defined") { arguments, context in
+            .boolean(context.trueGlobalDefined(arguments.first?.value.outputString ?? ""))
+        }
+        register("global_remove") { arguments, context in
+            context.removeTrueGlobal(arguments.first?.value.outputString ?? "")
+            return .void
+        }
+        register("globals") { _, context in
+            .map(context.trueGlobalsSnapshot())
         }
         let tagExists: LassoNativeFunction = { arguments, context in
             let name = arguments.first?.value.outputString ?? ""
@@ -432,6 +455,50 @@ public struct LassoNativeRegistry: Sendable {
         // Time Operations". See Documentation/date-format-plan.md for the
         // native "date" object representation and the DateFormatter/ICU
         // rendering approach.
+        // `RegExp(...)` constructor (Ch. 26 Table 7) — `-Find` is
+        // documented as required; defaulting to an empty pattern rather
+        // than throwing when omitted matches this codebase's general
+        // "missing argument degrades gracefully" convention elsewhere
+        // (e.g. `->replace`/`->contains` defaulting to `""`).
+        register("regexp") { arguments, _ in
+            .object(LassoObjectInstance(typeName: "regexp", data: [
+                "find": .string(arguments.lastString(named: "find") ?? ""),
+                "replace": .string(arguments.lastString(named: "replace") ?? ""),
+                "input": .string(arguments.lastString(named: "input") ?? ""),
+                "ignorecase": .boolean(arguments.hasTruthyFlag("ignorecase")),
+            ]))
+        }
+        register("string_findregexp") { arguments, _ in
+            // Ch. 26 Table 11 — returns a single FLAT array across every
+            // match: full match text then each capture group's text, per
+            // match, concatenated (see LassoRegularExpressions.findAll's
+            // own doc comment for the worked-example evidence).
+            let text = arguments.positionalValue(at: 0)?.outputString ?? ""
+            let pattern = arguments.lastString(named: "find") ?? ""
+            let ignoreCase = arguments.hasTruthyFlag("ignorecase")
+            return .array(LassoRegularExpressions.findAll(in: text, pattern: pattern, ignoreCase: ignoreCase))
+        }
+        register("string_replaceregexp") { arguments, _ in
+            // Table 11's own description text says this "Returns an
+            // array with each instance... replaced" — almost certainly a
+            // copy-paste artifact from the FindRegExp row just above it,
+            // since every one of the Guide's own worked examples for
+            // this exact tag shows a plain STRING result (e.g.
+            // `<font color="blue">Blue</font> lake...`), never an array
+            // representation. Implemented against the worked examples.
+            let text = arguments.positionalValue(at: 0)?.outputString ?? ""
+            let pattern = arguments.lastString(named: "find") ?? ""
+            let replacement = arguments.lastString(named: "replace") ?? ""
+            let ignoreCase = arguments.hasTruthyFlag("ignorecase")
+            if arguments.hasTruthyFlag("replaceonlyone") {
+                return .string(LassoRegularExpressions.replaceFirst(
+                    in: text, pattern: pattern, replacement: replacement, ignoreCase: ignoreCase
+                ))
+            }
+            return .string(LassoRegularExpressions.replaceAll(
+                in: text, pattern: pattern, replacement: replacement, ignoreCase: ignoreCase
+            ))
+        }
         register("date") { arguments, _ in
             // -Year/-Month/-Day/-Hour/-Minute/-Second construction keywords
             // (Chapter 29 Table 1) take priority when present — cheap to
@@ -581,6 +648,67 @@ public struct LassoNativeRegistry: Sendable {
                 return .string("null")
             }
             return .string(string)
+        }
+        // String_Is* whole-string validation family (Ch. 25 Table 10) —
+        // each returns True only if the string is non-empty AND every
+        // character matches the criterion. The Guide doesn't address the
+        // empty-string case explicitly, but a vacuous "every character
+        // of nothing matches" true (Swift's own `allSatisfy` default on
+        // an empty collection) reads as a wrong answer for an "is this
+        // string alphabetic" style check — most languages' equivalent
+        // predicates (e.g. Python's `str.isalpha()`) special-case empty
+        // as False for the same reason, and it's what this file's own
+        // pre-existing `->IsLower`/`->IsUpper`-shaped checks already do
+        // via their own `.contains { $0.isLetter }` guard.
+        register("string_isalpha") { arguments, _ in
+            .boolean(isEveryCharacter(arguments.positionalValue(at: 0)?.outputString ?? "") { $0.isLetter })
+        }
+        register("string_isalphanumeric") { arguments, _ in
+            .boolean(isEveryCharacter(arguments.positionalValue(at: 0)?.outputString ?? "") { $0.isLetter || $0.isNumber })
+        }
+        register("string_isdigit") { arguments, _ in
+            .boolean(isEveryCharacter(arguments.positionalValue(at: 0)?.outputString ?? "") { $0.isNumber })
+        }
+        register("string_ishexdigit") { arguments, _ in
+            .boolean(isEveryCharacter(arguments.positionalValue(at: 0)?.outputString ?? "") { $0.isHexDigit })
+        }
+        register("string_islower") { arguments, _ in
+            let text = arguments.positionalValue(at: 0)?.outputString ?? ""
+            return .boolean(isEveryCharacter(text) { $0.isLowercase } && text.contains { $0.isLetter })
+        }
+        register("string_isupper") { arguments, _ in
+            let text = arguments.positionalValue(at: 0)?.outputString ?? ""
+            return .boolean(isEveryCharacter(text) { $0.isUppercase } && text.contains { $0.isLetter })
+        }
+        register("string_isnumeric") { arguments, _ in
+            // Ch. 25 Table 10: "only numerals, hyphens, or periods" —
+            // distinct from `->IsDigit`, which is numerals only.
+            .boolean(isEveryCharacter(arguments.positionalValue(at: 0)?.outputString ?? "") { $0.isNumber || $0 == "-" || $0 == "." })
+        }
+        register("string_ispunctuation") { arguments, _ in
+            // Ch. 25 Table 10 says only "contains punctuation characters"
+            // (no mention of symbols like `$`/`+`/`=`) and gives no
+            // worked example that would resolve punctuation-vs-symbol
+            // either way — tracking the doc's literal wording rather
+            // than also matching `Character.isSymbol`, which an earlier
+            // version did with no evidence to justify the broader
+            // reading (flagged in architect review).
+            .boolean(isEveryCharacter(arguments.positionalValue(at: 0)?.outputString ?? "") { $0.isPunctuation })
+        }
+        register("string_isspace") { arguments, _ in
+            .boolean(isEveryCharacter(arguments.positionalValue(at: 0)?.outputString ?? "") { $0.isWhitespace })
+        }
+        register("string_length") { arguments, _ in
+            // Documented synonym for `->Size` (Ch. 25 Table 10).
+            .integer(arguments.positionalValue(at: 0)?.outputString.count ?? 0)
+        }
+        register("string_endswith") { arguments, _ in
+            // Ch. 25 Table 8: `[String_EndsWith]` — a string value plus a
+            // `-Find` keyword parameter, case insensitive (matching the
+            // member form's own documented case-insensitivity).
+            let text = arguments.positionalValue(at: 0)?.outputString ?? ""
+            let suffix = arguments.lastString(named: "find") ?? ""
+            return .boolean(suffix.isEmpty || text.range(of: suffix, options: [.caseInsensitive, .backwards, .anchored]) != nil)
         }
         register("valid_email") { arguments, _ in
             let email = arguments.positionalValue(at: 0)?.outputString ?? ""
@@ -1031,6 +1159,9 @@ enum LoopControlSignal: Sendable, Equatable {
 public struct LassoContext: Sendable {
     private var globals: [String: LassoValue]
     private var locals: [String: LassoValue]
+    // Genuinely separate namespace from `globals` above — see
+    // `VariableScope.trueGlobal`'s own doc comment for why.
+    private var trueGlobals: [String: LassoValue] = [:]
     private var inlineFrames: [ActiveInlineFrame]
     public var natives: LassoNativeRegistry
     public var nativeTypes: LassoNativeTypeRegistry
@@ -1241,15 +1372,66 @@ public struct LassoContext: Sendable {
         switch scope {
         case .local: locals[name.lowercased()] = value
         case .global, .unscoped: globals[name.lowercased()] = value
+        case .trueGlobal: trueGlobals[name.lowercased()] = value
         }
     }
 
+    // Ch. 15 p.227: "The $ symbol will return a global variable if no
+    // page variable of the same name has been created" — `$name` parses
+    // straight to `.variable(name, .global)` (ExpressionParser.swift),
+    // not `.unscoped`, so the fallback belongs on `.global` itself: a
+    // page variable of the same name still wins (checked first), true-
+    // global is the fallback. `[Variable: 'name']`'s own read form maps
+    // to this same `.global` scope (see `Evaluator.declarationScope(for:)`),
+    // so it gets this fallback too — matching the Guide's parallel
+    // wording for both: "use the [Variable] tag to retrieve the value
+    // of the global variable" when no page variable overrides it.
+    // `.unscoped` deliberately does NOT get this fallback: p.225 scopes
+    // `Variable_Defined`/`Var_Defined` to "the current Lasso page", and
+    // `var_defined`'s free-function registration (this file, above)
+    // reads through the `.unscoped` default — an earlier version of
+    // this fallback lived on `.unscoped` too and silently made
+    // `Var_Defined('x')` report true whenever an unrelated true Global
+    // named "x" existed, even with no page variable ever created
+    // (caught by architect review, no test previously exercised this).
     public func value(for name: String, scope: VariableScope = .unscoped) -> LassoValue {
         switch scope {
         case .local: locals[name.lowercased()] ?? .null
-        case .global: globals[name.lowercased()] ?? .null
+        case .global: globals[name.lowercased()] ?? trueGlobals[name.lowercased()] ?? .null
+        case .trueGlobal: trueGlobals[name.lowercased()] ?? .null
         case .unscoped: locals[name.lowercased()] ?? globals[name.lowercased()] ?? .null
         }
+    }
+
+    /// `[Global_Remove]` (Ch. 15 Table 3): "Removes the specified
+    /// variable from the globals."
+    public mutating func removeTrueGlobal(_ name: String) {
+        trueGlobals.removeValue(forKey: name.lowercased())
+    }
+
+    /// `[Global_Defined]` (Ch. 15 Table 3): "Returns True if the global
+    /// variable has been defined or False otherwise." Mirrors
+    /// `var_defined`/`local_defined`'s existing (Runtime.swift,
+    /// `registerDefaultFunctions`) treatment of a variable holding
+    /// `.null` as "not defined" — the Guide's prose for the page-
+    /// variable sibling `[Variable_Defined]` says a Null-valued
+    /// variable should still count as defined, but this codebase's
+    /// storage can't currently distinguish "never created" from
+    /// "created and set to Null" (both collapse to `.null` in
+    /// `value(for:)`), and `var_defined`/`local_defined` already made
+    /// this same simplification — kept consistent here rather than
+    /// introducing a third, differently-behaved variant.
+    public func trueGlobalDefined(_ name: String) -> Bool {
+        switch trueGlobals[name.lowercased()] {
+        case nil, .void, .null: false
+        default: true
+        }
+    }
+
+    /// `[Globals]` (Ch. 15 Table 3): "Returns a map of all global
+    /// variables that are currently defined."
+    public func trueGlobalsSnapshot() -> [String: LassoValue] {
+        trueGlobals
     }
 
     public var currentInlineFrame: LassoInlineFrame? {

@@ -5206,6 +5206,354 @@ private final class MapIncludeLoader: LassoIncludeLoader, @unchecked Sendable {
     #expect(output == "4|1111")
 }
 
+@Test func stringValidationMembersMatchTheLanguageGuidesOwnWorkedExampleCaseInsensitively() async throws {
+    // Lasso 8.5 Language Guide Ch. 25 Table 7, confirmed via the Guide's
+    // own worked example verbatim (testString = 'A short string'):
+    // BeginsWith/EndsWith/Contains/Equals are all documented case
+    // INSENSITIVE -- an earlier version of `->Contains` used Swift's raw
+    // case-sensitive `String.contains`, contradicting its own sibling
+    // members (`->BeginsWith`/`->EndsWith`/`->Equals`, all newly added
+    // here with the correct case-insensitive behavior); caught while
+    // verifying those siblings against this same page and fixed
+    // alongside them.
+    var context = LassoContext()
+    let output = try await LassoRenderer().render(
+        """
+        [var(testString = 'A short string')]
+        beginsA=[$testString->beginsWith('a')]|
+        beginsPhrase=[$testString->beginsWith('A short')]|
+        beginsFalse=[$testString->beginsWith('string')]|
+        ends=[$testString->endsWith('string')]|
+        contains=[$testString->contains('short')]|
+        containsMixedCase=[$testString->contains('SHORT')]|
+        equals=[$testString->equals('a short string')]
+        """,
+        context: &context
+    )
+    #expect(output.contains("beginsA=true"))
+    #expect(output.contains("beginsPhrase=true"))
+    #expect(output.contains("beginsFalse=false"))
+    #expect(output.contains("ends=true"))
+    #expect(output.contains("contains=true"))
+    #expect(output.contains("containsMixedCase=true"))
+    #expect(output.contains("equals=true"))
+}
+
+@Test func stringCompareIsThreeWayCaseInsensitiveByDefaultCaseSensitiveWithFlag() async throws {
+    // Ch. 25 Table 7: "[String->Compare] ... returns 0 if the parameter
+    // is equal to the string, 1 if the characters in the string are
+    // bitwise greater than the parameter, and -1 if... less... Comparison
+    // is case insensitive by default. An optional -Case parameter makes
+    // the comparison case sensitive." NOT tested against the Guide's own
+    // "[$testString->(Compare: 'a short string', -Case)] -> False" line
+    // for this exact scenario -- that line is internally inconsistent
+    // (an integer-returning tag's worked example showing the literal
+    // word "False", not a 0/1/-1 value) and looks like the same class of
+    // transcription defect already confirmed once in this project
+    // (Math_Div's page-370 examples). Verified instead with
+    // self-computed, unambiguous cases.
+    var context = LassoContext()
+    let output = try await LassoRenderer().render(
+        "[('abc')->compare('abc')]|[('abc')->compare('abd')]|[('abd')->compare('abc')]|" +
+            "[('A short string')->compare('a short string')]|" +
+            "[('A short string')->compare('a short string', -Case)]",
+        context: &context
+    )
+    let parts = output.components(separatedBy: "|")
+    #expect(parts[0] == "0")
+    #expect(parts[1] == "-1")
+    #expect(parts[2] == "1")
+    // Case-insensitive by default: equal.
+    #expect(parts[3] == "0")
+    // -Case forces case-sensitive comparison: 'A' (0x41) sorts before
+    // 'a' (0x61) bitwise, so the base string is "less than" the parameter.
+    #expect(parts[4] == "-1")
+}
+
+@Test func stringFindReturnsAOneBasedPositionOrZeroForAMiss() async throws {
+    // Ch. 25 Table 9: "Returns the position at which the first parameter
+    // is found within the string or 0 if the first parameter is not
+    // found." Distinct from Array->Find (returns an array of all
+    // matches) -- dispatch is keyed on `(base, name)` together so the
+    // two don't collide.
+    var context = LassoContext()
+    let output = try await LassoRenderer().render(
+        "[('A Short String')->find('Short')]|[('A Short String')->find('zzz')]",
+        context: &context
+    )
+    #expect(output == "3|0")
+}
+
+@Test func stringGetReturnsASingleCharacterAtAOneBasedPosition() async throws {
+    // Ch. 25 Table 9 worked example: ['Alpha'->(Get: 3)] -> 'p'.
+    var context = LassoContext()
+    let output = try await LassoRenderer().render("[('Alpha')->get(3)]", context: &context)
+    #expect(output == "p")
+}
+
+@Test func stringPadLeadingAndPadTrailingPadToALengthWithADefaultOrCustomCharacter() async throws {
+    // Ch. 25 Table 3: pads to a specified length with a pad character
+    // (defaults to space); a string already at or past the target
+    // length is left unchanged (mutating members return the invocant
+    // unmodified rather than truncating).
+    var context = LassoContext()
+    let output = try await LassoRenderer().render(
+        """
+        [var(a = 'ab')][$a->padLeading(5, '0')]a=[$a]|
+        [var(b = 'ab')][$b->padTrailing(5, '0')]b=[$b]|
+        [var(c = 'ab')][$c->padLeading(4)]c=[$c]|
+        [var(d = 'abcdef')][$d->padLeading(3, '0')]d=[$d]
+        """,
+        context: &context
+    )
+    #expect(output.contains("a=000ab"))
+    #expect(output.contains("b=ab000"))
+    #expect(output.contains("c=  ab"))
+    #expect(output.contains("d=abcdef"))
+}
+
+@Test func stringRemoveLeadingAndRemoveTrailingStripEveryRepeatedInstance() async throws {
+    // Ch. 25 Table 3: "Removes ALL instances of the parameter from the
+    // beginning/end" -- repeated, not just a single occurrence, distinct
+    // from `->Trim` (whitespace-only).
+    var context = LassoContext()
+    let output = try await LassoRenderer().render(
+        "[var(s = '**A Short String**')][$s->removeLeading('*')][$s->removeTrailing('*')]result=[$s]",
+        context: &context
+    )
+    #expect(output == "result=A Short String")
+}
+
+@Test func stringReverseReversesTheEntireString() async throws {
+    var context = LassoContext()
+    let output = try await LassoRenderer().render("[var(s = 'Hello')][$s->reverse]result=[$s]", context: &context)
+    #expect(output == "result=olleH")
+}
+
+@Test func stringTitlecaseCapitalizesTheFirstLetterOfEachWord() async throws {
+    // Ch. 25 Table 5: "Converts the string to titlecase with the first
+    // character of each word capitalized." Word boundaries are
+    // whitespace (no locale-parameter support implemented here).
+    var context = LassoContext()
+    let output = try await LassoRenderer().render(
+        "[var(s = 'hello WORLD from lasso')][$s->titlecase]result=[$s]",
+        context: &context
+    )
+    #expect(output == "result=Hello World From Lasso")
+}
+
+@Test func stringIsFamilyValidatesTheWholeStringMatchingTheLanguageGuidesOwnWorkedExamples() async throws {
+    // Ch. 25 Table 10, confirmed via the Guide's own worked examples
+    // verbatim. Empty-string inputs deliberately return False (not the
+    // vacuously-true default Swift's `allSatisfy` would give on an empty
+    // collection) -- see the registration's own doc comment for why.
+    var context = LassoContext()
+    let output = try await LassoRenderer().render(
+        "[String_IsAlpha('word')]|[String_IsAlphaNumeric('word')]|[String_IsLower('word')]|" +
+            "[String_IsNumeric('word')]|[String_IsUpper('word')]|" +
+            "[String_IsAlpha('2468')]|[String_IsAlphaNumeric('2468')]|[String_IsNumeric('2468')]|" +
+            "[String_IsDigit('9')]|[String_IsHexDigit('a')]|[String_IsPunctuation('.')]|[String_IsSpace(' ')]|" +
+            "[String_IsAlpha('')]",
+        context: &context
+    )
+    let parts = output.components(separatedBy: "|")
+    #expect(parts == [
+        "true", "true", "true", "false", "false",
+        "false", "true", "true",
+        "true", "true", "true", "true",
+        "false",
+    ])
+}
+
+@Test func stringLengthIsASynonymForSizeAndStringEndsWithMatchesTheMemberForm() async throws {
+    // Ch. 25 Table 10 worked example: String_Length('A Short String') ==
+    // 'A Short String'->Size == 14.
+    var context = LassoContext()
+    let output = try await LassoRenderer().render(
+        "[String_Length('A Short String')]|[('A Short String')->size]|" +
+            "[String_EndsWith('A Short String', -Find='String')]",
+        context: &context
+    )
+    #expect(output == "14|14|true")
+}
+
+@Test func regExpConstructorAndAccessorsMatchTheLanguageGuidesOwnWorkedExample() async throws {
+    // Lasso 8.5 Language Guide Ch. 26 Table 7/8 (pp. 350-351), verified
+    // directly against the PDF including its own worked example
+    // (`$MyRegExp` built from `-Find='[aeiou]', -Replace='x', -IgnoreCase`).
+    // `->FindPattern`/`->ReplacePattern`/`->Input`/`->IgnoreCase` are
+    // implemented as read-only getters here (see NativeTypes.swift's own
+    // doc comment on `makeRegExpType()` for why a setter needs the same
+    // treatment `Date->Add`/`->Subtract` required after their aliasing
+    // bug, deferred to a follow-up).
+    var context = LassoContext()
+    let output = try await LassoRenderer().render(
+        """
+        [var(re = RegExp(-Find='[aeiou]', -Replace='x', -IgnoreCase))]
+        FindPattern: [$re->findPattern]
+        ReplacePattern: [$re->replacePattern]
+        IgnoreCase: [$re->ignoreCase]
+        GroupCount: [$re->groupCount]
+        """,
+        context: &context
+    )
+    #expect(output.contains("FindPattern: [aeiou]"))
+    #expect(output.contains("ReplacePattern: x"))
+    #expect(output.contains("IgnoreCase: true"))
+    #expect(output.contains("GroupCount: 0"))
+}
+
+@Test func regExpReplaceAllMatchesTheLanguageGuidesOwnVowelReplacementWorkedExample() async throws {
+    // Ch. 26 p.352, exact worked example (vowel-to-x substitution).
+    var context = LassoContext()
+    let output = try await LassoRenderer().render(
+        """
+        [var(re = RegExp(-Find='[aeiou]', -Replace='x', -IgnoreCase))]
+        [$re->replaceAll(-Input='The quick brown fox jumped over the lazy dog.')]
+        """,
+        context: &context
+    )
+    #expect(output.trimmingCharacters(in: .whitespacesAndNewlines) == "Thx qxxck brxwn fxx jxmpxd xvxr thx lxzy dxg.")
+}
+
+@Test func regExpReplaceAllSupportsGroupPlaceholders() async throws {
+    // Ch. 26 p.352: "The replacement pattern can reference groups from
+    // the input using \\1 through \\9." Uses a simpler pattern than the
+    // Guide's own phone-number example (which needs several `\d`/`\(`
+    // escapes) purely to keep the Swift-literal -> Lasso-source-literal
+    // -> regex-template escaping chain in this test legible, but
+    // exercises the identical group-reference mechanism: two groups,
+    // swapped in the replacement.
+    var context = LassoContext()
+    let output = try await LassoRenderer().render(
+        "[var(re = RegExp(-Find='(a+)(b+)', -Replace='\\\\2\\\\1'))][$re->replaceAll(-Input='xxaaabbbyy')]",
+        context: &context
+    )
+    #expect(output == "xxbbbaaayy")
+}
+
+@Test func regExpReplaceAllSupportsTheDollarSignGroupPlaceholderAlternateForm() async throws {
+    // Ch. 26 Table 5, p.349, second Note: "The [RegExp] type also
+    // supports $0 and $1 through $9 as replacement symbols" — an
+    // alternate to `\1`-`\9`, so it must produce identical output to
+    // `regExpReplaceAllSupportsGroupPlaceholders`'s `\2\1` case above.
+    var context = LassoContext()
+    let output = try await LassoRenderer().render(
+        "[var(re = RegExp(-Find='(a+)(b+)', -Replace='$2$1'))][$re->replaceAll(-Input='xxaaabbbyy')]",
+        context: &context
+    )
+    #expect(output == "xxbbbaaayy")
+}
+
+@Test func regExpReplaceAllSupportsTheDollarSignLiteralEscapeEvenWhenFollowedByADigit() async throws {
+    // Ch. 26 Table 5, p.349, second Note: "In order to place a literal
+    // $ in a replacement string it is necessary to escape it as \$."
+    // Regression test for a real bug: the escaped `$` was previously
+    // emitted raw into the NSRegularExpression template, so a digit
+    // immediately following it (a realistic case, e.g. escaping a
+    // dollar amount) was misread as a `$<digit>` group reference
+    // instead of literal text. `\\$5.00` here is the Lasso source
+    // text's own `\$` escape (see the Swift-literal -> Lasso-source
+    // -> lexer chain documented on `regExpReplaceAllSupportsGroupPlaceholders`
+    // above) producing a literal `$5.00`, not a group-1 reference.
+    var context = LassoContext()
+    let output = try await LassoRenderer().render(
+        "[var(re = RegExp(-Find='[aeiou]', -Replace='\\\\$5.00'))][$re->replaceFirst(-Input='banana')]",
+        context: &context
+    )
+    #expect(output == "b$5.00nana")
+}
+
+@Test func regExpReplaceFirstOnlyReplacesTheFirstMatch() async throws {
+    // Ch. 26 Table 9: "[RegExp->ReplaceFirst] Replaces the first
+    // occurence of the current find pattern... Uses the same parameters
+    // as [RegExp->ReplaceAll]."
+    var context = LassoContext()
+    let output = try await LassoRenderer().render(
+        "[var(re = RegExp(-Find='[aeiou]', -Replace='x', -IgnoreCase))][$re->replaceFirst(-Input='banana')]",
+        context: &context
+    )
+    #expect(output == "bxnana")
+}
+
+@Test func regExpSplitMatchesTheLanguageGuidesOwnWordSplittingWorkedExample() async throws {
+    // Ch. 26 p.353, exact worked example: splitting on runs of
+    // non-word characters yields just the words, no empty/punctuation
+    // elements.
+    var context = LassoContext()
+    let output = try await LassoRenderer().render(
+        "[var(re = RegExp(-Find='[aeiou]'))][$re->split(-Find='\\\\W+', -Input='The quick brown fox jumped over the lazy dog.')->join(',')]",
+        context: &context
+    )
+    #expect(output == "The,quick,brown,fox,jumped,over,the,lazy,dog")
+}
+
+@Test func regExpSplitInterleavesCaptureGroupsBetweenSegmentsWhenTheFindPatternHasGroups() async throws {
+    // Ch. 26 p.353, exact worked example: wrapping the split pattern in
+    // parentheses interleaves the matched delimiter text itself into the
+    // result array between each pair of word segments.
+    var context = LassoContext()
+    let output = try await LassoRenderer().render(
+        "[var(re = RegExp(-Find='[aeiou]'))][$re->split(-Find='(\\\\W+)', -Input='ab cd')->join('|')]",
+        context: &context
+    )
+    #expect(output == "ab| |cd")
+}
+
+@Test func stringFindRegExpReturnsAFlatArrayOfFullMatchThenEachCaptureGroupPerMatch() async throws {
+    // Ch. 26 Table 11 / p.356, exact worked example: a 2-group pattern
+    // matching one email address in the source text yields a 3-element
+    // flat array (full match, then each group) -- not a nested
+    // array-of-arrays-per-match.
+    var context = LassoContext()
+    let output = try await LassoRenderer().render(
+        "[String_FindRegExp('Send email to documentation@lassosoft.com.', " +
+            "-Find='([A-Za-z0-9_]+)@([A-Za-z0-9_]+\\\\.[A-Za-z0-9_]+)')->join('|')]",
+        context: &context
+    )
+    #expect(output == "documentation@lassosoft.com|documentation|lassosoft.com")
+}
+
+@Test func stringFindRegExpFlattensMultipleMatchesIntoOneArrayInOrder() async throws {
+    // Ch. 26 p.356, exact worked example: a 1-group pattern ("first
+    // character of each word") matching 9 words in the source yields an
+    // 18-element flat array (full+group1, full+group1, ... per match, in
+    // order) -- confirms the "flat, not nested" contract holds across
+    // multiple matches, not just one.
+    var context = LassoContext()
+    let output = try await LassoRenderer().render(
+        "[String_FindRegExp('The quick brown fox jumped over a lazy dog.', -Find='([A-Za-z])[A-Za-z]*')->join('|')]",
+        context: &context
+    )
+    #expect(output == "The|T|quick|q|brown|b|fox|f|jumped|j|over|o|a|a|lazy|l|dog|d")
+}
+
+@Test func stringReplaceRegExpReturnsAStringMatchingTheLanguageGuidesOwnWorkedExampleNotAnArray() async throws {
+    // Ch. 26 Table 11's own description text says this tag "Returns an
+    // array..." -- almost certainly a copy-paste artifact from the
+    // FindRegExp row just above it (see the registration's own doc
+    // comment), since the Guide's own worked example output (p.357) is
+    // unambiguously a plain string.
+    var context = LassoContext()
+    let output = try await LassoRenderer().render(
+        "[String_ReplaceRegExp('Blue Lake sure is blue today.', " +
+            "-Find='[Bb]lue', -Replace='<b>x</b>')]",
+        context: &context
+    )
+    #expect(output == "<b>x</b> Lake sure is <b>x</b> today.")
+}
+
+@Test func stringReplaceRegExpOnlyOneFlagLimitsToTheFirstMatch() async throws {
+    // Ch. 26 Table 11: "Optional -ReplaceOnlyOne parameter replaces only
+    // the first pattern match."
+    var context = LassoContext()
+    let output = try await LassoRenderer().render(
+        "[String_ReplaceRegExp('aaa', -Find='a', -Replace='b', -ReplaceOnlyOne)]",
+        context: &context
+    )
+    #expect(output == "baa")
+}
+
 @Test func pairConstructorSupportsAllFourRealLassoForms() async throws {
     // LassoGuide, "Collections": pair() -> both null; pair(anotherPair) ->
     // copies first/second; pair(value, value) -> two positional elements;
@@ -6872,5 +7220,236 @@ struct IncludeURLTests {
     for (name, forms) in expected {
         #expect(TagCatalog.entry(name)?.openForms == forms, "\(name) openForms mismatch")
     }
+}
+
+@Test func typeReturnsCapitalizedTypeNameMatchingTheLanguageGuidesOwnWorkedExamples() async throws {
+    // Lasso 8.5 Language Guide Ch. 43 Table 6 / p.560, exact worked
+    // examples: `[123->Type] -> Integer`, `[Output: 123.456->Type] ->
+    // Decimal`, `['String'->Type] -> String`, `[Null->Type] -> Null`,
+    // `[(Array: 1, 2, 3)->Type] -> Array`.
+    var context = LassoContext()
+    let output = try await LassoRenderer().render(
+        "[123->type]|[123.456->type]|['String'->type]|[Null->type]|[(Array(1,2,3))->type]",
+        context: &context
+    )
+    #expect(output == "Integer|Decimal|String|Null|Array")
+}
+
+@Test func typeReturnsTheRegisteredNativeTypeNameUnmodifiedForObjectInstances() async throws {
+    // lassoguide.com's Lasso 9 "Type/Object Introspection Methods":
+    // "Returns the type name for any type instance. The value is the
+    // name that was used when the type was defined" — native types are
+    // registered lowercase (see NativeTypes.swift's `makeRegExpType`),
+    // so unlike the primitive-literal capitalization above, this is
+    // returned as-is, not capitalized.
+    var context = LassoContext()
+    let output = try await LassoRenderer().render(
+        "[var(re = RegExp(-Find='a'))][$re->type]",
+        context: &context
+    )
+    #expect(output.trimmingCharacters(in: .whitespacesAndNewlines) == "regexp")
+}
+
+@Test func isAMatchesTheValuesOwnTypeNameCaseInsensitivelyAndIsNotAIsItsOpposite() async throws {
+    // Ch. 43 Table 6: "[Null->IsA] Requires a type name as a parameter.
+    // Returns true if the object is of that type or inherits from that
+    // type." This interpreter has no type-inheritance model (see the
+    // doc comment on `member()`'s "isa"/"isnota" case), so only the
+    // exact-type-name half is exercised here. `->IsNotA` per
+    // lassoguide.com: "The opposite of null->isA."
+    var context = LassoContext()
+    let output = try await LassoRenderer().render(
+        "[('hello')->isA('string')]|[('hello')->isA('String')]|[(123)->isA('integer')]|[(123)->isA('string')]|[('hello')->isNotA('string')]|[('hello')->isNotA('integer')]",
+        context: &context
+    )
+    #expect(output == "true|true|true|false|false|true")
+}
+
+@Test func hasMethodReportsTrueForRealMemberMethodsAndFalseForUnknownOnes() async throws {
+    var context = LassoContext()
+    let output = try await LassoRenderer().render(
+        "[('hello')->hasMethod('uppercase')]|[('hello')->hasMethod('notarealmethod')]|[(Array(1,2))->hasMethod('sort')]|[(Array(1,2))->hasMethod('notarealmethod')]",
+        context: &context
+    )
+    #expect(output == "true|false|true|false")
+}
+
+@Test func typeIsAAndHasMethodAreThemselvesAlwaysReportedAvailable() async throws {
+    // "the null data type is the base type for all other data types...
+    // All of the tags of the null data type are available for use with
+    // values of any data type" (Ch. 43, introducing Table 6) — so
+    // ->HasMethod must report its own sibling introspection tags as
+    // present on every type, not just the type-specific methods listed
+    // in `Evaluator.primitiveMethodNames`.
+    var context = LassoContext()
+    let output = try await LassoRenderer().render(
+        "[(123)->hasMethod('type')]|[(123)->hasMethod('isA')]|[(123)->hasMethod('isNotA')]|[(123)->hasMethod('hasMethod')]",
+        context: &context
+    )
+    #expect(output == "true|true|true|true")
+}
+
+@Test func hasMethodTypeAndIsAWorkOnACustomUserDefinedType() async throws {
+    // Scrubbed down from the same js_timer.inc shape used by
+    // `legacyDefineTypeColonCallRegistersTypeAndMethods` above.
+    // `->HasMethod` for `.object` instances consults the user-defined
+    // type's own registered methods (not the hand-maintained primitive
+    // table), and `->Type` returns the name exactly as it was passed to
+    // `Define_Type` (case preserved, not capitalized like the
+    // primitive-literal worked examples above).
+    var context = LassoContext()
+    let output = try await LassoRenderer().render(
+        """
+        [
+        define_type: 'Ex_Timer', 'integer', -prototype;
+            local: 'ticks'=0;
+            define_tag: 'bump';
+                (self->'ticks') = (self->'ticks') + 1;
+            /define_tag;
+        /define_type;
+        ]
+        [Local(t = Ex_Timer())][#t->type]|[#t->isA('Ex_Timer')]|[#t->hasMethod('bump')]|[#t->hasMethod('notarealmethod')]
+        """,
+        context: &context
+    ).trimmingCharacters(in: .whitespacesAndNewlines)
+
+    #expect(output == "Ex_Timer|true|true|false")
+}
+
+@Test func typeIsAAndHasMethodReachTheOuterDefaultFallbackForBooleanAndPair() async throws {
+    // `.boolean` and `.pair` have no dedicated case anywhere in
+    // `member()`'s own switch, so these three tags are ONLY reachable
+    // for them via the outer switch's final `default:` fallback —
+    // locking that path in directly (architect review flagged it as
+    // otherwise unverified by any test) rather than relying on it being
+    // exercised incidentally by the primitive-literal tests above.
+    var context = LassoContext()
+    let output = try await LassoRenderer().render(
+        "[(true)->type]|[(true)->isA('boolean')]|[(true)->hasMethod('type')]|[(Pair(1,2))->type]|[(Pair(1,2))->isA('pair')]",
+        context: &context
+    )
+    #expect(output == "Boolean|true|true|Pair|true")
+}
+
+@Test func typeWorksOnAMapWithNoKeyCollidingWithTheTagName() async throws {
+    // The other `.map` coverage above (`hasMethodReportsTrueForRealMemberMethodsAndFalseForUnknownOnes`
+    // and the pre-existing `fileUploadsExposeMetadataUnderBothLasso9And8KeyNames`)
+    // only exercises the key-collision side of `.map`'s key-first
+    // priority. This locks in the OTHER side: a map with no `"type"`
+    // key must still reach `introspectionResult`'s fallback rather than
+    // falling all the way through to the unconditional `.null` the
+    // `.map` case returns for any other genuinely unknown member.
+    var context = LassoContext()
+    let output = try await LassoRenderer().render(
+        "[(Map('a'=1))->type]|[(Map('a'=1))->hasMethod('type')]",
+        context: &context
+    )
+    #expect(output == "Map|true")
+}
+
+@Test func voidTypeDegradesGracefullyLikeItsOtherMemberAccessesInsteadOfThrowing() async throws {
+    // Regression-locks a deliberate, disclosed extension of the
+    // existing void-degrades-to-empty-string convention (see the
+    // `(.void, _)` case's own doc comment) rather than leaving it as an
+    // unexamined side effect of adding these tags, per architect
+    // review. `action_param('missing')` is the same real-corpus
+    // lookup-miss source `voidLookupMissBehavesLikeEmptyStringButNullStaysStrict`
+    // already uses above.
+    var context = LassoContext()
+    let output = try await LassoRenderer().render(
+        "[action_param('missing')->type]|[action_param('missing')->hasMethod('uppercase')]",
+        context: &context
+    )
+    #expect(output == "String|true")
+}
+
+@Test func varResetAndLocalResetSetAVariableMatchingTheLanguageGuidesOwnWorkedExample() async throws {
+    // Lasso 8.5 Language Guide Ch. 15 p.226, exact worked example:
+    // `Var_Reset: 'VariableName'='New Value'; $VariableName;` -> "New
+    // Value". This codebase has no `@`/`[Reference]` variable-aliasing
+    // system (deferred — see `Evaluator.declarationScope(for:)`'s own
+    // doc comment), so "detaching any references" has nothing to do;
+    // `Var_Reset`/`Local_Reset` are implemented as plain synonyms for
+    // `Var`/`Local`, verified here to at least match the documented
+    // set-and-read behavior.
+    var context = LassoContext()
+    let output = try await LassoRenderer().render(
+        "[Var_Reset: 'VariableName'='New Value'][$VariableName][Local('l' = 1)][Local_Reset('l' = 2)][#l]",
+        context: &context
+    )
+    #expect(output == "New Value2")
+}
+
+@Test func globalSetAndGetMatchesTheLanguageGuidesOwnWorkedExample() async throws {
+    // Ch. 15 p.227, exact worked example:
+    // `[Global: 'Administrator_Email' = 'administrator@example.com']`
+    // then `[Global: 'Administrator_Email']` ->
+    // "administrator@example.com".
+    var context = LassoContext()
+    let output = try await LassoRenderer().render(
+        "[Global: 'Administrator_Email' = 'administrator@example.com'][Global: 'Administrator_Email']",
+        context: &context
+    )
+    #expect(output == "administrator@example.com")
+}
+
+@Test func dollarSymbolFallsBackToAGlobalOnlyWhenNoPageVariableOfTheSameNameExists() async throws {
+    // Ch. 15 p.227: "The $ symbol will return a global variable if no
+    // page variable of the same name has been created." Also verifies
+    // the two namespaces stay genuinely separate (a page `Variable` and
+    // a true `Global` sharing a name are different variables, matching
+    // real Lasso) rather than colliding in shared storage.
+    var context = LassoContext()
+    let fallbackOutput = try await LassoRenderer().render(
+        "[Global: 'g_only' = 'from global'][$g_only]",
+        context: &context
+    )
+    #expect(fallbackOutput == "from global")
+
+    var shadowedContext = LassoContext()
+    let shadowedOutput = try await LassoRenderer().render(
+        "[Global: 'shared' = 'global value'][Variable: 'shared' = 'page value'][$shared]|[Global: 'shared']",
+        context: &shadowedContext
+    )
+    #expect(shadowedOutput == "page value|global value")
+}
+
+@Test func globalResetGlobalDefinedGlobalRemoveAndGlobalsMap() async throws {
+    var context = LassoContext()
+    let output = try await LassoRenderer().render(
+        """
+        [Global_Reset: 'g' = 1]
+        [Global_Defined: 'g']|[Global_Defined: 'never_set']
+        [Global: 'g2' = 2]
+        [(Globals)->size]
+        [Global_Remove: 'g']
+        [Global_Defined: 'g']|[(Globals)->size]
+        """,
+        context: &context
+    )
+    let lines = output
+        .split(separator: "\n")
+        .map { $0.trimmingCharacters(in: .whitespaces) }
+        .filter { !$0.isEmpty }
+    #expect(lines == ["true|false", "2", "false|1"])
+}
+
+@Test func varDefinedStaysScopedToThePageAndIsNotFooledByAnUnrelatedTrueGlobal() async throws {
+    // Ch. 15 p.225: "The [Variable_Defined] tag can be used to check if
+    // a variable has been created and used in THE CURRENT LASSO PAGE."
+    // Regression test for a real bug caught by architect review: an
+    // earlier version of the `$name`-falls-back-to-a-global fix
+    // (`LassoContext.value(for:scope:)`'s `.global` case, see its own
+    // doc comment) mistakenly also placed the fallback on `.unscoped`
+    // — which `var_defined`'s free-function registration reads through
+    // — making `Var_Defined('x')` silently report `true` whenever an
+    // unrelated true Global named "x" existed, even with no page
+    // variable ever created.
+    var context = LassoContext()
+    let output = try await LassoRenderer().render(
+        "[Global: 'onlyglobal' = 'g'][Var_Defined: 'onlyglobal']",
+        context: &context
+    )
+    #expect(output == "false")
 }
 
