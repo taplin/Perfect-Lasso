@@ -346,6 +346,27 @@ public struct LassoNativeRegistry: Sendable {
         register("array") { arguments, _ in
             .array(arguments.map { $0.value })
         }
+        // Real Lasso's Pair constructor (LassoGuide, "Collections"):
+        // pair() -> both null; pair(anotherPair) -> copies first/second;
+        // pair(value, value) -> two positional elements; pair(value=value)
+        // -> the key-value/named-assignment form. Real corpus:
+        // includes/efs_process.lasso's `Pair('x_Login'=#x_login)` and 20+
+        // sibling calls building a gateway POST param array -- previously
+        // unregistered entirely, so every one of those calls threw
+        // unknownFunction("Pair") immediately, well before the page ever
+        // reached its own real (separate, still-unimplemented) gap around
+        // include_url.
+        register("pair") { arguments, _ in
+            guard let first = arguments.first else { return .pair(.null, .null) }
+            if let label = first.label {
+                return .pair(.string(label), first.value)
+            }
+            if arguments.count == 1, case let .pair(a, b) = first.value {
+                return .pair(a, b)
+            }
+            let second = arguments.count > 1 ? arguments[1].value : .null
+            return .pair(first.value, second)
+        }
         // Real Lasso 9's `set` (an ordered, unique-valued collection) —
         // real corpus: includes/detail_a_sku.lasso's
         // `var('skuArrayColor' = set)` followed by

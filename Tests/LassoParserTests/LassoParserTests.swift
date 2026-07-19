@@ -4928,6 +4928,26 @@ private final class MapIncludeLoader: LassoIncludeLoader, @unchecked Sendable {
     #expect(output == "4|1111")
 }
 
+@Test func pairConstructorSupportsAllFourRealLassoForms() async throws {
+    // LassoGuide, "Collections": pair() -> both null; pair(anotherPair) ->
+    // copies first/second; pair(value, value) -> two positional elements;
+    // pair(value=value) -> key-value/named-assignment form. Real corpus:
+    // includes/efs_process.lasso's `Pair('x_Login'=#x_login)` and 20+
+    // sibling calls -- previously unregistered entirely, so every one
+    // threw unknownFunction("Pair") immediately.
+    var context = LassoContext()
+    let output = try await LassoRenderer().render(
+        """
+        [pair(3, 4)->first]=[pair(3, 4)->second]|\
+        [pair('x_login'='abc')->first]=[pair('x_login'='abc')->second]|\
+        [var(original = pair('a', 'b'))][pair($original)->first]=[pair($original)->second]|\
+        [pair()->first]
+        """,
+        context: &context
+    )
+    #expect(output == "3=4|x_login=abc|a=b|")
+}
+
 @Test func chainedStringReplaceCallsBuildASlugWithNoStrayOutput() async throws {
     // The exact real-corpus shape from pages/thumbs2.page.lasso (also
     // pages/thumbs.page.lasso, thumbs3.page.lasso, and every
