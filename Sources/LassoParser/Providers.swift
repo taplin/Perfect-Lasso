@@ -787,26 +787,95 @@ public struct LassoSessionStartResult: Equatable, Sendable {
     }
 }
 
+/// A `session_start(name, -flag=value, ...)` call's fully-evaluated
+/// arguments — built from real `[EvaluatedArgument]` at the point
+/// `session_start` is actually evaluated (see
+/// `SessionArgumentResolution.swift`'s `makeSessionStartCall`), not from
+/// raw parse-time AST. Dynamic values (a variable, a concatenation,
+/// `action_param(...)`, etc.) all resolve correctly here since evaluation
+/// has already happened by the time this is built — unlike the retired
+/// parse-time preflight scan this replaces, which could only ever see
+/// literal arguments.
+public struct LassoSessionStartCall: Equatable, Sendable {
+    public let name: String
+    public let expiresSeconds: Int?
+    public let id: String?
+    public let useCookie: Bool
+    public let useLink: Bool
+    public let useAuto: Bool
+    public let useNone: Bool
+    public let cookieExpires: String?
+    public let domain: String?
+    public let path: String?
+    public let secure: Bool
+    public let httpOnly: Bool
+    public let rotate: Bool
+
+    public init(
+        name: String,
+        expiresSeconds: Int? = nil,
+        id: String? = nil,
+        useCookie: Bool = true,
+        useLink: Bool = false,
+        useAuto: Bool = false,
+        useNone: Bool = false,
+        cookieExpires: String? = nil,
+        domain: String? = nil,
+        path: String? = nil,
+        secure: Bool = false,
+        httpOnly: Bool = false,
+        rotate: Bool = false
+    ) {
+        self.name = name
+        self.expiresSeconds = expiresSeconds
+        self.id = id
+        self.useCookie = useCookie
+        self.useLink = useLink
+        self.useAuto = useAuto
+        self.useNone = useNone
+        self.cookieExpires = cookieExpires
+        self.domain = domain
+        self.path = path
+        self.secure = secure
+        self.httpOnly = httpOnly
+        self.rotate = rotate
+    }
+}
+
 /// Real Lasso sessions are named (`session_start(name, ...)`), each backing
 /// a set of persisted thread variables (`session_addVar(name, varName)`) —
 /// see `Documentation/session-upload-support-plan.md`'s "Lasso Session
-/// Semantics". The evaluator is synchronous but real session storage
-/// (`PerfectSessionCore.SessionDriver`) is async, so conformers are expected
-/// to do the actual create/resume/save work at the server boundary (before
-/// and after the synchronous render call) and expose only already-loaded,
-/// synchronous state through this protocol.
+/// Semantics".
 ///
-/// Replaces an earlier `value(for:)`/`set(_:for:)` single-unnamed-session
-/// shape that didn't match Lasso's documented `sessionName`/`varName`
-/// contract (it was an unverified placeholder, not a considered design —
-/// see `lasso-adapter-feedback` project memory on verifying real Lasso
-/// semantics against docs before building on top of a guess).
+/// **2026-07-18 architecture correction**: this protocol's `start` method
+/// was originally synchronous, forcing a parse-time "preflight scan" of
+/// the page for literal `session_start(...)` calls so every session could
+/// be created/resumed up front (real session storage,
+/// `PerfectSessionCore.SessionDriver`, is async; the evaluator used to be
+/// synchronous). That scan was a static approximation of what the page
+/// would actually do at render time, and any static approximation of
+/// procedural execution is necessarily incomplete — confirmed live: it
+/// missed `session_start` calls hidden inside `include(...)`-loaded files
+/// (the standard real-world pattern), and by its own documented design it
+/// could never see a dynamically-computed session name or flag value
+/// either. The evaluator was converted to fully `async throws` end to end
+/// on 2026-07-15 (`Documentation/synchronous-render-pipeline.md`) — three
+/// days after this session bridge was built on the now-stale "evaluator is
+/// sync" premise, and nobody revisited it. `start` is now `async`: real
+/// session creation/resumption happens exactly when `session_start` is
+/// actually evaluated, in real program order, with the full context
+/// (variables, prior session state, whatever `include`/custom-tag nesting
+/// got it there) that a parse-time scan could never have. The scan
+/// (`LassoSessionPreflight`) has been removed entirely — there is nothing
+/// left for it to preload.
 public protocol LassoSessionProvider: Sendable {
-    /// Starts (creates or resumes) a named session. Returns `nil` if `name`
-    /// was never prepared for this request (e.g. missed by preflight
-    /// scanning for `session_start` calls) — callers should treat that as
-    /// "session unavailable," not fabricate one on the spot.
-    func start(session name: String) -> LassoSessionStartResult?
+    /// Starts (creates or resumes) a named session, doing the actual async
+    /// `SessionDriver` create/resume work in place. Returns `nil` only when
+    /// no session provider is configured at all (see `LassoContext`) —
+    /// every real conformer always succeeds (a resume failure falls back to
+    /// creating a new session, matching real Lasso's own behavior for an
+    /// expired/invalid session id).
+    func start(session name: String, call: LassoSessionStartCall) async -> LassoSessionStartResult?
     func id(session name: String) -> String?
     /// The value restored from a resumed session for `varName`, or `nil` for
     /// a new session, an ended/aborted one, or a name never persisted before.

@@ -1075,7 +1075,7 @@ import PerfectSessionCore
 
     final class SessionProvider: LassoSessionProvider, @unchecked Sendable {
         private var startedNames: Set<String> = []
-        func start(session name: String) -> LassoSessionStartResult? {
+        func start(session name: String, call: LassoSessionStartCall) async -> LassoSessionStartResult? {
             let isNew = startedNames.contains(name) == false
             startedNames.insert(name)
             return LassoSessionStartResult(sessionID: "fake-\(name)", isNew: isNew)
@@ -3801,7 +3801,7 @@ final class FullyRecordingResponseSink: LassoResponseSink, @unchecked Sendable {
         private(set) var persisted: [String: [String: LassoValue]] = [:]
         private(set) var endedNames: Set<String> = []
         private var startedNames: Set<String> = []
-        func start(session name: String) -> LassoSessionStartResult? {
+        func start(session name: String, call: LassoSessionStartCall) async -> LassoSessionStartResult? {
             let isNew = startedNames.contains(name) == false
             startedNames.insert(name)
             return LassoSessionStartResult(sessionID: "fake-\(name)", isNew: isNew)
@@ -3836,117 +3836,107 @@ final class FullyRecordingResponseSink: LassoResponseSink, @unchecked Sendable {
     #expect(endProvider.endedNames.contains("cart"))
 }
 
-@Test func sessionPreflightScanFindsLiteralSessionStartCalls() {
-    let document = LassoParser().parse(
-        "<?lassoscript session_start('cart', -expires=3600, -secure=true, -domain='example.test') ?>"
+// The parse-time `LassoSessionPreflight` scan (and its tests, formerly
+// here) was retired 2026-07-18 — `session_start` now creates/resumes its
+// session directly, in place, exactly when evaluated (see
+// `LassoSessionProvider`'s doc comment for the full architectural
+// history). This makes the scan's own documented limitations moot rather
+// than needing new test coverage: a dynamic session name, a dynamic flag
+// value, and a `session_start` hidden inside any depth of `include(...)`
+// nesting all now resolve correctly, because there's no separate
+// parse-time step trying to see them ahead of render. See
+// `sessionStartResolvesADynamicSessionNameAndFlagsAtEvaluationTime` and
+// `perfectBackedSessionProviderPersistsVariablesAcrossTwoRequestsViaMemoryDriver`
+// below for direct coverage of the new behavior.
+@Test func sessionStartResolvesADynamicSessionNameAndFlagsAtEvaluationTime() async throws {
+    final class SessionProvider: LassoSessionProvider, @unchecked Sendable {
+        private(set) var lastCall: LassoSessionStartCall?
+        func start(session name: String, call: LassoSessionStartCall) async -> LassoSessionStartResult? {
+            lastCall = call
+            return LassoSessionStartResult(sessionID: "fake-\(name)", isNew: true)
+        }
+        func id(session name: String) -> String? { "fake-\(name)" }
+        func restoredValue(for varName: String, session name: String) -> LassoValue? { nil }
+        func persist(_ value: LassoValue, for varName: String, session name: String) {}
+        func removeVar(_ varName: String, session name: String) {}
+        func end(session name: String) {}
+        func abort(session name: String) {}
+    }
+    let provider = SessionProvider()
+    var context = LassoContext(sessionProvider: provider)
+    // A dynamically computed name AND a dynamic -Expires value -- both
+    // invisible to the old parse-time scan, both resolve correctly now
+    // since this runs at real evaluation time.
+    _ = try await LassoRenderer().render(
+        "[var(sessionName = 'cart')][var(expirySeconds = 3600)][session_start($sessionName, -expires=$expirySeconds, -secure=true, -domain='example.test')]",
+        context: &context
     )
-    let calls = LassoSessionPreflight.scan(document)
-    #expect(calls.count == 1)
-    #expect(calls.first?.name == "cart")
-    #expect(calls.first?.expiresSeconds == 3600)
-    #expect(calls.first?.secure == true)
-    #expect(calls.first?.domain == "example.test")
-    #expect(calls.first?.useCookie == true)
+    #expect(provider.lastCall?.name == "cart")
+    #expect(provider.lastCall?.expiresSeconds == 3600)
+    #expect(provider.lastCall?.secure == true)
+    #expect(provider.lastCall?.domain == "example.test")
+    #expect(provider.lastCall?.useCookie == true)
 }
 
-@Test func sessionPreflightScanIgnoresDynamicSessionNames() {
-    // A documented limitation, not a crash — see LassoSessionPreflight's
-    // doc comment and Documentation/session-upload-support-plan.md.
-    let document = LassoParser().parse("<?lassoscript session_start(var(name)) ?>")
-    #expect(LassoSessionPreflight.scan(document).isEmpty)
-}
-
-@Test func sessionPreflightScanRecognizesTheNameKeywordForm() {
+@Test func sessionStartRecognizesTheNameKeywordForm() async throws {
     // Real corpus shape (Documentation/outstanding-compatibility-project-plans.md
     // item 7) — session_start's name spelled as -Name=, not positional,
-    // across every real page using it. Before adding the shared
-    // resolveSessionName helper, this returned zero calls (only
-    // positional names were recognized), so every one of these real
-    // pages silently found no preloaded session at render time.
-    let document = LassoParser().parse(
-        "[session_start(-Name='cart', -Expires=30, -UseCookie, -Path='/', -Domain='example.test')]"
+    // across every real page using it.
+    final class SessionProvider: LassoSessionProvider, @unchecked Sendable {
+        private(set) var lastCall: LassoSessionStartCall?
+        func start(session name: String, call: LassoSessionStartCall) async -> LassoSessionStartResult? {
+            lastCall = call
+            return LassoSessionStartResult(sessionID: "fake-\(name)", isNew: true)
+        }
+        func id(session name: String) -> String? { "fake-\(name)" }
+        func restoredValue(for varName: String, session name: String) -> LassoValue? { nil }
+        func persist(_ value: LassoValue, for varName: String, session name: String) {}
+        func removeVar(_ varName: String, session name: String) {}
+        func end(session name: String) {}
+        func abort(session name: String) {}
+    }
+    let provider = SessionProvider()
+    var context = LassoContext(sessionProvider: provider)
+    _ = try await LassoRenderer().render(
+        "[session_start(-Name='cart', -Expires=30, -UseCookie, -Path='/', -Domain='example.test')]",
+        context: &context
     )
-    let calls = LassoSessionPreflight.scan(document)
-    #expect(calls.count == 1)
-    #expect(calls.first?.name == "cart")
-    #expect(calls.first?.expiresSeconds == 30)
-    #expect(calls.first?.path == "/")
-    #expect(calls.first?.domain == "example.test")
-    #expect(calls.first?.useCookie == true)
+    #expect(provider.lastCall?.name == "cart")
+    #expect(provider.lastCall?.expiresSeconds == 30)
+    #expect(provider.lastCall?.path == "/")
+    #expect(provider.lastCall?.domain == "example.test")
+    #expect(provider.lastCall?.useCookie == true)
 }
 
-@Test func sessionPreflightScanIgnoresANonLiteralNameKeywordValue() {
-    // -Name=var(x) mirrors the existing positional-form limitation
-    // (sessionPreflightScanIgnoresDynamicSessionNames) — only literal
-    // string names are visible to a parse-time scan either way.
-    let document = LassoParser().parse("<?lassoscript session_start(-Name=var(x)) ?>")
-    #expect(LassoSessionPreflight.scan(document).isEmpty)
-}
-
-// Real corpus (koi.lasso -> includes/siteconfig_cookies.inc) puts its
-// Session_Start calls inside a shared config include, not directly in the
-// top-level page -- confirmed live 2026-07-18 that without following
-// include(...)/library(...) calls, this scanner found zero session_start
-// calls for the whole real site, silently disabling session tracking
-// altogether (not a narrow edge case -- the standard real-world pattern).
-@Test func sessionPreflightScanFollowsLiteralIncludeCallsWhenALoaderIsSupplied() {
-    let loader = MapIncludeLoader(files: [
-        "includes/siteconfig_cookies.inc": "<?lassoscript session_start('scrubs', -expires=120, -usecookie) ?>",
-    ])
-    let document = LassoParser().parse("<?lassoscript include('includes/siteconfig_cookies.inc') ?>")
-    let calls = LassoSessionPreflight.scan(document, includeLoader: loader, includePath: "koi.lasso")
-    #expect(calls.count == 1)
-    #expect(calls.first?.name == "scrubs")
-    #expect(calls.first?.expiresSeconds == 120)
-}
-
-@Test func sessionPreflightScanFollowsLibraryCallsToo() {
-    let loader = MapIncludeLoader(files: [
-        "includes/siteconfig.lib": "<?lassoscript session_start('cart') ?>",
-    ])
-    let document = LassoParser().parse("<?lassoscript library('includes/siteconfig.lib') ?>")
-    let calls = LassoSessionPreflight.scan(document, includeLoader: loader, includePath: "koi.lasso")
-    #expect(calls.count == 1)
-    #expect(calls.first?.name == "cart")
-}
-
-@Test func sessionPreflightScanFollowsNestedIncludesTransitively() {
+// koi.lasso -> includes/siteconfig_cookies.inc puts every Session_Start
+// call inside a shared config include, not directly in the top-level page
+// -- confirmed live 2026-07-18 that the retired parse-time scan found zero
+// session_start calls for the whole real site because of this, silently
+// disabling session tracking altogether. Evaluating session_start
+// directly (this test) works regardless of how deeply nested the include
+// is, since there's no separate scan needing to see through it.
+@Test func sessionStartWorksFromInsideAnyDepthOfIncludeNesting() async throws {
+    final class SessionProvider: LassoSessionProvider, @unchecked Sendable {
+        private(set) var lastCall: LassoSessionStartCall?
+        func start(session name: String, call: LassoSessionStartCall) async -> LassoSessionStartResult? {
+            lastCall = call
+            return LassoSessionStartResult(sessionID: "fake-\(name)", isNew: true)
+        }
+        func id(session name: String) -> String? { "fake-\(name)" }
+        func restoredValue(for varName: String, session name: String) -> LassoValue? { nil }
+        func persist(_ value: LassoValue, for varName: String, session name: String) {}
+        func removeVar(_ varName: String, session name: String) {}
+        func end(session name: String) {}
+        func abort(session name: String) {}
+    }
     let loader = MapIncludeLoader(files: [
         "includes/outer.inc": "<?lassoscript include('includes/inner.inc') ?>",
         "includes/inner.inc": "<?lassoscript session_start('cart') ?>",
     ])
-    let document = LassoParser().parse("<?lassoscript include('includes/outer.inc') ?>")
-    let calls = LassoSessionPreflight.scan(document, includeLoader: loader, includePath: "koi.lasso")
-    #expect(calls.count == 1)
-    #expect(calls.first?.name == "cart")
-}
-
-@Test func sessionPreflightScanDoesNotInfiniteLoopOnACircularInclude() {
-    let loader = MapIncludeLoader(files: [
-        "includes/a.inc": "<?lassoscript include('includes/b.inc') ?>",
-        "includes/b.inc": "<?lassoscript session_start('cart') include('includes/a.inc') ?>",
-    ])
-    let document = LassoParser().parse("<?lassoscript include('includes/a.inc') ?>")
-    let calls = LassoSessionPreflight.scan(document, includeLoader: loader, includePath: "koi.lasso")
-    #expect(calls.count == 1)
-    #expect(calls.first?.name == "cart")
-}
-
-@Test func sessionPreflightScanIgnoresIncludesWithNoLoaderSupplied() {
-    // Backward compatible with every existing call site/test that doesn't
-    // pass includeLoader — a plain flat scan, matching prior behavior.
-    let document = LassoParser().parse("<?lassoscript include('includes/siteconfig_cookies.inc') ?>")
-    #expect(LassoSessionPreflight.scan(document).isEmpty)
-}
-
-@Test func sessionPreflightScanIgnoresADynamicIncludePath() {
-    // Same documented literal-only limitation as session_start's own
-    // arguments — a computed include path can't be resolved from raw AST.
-    let loader = MapIncludeLoader(files: [
-        "includes/siteconfig_cookies.inc": "<?lassoscript session_start('cart') ?>",
-    ])
-    let document = LassoParser().parse("<?lassoscript include(var(includePath)) ?>")
-    #expect(LassoSessionPreflight.scan(document, includeLoader: loader, includePath: "koi.lasso").isEmpty)
+    let provider = SessionProvider()
+    var context = LassoContext(includeLoader: loader, sessionProvider: provider)
+    _ = try await LassoRenderer().render("[include('includes/outer.inc')]", context: &context)
+    #expect(provider.lastCall?.name == "cart")
 }
 
 @Test func sessionAddvarResolvesNameKeywordAndPositionalVarNameCorrectly() async throws {
@@ -3959,7 +3949,7 @@ final class FullyRecordingResponseSink: LassoResponseSink, @unchecked Sendable {
     final class SessionProvider: LassoSessionProvider, @unchecked Sendable {
         private(set) var persisted: [String: [String: LassoValue]] = [:]
         private var startedNames: Set<String> = []
-        func start(session name: String) -> LassoSessionStartResult? {
+        func start(session name: String, call: LassoSessionStartCall) async -> LassoSessionStartResult? {
             let isNew = startedNames.contains(name) == false
             startedNames.insert(name)
             return LassoSessionStartResult(sessionID: "fake-\(name)", isNew: isNew)
@@ -3991,7 +3981,7 @@ final class FullyRecordingResponseSink: LassoResponseSink, @unchecked Sendable {
     final class SessionProvider: LassoSessionProvider, @unchecked Sendable {
         private(set) var endedNames: Set<String> = []
         private var startedNames: Set<String> = []
-        func start(session name: String) -> LassoSessionStartResult? {
+        func start(session name: String, call: LassoSessionStartCall) async -> LassoSessionStartResult? {
             startedNames.insert(name)
             return LassoSessionStartResult(sessionID: "fake-\(name)", isNew: true)
         }
@@ -4025,7 +4015,7 @@ final class FullyRecordingResponseSink: LassoResponseSink, @unchecked Sendable {
     final class SessionProvider: LassoSessionProvider, @unchecked Sendable {
         private(set) var persisted: [String: [String: LassoValue]] = [:]
         private(set) var abortedNames: Set<String> = []
-        func start(session name: String) -> LassoSessionStartResult? {
+        func start(session name: String, call: LassoSessionStartCall) async -> LassoSessionStartResult? {
             LassoSessionStartResult(sessionID: "fake-\(name)", isNew: true)
         }
         func id(session name: String) -> String? { "fake-\(name)" }
@@ -4061,18 +4051,16 @@ final class FullyRecordingResponseSink: LassoResponseSink, @unchecked Sendable {
 
 @Test func perfectBackedSessionProviderPersistsVariablesAcrossTwoRequestsViaMemoryDriver() async throws {
     let driver = MemorySessionDriver()
-    let call = LassoSessionStartCall(name: "cart")
 
     // Request 1: new session, register+set a variable, finalize (saves it).
-    let firstBridge = PerfectBackedLassoSessionProvider()
-    await firstBridge.prepare(calls: [call], driver: driver, cookies: [:], remoteAddress: "", userAgent: "")
+    let firstBridge = PerfectBackedLassoSessionProvider(driver: driver, cookies: [:], remoteAddress: "", userAgent: "")
     var firstContext = LassoContext(sessionProvider: firstBridge)
     let firstOutput = try await LassoRenderer().render(
         "[session_start('cart')][var(total = 3)][session_addvar('cart','total')][total]",
         context: &firstContext
     )
     #expect(firstOutput == "3")
-    let firstActions = await firstBridge.finalize(driver: driver)
+    let firstActions = await firstBridge.finalize()
     guard let token = firstActions.first(where: { $0.call.name == "cart" })?.token else {
         Issue.record("Expected a tracker token from finalize")
         return
@@ -4081,9 +4069,8 @@ final class FullyRecordingResponseSink: LassoResponseSink, @unchecked Sendable {
     // Request 2: resumes via the cookie the first request would have set —
     // the previously-persisted variable should come back without the page
     // setting it again.
-    let secondBridge = PerfectBackedLassoSessionProvider()
-    await secondBridge.prepare(
-        calls: [call], driver: driver,
+    let secondBridge = PerfectBackedLassoSessionProvider(
+        driver: driver,
         cookies: ["_LassoSessionTracker_cart": token],
         remoteAddress: "", userAgent: ""
     )
@@ -4097,13 +4084,11 @@ final class FullyRecordingResponseSink: LassoResponseSink, @unchecked Sendable {
 
 @Test func perfectBackedSessionProviderEndDestroysSessionAndClearsCookie() async throws {
     let driver = MemorySessionDriver()
-    let call = LassoSessionStartCall(name: "cart")
 
-    let bridge = PerfectBackedLassoSessionProvider()
-    await bridge.prepare(calls: [call], driver: driver, cookies: [:], remoteAddress: "", userAgent: "")
+    let bridge = PerfectBackedLassoSessionProvider(driver: driver, cookies: [:], remoteAddress: "", userAgent: "")
     var context = LassoContext(sessionProvider: bridge)
     _ = try await LassoRenderer().render("[session_start('cart')][session_end('cart')]", context: &context)
-    let actions = await bridge.finalize(driver: driver)
+    let actions = await bridge.finalize()
     let action = actions.first(where: { $0.call.name == "cart" })
     #expect(action?.shouldClearCookie == true)
     #expect(action?.token == nil)

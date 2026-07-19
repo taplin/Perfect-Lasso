@@ -45,3 +45,47 @@ func resolveSessionName<Argument: LassoNamedArgument>(
     }
     return (name, Array(unlabeled.dropFirst()))
 }
+
+/// Builds a full `LassoSessionStartCall` from `session_start`'s real,
+/// fully-evaluated call-site arguments — used directly by `Runtime.swift`'s
+/// `session_start` registration now that session creation/resumption
+/// happens in place at evaluation time, not via a parse-time preflight
+/// scan (see `LassoSessionProvider`'s 2026-07-18 doc comment). Every flag
+/// value here can be arbitrarily dynamic (a variable, a concatenation,
+/// etc.) since `arguments` has already been evaluated by the time this
+/// runs — unlike the retired scan, which could only see literal AST.
+func makeSessionStartCall(from arguments: [EvaluatedArgument]) -> LassoSessionStartCall? {
+    guard let resolved = resolveSessionName(in: arguments, stringValue: { $0.value.outputString }) else {
+        return nil
+    }
+    let name = resolved.name
+
+    func flagString(_ label: String) -> String? {
+        arguments.first(where: { $0.label?.caseInsensitiveCompare(label) == .orderedSame })?.value.outputString
+    }
+    func flagInt(_ label: String) -> Int? {
+        arguments.first(where: { $0.label?.caseInsensitiveCompare(label) == .orderedSame })?.value.number.map(Int.init)
+    }
+    func flagBool(_ label: String, default defaultValue: Bool) -> Bool {
+        guard let argument = arguments.first(where: { $0.label?.caseInsensitiveCompare(label) == .orderedSame }) else {
+            return defaultValue
+        }
+        return argument.value.isTruthy
+    }
+
+    return LassoSessionStartCall(
+        name: name,
+        expiresSeconds: flagInt("expires"),
+        id: flagString("id"),
+        useCookie: flagBool("usecookie", default: true),
+        useLink: flagBool("uselink", default: false),
+        useAuto: flagBool("useauto", default: false),
+        useNone: flagBool("usenone", default: false),
+        cookieExpires: flagString("cookieexpires"),
+        domain: flagString("domain"),
+        path: flagString("path"),
+        secure: flagBool("secure", default: false),
+        httpOnly: flagBool("httponly", default: false),
+        rotate: flagBool("rotate", default: false)
+    )
+}

@@ -97,7 +97,7 @@ struct SmokeRequestProvider: LassoRequestProvider {
 final class SmokeSessionProvider: LassoSessionProvider, @unchecked Sendable {
     private var startedNames: Set<String> = []
 
-    func start(session name: String) -> LassoSessionStartResult? {
+    func start(session name: String, call: LassoSessionStartCall) async -> LassoSessionStartResult? {
         let isNew = startedNames.contains(name) == false
         startedNames.insert(name)
         return LassoSessionStartResult(sessionID: "smoke-\(name)", isNew: isNew)
