@@ -526,7 +526,12 @@ struct Evaluator {
         }
     }
 
-    private func binary(_ left: LassoValue, _ op: String, _ right: LassoValue) throws -> LassoValue {
+    // `internal` (not `private`) since `Collections.swift`'s Set/List
+    // implementation reuses this directly for element equality/ordering —
+    // see `lassoEquals`'s own doc comment below. Purely functional on the
+    // two passed-in values, no `self`/`context` state touched anywhere in
+    // its body, so widening this doesn't change what it can observe.
+    func binary(_ left: LassoValue, _ op: String, _ right: LassoValue) throws -> LassoValue {
         switch op {
         case "+":
             if case .string = left { return .string(left.outputString + right.outputString) }
@@ -1220,6 +1225,20 @@ struct Evaluator {
         // `.string` member case uses either name, so this has no effect
         // on those.
         "add", "subtract",
+        // List/Queue/Stack/Set (Ch. 30 Tables 5/13/16/18) — each
+        // documented "Returns no value" except `Queue->Get`/`Stack->Get`
+        // (deliberately excluded here — see `Collections.swift`'s own
+        // top-level doc comment for why those two need a different,
+        // narrower mechanism instead). `Difference`/`Intersection`/
+        // `Union` "return a new [list/set]" per their own Table
+        // wording, but the Guide's own worked example
+        // (`[$ResultSet->(Difference: $SecondSet)] [$ResultSet]`, Ch.
+        // 30 p.412) calls one bare and shows the CALLING variable
+        // reflecting the result afterward with no reassignment — the
+        // exact same self-mutating write-back shape as everything else
+        // in this set.
+        "insertfirst", "insertlast", "removefirst", "removelast",
+        "difference", "intersection", "union",
     ]
 
     /// Best-effort ordering for `Array->Sort` — every numeric-parseable
@@ -1237,7 +1256,8 @@ struct Evaluator {
     /// "5apple"` is FALSE (`'9' > '5'`) — `9 < 10 < "5apple"` yet NOT
     /// `9 < "5apple"`, a transitivity violation Swift's `sorted(by:)`
     /// doesn't validate and would silently mis-sort on.
-    private static func lassoSortKey(_ value: LassoValue) -> (Int, Double, String) {
+    // `internal`, same reason as `binary` above.
+    static func lassoSortKey(_ value: LassoValue) -> (Int, Double, String) {
         // `.isFinite` guards against Swift's `Double(String)` parsing
         // tokens like `"nan"`/`"inf"`/`"infinity"` (matching C's `strtod`)
         // into real IEEE 754 NaN/infinity rather than returning `nil` —
@@ -1251,7 +1271,8 @@ struct Evaluator {
         return (1, 0, value.outputString)
     }
 
-    private static func lassoLessThan(_ lhs: LassoValue, _ rhs: LassoValue) -> Bool {
+    // `internal`, same reason as `binary` above.
+    static func lassoLessThan(_ lhs: LassoValue, _ rhs: LassoValue) -> Bool {
         lassoSortKey(lhs) < lassoSortKey(rhs)
     }
 
@@ -1265,7 +1286,11 @@ struct Evaluator {
     /// real production incident for (`thumbs2.page.lasso`'s ribbon check
     /// silently breaking on `'Yes'` vs `'yes'`) — flagged in architect
     /// review before it shipped.
-    private func lassoEquals(_ lhs: LassoValue, _ rhs: LassoValue) -> Bool {
+    // `internal`, same reason as `binary` above — `Collections.swift`
+    // constructs a throwaway `Evaluator(context:)` (a cheap value-type
+    // copy, not aliasing) purely to call this and `binary`, neither of
+    // which read or mutate `self.context`.
+    func lassoEquals(_ lhs: LassoValue, _ rhs: LassoValue) -> Bool {
         (try? binary(lhs, "==", rhs))?.isTruthy ?? false
     }
 

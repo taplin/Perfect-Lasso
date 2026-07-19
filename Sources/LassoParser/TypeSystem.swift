@@ -31,6 +31,25 @@ public final class LassoObjectInstance: @unchecked Sendable, Equatable {
         defer { lock.unlock() }
         return data
     }
+
+    /// Atomic read-modify-write under a single lock hold — for callers
+    /// that need to read a value and write a derived value back without
+    /// a race window between the two (e.g. `Queue->Get`/`Stack->Get`
+    /// popping an element: composing `value(for:)` then `set(_:for:)`
+    /// as two separate critical sections lets two concurrent callers
+    /// both read the same pre-pop snapshot and clobber each other's
+    /// write, silently losing an element instead of popping one each).
+    /// `name` is looked up/stored pre-lowercased, matching `value(for:)`
+    /// /`set(_:for:)`'s own normalization.
+    public func withLock<T>(_ name: String, _ body: (inout LassoValue) -> T) -> T {
+        let key = name.lowercased()
+        lock.lock()
+        defer { lock.unlock() }
+        var current = data[key] ?? .null
+        let result = body(&current)
+        data[key] = current
+        return result
+    }
 }
 
 struct LassoResolvedMethod {

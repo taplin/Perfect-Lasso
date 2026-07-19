@@ -67,6 +67,10 @@ public struct LassoNativeTypeRegistry: Sendable {
         register(Self.makeDateType())
         register(Self.makeBytesType())
         register(Self.makeRegExpType())
+        register(Self.makeListType())
+        register(Self.makeQueueType())
+        register(Self.makeStackType())
+        register(Self.makeSetType())
     }
 }
 

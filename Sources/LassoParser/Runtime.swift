@@ -51,13 +51,23 @@ public indirect enum LassoValue: Equatable, Sendable {
         case let .array(value): value.map(\.outputString).joined()
         case let .map(value): String(describing: value)
         case let .object(value):
-            // `bytes` is the one native type whose bare output is
-            // meaningful content, not a type-name placeholder (matching
-            // real Lasso's auto-stringification of a byte stream) — every
-            // other native type (web_request/web_response/date) has no
-            // documented bare-output contract, so they keep the existing
-            // type-name fallback.
-            value.typeName == LassoBytesValue.typeName ? LassoBytesValue.string(from: value) : value.typeName
+            // `bytes` is one native type whose bare output is meaningful
+            // content, not a type-name placeholder (matching real
+            // Lasso's auto-stringification of a byte stream). List/
+            // Queue/Stack/Set are a second such group — Ch. 30's own
+            // worked examples show a documented "TypeName: elem1, elem2"
+            // auto-stringification (see `LassoCollectionValue
+            // .autoStringDescription`'s own doc comment for citations).
+            // Every other native type (web_request/web_response/date)
+            // has no documented bare-output contract, so they keep the
+            // existing type-name fallback.
+            if value.typeName == LassoBytesValue.typeName {
+                LassoBytesValue.string(from: value)
+            } else if LassoCollectionValue.typeNames.contains(value.typeName) {
+                LassoCollectionValue.autoStringDescription(for: value)
+            } else {
+                value.typeName
+            }
         case let .pair(key, value): "\(key.outputString) = \(value.outputString)"
         }
     }
@@ -709,20 +719,72 @@ public struct LassoNativeRegistry: Sendable {
             let second = arguments.count > 1 ? arguments[1].value : .null
             return .pair(first.value, second)
         }
-        // Real Lasso 9's `set` (an ordered, unique-valued collection) —
-        // real corpus: includes/detail_a_sku.lasso's
-        // `var('skuArrayColor' = set)` followed by
-        // `$skuArrayColor->insert(field('color'))`, building "a special
-        // 'color' array that contains every color/print found" (per that
-        // file's own comment) across a loop of skus, several sharing the
-        // same color. Modeled as a plain `.array` for now — real `set`
-        // additionally skips inserting a value already present, which
-        // this doesn't reproduce (a real gap: the resulting color list
-        // can contain duplicates this way), but an unrecognized bare
-        // `set` identifier previously evaluated to `.void`, so
-        // `->insert` threw outright and the whole page failed to render.
-        register("set") { arguments, _ in
-            .array(arguments.map { $0.value })
+        // `Set`/`List`/`Queue`/`Stack`/`Series` (Ch. 30 Tables 4/12/14/15/17)
+        // — see `Collections.swift` for the native-type method tables.
+        // A bare `set`/`list`/`queue`/`stack` identifier (no parens —
+        // real corpus: includes/detail_a_sku.lasso's `var('skuArrayColor'
+        // = set)`, building "a special 'color' array that contains every
+        // color/print found" per that file's own comment) already
+        // resolves to an empty instance of the right type via the
+        // generic bare-identifier-to-native-type path
+        // (`Evaluator.evaluate`'s `.identifier` case, `context.nativeTypes.containsType`)
+        // with no registration needed here — this is only for the
+        // PAREN-CALL form (`(Set)`/`(List: 'a', 'b')`), matching the
+        // dual free-function-plus-native-type registration pattern
+        // `date`/`bytes`/`regexp` already established. Real Set replaces
+        // the previous `.array`-alias placeholder, which admitted (in
+        // its own comment, now resolved) that it couldn't dedup —
+        // `Collections.swift`'s `->Insert` now does via the same
+        // `lassoEquals` this project already uses for `Array->Contains`.
+        register("list") { arguments, _ in
+            .object(LassoCollectionValue.makeObject(typeName: "list", elements: arguments.map(\.value)))
+        }
+        // The 8.5 PDF's own Table 12/17 say "Creates an empty queue"/
+        // "Creates an empty stack" (Ch. 30 pp.408, 413) with no
+        // parameters documented at all — but lassoguide.com's Lasso 9
+        // docs explicitly say "Creates a queue/stack object using the
+        // parameters passed to it as the elements of the queue/stack",
+        // matching List's own documented constructor behavior. Cross-
+        // checked directly against lassoguide.com/operations/
+        // collections.html, not inferred. Following the newer/more
+        // complete source here, same as this project's established
+        // practice elsewhere of preferring lassoguide.com over 8.5 PDF
+        // gaps. Argument order is preserved as insertion order, so
+        // `queue('One', 'Two')`'s `->First` is 'One' (FIFO) and
+        // `stack('One', 'Two')`'s `->First` is 'Two' (LIFO) — identical
+        // to what sequential `->Insert` calls would produce.
+        register("queue") { arguments, _ in
+            .object(LassoCollectionValue.makeObject(typeName: "queue", elements: arguments.map(\.value)))
+        }
+        register("stack") { arguments, _ in
+            .object(LassoCollectionValue.makeObject(typeName: "stack", elements: arguments.map(\.value)))
+        }
+        register("set") { _, _ in
+            // Table 15's own documented parameter is a `-Comparator`
+            // (Stage 2 concept, not implemented yet) — any argument
+            // given here is ignored this stage; always natural-sorts.
+            .object(LassoCollectionValue.makeObject(typeName: "set", elements: []))
+        }
+        register("series") { arguments, _ in
+            // "The start value is incremented until it equals the end
+            // value" — ascending only; no worked example covers a
+            // start > end descending series, deferred/unverified.
+            // Per-element whole-number rounding mirrors this codebase's
+            // established `.integer`-vs-`.decimal` convention
+            // (`numeric(_:_:_:)`), matching the Guide's own worked
+            // example (`Series(1,10)` → all integers).
+            guard let start = arguments.first?.value.number,
+                  let end = arguments.positionalValue(at: 1)?.number,
+                  start <= end else {
+                return .array([])
+            }
+            var elements: [LassoValue] = []
+            var current = start
+            while current <= end {
+                elements.append(current.rounded() == current ? .integer(Int(current)) : .decimal(current))
+                current += 1
+            }
+            return .array(elements)
         }
         register("json_serialize") { arguments, _ in
             let value = arguments.first?.value ?? .null

@@ -8193,3 +8193,325 @@ struct IncludeURLTests {
     #expect(output == "false")
 }
 
+@Test func listFirstAndLastMatchTheLanguageGuidesWorkedExample() async throws {
+    // Ch. 30 p.399: `Var('MyList' = (List: 'Uno', 'Dos', 'Tres',
+    // 'Quatro'))` then `$myList->First + ', ' + $myList->Last` → "Uno,
+    // Quatro". Also covers `->Size` → 4 from the same page.
+    var context = LassoContext()
+    let output = try await LassoRenderer().render(
+        """
+        [var('myList' = (list: 'Uno', 'Dos', 'Tres', 'Quatro'))]\
+        [$myList->First] + [$myList->Last]|[$myList->Size]
+        """,
+        context: &context
+    )
+    #expect(output == "Uno + Quatro|4")
+}
+
+@Test func listInsertFirstInsertLastThenAutoStringMatchesTheGuidesSixElementResult() async throws {
+    // Ch. 30 p.399: `->InsertFirst('Cero')` + `->InsertLast('Cinco')`
+    // on the same list, then `[String: $myList]` → "List: Cero, Uno,
+    // Dos, Tres, Quatro, Cinco" — a bare-statement self-mutating
+    // write-back, no reassignment.
+    var context = LassoContext()
+    let output = try await LassoRenderer().render(
+        """
+        [var('myList' = (list: 'Uno', 'Dos', 'Tres', 'Quatro'))]\
+        [$myList->InsertFirst('Cero')][$myList->InsertLast('Cinco')]\
+        [string($myList)]
+        """,
+        context: &context
+    )
+    #expect(output == "List: Cero, Uno, Dos, Tres, Quatro, Cinco")
+}
+
+@Test func listRemoveFirstAndRemoveLastReturnToTheOriginalFourElements() async throws {
+    // Ch. 30 p.399: continuing from the six-element list above,
+    // `->RemoveFirst` + `->RemoveLast` → "List: Uno, Dos, Tres, Quatro".
+    var context = LassoContext()
+    let output = try await LassoRenderer().render(
+        """
+        [var('myList' = (list: 'Cero', 'Uno', 'Dos', 'Tres', 'Quatro', 'Cinco'))]\
+        [$myList->RemoveFirst][$myList->RemoveLast]\
+        [string($myList)]
+        """,
+        context: &context
+    )
+    #expect(output == "List: Uno, Dos, Tres, Quatro")
+}
+
+@Test func listDifferenceIntersectionAndUnionSelfMutateOnABareStatementLikeSetDoes() async throws {
+    // Extrapolation test, NOT a primary-source-verified worked example
+    // — unlike Set, the Guide has no dedicated List->Difference/
+    // ->Intersection/->Union worked example to confirm bare-statement
+    // behavior against. This is included in `Evaluator
+    // .selfMutatingMethods` on the (disclosed, name-based-not-type-
+    // scoped) theory that List's own Table 5 wording ("returning a new
+    // list"/"Returns a new list") is JUST as inconsistent with actual
+    // bare-statement-mutates behavior as Set's identically-worded Table
+    // 16 turned out to be (verified by Set's own worked example, see
+    // `setDifferenceIntersectionAndUnionMatchTheGuidesFirstSetSecondSetWorkedExamples`
+    // above) — flagged explicitly by architect review as an
+    // unverified-for-List extrapolation, kept as the most consistent
+    // reading available, and captured here as a regression test of the
+    // actual implemented behavior rather than left silently untested.
+    var context = LassoContext()
+    let output = try await LassoRenderer().render(
+        """
+        [var('FirstList' = (list: 'Alpha', 'Beta', 'Gamma'))]\
+        [var('SecondList' = (list: 'Beta', 'Gamma', 'Delta'))]\
+        [var('ResultList' = $FirstList)][$ResultList->Difference($SecondList)][$ResultList->Size]|\
+        [var('ResultList' = $FirstList)][$ResultList->Intersection($SecondList)][$ResultList->Size]|\
+        [var('ResultList' = $FirstList)][$ResultList->Union($SecondList)][$ResultList->Size]
+        """,
+        context: &context
+    )
+    #expect(output == "1|2|4")
+}
+
+@Test func listConstructorWithNoArgumentsIsEmptyAndBareIdentifierResolvesToAnEmptyList() async throws {
+    // `List` constructor "Any parameters passed to the tag are used as
+    // the initial values" (Table 4) implies zero parameters is a valid
+    // empty list. Also confirms the real-corpus bare-identifier path
+    // (`var('x' = list)`, mirroring `includes/detail_a_sku.lasso`'s
+    // `var('skuArrayColor' = set)`) resolves to an empty instance with
+    // no separate free-function registration needed for that shape.
+    var context = LassoContext()
+    let output = try await LassoRenderer().render(
+        "[(list)->size]|[var('x' = list)][$x->size]",
+        context: &context
+    )
+    #expect(output == "0|0")
+}
+
+@Test func queueFirstSizeAndAutoStringMatchTheLanguageGuidesWorkedExamples() async throws {
+    // Ch. 30 pp.408-409: Insert('One'), Insert('Two') then `->First` →
+    // "One" (FIFO peek, no mutation), `->Size` → 2, `[String: $myQueue]`
+    // → "Queue: One, Two".
+    var context = LassoContext()
+    let output = try await LassoRenderer().render(
+        """
+        [var('myQueue' = queue)][$myQueue->Insert('One')][$myQueue->Insert('Two')]\
+        [$myQueue->First]|[$myQueue->Size]|[string($myQueue)]
+        """,
+        context: &context
+    )
+    #expect(output == "One|2|Queue: One, Two")
+}
+
+@Test func queueAndStackConstructorsAcceptInitialElementsLikeListDoes() async throws {
+    // The 8.5 PDF's own Table 12/17 say "Creates an empty queue"/
+    // "Creates an empty stack" with no constructor parameters
+    // documented at all, but lassoguide.com's Lasso 9 docs explicitly
+    // say "Creates a queue/stack object using the parameters passed to
+    // it as the elements" (cross-checked directly against
+    // lassoguide.com/operations/collections.html, flagged as a real gap
+    // by architect review, not left as the PDF's narrower "always
+    // empty" reading). Argument order becomes insertion order, so
+    // Queue's FIFO `->First` is the first argument and Stack's LIFO
+    // `->First` is the last argument.
+    var context = LassoContext()
+    let output = try await LassoRenderer().render(
+        "[(queue: 'One', 'Two')->First]|[(stack: 'One', 'Two')->First]",
+        context: &context
+    )
+    #expect(output == "One|Two")
+}
+
+@Test func queueGetPopsAndDisplaysTheFirstElementMatchingTheGuidesOneThenOneResult() async throws {
+    // Ch. 30 p.409: the exact worked example this project's disclosed
+    // `->Get` exception exists for — a bare `$myQueue->Get;` statement
+    // both DISPLAYS "One" and MUTATES the queue (confirmed by `->Size`
+    // afterward reporting 1, not 2).
+    var context = LassoContext()
+    let output = try await LassoRenderer().render(
+        """
+        [var('myQueue' = queue)][$myQueue->Insert('One')][$myQueue->Insert('Two')]\
+        [$myQueue->Get]|[$myQueue->Size]
+        """,
+        context: &context
+    )
+    #expect(output == "One|1")
+}
+
+@Test func queueRemoveDiscardsTheFirstElementWithoutReturningItsValue() async throws {
+    // Ch. 30 p.409: `[Queue->Remove]` "does not return any value so
+    // only the size is output" — 1, after removing one of two elements.
+    // Also confirms it's FIFO removal specifically (not just "any
+    // element"): `->First` afterward is the surviving 'Two', not 'One'
+    // — code review flagged the original version of this test as
+    // unable to distinguish `removeFirst` from `removeLast` since
+    // either leaves size 1 on a 2-element queue.
+    var context = LassoContext()
+    let output = try await LassoRenderer().render(
+        """
+        [var('myQueue' = queue)][$myQueue->Insert('One')][$myQueue->Insert('Two')]\
+        [$myQueue->Remove][$myQueue->First]|[$myQueue->Size]
+        """,
+        context: &context
+    )
+    #expect(output == "Two|1")
+}
+
+@Test func stackFirstSizeAndAutoStringMatchTheLanguageGuidesWorkedExamplesLIFOOrder() async throws {
+    // Ch. 30 pp.413-414: Insert('One'), Insert('Two') then `->First` →
+    // "Two" (LIFO peek — the most recently inserted, unlike Queue's
+    // FIFO "One"), `->Size` → 2, `[String: $myStack]` → "Stack: One,
+    // Two" (still insertion order for the auto-string dump, per the
+    // Guide's own worked example — NOT peek order).
+    var context = LassoContext()
+    let output = try await LassoRenderer().render(
+        """
+        [var('myStack' = stack)][$myStack->Insert('One')][$myStack->Insert('Two')]\
+        [$myStack->First]|[$myStack->Size]|[string($myStack)]
+        """,
+        context: &context
+    )
+    #expect(output == "Two|2|Stack: One, Two")
+}
+
+@Test func stackGetPopsAndDisplaysTheMostRecentlyInsertedElementMatchingTheGuidesTwoThenOneResult() async throws {
+    // Ch. 30 p.415: same disclosed `->Get` exception as Queue, but LIFO
+    // — pops "Two" (not "One"), leaving size 1.
+    var context = LassoContext()
+    let output = try await LassoRenderer().render(
+        """
+        [var('myStack' = stack)][$myStack->Insert('One')][$myStack->Insert('Two')]\
+        [$myStack->Get]|[$myStack->Size]
+        """,
+        context: &context
+    )
+    #expect(output == "Two|1")
+}
+
+@Test func stackRemoveDiscardsTheMostRecentlyInsertedElementSpecificallyNotJustAnyElement() async throws {
+    // Same order-verification gap code review flagged for Queue->Remove
+    // above, mirrored for Stack: `->Remove` is LIFO (removes 'Two', not
+    // 'One'), confirmed via `->First` on the survivor afterward rather
+    // than size alone.
+    var context = LassoContext()
+    let output = try await LassoRenderer().render(
+        """
+        [var('myStack' = stack)][$myStack->Insert('One')][$myStack->Insert('Two')]\
+        [$myStack->Remove][$myStack->First]|[$myStack->Size]
+        """,
+        context: &context
+    )
+    #expect(output == "One|1")
+}
+
+@Test func listContainsMatchesAnElementByValueEqualityNotReferenceIdentity() async throws {
+    var context = LassoContext()
+    let output = try await LassoRenderer().render(
+        "[(list: 'Uno', 'Dos', 'Tres')->Contains('Dos')]|[(list: 'Uno', 'Dos', 'Tres')->Contains('Cero')]",
+        context: &context
+    )
+    #expect(output == "true|false")
+}
+
+@Test func setFindReturnsANewSetOfMatchesNotAnArrayUnlikeListFind() async throws {
+    // Table 16: "[Set->Find] Returns a SET of elements that match" —
+    // deliberately distinct from List->Find, which returns a plain
+    // array (Table 5). Asserting the auto-string prefix is "Set:" (not
+    // bare/array-shaped output) is what actually distinguishes this
+    // from a copy-pasted List->Find implementation, which is exactly
+    // the regression code review flagged this as having zero coverage
+    // against.
+    var context = LassoContext()
+    let output = try await LassoRenderer().render(
+        """
+        [var('mySet' = set)][$mySet->Insert('Alpha')][$mySet->Insert('Beta')][$mySet->Insert('Gamma')]\
+        [string($mySet->Find('Beta'))]
+        """,
+        context: &context
+    )
+    #expect(output == "Set: (Beta)")
+}
+
+@Test func setContainsGetAndRemoveAllMatchTheirOwnTableDescriptions() async throws {
+    // Table 16: `->Contains` (boolean membership test), `->Get` (1-
+    // based positional getter — sets are always sorted, so position 1
+    // of {Alpha,Beta,Gamma} is 'Alpha'), `->RemoveAll` (VALUE-based,
+    // unlike `->Remove`'s position-based removal — removes every
+    // matching element, "Returns no value").
+    var context = LassoContext()
+    let output = try await LassoRenderer().render(
+        """
+        [var('mySet' = set)][$mySet->Insert('Alpha')][$mySet->Insert('Beta')][$mySet->Insert('Gamma')]\
+        [$mySet->Contains('Beta')]|[$mySet->Get(1)]|\
+        [$mySet->RemoveAll('Beta')][$mySet->Size]|[string($mySet)]
+        """,
+        context: &context
+    )
+    #expect(output == "true|Alpha|2|Set: (Alpha), (Gamma)")
+}
+
+@Test func seriesConstructorProducesAnInclusiveAscendingArrayMatchingTheGuidesTenElementExample() async throws {
+    // Ch. 30 p.413: `[Series(1, 10)]` produces 10 elements from 1 to 10
+    // inclusive. Implemented as a plain `.array` (not object-wrapped)
+    // per the same page's "supports the same member tags as the array
+    // data type" — so this test exercises `->join` (an existing Array
+    // member) rather than the Guide's own bare-cast "Series: (1),
+    // (2)..." per-element-parens format, which is deliberately not
+    // reproduced (see `LassoCollectionValue.autoStringDescription`'s
+    // doc comment).
+    var context = LassoContext()
+    let output = try await LassoRenderer().render(
+        "[(series(1, 10))->size]|[(series(1, 10))->join(',')]",
+        context: &context
+    )
+    #expect(output == "10|1,2,3,4,5,6,7,8,9,10")
+}
+
+@Test func setDeduplicatesRepeatedInsertsMatchingTheGuidesOneThreeWorkedExample() async throws {
+    // Ch. 30 p.411: inserting 'Three' three times still yields only two
+    // elements — "the multiple inserts of Three are ignored since the
+    // set can only contain unique values" — dedup via `lassoEquals`,
+    // no new Hashable infrastructure.
+    var context = LassoContext()
+    let output = try await LassoRenderer().render(
+        """
+        [var('mySet' = set)][$mySet->Insert('One')][$mySet->Insert('Three')]\
+        [$mySet->Insert('Three')][$mySet->Insert('Three')]\
+        [$mySet->Size]|[string($mySet)]
+        """,
+        context: &context
+    )
+    #expect(output == "2|Set: (One), (Three)")
+}
+
+@Test func setDifferenceIntersectionAndUnionMatchTheGuidesFirstSetSecondSetWorkedExamples() async throws {
+    // Ch. 30 p.412: FirstSet={Alpha,Beta,Gamma}, SecondSet={Beta,Gamma,
+    // Delta}. Each of Difference/Intersection/Union duplicates FirstSet
+    // as ResultSet, calls the operation as a bare statement (no
+    // reassignment), then displays $ResultSet — exercising the same
+    // self-mutating write-back mechanism as everything else in this
+    // set, now widened to cover these three method names too.
+    var context = LassoContext()
+    let output = try await LassoRenderer().render(
+        """
+        [var('FirstSet' = set)][$FirstSet->Insert('Alpha')][$FirstSet->Insert('Beta')][$FirstSet->Insert('Gamma')]\
+        [var('SecondSet' = set)][$SecondSet->Insert('Beta')][$SecondSet->Insert('Gamma')][$SecondSet->Insert('Delta')]\
+        [var('ResultSet' = $FirstSet)][$ResultSet->Difference($SecondSet)][$ResultSet]|\
+        [var('ResultSet' = $FirstSet)][$ResultSet->Intersection($SecondSet)][$ResultSet]|\
+        [var('ResultSet' = $FirstSet)][$ResultSet->Union($SecondSet)][$ResultSet]
+        """,
+        context: &context
+    )
+    #expect(output == "Set: (Alpha)|Set: (Beta), (Gamma)|Set: (Alpha), (Beta), (Delta), (Gamma)")
+}
+
+@Test func setConstructorWithNoArgumentsIsEmptyAndBareIdentifierResolvesToAnEmptySet() async throws {
+    // Same bare-identifier confirmation as List above, but for `set` —
+    // the exact real-corpus shape `includes/detail_a_sku.lasso` used
+    // (`var('skuArrayColor' = set)`) that originally motivated this
+    // whole file (the old placeholder `set(...)` registration didn't
+    // dedup at all; see this file's own top-level doc comment).
+    var context = LassoContext()
+    let output = try await LassoRenderer().render(
+        "[(set)->size]|[var('x' = set)][$x->size]",
+        context: &context
+    )
+    #expect(output == "0|0")
+}
+
