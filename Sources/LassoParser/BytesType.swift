@@ -37,6 +37,19 @@ enum LassoBytesValue {
         return Array(data)
     }
 
+    /// lassoguide.com's byte-streams docs document several member methods
+    /// (`->find`/`->contains`/`->beginsWith`/`->endsWith`/`->split`/
+    /// `->append`/`->replace`) as accepting EITHER a `bytes` object or a
+    /// plain `string` for their "needle"/data parameter — this extracts
+    /// raw bytes from either representation uniformly (a plain string's
+    /// raw UTF-8 bytes, or another `bytes` object's own raw content).
+    static func rawBytes(from value: LassoValue) -> [UInt8] {
+        if case let .object(instance) = value, instance.typeName == typeName {
+            return rawBytes(from: instance)
+        }
+        return Array(value.outputString.utf8)
+    }
+
     /// Lossy UTF-8 decode of the current raw byte content — used for both
     /// bare output (`[$myBytes]`) and `string(bytesValue)`, matching the
     /// same documented fallback `includeBytes` already uses for the same
