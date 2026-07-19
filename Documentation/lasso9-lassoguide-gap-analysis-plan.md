@@ -6,6 +6,23 @@ Built a ground-truth inventory directly from lassoguide.com 9.3 (Language Guide 
 
 **Headline finding**: the corpus-driven approach built a real, well-engineered *tag/parsing/runtime infrastructure* (control-flow blocks, custom tags/types, sessions, datasources, includes) but the *primitive value method surface* — the actual `->` methods real Lasso code calls constantly on strings/arrays/maps/integers/decimals/dates — is a small fraction of what's documented. `Evaluator.member` (the one function handling every `->` call on a non-object value) implements roughly 20 string methods, 4 array methods, and 2 map/pair methods total, against LassoGuide's ~140 documented. This is exactly the blind spot the task predicted: a site whose corpus never happens to call `->sort`, `->find`, `math_round`, `->beginsWith`, etc. will never surface these gaps through crawling, yet they are foundational, frequently-used language surface.
 
+## Implementation status (2026-07-18 — branch `language-primitives-p0-batch`)
+
+The Top-10 list's overlap with `lasso85-gap-analysis-plan.md` was implemented as a first pass, each item reviewed by an application architect, a Swift concurrency reviewer, and a standard code reviewer before landing (see that doc's own status section for the same list from the classic-tag side):
+
+- **✅ DONE — #1 `loop_abort()`/`loop_continue()`** (Section 7) — plus `loop_key()`. Correctly scoped to the nearest enclosing loop; a stray call with no enclosing loop is a true no-op (an early draft let it truncate the rest of the page); a call inside a called custom tag with no loop of its own can't leak out and hijack the caller's loop (an early draft let it).
+- **✅ DONE — #2 `date->year()`/`->month()`/etc. field accessors** (Section 4) — plus `->dayOfWeek`/`->asInteger`.
+- **✅ DONE — #3 `array->sort`/`->join`** (Section 2) — plus `->last`/`->second`/`->reverse`/`->contains`/`->find`/`->findPosition`/`->remove`/`->removeAll`. `map->keys`/`->values` also done (see #9 below).
+- **✅ DONE — #4 `date_add`/`date->add`** (date arithmetic) — plus `date_subtract`/`date->subtract`. A real aliasing bug was found and fixed: mutating a date object's own class instance in place silently corrupted any other variable referencing the same object after `var(d2 = $d1)` — real Lasso's assignment semantics are copy, not alias, per the Language Guide's own "References" section (aliasing is only ever the explicit, opt-in `[Reference]`/`@` mechanism).
+- **Still open — #5 `string->find`/`->beginsWith`/`->endsWith`** (Section 1) — not reached in this pass; string method expansion beyond what already existed was out of scope for the P0 batch actually implemented.
+- **✅ DONE — #6 `math_*` free-function family** — `abs`/`min`/`max`/`round`/`floor`/`ceil`/`sqrt`/`random`/`add`/`sub`/`mult`/`div`/`mod`/`pow`, verified against the Lasso 8.5 Language Guide's own worked examples (one confirmed real documentation defect found in `Math_Div`'s page-370 examples, not followed). A pre-existing, unrelated interpreter-wide bug was found and fixed during this work: unary minus always returned a decimal regardless of the operand's type, silently downgrading integer literals like `-5` (`Math_Add(-5, 3)` printed `-2.0`, not `-2`).
+- **Still open — #7 `regexp` type + `string->findRegExp`/`->replaceRegExp`** (Section 5) — not touched.
+- **Still open — #8 Captures** (Section 6) — not touched; remains the single biggest structural gap.
+- **✅ DONE — #9 `array->remove`/`->removeAll` and `map->remove`/`->size`/`->contains`** (Section 2) — plus `map->keys`/`->values`/`->find`. A real, more serious bug was found and fixed here: giving `map->remove`/`->removeall` the same key-first priority as `->size`/`->keys` would have let a map with a literal `"remove"` key silently overwrite the entire variable (not just misread a value) via the self-mutating write-back mechanism — fixed by keeping those two unconditional, matching `->insert`'s existing precedent, while `->size`/`->keys`/`->values`/`->contains`/`->find` stay key-first (a map with a literal `"size"` key — confirmed real, via `file_uploads->get(1)->size` — needs that to keep working).
+- **Still open — #10 Type introspection (`->isA`, `->hasMethod`, `->type()`)** (Section 6) — not touched.
+
+Everything else below (String iteration/capture-dependent methods, the full Array/List/Set/Stack/Queue/Duration/Regexp/Traits/Query-Expression subsystems, most of Error Handling beyond what's tracked) is still open, unchanged from the original analysis below.
+
 ---
 
 ## 1. String Methods
