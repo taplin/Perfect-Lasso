@@ -260,6 +260,114 @@ struct Evaluator {
         return .object(object)
     }
 
+    /// `.object`'s own `typeName` (e.g. "regexp", "date", or a custom
+    /// user-defined type's name) is returned exactly as registered/
+    /// defined — lassoguide.com's own doc says `null->type()` "Returns...
+    /// the name that was used when the type was defined." Every other
+    /// case is capitalized to match the Lasso 8.5 Language Guide's own
+    /// worked examples verbatim (Ch. 43 p.560: `[123->Type] → Integer`,
+    /// `[123.456->Type] → Decimal`, `['String'->Type] → String`,
+    /// `[Null->Type] → Null`, `[(Array: 1,2,3)->Type] → Array`) —
+    /// `.boolean`/`.map`/`.pair` have no worked example in the Guide but
+    /// follow the same capitalization convention.
+    static func introspectionTypeName(for value: LassoValue) -> String {
+        if case .object = value { return value.typeName }
+        return value.typeName.prefix(1).uppercased() + value.typeName.dropFirst()
+    }
+
+    /// `Null->Type`/`->IsA`/`->IsNotA`/`->HasMethod` (Lasso 8.5 Language
+    /// Guide Ch. 43 Table 6 "Null Member Tags", pp.559-560; `->IsNotA`
+    /// and `->HasMethod` verified against lassoguide.com's Lasso 9
+    /// "Type/Object Introspection Methods" section, since 8.5's table
+    /// doesn't list them). Returns `nil` when `normalized` isn't one of
+    /// these four names, so every call site below treats it as a
+    /// LOW-PRIORITY fallback — checked only after real data/methods have
+    /// already had a chance to match: `.map`'s existing key-first design
+    /// (a literal `"type"` key, e.g. a file upload's content type, must
+    /// still win — an earlier version that checked this unconditionally
+    /// broke exactly that, caught by
+    /// `fileUploadsExposeMetadataUnderBothLasso9And8KeyNames` failing)
+    /// and `.object`'s existing native-method-then-custom-method chain
+    /// (a real user-defined `type`/`isA` method, however unlikely, wins
+    /// too). This codebase has no type-inheritance/trait model at all (a
+    /// custom `define_type`'s parent/base names are parsed but not yet
+    /// acted on — see Renderer.swift's own "define_type" case), so
+    /// `->IsA` here matches Lasso 8.5's simpler documented semantics
+    /// ("Returns true if the object is of that type... or inherits from
+    /// that type") as a flat, case-insensitive exact-type-name match —
+    /// NOT Lasso 9's richer integer 0-3 trait/parent-aware return value.
+    private mutating func introspectionResult(
+        _ normalized: String,
+        _ value: LassoValue,
+        _ arguments: [LassoArgument]
+    ) async throws -> LassoValue? {
+        switch normalized {
+        case "type":
+            return .string(Self.introspectionTypeName(for: value))
+        case "isa", "isnota":
+            let requested = arguments.first != nil ? try await evaluate(arguments[0].value).outputString : ""
+            let matches = value.typeName.caseInsensitiveCompare(requested) == .orderedSame
+            return .boolean(normalized == "isa" ? matches : !matches)
+        case "hasmethod":
+            let requested = (arguments.first != nil ? try await evaluate(arguments[0].value).outputString : "").lowercased()
+            return .boolean(hasMethod(named: requested, on: value))
+        default:
+            return nil
+        }
+    }
+
+    /// `.object`: consults the SAME two registries the `.object` case
+    /// further below checks when actually dispatching a call (native
+    /// type methods, then a user-defined `define_type`'s methods) —
+    /// existence-only, no argument/overload matching. Primitives: no
+    /// unified per-type method registry exists here (each is a
+    /// hand-written `case` in `member()`'s own switch above), so this
+    /// consults a hand-maintained mirror of those case labels instead —
+    /// verified complete against `member()`'s switch as of this writing,
+    /// but NOT auto-derived from it, so a future member-case addition
+    /// needs a matching update here or `->HasMethod` will under-report.
+    /// `type`/`isA`/`isNotA`/`hasMethod` themselves are always reported
+    /// present, matching the Guide's own framing of these as base tags
+    /// "available for use with values of any data type" — every OTHER
+    /// Table 6 tag (`->Serialize`, `->Properties`, etc.) is intentionally
+    /// excluded since this stage doesn't implement them; claiming one
+    /// exists via `->HasMethod` while `->Serialize` itself still throws
+    /// would be worse than not answering at all.
+    private func hasMethod(named requested: String, on value: LassoValue) -> Bool {
+        if Self.introspectionMethodNames.contains(requested) { return true }
+        if case let .object(object) = value {
+            if context.nativeTypes.type(named: object.typeName)?.method(named: requested) != nil {
+                return true
+            }
+            if let type = context.tagRegistry.type(named: object.typeName) {
+                return type.methods.contains { $0.name.lowercased() == requested }
+            }
+            return false
+        }
+        return Self.primitiveMethodNames[value.typeName]?.contains(requested) ?? false
+    }
+
+    private static let introspectionMethodNames: Set<String> = ["type", "isa", "isnota", "hasmethod"]
+
+    private static let primitiveMethodNames: [String: Set<String>] = [
+        "string": [
+            "size", "uppercase", "lowercase", "asstring", "encodehtml", "encodeurl",
+            "encodesmart", "encodebreak", "encodexml", "encodestricturl", "encodesql",
+            "encodebase64", "decodebase64", "contains", "beginswith", "endswith",
+            "equals", "compare", "comparecodepointorder", "find", "get", "split",
+            "replace", "append", "trim", "padleading", "padtrailing", "removeleading",
+            "removetrailing", "reverse", "titlecase", "substring", "sub",
+        ],
+        "integer": ["asstring", "ceil"],
+        "decimal": ["asstring", "ceil"],
+        "pair": ["first", "second"],
+        "array": [
+            "size", "first", "insert", "get", "last", "second", "reverse", "sort",
+            "join", "contains", "find", "findposition", "remove", "removeall",
+        ],
+        "map": ["insert", "remove", "removeall", "size", "keys", "values", "contains", "find"],
+    ]
+
     private mutating func invokeMemberMethod(
         named name: String,
         on object: LassoObjectInstance,
@@ -478,7 +586,13 @@ struct Evaluator {
             // Lasso 8-style graceful degradation actually lives: treat it
             // as an empty string for member access, matching how it
             // already behaves for truthiness (`false`) and string output
-            // (`""`) elsewhere in this runtime.
+            // (`""`) elsewhere in this runtime. This redirect means
+            // `void->Type`/`->IsA`/`->HasMethod` report `"String"`/
+            // string-typed answers rather than surfacing "this was a
+            // lookup miss" — a deliberate extension of the same
+            // graceful-degradation tradeoff already made above, not a
+            // new one introduced by `introspectionResult` (flagged and
+            // confirmed intentional by architect review).
             return try await member(.string(""), name, arguments)
         case let (.string(value), "size"): return .integer(value.count)
         case let (.string(value), "uppercase"): return .string(value.uppercased())
@@ -927,20 +1041,37 @@ struct Evaluator {
         // (`TypeSystem.swift`'s `data[name.lowercased()] ?? .null`),
         // the more relevant precedent given `.map`'s dual use as a
         // record/object-like container for request/upload metadata.
-        case (.map, _): return .null
+        // `introspectionResult` is checked first so `->Type`/`->IsA`/
+        // `->HasMethod` still work on a map — but only after the
+        // key-first case above has already had first refusal, so a real
+        // key named "type" (e.g. a file upload's content type) keeps
+        // winning exactly as it did before this fallback existed.
+        case (.map, _):
+            if let introspected = try await introspectionResult(normalized, base, arguments) { return introspected }
+            return .null
         case let (.object(object), _):
             if let nativeMethod = context.nativeTypes.type(named: object.typeName)?.method(named: name) {
                 let evaluatedArguments = try await evaluate(arguments)
                 return try await nativeMethod(object, evaluatedArguments, &context)
             }
-            guard let type = context.tagRegistry.type(named: object.typeName) else {
-                return object.value(for: name)
-            }
-            if let value = try await invokeMemberMethod(named: name, on: object, type: type, arguments: arguments) {
+            if let type = context.tagRegistry.type(named: object.typeName),
+               let value = try await invokeMemberMethod(named: name, on: object, type: type, arguments: arguments) {
                 return value
             }
+            // A real native/custom-defined method (checked above) wins
+            // over the synthetic introspection tags, which in turn win
+            // over a plain data-field fallback — matching this case's
+            // existing method-before-field priority (native method, then
+            // custom method, then raw field) rather than `.map`'s
+            // key-first design: unlike `.map`, `.object` already treats
+            // methods as taking priority over generic field access, and
+            // no real corpus type defines a data member literally named
+            // "type"/"isa"/"isnota"/"hasmethod".
+            if let introspected = try await introspectionResult(normalized, base, arguments) { return introspected }
             return object.value(for: name)
-        default: throw LassoRuntimeError.unsupportedExpression("Member \(name)")
+        default:
+            if let introspected = try await introspectionResult(normalized, base, arguments) { return introspected }
+            throw LassoRuntimeError.unsupportedExpression("Member \(name)")
         }
     }
 

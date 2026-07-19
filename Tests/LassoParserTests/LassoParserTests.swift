@@ -7222,3 +7222,144 @@ struct IncludeURLTests {
     }
 }
 
+@Test func typeReturnsCapitalizedTypeNameMatchingTheLanguageGuidesOwnWorkedExamples() async throws {
+    // Lasso 8.5 Language Guide Ch. 43 Table 6 / p.560, exact worked
+    // examples: `[123->Type] -> Integer`, `[Output: 123.456->Type] ->
+    // Decimal`, `['String'->Type] -> String`, `[Null->Type] -> Null`,
+    // `[(Array: 1, 2, 3)->Type] -> Array`.
+    var context = LassoContext()
+    let output = try await LassoRenderer().render(
+        "[123->type]|[123.456->type]|['String'->type]|[Null->type]|[(Array(1,2,3))->type]",
+        context: &context
+    )
+    #expect(output == "Integer|Decimal|String|Null|Array")
+}
+
+@Test func typeReturnsTheRegisteredNativeTypeNameUnmodifiedForObjectInstances() async throws {
+    // lassoguide.com's Lasso 9 "Type/Object Introspection Methods":
+    // "Returns the type name for any type instance. The value is the
+    // name that was used when the type was defined" — native types are
+    // registered lowercase (see NativeTypes.swift's `makeRegExpType`),
+    // so unlike the primitive-literal capitalization above, this is
+    // returned as-is, not capitalized.
+    var context = LassoContext()
+    let output = try await LassoRenderer().render(
+        "[var(re = RegExp(-Find='a'))][$re->type]",
+        context: &context
+    )
+    #expect(output.trimmingCharacters(in: .whitespacesAndNewlines) == "regexp")
+}
+
+@Test func isAMatchesTheValuesOwnTypeNameCaseInsensitivelyAndIsNotAIsItsOpposite() async throws {
+    // Ch. 43 Table 6: "[Null->IsA] Requires a type name as a parameter.
+    // Returns true if the object is of that type or inherits from that
+    // type." This interpreter has no type-inheritance model (see the
+    // doc comment on `member()`'s "isa"/"isnota" case), so only the
+    // exact-type-name half is exercised here. `->IsNotA` per
+    // lassoguide.com: "The opposite of null->isA."
+    var context = LassoContext()
+    let output = try await LassoRenderer().render(
+        "[('hello')->isA('string')]|[('hello')->isA('String')]|[(123)->isA('integer')]|[(123)->isA('string')]|[('hello')->isNotA('string')]|[('hello')->isNotA('integer')]",
+        context: &context
+    )
+    #expect(output == "true|true|true|false|false|true")
+}
+
+@Test func hasMethodReportsTrueForRealMemberMethodsAndFalseForUnknownOnes() async throws {
+    var context = LassoContext()
+    let output = try await LassoRenderer().render(
+        "[('hello')->hasMethod('uppercase')]|[('hello')->hasMethod('notarealmethod')]|[(Array(1,2))->hasMethod('sort')]|[(Array(1,2))->hasMethod('notarealmethod')]",
+        context: &context
+    )
+    #expect(output == "true|false|true|false")
+}
+
+@Test func typeIsAAndHasMethodAreThemselvesAlwaysReportedAvailable() async throws {
+    // "the null data type is the base type for all other data types...
+    // All of the tags of the null data type are available for use with
+    // values of any data type" (Ch. 43, introducing Table 6) — so
+    // ->HasMethod must report its own sibling introspection tags as
+    // present on every type, not just the type-specific methods listed
+    // in `Evaluator.primitiveMethodNames`.
+    var context = LassoContext()
+    let output = try await LassoRenderer().render(
+        "[(123)->hasMethod('type')]|[(123)->hasMethod('isA')]|[(123)->hasMethod('isNotA')]|[(123)->hasMethod('hasMethod')]",
+        context: &context
+    )
+    #expect(output == "true|true|true|true")
+}
+
+@Test func hasMethodTypeAndIsAWorkOnACustomUserDefinedType() async throws {
+    // Scrubbed down from the same js_timer.inc shape used by
+    // `legacyDefineTypeColonCallRegistersTypeAndMethods` above.
+    // `->HasMethod` for `.object` instances consults the user-defined
+    // type's own registered methods (not the hand-maintained primitive
+    // table), and `->Type` returns the name exactly as it was passed to
+    // `Define_Type` (case preserved, not capitalized like the
+    // primitive-literal worked examples above).
+    var context = LassoContext()
+    let output = try await LassoRenderer().render(
+        """
+        [
+        define_type: 'Ex_Timer', 'integer', -prototype;
+            local: 'ticks'=0;
+            define_tag: 'bump';
+                (self->'ticks') = (self->'ticks') + 1;
+            /define_tag;
+        /define_type;
+        ]
+        [Local(t = Ex_Timer())][#t->type]|[#t->isA('Ex_Timer')]|[#t->hasMethod('bump')]|[#t->hasMethod('notarealmethod')]
+        """,
+        context: &context
+    ).trimmingCharacters(in: .whitespacesAndNewlines)
+
+    #expect(output == "Ex_Timer|true|true|false")
+}
+
+@Test func typeIsAAndHasMethodReachTheOuterDefaultFallbackForBooleanAndPair() async throws {
+    // `.boolean` and `.pair` have no dedicated case anywhere in
+    // `member()`'s own switch, so these three tags are ONLY reachable
+    // for them via the outer switch's final `default:` fallback —
+    // locking that path in directly (architect review flagged it as
+    // otherwise unverified by any test) rather than relying on it being
+    // exercised incidentally by the primitive-literal tests above.
+    var context = LassoContext()
+    let output = try await LassoRenderer().render(
+        "[(true)->type]|[(true)->isA('boolean')]|[(true)->hasMethod('type')]|[(Pair(1,2))->type]|[(Pair(1,2))->isA('pair')]",
+        context: &context
+    )
+    #expect(output == "Boolean|true|true|Pair|true")
+}
+
+@Test func typeWorksOnAMapWithNoKeyCollidingWithTheTagName() async throws {
+    // The other `.map` coverage above (`hasMethodReportsTrueForRealMemberMethodsAndFalseForUnknownOnes`
+    // and the pre-existing `fileUploadsExposeMetadataUnderBothLasso9And8KeyNames`)
+    // only exercises the key-collision side of `.map`'s key-first
+    // priority. This locks in the OTHER side: a map with no `"type"`
+    // key must still reach `introspectionResult`'s fallback rather than
+    // falling all the way through to the unconditional `.null` the
+    // `.map` case returns for any other genuinely unknown member.
+    var context = LassoContext()
+    let output = try await LassoRenderer().render(
+        "[(Map('a'=1))->type]|[(Map('a'=1))->hasMethod('type')]",
+        context: &context
+    )
+    #expect(output == "Map|true")
+}
+
+@Test func voidTypeDegradesGracefullyLikeItsOtherMemberAccessesInsteadOfThrowing() async throws {
+    // Regression-locks a deliberate, disclosed extension of the
+    // existing void-degrades-to-empty-string convention (see the
+    // `(.void, _)` case's own doc comment) rather than leaving it as an
+    // unexamined side effect of adding these tags, per architect
+    // review. `action_param('missing')` is the same real-corpus
+    // lookup-miss source `voidLookupMissBehavesLikeEmptyStringButNullStaysStrict`
+    // already uses above.
+    var context = LassoContext()
+    let output = try await LassoRenderer().render(
+        "[action_param('missing')->type]|[action_param('missing')->hasMethod('uppercase')]",
+        context: &context
+    )
+    #expect(output == "String|true")
+}
+
