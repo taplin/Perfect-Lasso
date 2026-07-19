@@ -124,7 +124,7 @@ Parameter mapping, corrected per review:
 | `-host`/`-port`/`-username`/`-password` | **Substantially revised per security review, see §5 — no longer "operator opt-in flag for an arbitrary caller-supplied host."** |
 | `-timeout` | Maps to `RelayConfig`'s connect timeout; document that per-phase timeouts aren't independently reachable through this one param. |
 | `-ssl` | `true` → `.startTLS` unless `-port=465`, then `.implicit`; `false`/absent → configured relay's own `tls` mode. |
-| `-date` | No Perfect-SMTP equivalent. Either `LassoEmailJobTracker`-based scheduling (Phase E) or explicit "not yet supported" error in Phase A — decide explicitly (§7 item 2, unchanged). |
+| `-date` | No Perfect-SMTP equivalent. **Resolved (no longer open, §7 item 2): Phase A throws an explicit "not yet supported" error for `-date` rather than silently sending immediately.** Real scheduling lands in Phase E once `LassoEmailJobTracker` exists — scheduling genuinely needs that machinery to do correctly (a due-time to wait on, a way to observe/cancel the pending send), so it shouldn't be bolted onto Phase A just to avoid the error message. |
 | `-simpleform` | Should work naturally with both bodies nil — verify `MIMEComposer` doesn't reject an empty-body message. |
 | `-ContentDisposition` (8.5) | `EmailMessage.defaultDisposition`. |
 
@@ -222,7 +222,7 @@ Each phase gets its own branch and its own milestone review (architecture, concu
 ## 7. Open decisions requiring explicit sign-off before implementation starts
 
 1. **`email_smtp`'s design (§4.8)** — now recommended: direct unpooled dialing via already-public `SMTPBootstrap.connect`/`SMTPConnection`, with explicit in-place mutation (option (a)) on the native-type object — corrected from the first draft's stateless-envelope recommendation, which was based on an inaccurate premise.
-2. **`-date` scheduled-send (§4.3)** — job-tracker scheduling in Phase E vs. explicit "not yet supported" error in Phase A. Unchanged from first draft.
+2. **`-date` scheduled-send (§4.3)** — **resolved, no longer open**: Phase A throws an explicit "not yet supported" error; real scheduling lands in Phase E alongside `LassoEmailJobTracker`, which it genuinely depends on.
 3. **`-host`/relay-selection posture (§4.3, §5)** — **resolved by review, no longer open**: named relays only, never a literal caller-supplied host, with a `DirectMXTransport`-routed escape hatch (never `RelayTransport`) if literal-host support is ever genuinely needed.
 4. **Attachment path-containment policy (§4.5)** — **resolved by review, no longer open**: reuse `LassoSiteServer`'s existing `isWithinRoot`, add regular-file+TOCTOU handling and a count ceiling on top of the byte ceiling.
 5. **`-contentType`/`-transferEncoding` landing spot (§4.3)** — new open decision from review: scope out with an explicit error (recommended for the initial release) vs. a small, separately-scoped addition to Perfect-SMTP's own public `EmailMessage` surface.
