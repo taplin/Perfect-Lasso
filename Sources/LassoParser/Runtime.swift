@@ -449,6 +449,17 @@ public struct LassoNativeRegistry: Sendable {
                 arguments.first?.value.outputString ?? ""
             return context.requestProvider?.parameter(named: name) ?? .void
         }
+        // Real Lasso's action_params(): every submitted name/value pair as
+        // an ordered array, POST before GET (same precedence as
+        // action_param's own combined lookup) -- unlike the dictionary-
+        // shaped parameter(named:) above, this preserves duplicate names
+        // and ordering, since real corpus code (e.g.
+        // includes/send_debug_email.include.lasso) walks it with
+        // ->size/->get(n)->first/->second to log every submitted param.
+        register("action_params") { _, context in
+            let pairs = (context.requestProvider?.postPairs ?? []) + (context.requestProvider?.queryPairs ?? [])
+            return .array(pairs.map { .pair(.string($0.name), $0.value) })
+        }
         // Real Lasso 8's bare `server_name` global tag — same underlying
         // value `web_request->serverName` already exposes
         // (NativeTypes.swift), just also reachable without the

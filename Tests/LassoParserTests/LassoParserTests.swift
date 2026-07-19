@@ -3407,6 +3407,45 @@ func perfectCRUDConnectorFailuresBecomeInlineErrorFrames(source: String, expecte
     #expect(output == "from-post|term=from-post&color=red&color=blue|from-post|from-query|red,blue|2|red|red|red")
 }
 
+@Test func actionParamsReturnsOrderedPairsPostBeforeGet() async throws {
+    // Real corpus shape (includes/send_debug_email.include.lasso):
+    // Loop(action_params->size); ... action_params->get(n)->first/second ...
+    // -- action_params (plural) must be an ordered array of name/value
+    // pairs, duplicates and all, unlike action_param's dictionary-shaped
+    // single-value lookup. Previously unregistered entirely, so the bare
+    // identifier resolved to .null and ->size threw
+    // unsupportedExpression("Member size").
+    struct FormRequestProvider: LassoRequestProvider {
+        let queryPairs: [LassoRequestPair] = [
+            LassoRequestPair(name: "term", value: .string("from-query")),
+        ]
+        let postPairs: [LassoRequestPair] = [
+            LassoRequestPair(name: "color", value: .string("red")),
+            LassoRequestPair(name: "color", value: .string("blue")),
+        ]
+        func parameter(named name: String) -> LassoValue {
+            (postPairs + queryPairs).first { $0.name.caseInsensitiveCompare(name) == .orderedSame }?.value ?? .void
+        }
+        func header(named name: String) -> LassoValue { .void }
+        func cookie(named name: String) -> LassoValue { .void }
+        var parameters: [String: LassoValue] {
+            Dictionary((postPairs + queryPairs).map { ($0.name.lowercased(), $0.value) }, uniquingKeysWith: { first, _ in first })
+        }
+    }
+
+    var context = LassoContext(requestProvider: FormRequestProvider())
+    let output = try await LassoRenderer().render(
+        """
+        [action_params->size]|\
+        [action_params->get(1)->first]=[action_params->get(1)->second]|\
+        [action_params->get(2)->first]=[action_params->get(2)->second]|\
+        [action_params->get(3)->first]=[action_params->get(3)->second]
+        """,
+        context: &context
+    )
+    #expect(output == "3|color=red|color=blue|term=from-query")
+}
+
 @Test func fileUploadsExposeMetadataUnderBothLasso9And8KeyNames() async throws {
     // Documentation/session-upload-support-plan.md Milestone 1:
     // web_request->fileUploads() (Lasso 9 keys) and [file_uploads] (Lasso 8
