@@ -182,10 +182,20 @@ struct ScriptBodyParser {
 
         let body = readBalanced(open: "(", close: ")")
         let arguments = parseCallArguments(name: name, body: body)
+        // Only skip to the next line when no brace body was opened: once
+        // `consumeArrowBlockStartIfPresent()` has consumed the body's own
+        // opening `{`, we're positioned INSIDE that body, not on the
+        // opener line's trailer — an unconditional `skipLineRemainder()`
+        // here would blindly discard everything up to the next newline,
+        // silently swallowing the entire body (and, for a single-line
+        // `tag(...) => { ... }`, its closing `}` too) whenever the body
+        // sits on the same line as the opener. Multi-line bodies never hit
+        // this because the character right after `{` is already `\n`.
         if consumeArrowBlockStartIfPresent() {
             openBraceBlockStack.append(name)
+        } else {
+            skipLineRemainder()
         }
-        skipLineRemainder()
         nodes.append(.tag(name: name, arguments: arguments, closing: false, dialect: .lasso9, range: range))
         return true
     }
@@ -285,18 +295,31 @@ struct ScriptBodyParser {
             recordFire(name, form)
             let body = readBalanced(open: "(", close: ")")
             let arguments = parseCallArguments(name: name, body: body)
+            // See the matching comment in `parseBlockOpening`: skipping to
+            // the next line here is only correct when no brace body was
+            // just opened — otherwise it silently swallows a single-line
+            // `if(...) => { ... }` body (and its closing `}`) whole.
             if consumeArrowBlockStartIfPresent() {
                 openBraceBlockStack.append(name)
+            } else {
+                skipLineRemainder()
             }
-            skipLineRemainder()
             nodes.append(.tag(name: name, arguments: arguments, closing: false, dialect: .lasso9, range: range))
             return true
         case let .bareCondition(trimmedCondition):
+            // `classifyIfOpen` only ever returns `.bareCondition` after its
+            // own `consumeArrowBlockStartIfPresent()` call already
+            // succeeded (see that function's doc) — this case is always
+            // reached already positioned inside the freshly-opened brace
+            // body, so — unlike the sibling case above — there is no
+            // "no brace body was opened" branch to fall back to here at
+            // all; a `skipLineRemainder()` call in this case would
+            // unconditionally swallow the body whole on a single-line
+            // `if cond { ... }`, the same bug fixed above.
             recordFire(name, .bareCondition)
             openBraceBlockStack.append(name)
             var conditionParser = ExpressionParser(trimmedCondition)
             let conditionExpression = conditionParser.parseExpression()
-            skipLineRemainder()
             nodes.append(.tag(
                 name: name,
                 arguments: [LassoArgument(label: nil, value: conditionExpression)],
