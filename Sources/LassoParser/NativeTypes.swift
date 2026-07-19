@@ -411,6 +411,79 @@ extension LassoNativeTypeRegistry {
             return .string(LassoDateFormatting.format(components, using: format))
         }
 
+        // Field accessors (lassoguide.com 9.3 date-duration.html) — the
+        // six wall-clock fields were already stored on every `date`
+        // object (`LassoDateParsing.makeObject`) but had no way to read
+        // any of them back individually; `->format('%Y')`-style string
+        // formatting was the only option, forcing every date-comparison/
+        // date-math need through string parsing instead of a direct
+        // accessor. `->dayOfMonth` is a documented alias for `->day`.
+        for (methodName, keyPath) in [
+            ("year", \LassoDateComponents.year),
+            ("month", \LassoDateComponents.month),
+            ("day", \LassoDateComponents.day),
+            ("dayofmonth", \LassoDateComponents.day),
+            ("hour", \LassoDateComponents.hour),
+            ("minute", \LassoDateComponents.minute),
+            ("second", \LassoDateComponents.second),
+        ] {
+            type.register(methodName) { receiver, _, _ in
+                .integer((LassoDateParsing.dateComponents(from: receiver) ?? .now())[keyPath: keyPath])
+            }
+        }
+        type.register("dayofweek") { receiver, _, _ in
+            // Lasso's own Sunday=1...Saturday=7 numbering — see
+            // `LassoDateComponents.weekday`'s own doc comment.
+            .integer((LassoDateParsing.dateComponents(from: receiver) ?? .now()).weekday)
+        }
+        type.register("asinteger") { receiver, _, _ in
+            // Epoch seconds — needed for date comparison/sorting/
+            // serialization without round-tripping through a string.
+            .integer(Int((LassoDateParsing.dateComponents(from: receiver) ?? .now()).asDate.timeIntervalSince1970))
+        }
+
+        // `Date->Add`/`Date->Subtract` (Ch. 29 Table 7) — documented as
+        // mutating the invocant IN THE CALLING VARIABLE ("do not directly
+        // output values, but can be used to change the values of
+        // variables that contain date... data types") when called as a
+        // bare statement, and joins `Evaluator.selfMutatingMethods` below
+        // for exactly that reason.
+        //
+        // An earlier version of this mutated `receiver`'s own stored
+        // fields directly, reasoning that `date` objects are backed by
+        // `LassoObjectInstance` (a class — reference semantics) so no
+        // write-back mechanism should be needed. That reasoning was
+        // wrong and caused a real aliasing bug, caught by testing it
+        // directly: `var(d1 = Date(...))` / `var(d2 = $d1)` / `$d1->add(...)`
+        // also silently changed `$d2`, because plain assignment in this
+        // interpreter copies the `LassoValue.object` ENUM CASE but not
+        // the class instance it wraps — both variables end up pointing at
+        // the same `LassoObjectInstance`. Real Lasso's own documented
+        // model (Language Guide's "References" section) confirms plain
+        // assignment is supposed to copy, NOT alias — aliasing is an
+        // explicit, opt-in feature (`[Reference]`/`@`), never the default.
+        // The fix: never mutate `receiver` at all. Compute a genuinely
+        // NEW date object and return it as this method's plain result,
+        // exactly like `Array->Insert` already does for `.array` — the
+        // mutation-on-bare-statement illusion comes entirely from
+        // `Evaluator.evaluateStatement`'s existing write-back mechanism
+        // reassigning the CALLING variable to that new object, which
+        // never touches whatever other variable(s) still hold the old
+        // one. The documented `-Duration=` parameter form isn't supported
+        // — this interpreter has no `Duration` type yet (see
+        // Documentation/lasso9-lassoguide-gap-analysis-plan.md Section 4)
+        // — only the keyword-parameter form (`->Add(-Week=1)`).
+        type.register("add") { receiver, arguments, _ in
+            let components = LassoDateParsing.dateComponents(from: receiver) ?? .now()
+            let delta = LassoDateParsing.dateMathDelta(from: arguments, negate: false)
+            return .object(LassoDateParsing.makeObject(components.adding(delta)))
+        }
+        type.register("subtract") { receiver, arguments, _ in
+            let components = LassoDateParsing.dateComponents(from: receiver) ?? .now()
+            let delta = LassoDateParsing.dateMathDelta(from: arguments, negate: true)
+            return .object(LassoDateParsing.makeObject(components.adding(delta)))
+        }
+
         return type
     }
 

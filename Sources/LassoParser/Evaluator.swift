@@ -890,6 +890,16 @@ struct Evaluator {
         // lists (`->Sort`) and building a list from search results while
         // dropping already-seen SKUs (`->Remove`).
         "sort", "reverse", "remove", "removeall",
+        // `Date->Add`/`Date->Subtract` (Lasso 8.5 Language Guide Ch. 29
+        // Table 7) — documented as changing "the values of variables
+        // that contain date... data types" when called as a bare
+        // statement. This check is purely syntactic (AST shape + name),
+        // not type-scoped, so it's safe to share across every base type:
+        // only `date` objects actually register "add"/"subtract" methods
+        // (see `NativeTypes.makeDateType()`) — no `.array`/`.map`/
+        // `.string` member case uses either name, so this has no effect
+        // on those.
+        "add", "subtract",
     ]
 
     /// Best-effort ordering for `Array->Sort` — every numeric-parseable

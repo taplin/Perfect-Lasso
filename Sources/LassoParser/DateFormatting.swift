@@ -74,6 +74,17 @@ struct LassoDateComponents: Equatable, Sendable {
     var weekOfYear: Int {
         Self.referenceCalendar.component(.weekOfYear, from: asDate)
     }
+
+    /// Applies a `Date_Add`/`Date_Subtract`-style calendar delta (see
+    /// `LassoDateParsing.dateMathDelta(from:negate:)`) and returns the
+    /// resulting components — through the same fixed GMT
+    /// `referenceCalendar` every other date computation here uses, so
+    /// month/year-length and day-count arithmetic (e.g. `-Month=1` from
+    /// Jan 31) follows ordinary Gregorian calendar rules, not a naive
+    /// fixed-seconds shift.
+    func adding(_ delta: DateComponents) -> LassoDateComponents {
+        LassoDateComponents(date: Self.referenceCalendar.date(byAdding: delta, to: asDate) ?? asDate)
+    }
 }
 
 /// Parses a value into `LassoDateComponents`, matching Lasso 8.5's `[Date]`
@@ -142,6 +153,34 @@ enum LassoDateParsing {
             "minute": .integer(components.minute),
             "second": .integer(components.second),
         ])
+    }
+
+    /// Builds a Foundation `DateComponents` delta from `Date_Add`/
+    /// `Date_Subtract`/`Date->Add`/`Date->Subtract`'s documented keyword
+    /// parameters (Lasso 8.5 Language Guide Ch. 29 Table 6/7, confirmed by
+    /// reading the PDF directly): `-Second`/`-Minute`/`-Hour`/`-Day`/
+    /// `-Week`/`-Month`/`-Year`. `-Millisecond` is documented too but has
+    /// no effect here — this interpreter's date model is whole-seconds
+    /// only (`LassoDateComponents` has no sub-second field; see its own
+    /// doc comment). `negate` flips every present field for the Subtract
+    /// form, which the Guide documents as accepting the identical keyword
+    /// set as Add.
+    static func dateMathDelta(from arguments: [EvaluatedArgument], negate: Bool) -> DateComponents {
+        let sign = negate ? -1 : 1
+        var delta = DateComponents()
+        if let value = arguments.lastInt(named: "second") { delta.second = value * sign }
+        if let value = arguments.lastInt(named: "minute") { delta.minute = value * sign }
+        if let value = arguments.lastInt(named: "hour") { delta.hour = value * sign }
+        // Both additive (not a plain overwrite) so `-Day` and `-Week`
+        // combine correctly regardless of which is checked first —
+        // undocumented as a combination, but robust to reordering this
+        // way rather than depending on `-Day` being checked before
+        // `-Week` (flagged in architect review as a latent footgun).
+        if let value = arguments.lastInt(named: "day") { delta.day = (delta.day ?? 0) + value * sign }
+        if let value = arguments.lastInt(named: "week") { delta.day = (delta.day ?? 0) + value * 7 * sign }
+        if let value = arguments.lastInt(named: "month") { delta.month = value * sign }
+        if let value = arguments.lastInt(named: "year") { delta.year = value * sign }
+        return delta
     }
 
     static func dateComponents(from object: LassoObjectInstance) -> LassoDateComponents? {

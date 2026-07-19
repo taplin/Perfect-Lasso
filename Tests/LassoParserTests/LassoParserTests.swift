@@ -977,6 +977,116 @@ import PerfectSessionCore
     #expect(parts.count == 3 && parts[0].count == 2 && parts[1].count == 2 && parts[2].count == 4)
 }
 
+@Test func dateFieldAccessorsExposeTheAlreadyStoredComponents() async throws {
+    // lassoguide.com date-duration.html — `->year()`/`->month()`/`->day()`/
+    // `->hour()`/`->minute()`/`->second()`/`->dayOfWeek()` were entirely
+    // missing before this; `LassoDateComponents` already stored every one
+    // of these fields internally (`date_format` could always render them
+    // via `%Y`/`%m`/etc.), but there was no direct accessor — forcing any
+    // date-comparison/date-math need through string formatting instead.
+    // 2001-06-14 was a Thursday.
+    var context = LassoContext()
+    let output = try await LassoRenderer().render(
+        "[var(d = Date('2001-06-14 15:05:03'))]" +
+            "[$d->year]-[$d->month]-[$d->day]-[$d->dayOfMonth] " +
+            "[$d->hour]:[$d->minute]:[$d->second] dow=[$d->dayOfWeek]",
+        context: &context
+    )
+    #expect(output.contains("2001-6-14-14"))
+    #expect(output.contains("15:5:3"))
+    // Sunday=1...Saturday=7 (Lasso's own numbering, matches Calendar's
+    // .weekday for Gregorian) — Thursday is day 5.
+    #expect(output.contains("dow=5"))
+}
+
+@Test func dateAsIntegerReturnsEpochSeconds() async throws {
+    var context = LassoContext()
+    let output = try await LassoRenderer().render(
+        "[(Date('1970-01-02'))->asInteger]",
+        context: &context
+    )
+    #expect(output == "86400")
+}
+
+@Test func dateAddAndDateSubtractFreeTagsSupportEveryDocumentedUnit() async throws {
+    // Lasso 8.5 Language Guide Ch. 29 Table 6, confirmed by reading the
+    // PDF directly — first parameter is the date, keyword parameters name
+    // the unit(s) to add/subtract: -Second/-Minute/-Hour/-Day/-Week/
+    // -Month/-Year. Explicitly planned in this project's own backlog
+    // (Documentation/outstanding-compatibility-project-plans.md's Goal
+    // section) but never actually shipped until now.
+    var context = LassoContext()
+    let output = try await LassoRenderer().render(
+        "[Date_Add(Date('2002-05-22 14:02:05'), -Second=15)->format('%Q %T')]|" +
+            "[Date_Add(Date('2002-05-22 14:02:05'), -Day=15)->format('%Q')]|" +
+            "[Date_Add(Date('2002-05-22 14:02:05'), -Week=15)->format('%Q')]|" +
+            "[Date_Add(Date('2002-05-22 14:02:05'), -Month=6)->format('%Q')]|" +
+            "[Date_Add(Date('2002-05-22 14:02:05'), -Year=1)->format('%Q')]|" +
+            "[Date_Subtract(Date('2001-05-22 14:02:05'), -Second=15)->format('%Q %T')]",
+        context: &context
+    )
+    let parts = output.components(separatedBy: "|")
+    #expect(parts[0] == "2002-05-22 14:02:20")
+    #expect(parts[1] == "2002-06-06")
+    #expect(parts[2] == "2002-09-04")
+    #expect(parts[3] == "2002-11-22")
+    #expect(parts[4] == "2003-05-22")
+    #expect(parts[5] == "2001-05-22 14:01:50")
+}
+
+@Test func dateAddMemberMutatesTheInvocantInPlaceAndReturnsVoid() async throws {
+    // Ch. 29 Table 7: "[Date->Add] ... do not directly output values, but
+    // can be used to change the values of variables that contain date...
+    // data types" — unlike the free-tag form, this mutates in place.
+    var context = LassoContext()
+    let output = try await LassoRenderer().render(
+        "[var(d = Date('2002-05-22'))][$d->add(-Week=1)]after=[$d->format('%Q')]",
+        context: &context
+    )
+    // ->add itself prints nothing (returns void); the mutation is only
+    // visible through the variable afterward.
+    #expect(output == "after=2002-05-29")
+}
+
+@Test func dateSubtractMemberMutatesTheInvocantInPlace() async throws {
+    var context = LassoContext()
+    let output = try await LassoRenderer().render(
+        "[var(d = Date('2002-05-22'))][$d->subtract(-Day=1)]after=[$d->format('%Q')]",
+        context: &context
+    )
+    #expect(output == "after=2002-05-21")
+}
+
+@Test func dateAddDoesNotAliasAnotherVariableThatWasAssignedFromTheSameDate() async throws {
+    // Real bug: an earlier version of `->Add`/`->Subtract` mutated the
+    // receiver's own `LassoObjectInstance` fields directly (reasoning
+    // that `date` objects are class-backed, so no write-back was
+    // needed) — but plain variable assignment in this interpreter copies
+    // the `LassoValue.object` enum case, not the class instance it
+    // wraps, so `var(d2 = $d1)` leaves both variables pointing at the
+    // SAME instance. Mutating it in place made `$d1->add(...)` silently
+    // also change `$d2`. Real Lasso's own Language Guide "References"
+    // section confirms plain assignment is supposed to copy — aliasing
+    // is only ever the explicit, opt-in `[Reference]`/`@` mechanism, not
+    // the default. Fixed by never mutating the receiver: `->Add`/
+    // `->Subtract` now build a genuinely new date object and rely on
+    // `Evaluator.evaluateStatement`'s existing self-mutating write-back
+    // to reassign only the calling variable, exactly like `Array->Insert`
+    // already does for `.array`.
+    var context = LassoContext()
+    let output = try await LassoRenderer().render(
+        """
+        [var(d1 = Date('2002-05-22'))]
+        [var(d2 = $d1)]
+        [$d1->add(-Day=1)]
+        d1=[$d1->format('%Q')]|d2=[$d2->format('%Q')]
+        """,
+        context: &context
+    )
+    #expect(output.contains("d1=2002-05-23"))
+    #expect(output.contains("d2=2002-05-22"))
+}
+
 // lassoguide.com "Byte Streams" — `bytes(...)->decodeBase64`/
 // `->encodeBase64`/`->encodeUrl` are the only three members implemented,
 // matching the only three real corpus ever calls (confirmed by grepping

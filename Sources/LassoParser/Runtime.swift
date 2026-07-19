@@ -318,6 +318,24 @@ public struct LassoNativeRegistry: Sendable {
             components = LassoDateComponents(date: date)
             return .object(LassoDateParsing.makeObject(components))
         }
+        register("date_add") { arguments, _ in
+            // Lasso 8.5 Language Guide Ch. 29 Table 6: "First parameter is
+            // a Lasso date. Keyword/value parameters define what should
+            // be added" — real corpus need (Documentation/
+            // outstanding-compatibility-project-plans.md's own Goal
+            // section named this explicitly, but it was never actually
+            // shipped despite Date_Format/Date_LocalToGMT landing).
+            let positional = arguments.positionalValue(at: 0) ?? .void
+            let components = LassoDateParsing.parse(positional) ?? .now()
+            let delta = LassoDateParsing.dateMathDelta(from: arguments, negate: false)
+            return .object(LassoDateParsing.makeObject(components.adding(delta)))
+        }
+        register("date_subtract") { arguments, _ in
+            let positional = arguments.positionalValue(at: 0) ?? .void
+            let components = LassoDateParsing.parse(positional) ?? .now()
+            let delta = LassoDateParsing.dateMathDelta(from: arguments, negate: true)
+            return .object(LassoDateParsing.makeObject(components.adding(delta)))
+        }
         register("server_date") { _, _ in
             .object(LassoDateParsing.makeObject(.now()))
         }
