@@ -104,6 +104,10 @@ public final class PerfectBackedLassoSessionProvider: LassoSessionProvider, @unc
         restoredValues[name]?[varName]
     }
 
+    public func restoredVariables(session name: String) -> [String: LassoValue] {
+        restoredValues[name] ?? [:]
+    }
+
     public func persist(_ value: LassoValue, for varName: String, session name: String) {
         pendingSaveValues[name, default: [:]][varName] = value
         removedVarNames[name]?.remove(varName)

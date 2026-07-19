@@ -3939,6 +3939,95 @@ final class FullyRecordingResponseSink: LassoResponseSink, @unchecked Sendable {
     #expect(provider.lastCall?.name == "cart")
 }
 
+// Real Lasso (LassoGuide): "Once a variable has been added to a session
+// using the session_addVar method, its stored value will be set each time
+// the session_start method is called. The variable does not need to be
+// added to the session on each request, though it is safe to do so."
+// Confirmed live 2026-07-18 against the real site: checkout_shipping.page.lasso
+// never re-adds 'cart_id' itself (only setup_cust_cart.lasso, run from
+// cart.page.lasso, ever registers it), yet real Lasso still resolves
+// $cart_id there correctly -- session_start alone must restore it.
+@Test func sessionStartAutoRestoresAPreviouslyAddedVariableWithoutRecallingSessionAddvar() async throws {
+    final class SessionProvider: LassoSessionProvider, @unchecked Sendable {
+        func start(session name: String, call: LassoSessionStartCall) async -> LassoSessionStartResult? {
+            LassoSessionStartResult(sessionID: "fake-\(name)", isNew: false)
+        }
+        func id(session name: String) -> String? { "fake-\(name)" }
+        func restoredValue(for varName: String, session name: String) -> LassoValue? {
+            restoredVariables(session: name)[varName]
+        }
+        func restoredVariables(session name: String) -> [String: LassoValue] {
+            name == "scrubs" ? ["cart_id": .string("TX04-abc123")] : [:]
+        }
+        func persist(_ value: LassoValue, for varName: String, session name: String) {}
+        func removeVar(_ varName: String, session name: String) {}
+        func end(session name: String) {}
+        func abort(session name: String) {}
+    }
+    let provider = SessionProvider()
+    var context = LassoContext(sessionProvider: provider)
+    // No session_addvar('scrubs', 'cart_id') call anywhere -- session_start
+    // alone must make $cart_id resolve.
+    let output = try await LassoRenderer().render(
+        "[session_start(-Name='scrubs')]cart_id=[$cart_id]",
+        context: &context
+    )
+    #expect(output == "cart_id=TX04-abc123")
+}
+
+@Test func perfectBackedSessionProviderAutoRestoresVariablesOnSessionStartWithoutRecallingSessionAddvar() async throws {
+    let driver = MemorySessionDriver()
+
+    // Request 1: registers 'cart_id' via session_addvar (as setup_cust_cart.lasso
+    // does, only reachable from cart.page.lasso) and finalizes.
+    let firstBridge = PerfectBackedLassoSessionProvider(driver: driver, cookies: [:], remoteAddress: "", userAgent: "")
+    var firstContext = LassoContext(sessionProvider: firstBridge)
+    _ = try await LassoRenderer().render(
+        "[session_start('scrubs')][var(cart_id = 'TX04-abc123')][session_addvar('scrubs','cart_id')]",
+        context: &firstContext
+    )
+    let firstActions = await firstBridge.finalize()
+    guard let token = firstActions.first(where: { $0.call.name == "scrubs" })?.token else {
+        Issue.record("Expected a tracker token from finalize")
+        return
+    }
+
+    // Request 2: a different page (like checkout_shipping.page.lasso) that
+    // never calls session_addvar for 'cart_id' at all -- session_start
+    // alone must still restore it, and modifying it here must still be
+    // eligible to persist even without an explicit re-add.
+    let secondBridge = PerfectBackedLassoSessionProvider(
+        driver: driver,
+        cookies: ["_LassoSessionTracker_scrubs": token],
+        remoteAddress: "", userAgent: ""
+    )
+    var secondContext = LassoContext(sessionProvider: secondBridge)
+    let secondOutput = try await LassoRenderer().render(
+        "[session_start('scrubs')]cart_id=[$cart_id][var(cart_id = 'TX04-updated')]",
+        context: &secondContext
+    )
+    #expect(secondOutput == "cart_id=TX04-abc123")
+    let secondActions = await secondBridge.finalize()
+    guard let secondToken = secondActions.first(where: { $0.call.name == "scrubs" })?.token else {
+        Issue.record("Expected a tracker token from the second request's finalize")
+        return
+    }
+
+    // Request 3: confirms the modification made in request 2 (without ever
+    // calling session_addvar there) actually persisted.
+    let thirdBridge = PerfectBackedLassoSessionProvider(
+        driver: driver,
+        cookies: ["_LassoSessionTracker_scrubs": secondToken],
+        remoteAddress: "", userAgent: ""
+    )
+    var thirdContext = LassoContext(sessionProvider: thirdBridge)
+    let thirdOutput = try await LassoRenderer().render(
+        "[session_start('scrubs')]cart_id=[$cart_id]",
+        context: &thirdContext
+    )
+    #expect(thirdOutput == "cart_id=TX04-updated")
+}
+
 @Test func sessionAddvarResolvesNameKeywordAndPositionalVarNameCorrectly() async throws {
     // Real corpus shape: Session_Addvar(-Name='cart', 'sort_by') — the
     // session name is the -Name= keyword, the var name is the (only)
