@@ -481,6 +481,16 @@ public struct LassoNativeRegistry: Sendable {
             let pairs = (context.requestProvider?.postPairs ?? []) + (context.requestProvider?.queryPairs ?? [])
             return .array(pairs.map { .pair(.string($0.name), $0.value) })
         }
+        // Real Lasso's include_url — see NetworkRequests.swift for the
+        // full implementation and its documented parameter coverage. Real
+        // corpus: includes/efs_process.lasso's Authorize.net gateway call
+        // (`include_URL(url, -POSTParams=$HSI_GatewaySend)`), previously
+        // unregistered entirely (unknownFunction), which crashed before
+        // the page had any chance to reach its own separate Pair(...)
+        // gap (fixed earlier the same day).
+        register("include_url") { arguments, context in
+            try await LassoIncludeURL.perform(arguments, context: &context)
+        }
         // Real Lasso 8's bare `server_name` global tag — same underlying
         // value `web_request->serverName` already exposes
         // (NativeTypes.swift), just also reachable without the
