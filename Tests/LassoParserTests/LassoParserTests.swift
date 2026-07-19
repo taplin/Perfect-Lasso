@@ -510,6 +510,200 @@ import PerfectSessionCore
     #expect(emptyPassword.hasPrefix("0x"))
 }
 
+@Test func encryptMd5MatchesKnownVectors() async throws {
+    // Independently-verifiable cryptographic test vectors (RFC 1321's
+    // own test suite), not something requiring Lasso doc confirmation:
+    // md5("") and md5("abc").
+    var context = LassoContext()
+    let output = try await LassoRenderer().render(
+        "[Encrypt_MD5('')]|[Encrypt_MD5('abc')]",
+        context: &context
+    )
+    #expect(output == "d41d8cd98f00b204e9800998ecf8427e|900150983cd24fb0d6963f7d28e17f72")
+}
+
+@Test func encryptMd5AndCipherDigestOperateOnRawBytesNotALossyStringDecodeOfABytesObject() async throws {
+    // Regression test (found by architect review): an earlier version
+    // extracted the input via `.outputString`, which for a `.object`
+    // bytes value routes through `LassoBytesValue.string(from:)` — an
+    // explicitly-documented LOSSY UTF-8 decode — silently hashing
+    // mangled data instead of the real bytes. `->decodeHex` builds
+    // genuinely non-UTF-8-safe binary (bytes 0x00/0xFF aren't valid
+    // standalone UTF-8), so hashing it must match hashing those exact
+    // raw bytes directly, not a lossy re-decode of them.
+    // Independently computed (Python hashlib, not this codebase) for
+    // the raw two-byte sequence 0x00 0xFF.
+    var context = LassoContext()
+    let output = try await LassoRenderer().render(
+        "[Encrypt_MD5(bytes('00ff')->decodeHex)]|[Cipher_Digest(bytes('00ff')->decodeHex, -digest='sha256', -hex)]",
+        context: &context
+    )
+    #expect(output == "d07d34efac6328007ad67c7e0a985e00|06eb7d6a69ee19e5fbdf749018d3d2abfa04bcbd1365db312eb86dc7169389b8")
+}
+
+@Test func cipherDigestMatchesKnownVectorsForEachSupportedAlgorithm() async throws {
+    // lassoguide.com "Calculate a Digest Value": `cipher_digest(field('message'), -digest='DSA')`
+    // — DSA itself isn't implemented (see Hashing.swift's own scope
+    // disclosure), but this exercises the same -Digest keyword shape
+    // against algorithms this codebase does support, verified against
+    // independently-known SHA1/SHA256 test vectors.
+    var context = LassoContext()
+    let output = try await LassoRenderer().render(
+        "[Cipher_Digest('abc', -digest='sha1', -hex)]|[Cipher_Digest('abc', -digest='sha256', -hex)]",
+        context: &context
+    )
+    #expect(output == "a9993e364706816aba3e25717850c26c9cd0d89d|ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad")
+}
+
+@Test func cipherDigestReturnsABytesObjectByDefaultWithoutHex() async throws {
+    // "Returns... bytes" (lassoguide.com's own signature) — -Hex is an
+    // explicit opt-in to a string encoding, not the default shape.
+    var context = LassoContext()
+    let output = try await LassoRenderer().render(
+        "[Cipher_Digest('abc', -digest='md5')->type]",
+        context: &context
+    )
+    #expect(output == "bytes")
+}
+
+@Test func cipherDigestWithAnUnsupportedAlgorithmFailsGracefullyRatherThanCrashing() async throws {
+    // DSA/MD2/MD4/RIPEMD160 etc. are real, documented cipher_list(-digest)
+    // entries this codebase doesn't implement (see Hashing.swift's own
+    // disclosed scope) — must degrade to a recoverable error, not throw
+    // an unrelated fatal error or silently return a wrong value.
+    var context = LassoContext()
+    let output = try await LassoRenderer().render(
+        "[protect][Cipher_Digest('abc', -digest='dsa')][/protect][error_currenterror(-errorcode)]",
+        context: &context
+    )
+    #expect(output == "\(LassoErrorHandling.Code.invalidParameter)")
+}
+
+@Test func cipherEncryptAndCipherDecryptRoundTripWithAesAndFailWithAWrongKey() async throws {
+    // Real Lasso's own AES worked example uses `-cipher='DES-EDE3-CBC'`
+    // (3DES, not AES) — this codebase's cipher_encrypt/decrypt only
+    // implements AES via swift-crypto's AES-GCM (disclosed scope, see
+    // Hashing.swift), so this exercises the actual supported algorithm
+    // rather than the Guide's own specific worked example. Round-trip
+    // correctness plus a wrong-key failure are both independently
+    // verifiable properties, not something needing doc confirmation.
+    var context = LassoContext()
+    let roundTrip = try await LassoRenderer().render(
+        "[var(enc = Cipher_Encrypt('a secret message', -cipher='AES', -key='correct horse'))]" +
+        "[Cipher_Decrypt($enc, -cipher='AES', -key='correct horse')->asString]",
+        context: &context
+    )
+    #expect(roundTrip == "a secret message")
+
+    var wrongKeyContext = LassoContext()
+    let wrongKeyOutput = try await LassoRenderer().render(
+        "[var(enc = Cipher_Encrypt('a secret message', -cipher='AES', -key='correct horse'))]" +
+        "[protect][Cipher_Decrypt($enc, -cipher='AES', -key='wrong key')][/protect][error_currenterror(-errorcode)]",
+        context: &wrongKeyContext
+    )
+    #expect(wrongKeyOutput == "\(LassoErrorHandling.Code.invalidParameter)")
+}
+
+@Test func cipherEncryptUsesAFreshRandomNonceEachCallRatherThanAFixedOrReusedOne() async throws {
+    // A real cryptographic property worth locking in with a test, not
+    // just trusting AES.GCM.seal's documented behavior: encrypting the
+    // identical plaintext with the identical key twice must produce
+    // DIFFERENT ciphertext each time. A fixed/reused nonce would be a
+    // real vulnerability (AES-GCM catastrophically leaks the XOR of two
+    // plaintexts encrypted under the same key+nonce), so this isn't a
+    // cosmetic check.
+    var context = LassoContext()
+    let output = try await LassoRenderer().render(
+        "[var(first = Cipher_Encrypt('same message', -cipher='AES', -key='same key'))]" +
+        "[var(second = Cipher_Encrypt('same message', -cipher='AES', -key='same key'))]" +
+        "[$first->encodeHex->asString == $second->encodeHex->asString]",
+        context: &context
+    )
+    #expect(output == "false")
+}
+
+@Test func cipherEncryptAndDecryptRoundTripAnEmptyPlaintext() async throws {
+    // Regression test (caught by architect review): AES-GCM ciphertext
+    // length equals plaintext length exactly (no padding), so
+    // encrypting an empty string produces exactly `nonce + 0 +
+    // tag` bytes — an earlier version's bounds check in
+    // `cipherDecrypt` (`data.count > nonceSize + tagSize`) incorrectly
+    // rejected exactly this valid, minimum-length ciphertext.
+    var context = LassoContext()
+    let output = try await LassoRenderer().render(
+        "[var(enc = Cipher_Encrypt('', -cipher='AES', -key='a key'))]" +
+        "[Cipher_Decrypt($enc, -cipher='AES', -key='a key')->asString]",
+        context: &context
+    )
+    #expect(output == "")
+}
+
+@Test func cipherListReturnsTheActuallySupportedAlgorithmsNotTheFullRealLassoList() async throws {
+    // Deliberately does NOT claim real Lasso's full OpenSSL-backed list
+    // (DES/3DES/RC4/RC2/CAST5/RC5/etc.) — only what Hashing.swift's
+    // digest()/cipherEncrypt() functions actually support, so a script
+    // checking `cipher_list->contains(...)` before calling a cipher
+    // never gets a false positive.
+    var context = LassoContext()
+    let output = try await LassoRenderer().render(
+        "[(Cipher_List)->join(',')]|[(Cipher_List(-digest))->join(',')]",
+        context: &context
+    )
+    #expect(output == "MD5,SHA1,SHA256,SHA384,SHA512,AES|MD5,SHA1,SHA256,SHA384,SHA512")
+}
+
+@Test func jsonDeserializeInvertsJsonSerializeForEveryDocumentedVariableType() async throws {
+    // Documentation/session-upload-support-plan.md's own "Variable
+    // strategy" list — string/integer/decimal/boolean/array/map/null —
+    // is exactly what json_serialize/LassoValue.from(json:) already
+    // round-trip for session persistence; this exercises the same
+    // round trip through the new free tag.
+    // 'f'=0/'g'=1 alongside 'd'=true are the exact combination that
+    // regresses the `LassoValue.from(json:)` fix below if it's ever
+    // reintroduced: `NSNumber as? Bool` only succeeds for a value of
+    // exactly 0 or 1 (per SE-0170), so those two specific integers —
+    // not 42/3.14/-5 — are what a naive `Bool`-checked-first `switch`
+    // would misclassify as booleans instead of integers.
+    var context = LassoContext()
+    let output = try await LassoRenderer().render(
+        "[var(m = Map('a'=1, 'b'='two', 'c'=(Array(1,2,3)), 'd'=true, 'e'=null, 'f'=0, 'g'=1.5))]" +
+        "[var(roundTripped = Json_Deserialize(Json_Serialize($m)))]" +
+        "[$roundTripped->find('a')]/[$roundTripped->find('a')->type]|" +
+        "[$roundTripped->find('b')]|[$roundTripped->find('c')->join(',')]|" +
+        "[$roundTripped->find('d')]/[$roundTripped->find('d')->type]|" +
+        "[$roundTripped->find('e')->isA('null')]|" +
+        "[$roundTripped->find('f')]/[$roundTripped->find('f')->type]|" +
+        "[$roundTripped->find('g')]/[$roundTripped->find('g')->type]",
+        context: &context
+    )
+    #expect(output == "1/Integer|two|1,2,3|true/Boolean|true|0/Integer|1.5/Decimal")
+}
+
+@Test func lassoValueFromJsonDirectlyDistinguishesBooleansFromZeroAndOneValuedNumbers() async throws {
+    // A direct, isolated unit test on `LassoValue.from(json:)` itself
+    // (not just indirectly via `Json_Deserialize`'s full round trip
+    // through `JSONSerialization`) — a future refactor of this exact
+    // function, or of the session-restore call site that also depends
+    // on it, has a regression guard even if it stops going through
+    // `JSONSerialization` at all.
+    #expect(LassoValue.from(json: NSNumber(value: true)) == .boolean(true))
+    #expect(LassoValue.from(json: NSNumber(value: false)) == .boolean(false))
+    #expect(LassoValue.from(json: NSNumber(value: 0)) == .integer(0))
+    #expect(LassoValue.from(json: NSNumber(value: 1)) == .integer(1))
+    #expect(LassoValue.from(json: NSNumber(value: 42)) == .integer(42))
+    #expect(LassoValue.from(json: NSNumber(value: 3.14)) == .decimal(3.14))
+    #expect(LassoValue.from(json: NSNull()) == .null)
+}
+
+@Test func jsonDeserializeOfMalformedJsonReturnsNullRatherThanThrowing() async throws {
+    var context = LassoContext()
+    let output = try await LassoRenderer().render(
+        "[Json_Deserialize('not valid json{{{')->type]",
+        context: &context
+    )
+    #expect(output == "Null")
+}
+
 @Test func logCriticalIsANoOpWhenNoDiagnosticLogSinkIsWired() async throws {
     // Pre-existing behavior for any host that doesn't wire a sink --
     // log_critical must never throw or produce output of its own.
@@ -1268,6 +1462,141 @@ import PerfectSessionCore
     #expect(output == "hello")
 }
 
+@Test func bytesSizeMatchesLassoguideComsOwnWorkedExample() async throws {
+    // http://www.lassoguide.com/operations/byte-streams.html "Return the
+    // Size of a Byte Stream": `bytes('abc…')->size // => 6` — the
+    // ellipsis character is 3 UTF-8 bytes, so 'abc' (3) + '…' (3) = 6.
+    var context = LassoContext()
+    let output = try await LassoRenderer().render("[bytes('abc\u{2026}')->size]", context: &context)
+    #expect(output == "6")
+}
+
+@Test func bytesGetReturnsAnIntegerByteValueMatchingLassoguideComsOwnWorkedExample() async throws {
+    // "Return a Single Byte from a Byte Stream": `bytes('hello
+    // world')->get(2) // => 101` (the ASCII code for the 1-based 2nd
+    // character, 'e').
+    var context = LassoContext()
+    let output = try await LassoRenderer().render("[bytes('hello world')->get(2)]", context: &context)
+    #expect(output == "101")
+}
+
+@Test func bytesGetRangeReturnsASliceAsANewBytesObject() async throws {
+    var context = LassoContext()
+    let output = try await LassoRenderer().render("[bytes('hello')->getRange(2, 3)->asString]", context: &context)
+    #expect(output == "ell")
+}
+
+@Test func bytesFindMatchesLassoguideComsOwnWorkedExample() async throws {
+    // "Find a Value Within a Byte Stream": `bytes('running rhinos risk
+    // rampage')->find('rhino') // => 9`.
+    var context = LassoContext()
+    let output = try await LassoRenderer().render(
+        "[bytes('running rhinos risk rampage')->find('rhino')]|[bytes('abc')->find('zzz')]",
+        context: &context
+    )
+    #expect(output == "9|0")
+}
+
+@Test func bytesContainsBeginsWithAndEndsWithMatchTheirOwnWrittenDescriptionsNotTheBuggyWorkedExample() async throws {
+    // lassoguide.com's "Determine If a Byte Stream Contains a Value"
+    // section's own worked example actually calls `->find` (not
+    // `->contains`) and expects a boolean `false` — which doesn't even
+    // match `->find`'s own documented integer-or-zero return type. This
+    // is a confirmed copy-paste artifact from the `->find` section
+    // directly above it; implemented against `->contains`'s own written
+    // description ("Returns 'true' if the byte stream contains the
+    // specified sequence") instead, per NativeTypes.swift's own doc
+    // comment on this registration.
+    var context = LassoContext()
+    let output = try await LassoRenderer().render(
+        "[bytes('running rhinos risk rampage')->contains('rhino')]|[bytes('running rhinos risk rampage')->contains('zebra')]|[bytes('hello world')->beginsWith('hello')]|[bytes('hello world')->endsWith('world')]|[bytes('hello world')->beginsWith('world')]",
+        context: &context
+    )
+    #expect(output == "true|false|true|true|false")
+}
+
+@Test func bytesAsStringDefaultsToUTF8MatchingLassoguideComsOwnWorkedExample() async throws {
+    // "Export a String from a Byte Stream" uses `->exportString`
+    // (deprecated-sibling form, not implemented this stage) with the
+    // same "This is a string" worked value — `->asString` is its
+    // documented UTF-8-default replacement.
+    var context = LassoContext()
+    let output = try await LassoRenderer().render("[bytes('This is a string')->asString]", context: &context)
+    #expect(output == "This is a string")
+}
+
+@Test func bytesAsStringHonorsAnExplicitISO88591Encoding() async throws {
+    // 0xE9 alone isn't valid UTF-8 (it's a 3-byte-sequence leading byte
+    // with no continuation), but every byte value 0-255 is a valid
+    // ISO-8859-1 character — 0xE9 is 'é'. Built via ->decodeHex since a
+    // Lasso string literal can only produce UTF-8-encoded bytes, not an
+    // arbitrary single non-ASCII byte directly.
+    var context = LassoContext()
+    let output = try await LassoRenderer().render("[bytes('e9')->decodeHex->asString('ISO-8859-1')]", context: &context)
+    #expect(output == "\u{00E9}")
+}
+
+@Test func bytesSplitOnADelimiterAndOnAnEmptyDelimiterSplitsPerByte() async throws {
+    // "If the delimiter provided is an empty byte stream or string, the
+    // byte stream is split on each byte, so the returned array will have
+    // each byte as one of its elements."
+    var context = LassoContext()
+    let output = try await LassoRenderer().render(
+        """
+        [(bytes('a,b,c')->split(','))->size]
+        [(bytes('a,b,c')->split(','))->get(1)->asString]|[(bytes('a,b,c')->split(','))->get(2)->asString]|[(bytes('a,b,c')->split(','))->get(3)->asString]
+        [(bytes('ab')->split(''))->size]
+        """,
+        context: &context
+    )
+    let lines = output
+        .split(separator: "\n")
+        .map { $0.trimmingCharacters(in: .whitespaces) }
+        .filter { !$0.isEmpty }
+    #expect(lines == ["3", "a|b|c", "2"])
+}
+
+@Test func bytesSubReturnsEverythingFromThePositionWhenNumIsOmitted() async throws {
+    // Unlike `->getRange`, `->sub`'s second parameter is optional — "all
+    // of the bytes following the index are returned" when omitted.
+    var context = LassoContext()
+    let output = try await LassoRenderer().render(
+        "[bytes('hello world')->sub(7)->asString]|[bytes('hello world')->sub(1, 5)->asString]",
+        context: &context
+    )
+    #expect(output == "world|hello")
+}
+
+@Test func bytesAppendTrimReplaceAndRemoveMutateTheInvocantInPlaceAsBareStatements() async throws {
+    // Documented "Bytes Manipulation Methods" — "Calling the following
+    // methods will modify the bytes object without returning a value" —
+    // exactly the same self-mutating write-back mechanism
+    // `String->Trim`/`->Append`/`->Replace`/`->Remove` already use
+    // (`Evaluator.selfMutatingMethods` is purely syntactic/name-based,
+    // not type-scoped, so no new entries were needed for `bytes`).
+    var context = LassoContext()
+    let output = try await LassoRenderer().render(
+        """
+        [var(b::bytes=bytes('hello '))][$b->(append('world'))][$b->asString]|\
+        [var(t::bytes=bytes('  hi  '))][$t->(trim)][$t->asString]|\
+        [var(r::bytes=bytes('Blue Red Yellow'))][$r->(replace('Blue', 'Green'))][$r->asString]|\
+        [var(rm::bytes=bytes('hello world'))][$rm->(remove(6, 6))][$rm->asString]|\
+        [var(rmAll::bytes=bytes('abc'))][$rmAll->(remove)][$rmAll->asString]|end
+        """,
+        context: &context
+    )
+    #expect(output == "hello world|hi|Green Red Yellow|hello||end")
+}
+
+@Test func bytesEncodeHexAndDecodeHexRoundTrip() async throws {
+    var context = LassoContext()
+    let output = try await LassoRenderer().render(
+        "[bytes('AB')->encodeHex->asString]|[bytes('4142')->decodeHex->asString]",
+        context: &context
+    )
+    #expect(output == "4142|AB")
+}
+
 @Test func bytesWithNoArgumentIsEmpty() async throws {
     var context = LassoContext()
     let output = try await LassoRenderer().render("[bytes]", context: &context)
@@ -1719,6 +2048,273 @@ import PerfectSessionCore
     let loader = try LassoFileSystemIncludeLoader(root: root)
     #expect(try loader.loadInclude(path: "siteconfig_cookies.inc", from: "/includes/b2b/parent.lasso") == "INNER")
     #expect(try loader.loadInclude(path: "includes/siteconfig.inc", from: "/includes/b2b/parent.lasso") == "OUTER")
+}
+
+@Test func fileExistsIsDirectoryAndGetSizeReflectRealFilesystemState() async throws {
+    let root = FileManager.default.temporaryDirectory
+        .appendingPathComponent("lasso-file-\(UUID().uuidString)")
+    try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
+    try FileManager.default.createDirectory(at: root.appendingPathComponent("sub"), withIntermediateDirectories: true)
+    try "hello".write(to: root.appendingPathComponent("a.txt"), atomically: true, encoding: .utf8)
+    defer { try? FileManager.default.removeItem(at: root) }
+
+    var context = LassoContext(includeLoader: try LassoFileSystemIncludeLoader(root: root))
+    let output = try await LassoRenderer().render(
+        "[File_Exists: 'a.txt']|[File_Exists: 'missing.txt']|[File_IsDirectory: 'sub']|[File_IsDirectory: 'a.txt']|[File_GetSize: 'a.txt']",
+        context: &context
+    )
+    #expect(output == "true|false|true|false|5")
+}
+
+@Test func fileCreationDateAndModDateReturnRealDateObjects() async throws {
+    let root = FileManager.default.temporaryDirectory
+        .appendingPathComponent("lasso-file-\(UUID().uuidString)")
+    try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
+    try "hello".write(to: root.appendingPathComponent("a.txt"), atomically: true, encoding: .utf8)
+    defer { try? FileManager.default.removeItem(at: root) }
+
+    var context = LassoContext(includeLoader: try LassoFileSystemIncludeLoader(root: root))
+    let output = try await LassoRenderer().render(
+        "[(File_CreationDate: 'a.txt')->year]|[(File_ModDate: 'a.txt')->year]",
+        context: &context
+    )
+    let currentYear = Calendar(identifier: .gregorian).component(.year, from: Date())
+    #expect(output == "\(currentYear)|\(currentYear)")
+}
+
+@Test func fileWriteThenReadRoundTripsAndOverwriteVsAppendBehaveAsDocumented() async throws {
+    // Ch. 31 Table 1: "[File_Write]... Optional -FileOverWrite keyword
+    // specifies that the destination file should be overwritten if it
+    // exists, otherwise the data specified is appended to the end of the
+    // file."
+    let root = FileManager.default.temporaryDirectory
+        .appendingPathComponent("lasso-file-\(UUID().uuidString)")
+    try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
+    defer { try? FileManager.default.removeItem(at: root) }
+
+    var context = LassoContext(includeLoader: try LassoFileSystemIncludeLoader(root: root))
+    let output = try await LassoRenderer().render(
+        """
+        [File_Write: 'out.txt', 'Hello', -FileOverWrite][File_Read: 'out.txt']|\
+        [File_Write: 'out.txt', ' World'][File_Read: 'out.txt']|\
+        [File_Write: 'out.txt', 'Reset', -FileOverWrite][File_Read: 'out.txt']
+        """,
+        context: &context
+    )
+    #expect(output == "Hello|Hello World|Reset")
+}
+
+@Test func fileCreateMakesAFileOrADirectoryDependingOnATrailingSlash() async throws {
+    // "If the file name ends in a / then a directory is created."
+    let root = FileManager.default.temporaryDirectory
+        .appendingPathComponent("lasso-file-\(UUID().uuidString)")
+    try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
+    defer { try? FileManager.default.removeItem(at: root) }
+
+    var context = LassoContext(includeLoader: try LassoFileSystemIncludeLoader(root: root))
+    let output = try await LassoRenderer().render(
+        "[File_Create: 'newfile.txt'][File_Exists: 'newfile.txt']|[File_Create: 'newdir/'][File_IsDirectory: 'newdir']",
+        context: &context
+    )
+    #expect(output == "true|true")
+}
+
+@Test func fileCreateWithoutOverwriteOnAnExistingFileSetsFileAlreadyExistsError() async throws {
+    let root = FileManager.default.temporaryDirectory
+        .appendingPathComponent("lasso-file-\(UUID().uuidString)")
+    try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
+    try "existing".write(to: root.appendingPathComponent("a.txt"), atomically: true, encoding: .utf8)
+    defer { try? FileManager.default.removeItem(at: root) }
+
+    var context = LassoContext(includeLoader: try LassoFileSystemIncludeLoader(root: root))
+    let output = try await LassoRenderer().render(
+        "[File_Create: 'a.txt'][File_CurrentError: -ErrorCode]: [File_CurrentError]",
+        context: &context
+    )
+    #expect(output == "-9983: File already exists.")
+}
+
+@Test func fileDeleteRemovesAFileAndFileCurrentErrorReportsNoErrorAfterASuccessfulOperation() async throws {
+    let root = FileManager.default.temporaryDirectory
+        .appendingPathComponent("lasso-file-\(UUID().uuidString)")
+    try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
+    try "bye".write(to: root.appendingPathComponent("a.txt"), atomically: true, encoding: .utf8)
+    defer { try? FileManager.default.removeItem(at: root) }
+
+    var context = LassoContext(includeLoader: try LassoFileSystemIncludeLoader(root: root))
+    let output = try await LassoRenderer().render(
+        "[File_Delete: 'a.txt'][File_Exists: 'a.txt']|[File_CurrentError: -ErrorCode]",
+        context: &context
+    )
+    #expect(output == "false|0")
+}
+
+@Test func fileListDirectoryMarksSubdirectoriesWithATrailingSlashMatchingTheLanguageGuidesOwnWorkedExample() async throws {
+    let root = FileManager.default.temporaryDirectory
+        .appendingPathComponent("lasso-file-\(UUID().uuidString)")
+    try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
+    try FileManager.default.createDirectory(at: root.appendingPathComponent("Images"), withIntermediateDirectories: true)
+    try "x".write(to: root.appendingPathComponent("default.htm"), atomically: true, encoding: .utf8)
+    defer { try? FileManager.default.removeItem(at: root) }
+
+    var context = LassoContext(includeLoader: try LassoFileSystemIncludeLoader(root: root))
+    let output = try await LassoRenderer().render(
+        "[(File_ListDirectory: '/')->join(',')]",
+        context: &context
+    )
+    #expect(output == "Images/,default.htm")
+}
+
+@Test func fileCopyAndFileMoveAndFileRenameOperateOnRealFiles() async throws {
+    let root = FileManager.default.temporaryDirectory
+        .appendingPathComponent("lasso-file-\(UUID().uuidString)")
+    try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
+    try "content".write(to: root.appendingPathComponent("source.txt"), atomically: true, encoding: .utf8)
+    defer { try? FileManager.default.removeItem(at: root) }
+
+    var context = LassoContext(includeLoader: try LassoFileSystemIncludeLoader(root: root))
+    let output = try await LassoRenderer().render(
+        """
+        [File_Copy: 'source.txt', 'copy.txt'][File_Exists: 'source.txt']|[File_Exists: 'copy.txt']|\
+        [File_Move: 'copy.txt', 'moved.txt'][File_Exists: 'copy.txt']|[File_Exists: 'moved.txt']|\
+        [File_Rename: 'moved.txt', 'renamed.txt'][File_Exists: 'moved.txt']|[File_Exists: 'renamed.txt']
+        """,
+        context: &context
+    )
+    #expect(output == "true|true|false|true|false|true")
+}
+
+@Test func fileTagsConfinePathsToTheSameRootIncludeAlreadyUsesAndDegradeGracefullyRatherThanCrashing() async throws {
+    // File_* tags reuse `LassoIncludeLoader.fileSystemRoot` — the SAME
+    // confinement `include()`/`library()` already rely on — rather than
+    // a second, independently-configured root. A path that escapes it
+    // must degrade gracefully (false/void + a File_CurrentError), never
+    // crash or silently touch the real filesystem outside the root.
+    let root = FileManager.default.temporaryDirectory
+        .appendingPathComponent("lasso-file-\(UUID().uuidString)")
+    try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
+    defer { try? FileManager.default.removeItem(at: root) }
+
+    var context = LassoContext(includeLoader: try LassoFileSystemIncludeLoader(root: root))
+    let output = try await LassoRenderer().render(
+        "[File_Exists: '../../../etc/passwd']",
+        context: &context
+    )
+    #expect(output == "false")
+}
+
+@Test func fileWriteCannotEscapeConfinementThroughASymlinkedIntermediateDirectory() async throws {
+    // Regression test: `resolvedURL`'s "target doesn't exist yet" branch
+    // (the one `File_Create`/`File_Write` use) must still resolve real,
+    // already-existing intermediate directory symlinks before its own
+    // confinement check — an earlier version only did this in the
+    // existing-file branch, so a symlink planted inside root pointing
+    // OUTSIDE it (`root/evil -> outside/`) passed confinement on the
+    // unresolved lexical path (`<root>/evil/newfile.txt` textually
+    // starts with root's own path) while the actual write would have
+    // gone through the symlink to the real, unconfined target — the OS
+    // follows intermediate-directory symlinks regardless of whether the
+    // final path component exists yet.
+    let root = FileManager.default.temporaryDirectory
+        .appendingPathComponent("lasso-file-\(UUID().uuidString)")
+    let outside = FileManager.default.temporaryDirectory
+        .appendingPathComponent("lasso-file-outside-\(UUID().uuidString)")
+    try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
+    try FileManager.default.createDirectory(at: outside, withIntermediateDirectories: true)
+    try FileManager.default.createSymbolicLink(at: root.appendingPathComponent("evil"), withDestinationURL: outside)
+    defer {
+        try? FileManager.default.removeItem(at: root)
+        try? FileManager.default.removeItem(at: outside)
+    }
+
+    var context = LassoContext(includeLoader: try LassoFileSystemIncludeLoader(root: root))
+    let output = try await LassoRenderer().render(
+        "[File_Write: 'evil/newfile.txt', 'leaked']",
+        context: &context
+    )
+    #expect(output == "")
+    #expect(FileManager.default.fileExists(atPath: outside.appendingPathComponent("newfile.txt").path) == false)
+}
+
+@Test func fileRenameCannotEscapeConfinementThroughATraversingNewName() async throws {
+    // Regression test: `File_Rename`'s second parameter is documented
+    // (Ch. 31 Table 1) as a bare NAME, not a path — but an earlier
+    // version trusted that documented contract from untrusted input,
+    // building the destination with plain string concatenation
+    // (`sourceURL.deletingLastPathComponent().appendingPathComponent(newName)`)
+    // with NO confinement check at all. A `newName` containing `../`
+    // traversal components reached a real, unconfined location on the
+    // actual filesystem with no symlink or special setup required — the
+    // single most directly exploitable finding from architect review.
+    let root = FileManager.default.temporaryDirectory
+        .appendingPathComponent("lasso-file-\(UUID().uuidString)")
+    let outside = FileManager.default.temporaryDirectory
+        .appendingPathComponent("lasso-file-outside-\(UUID().uuidString)")
+    try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
+    try FileManager.default.createDirectory(at: outside, withIntermediateDirectories: true)
+    try "secret".write(to: root.appendingPathComponent("source.txt"), atomically: true, encoding: .utf8)
+    defer {
+        try? FileManager.default.removeItem(at: root)
+        try? FileManager.default.removeItem(at: outside)
+    }
+
+    var context = LassoContext(includeLoader: try LassoFileSystemIncludeLoader(root: root))
+    _ = try await LassoRenderer().render(
+        "[File_Rename: 'source.txt', '../\(outside.lastPathComponent)/leaked.txt']",
+        context: &context
+    )
+    #expect(FileManager.default.fileExists(atPath: outside.appendingPathComponent("leaked.txt").path) == false)
+    // The source is untouched since the rename was correctly rejected —
+    // confirms this degraded gracefully rather than partially applying.
+    #expect(FileManager.default.fileExists(atPath: root.appendingPathComponent("source.txt").path) == true)
+}
+
+@Test func fileDeleteRefusesToDeleteTheConfinedRootItself() async throws {
+    // Regression test: an empty/"."/"/" path resolves to the confined
+    // root itself via `resolvedURL`'s own logic (a directory always
+    // exists, so it satisfies the existing-file loop trivially) —
+    // `removeItem` on a directory recurses, so an earlier version would
+    // have recursively deleted the entire confined site root for a
+    // blank/unset `File_Delete` argument (e.g.
+    // `File_Delete($_POST('filename'))` with no field submitted).
+    let root = FileManager.default.temporaryDirectory
+        .appendingPathComponent("lasso-file-\(UUID().uuidString)")
+    try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
+    try "still here".write(to: root.appendingPathComponent("sentinel.txt"), atomically: true, encoding: .utf8)
+    defer { try? FileManager.default.removeItem(at: root) }
+
+    var context = LassoContext(includeLoader: try LassoFileSystemIncludeLoader(root: root))
+    _ = try await LassoRenderer().render("[File_Delete: '']", context: &context)
+    #expect(FileManager.default.fileExists(atPath: root.path) == true)
+    #expect(FileManager.default.fileExists(atPath: root.appendingPathComponent("sentinel.txt").path) == true)
+}
+
+@Test func fileCopyAndFileMoveRefuseToOverwriteTheConfinedRootAsADestination() async throws {
+    // Regression test (found by a second, adversarial review pass on
+    // the fixes above — the same root-destination bug class as
+    // `File_Delete`/`File_Rename`, just on two sibling tags): a blank/
+    // "."/"/" `destination` resolves to the confined root itself, since
+    // the root directory always exists. Without a guard, an ordinary
+    // `-FileOverwrite` on that destination would hit the "destination
+    // exists, overwrite requested" branch and recursively delete the
+    // entire confined root via `removeItem` before the copy/move even
+    // ran — reachable via nothing more unusual than a blank destination
+    // field plus a flag many real callers set as a matter of course.
+    let root = FileManager.default.temporaryDirectory
+        .appendingPathComponent("lasso-file-\(UUID().uuidString)")
+    try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
+    try "still here".write(to: root.appendingPathComponent("sentinel.txt"), atomically: true, encoding: .utf8)
+    try "payload".write(to: root.appendingPathComponent("source.txt"), atomically: true, encoding: .utf8)
+    defer { try? FileManager.default.removeItem(at: root) }
+
+    var context = LassoContext(includeLoader: try LassoFileSystemIncludeLoader(root: root))
+    _ = try await LassoRenderer().render(
+        "[File_Copy: 'source.txt', '', -FileOverwrite][File_Move: 'source.txt', '/', -FileOverwrite]",
+        context: &context
+    )
+    #expect(FileManager.default.fileExists(atPath: root.path) == true)
+    #expect(FileManager.default.fileExists(atPath: root.appendingPathComponent("sentinel.txt").path) == true)
+    #expect(FileManager.default.fileExists(atPath: root.appendingPathComponent("source.txt").path) == true)
 }
 
 @Test func startupDirectoryLoadsMatchingExtensionsAndSkipsOthers() async throws {
@@ -4566,6 +5162,150 @@ final class FullyRecordingResponseSink: LassoResponseSink, @unchecked Sendable {
     ))
     #expect(context.currentError.code == 7)
     #expect(context.currentError.message == "Update failed")
+}
+
+@Test func failThrowsARecoverableErrorProtectCatchesMatchingTheLanguageGuidesOwnWorkedExample() async throws {
+    // Ch. 19 "Fail Tags": `[Fail: -1, 'An unrecoverable error occurred']`
+    // — code+message form. `fail` with no enclosing `protect` propagates
+    // as an unhandled LassoRecoverableError (real Lasso: "To report an
+    // unrecoverable error" — Handle/Handle_Error blocks, which would
+    // otherwise catch it, are a separate, deliberately deferred stage —
+    // see ErrorHandling.swift's own doc comment).
+    var protectedContext = LassoContext()
+    let protectedOutput = try await LassoRenderer().render(
+        "before-[protect]during-[fail(-1, 'An unrecoverable error occurred')]-unreached[/protect]-after-[error_currenterror(-errorcode)]: [error_currenterror]",
+        context: &protectedContext
+    )
+    #expect(protectedOutput == "before--after--1: An unrecoverable error occurred")
+
+    var unprotectedContext = LassoContext()
+    await #expect(throws: LassoRecoverableError(LassoErrorState(code: -1, message: "boom", kind: "fail"))) {
+        _ = try await LassoRenderer().render("[fail(-1, 'boom')]", context: &unprotectedContext)
+    }
+}
+
+@Test func failWithOnlyAMessageDefaultsToTheGenericCustomCode() async throws {
+    // lassoguide.com's Lasso 9 "Error Handling": `fail(msg::string)` —
+    // the message-only alternate form Ch. 19's own 8.5-era doc doesn't
+    // have; defaults to -1, the same generic-custom-error code the
+    // Guide's own two-arg worked example uses.
+    var context = LassoContext()
+    let output = try await LassoRenderer().render(
+        "[protect][fail('just a message')][/protect][error_currenterror(-errorcode)]: [error_currenterror]",
+        context: &context
+    )
+    #expect(output == "-1: just a message")
+}
+
+@Test func failIfOnlyTriggersWhenItsConditionIsTrueMatchingTheLanguageGuidesOwnWorkedExample() async throws {
+    // Ch. 19: `[Fail_If: (Found_Count == 0), (Error_NoRecordsFound:
+    // -ErrorCode), (Error_NoRecordsFound)]` — condition, code, message.
+    // Exercised here with a plain boolean condition rather than
+    // Found_Count specifically, since Error_NoRecordsFound is itself
+    // documented as deprecated in favor of a Found_Count == 0 check
+    // (Ch. 19's own "Note" right after Table 4).
+    var context = LassoContext()
+    let output = try await LassoRenderer().render(
+        "[protect][fail_if(1 == 2, -5, 'should not fire')][/protect][error_currenterror(-errorcode)]|" +
+        "[protect][fail_if(1 == 1, -5, 'should fire')][/protect][error_currenterror(-errorcode)]",
+        context: &context
+    )
+    #expect(output == "0|-5")
+}
+
+@Test func errorPushAndErrorPopRestoreThePreviousErrorConditionMatchingTheirOwnDocumentedContract() async throws {
+    // Ch. 19: "[Error_Push] Pushes the current error condition onto a
+    // stack and resets the current error code and error message."
+    // "[Error_Pop] Restores the last error condition stored using
+    // [Error_Push]." — real corpus pattern: preventing a preexisting
+    // error from bleeding into a protect block.
+    var context = LassoContext()
+    let output = try await LassoRenderer().render(
+        "[error_seterrorcode(99)][error_seterrormessage('outer')]" +
+        "[error_push][error_code]/[error_msg]|" +
+        "[error_seterrorcode(1)][error_seterrormessage('inner')][error_code]/[error_msg]|" +
+        "[error_pop][error_code]/[error_msg]",
+        context: &context
+    )
+    // Resets to the SAME `.noError` state (`code: 0, message: "No
+    // Error"`) `Runtime.swift` already uses everywhere else — not a
+    // truly blank message.
+    #expect(output == "0/No Error|1/inner|99/outer")
+}
+
+@Test func errorResetClearsTheCurrentErrorCaseInsensitivelyMatchingTheLasso9WorkedExample() async throws {
+    // Ch. 19's own prose says "[Error_Reset]... resets the error message
+    // to blank" — but lassoguide.com's Lasso 9 "Error Handling" page has
+    // its OWN worked example for the identical operation showing "No
+    // error" instead (`error_reset; error_code + ': ' + error_msg //
+    // => 0: No error`), directly contradicting the 8.5 prose. Matches
+    // this project's established practice of preferring a worked
+    // example over prose when the two disagree (see e.g. the Math_Div/
+    // String_ReplaceRegExp defects found earlier in this project) —
+    // also keeps this consistent with the already-tested default
+    // `error_currenterror` state (`errorCurrentErrorDefaultsToNoErrorAndInlineFramesUpdateIt`,
+    // "No Error/0"), which `error_reset` reuses via the same shared
+    // `context.clearError()`/`.noError` this codebase already has.
+    var context = LassoContext()
+    let output = try await LassoRenderer().render(
+        "[error_seterrorcode(-1)][error_seterrormessage('Too slow')][error_code]: [error_msg]|" +
+        "[error_reset][error_code]: [error_msg]",
+        context: &context
+    )
+    #expect(output == "-1: Too slow|0: No Error")
+}
+
+@Test func namedErrorTypeTagsReturnTheirOwnFixedCodeOrMessageIndependentOfCurrentErrorState() async throws {
+    // Table 4 "Error Type Tags" are named CONSTANT accessors, not
+    // `currentError` state — bare returns the fixed message, `-ErrorCode`
+    // the fixed code, verified against Appendix A's own numeric table
+    // (p.823 Action/Security Errors) and Table 4's own descriptions.
+    // Matches the Guide's own chaining worked example:
+    // `[Error_SetErrorCode: (Error_AddError: -ErrorCode)]`.
+    var context = LassoContext()
+    let output = try await LassoRenderer().render(
+        "[error_adderror(-errorcode)]|[error_deleteerror(-errorcode)]|[error_updateerror(-errorcode)]|" +
+        "[error_fieldrestriction(-errorcode)]|[error_columnrestriction(-errorcode)]|" +
+        "[error_nopermission(-errorcode)]|[error_invaliddatabase(-errorcode)]|" +
+        "[error_invalidpassword(-errorcode)]|[error_invalidusername(-errorcode)]|[error_noerror(-errorcode)]",
+        context: &context
+    )
+    #expect(output == "-9959|-9957|-9958|-9960|-9960|-9961|-9962|-9963|-9964|0")
+
+    var chainedContext = LassoContext()
+    let chainedOutput = try await LassoRenderer().render(
+        "[error_seterrorcode(error_adderror(-errorcode))][error_seterrormessage(error_adderror)][error_code]: [error_msg]",
+        context: &chainedContext
+    )
+    #expect(chainedOutput == "-9959: An error occurred during an -Add action.")
+}
+
+@Test func lasso9StyleErrorCodeAndErrorMsgConstantsMatchLassoguideComsOwnTable() async throws {
+    var context = LassoContext()
+    let output = try await LassoRenderer().render(
+        "[error_code_divideByzero]/[error_msg_divideByzero]|[error_code_filenotfound]/[error_msg_filenotfound]",
+        context: &context
+    )
+    #expect(output == "-9950/Divide by Zero|404/File not found")
+}
+
+@Test func divisionByZeroThrowsARecoverableErrorInsteadOfCrashingOrProducingInfinity() async throws {
+    // Previously: `.decimal` division silently produced `inf`/`nan`,
+    // `.integer` division crashed the process outright (Swift traps on
+    // integer divide-by-zero) — neither matches the documented,
+    // catchable `error_code_divideByZero`. A non-numeric right operand
+    // (e.g. dividing by an empty string) must ALSO be caught, not just
+    // a literal `0` — regression-guards the `right.number ?? 0` fix
+    // (comparing the raw Optional directly would have let this
+    // specific case slip through).
+    var context = LassoContext()
+    let output = try await LassoRenderer().render(
+        "[protect][10 / 0][/protect][error_currenterror(-errorcode)]: [error_currenterror]|" +
+        "[protect][10.5 / 0][/protect][error_currenterror(-errorcode)]: [error_currenterror]|" +
+        "[protect][10 / '']|[/protect][error_currenterror(-errorcode)]: [error_currenterror]",
+        context: &context
+    )
+    #expect(output == "-9950: Divide by Zero|-9950: Divide by Zero|-9950: Divide by Zero")
 }
 
 private func corpusFixtureContext(
