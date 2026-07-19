@@ -5693,6 +5693,32 @@ struct IncludeURLTests {
     #expect(output.contains("plain=x,y"))
 }
 
+@Test func bareColonCallArgumentDoesNotAbsorbATrailingArrowMemberAccess() async throws {
+    // Parser bug found while regression-testing the fix above: a bare
+    // colon-call (no parens) followed immediately by `->member`, as in
+    // `$var->get:1->first`, must parse as `($var->get:1)->first` — the
+    // `->first` targets the *call's result*. Previously `parsePostfix`'s
+    // recursive parse of the colon-call's own argument value greedily
+    // consumed the trailing `->first` as part of that argument (`1->first`),
+    // producing `.member(base: .integer(1), name: "first")`, which threw
+    // `unsupportedExpression("Member first")` since integers have no
+    // `first` member. Contrast with the parenthesized form
+    // `$var->get(1)->first`, which already worked because the `)` gives
+    // the argument parse an unambiguous stopping point.
+    var context = LassoContext()
+    let output = try await LassoRenderer().render(
+        """
+        [var(items::array = array)]
+        [$items->insert('a' = array(1, 2, 3))]
+        [$items->insert('b' = array(4, 5, 6))]
+        bare_colon=[$items->get:1->first]|parens=[$items->get(1)->first]
+        """,
+        context: &context
+    )
+    #expect(output.contains("bare_colon=a"))
+    #expect(output.contains("parens=a"))
+}
+
 @Test func mapInsertAddsAKeyedEntryMutatingTheInvocantInPlace() async throws {
     // Real corpus: includes/detail_by_size.lasso's
     // `var(skuArrayItem = map)` followed by
