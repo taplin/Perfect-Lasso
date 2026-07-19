@@ -100,37 +100,46 @@ This is real, new work in `Evaluator.assign`, not something that falls out of `.
 
 ## 4. Staged Implementation Plan
 
-**Stage 1 — Foundational native-type infrastructure + simplest wins**
-- [ ] New `Sources/LassoParser/Collections.swift`: shared helper patterns (element-storage-key convention, natural-ordering insert helper reusing `lassoLessThan`/`lassoEquals`) mirroring `BytesType.swift`'s `makeObject` pattern.
-- [ ] `List` — full Table 5 surface (front/back-only access maps cleanly onto `[LassoValue]`, cheapest of the six).
-- [ ] `Queue`/`Stack` — Tables 12/13, 17/18 (FIFO/LIFO, structurally near-identical to List).
-- [ ] `Series` — one free-function registration reusing existing Array infrastructure (§1.7, near-zero cost bonus).
-- [ ] Real `set(...)` replacement — fixes the anchor gap directly, per §3.5's design.
-- [ ] Extend `selfMutatingMethods` with the new type-specific mutating names (`insertfirst`, `insertlast`, `removefirst`, `removelast`, etc.) — trivial per §2's confirmation this set is purely name-based.
+**Status as of 2026-07-19: Stages 1–4 complete and merged to this branch (`collections-subsystem-scoping`, 6 commits ahead of `origin/main`, main synced throughout, no divergence). 459/459 tests passing. Each stage went through implement → architect review → swift-concurrency-pro review → code-reviewer review → fix → retest before commit. Stages 5–6 not started — see their own status note below before picking them back up.**
 
-**Stage 2 — Ordering-dependent types + built-in Comparators**
-- [ ] Built-in Comparator values (`\Compare_LessThan` etc. as `.object`-wrapped constants, §3.3) — needed by everything in this stage.
-- [ ] `PriorityQueue` — Table 10/11, including the greatest-first-by-default gotcha (§1.4), verified against the p.406 worked example specifically before shipping.
-- [ ] `TreeMap` — Table 19/20, any-type keys (not string-coerced, unlike Map — §1.9), sorted-by-comparator storage.
-- [ ] `Map->Get(n)`/position-based read — resolve using the SAME "sorted-by-key, deterministic, documented as arbitrary anyway" precedent already established for `->Keys`/`->Values` (§2), not an attempt at real insertion-order preservation `[String:LassoValue]` can't provide.
-- [ ] Lasso 9's `Map->Get=`/`->Get` setter (§1.2 divergence) — implement per Lasso 9, explicitly diverging from 8.5's prohibition, with the divergence documented in the code comment.
+**Stage 1 — Foundational native-type infrastructure + simplest wins** ✅ done (`bc4fd68`)
+- [x] New `Sources/LassoParser/Collections.swift`: shared helper patterns (element-storage-key convention, natural-ordering insert helper reusing `lassoLessThan`/`lassoEquals`) mirroring `BytesType.swift`'s `makeObject` pattern.
+- [x] `List` — full Table 5 surface (front/back-only access maps cleanly onto `[LassoValue]`, cheapest of the six).
+- [x] `Queue`/`Stack` — Tables 12/13, 17/18 (FIFO/LIFO, structurally near-identical to List).
+- [x] `Series` — one free-function registration reusing existing Array infrastructure (§1.7, near-zero cost bonus).
+- [x] Real `set(...)` replacement — fixes the anchor gap directly, per §3.5's design.
+- [x] Extend `selfMutatingMethods` with the new type-specific mutating names (`insertfirst`, `insertlast`, `removefirst`, `removelast`, etc.) — trivial per §2's confirmation this set is purely name-based.
+- Also done, beyond the original checklist: `LassoValue.outputString` extended with the documented "TypeName: elem1, elem2" auto-stringification for these types; `LassoObjectInstance.withLock(_:_:)` added to fix a lost-update race in `Queue`/`Stack->Get` found by concurrency review; `Queue`/`Stack` constructors made to accept initial-element arguments per lassoguide.com's Lasso 9 docs (the 8.5 PDF says "always empty", Lasso 9 documents them like `List`'s own constructor — a disclosed, deliberate divergence).
 
-**Stage 3 — Iterator mechanism (cross-cutting)**
-- [ ] `Iterator`/`ReverseIterator` (Tables 23/24) per §3.2's reference-typed design — required by `->Iterator`/`->ReverseIterator` on every type built in Stages 1–2, plus `While`-loop-driven manual iteration (the Guide's own primary documented pattern, p.422–426).
-- [ ] `[Iterator(...)]`/`[ReverseIterator(...)]` free-function constructors (built-in-preferred, generic `->Size`/`->Get` fallback per p.424).
+**Stage 2 — Ordering-dependent types + built-in Comparators** ⚠️ done except one item (`88ce137`)
+- [x] Built-in Comparator values (§3.3) — shipped as ordinary free tags (`(Compare_LessThan)`/`(Compare_LessThan: 1, 2)`), NOT the real `\Compare_LessThan` backslash-reference syntax, which needs Stage 6's parser work first (disclosed, deliberate substitution — see `Comparators.swift`'s own doc comment).
+- [x] `PriorityQueue` — Table 10/11, including the greatest-first-by-default gotcha (§1.4), verified against the p.406 worked example specifically.
+- [x] `TreeMap` — Table 19/20, any-type keys (not string-coerced, unlike Map — §1.9), sorted-by-comparator storage. Required a genuinely new architectural exception (`->Insert`/`->Find`/`->Remove`/`->RemoveAll` AND the `treemap(...)` constructor itself both special-cased ahead of generic dispatch to preserve real key types — see `Evaluator.swift`'s own doc comments) and a real key-equality bug fix (compound-type keys were colliding via lossy `outputString`-based comparison).
+- [x] `Map->Get(n)`/position-based read — sorted-by-key order, matching `->Keys`/`->Values`' own precedent.
+- [ ] **NOT DONE: Lasso 9's `Map->Get=`/`->Get` setter (§1.2 divergence).** Originally scoped here, then reconsidered mid-stage and reasoned (in conversation, not written into any code comment) that it should move to Stage 4 alongside the other `Evaluator.assign` extension work — but Stage 4 only actually implemented `Pair->First=`/`->Second=`, `Queue`/`Stack->First=`, and `Set->Get(n)=` (the last of which WAS already flagged in `Collections.swift`'s own `makeSetType()` doc comment as deferred to Stage 4). `Map->Get=` fell through the gap between those two stages and was never implemented. Real, open item — pick up alongside or after Stage 5/6.
+- Also done, beyond the original checklist: `Array->SortWith`/`List->SortWith` (unblocked once Comparators existed; not in this stage's original checklist text but flagged as blocked-on-Stage-2 in Stage 1's own doc comments, so implemented here once the blocker cleared).
 
-**Stage 4 — Assignment-target extension**
-- [ ] `Evaluator.assign` new case for `Pair->First=`/`->Second=`, `Stack->First=`, `Queue->First=` (§3.6) — genuinely new mechanism, isolated to its own stage given the risk profile (§6).
+**Stage 3 — Iterator mechanism (cross-cutting)** ✅ done (`fa2be10`)
+- [x] `Iterator`/`ReverseIterator` (Tables 23/24) per §3.2's reference-typed design — implemented uniformly across every collection type from Stages 1–2 (List/Queue/Stack/Set/PriorityQueue/TreeMap/Array/Map), not just the Table 23 "e.g." list, on the reading that the list is illustrative not exhaustive.
+- [x] `[Iterator(...)]`/`[ReverseIterator(...)]` free-function constructors — snapshot-based (not a live `->Size`/`->Get`-driven generic fallback; see `Iterator.swift`'s own doc comment for why a true generic fallback wasn't attempted).
+- Found along the way: a genuine, unrelated pre-existing parser bug — `"null"` is hardcoded as the literal `.null` value token at parse time, so the Guide's own idiomatic `Null: $iterator->Forward` (used throughout its Iterator worked examples) is completely unreachable in this codebase. Worked around in tests via `var('_' = ...)`; NOT fixed here — spawned as a separate follow-up task (see the note at the end of this status section).
+- `->RemoveCurrent`/`->InsertAtCurrent` mutate only the iterator's own internal snapshot, never the live source collection/variable — disclosed scope limit, not a bug (see `Iterator.swift`'s own doc comment for the full reasoning).
 
-**Stage 5 — Matchers**
+**Stage 4 — Assignment-target extension** ✅ done (`ea840e0`)
+- [x] `Evaluator.assign` new case for `Pair->First=`/`->Second=`, `Stack->First=`, `Queue->First=` (§3.6) — genuinely new mechanism, isolated to its own stage given the risk profile (§6). `Pair` (a value type) rebuilds-and-recursively-reassigns; `Queue`/`Stack` (object-wrapped) mutate `_elements` in place.
+- Also done, beyond the original checklist: `Set->Get(n)=` (flagged as deferred-to-here in Stage 2's own `makeSetType()` comment); `Pair->Size`/`->Get(1)`/`->Get(2)` (documented alongside `->First`/`->Second` in the same table); fixed `Pair`'s own bare-stringification format to match its documented `(key)=(value)` shape (was an uncited `"key = value"`).
+
+**Stage 5 — Matchers** — not started
 - [ ] Matcher value family (`Match_RegExp`/`Match_NotRegExp`/`Match_Range`/`Match_NotRange`/`Match_Comparator`, §3.4).
 - [ ] Extend `>>` and `->Contains`/`->Find`/`->RemoveAll`/`->Iterator` across all types to matcher-check their argument, fixing the adjacent `>>`-on-array string-concatenation bug (§1.11) in the same pass.
 
-**Stage 6 — `\TagName` bareword reference + custom Comparators/Matchers (explicitly separate, deferred design decision — see §5)**
+**Stage 6 — `\TagName` bareword reference + custom Comparators/Matchers (explicitly separate, deferred design decision — see §5)** — not started
 - [ ] New lexer/parser support for `\identifier` as an expression (§3.3).
 - [ ] Generic tag-reference invocation path (looked up in the existing tag registry).
 - [ ] Custom Comparators (via ordinary `Define_Tag`).
 - [ ] Custom Matchers via `onCompare` callback dispatch — flagged as the plan's highest-risk single item (§6); may warrant being split into its own follow-up scoping pass rather than being implemented alongside Stage 6's other items.
+
+**Other open follow-up (not part of this plan's original scope, found during Stage 3):** the `"null"`-as-literal-not-callable parser bug described above — a separate task was spawned for it (title: "Fix Null tag being unreachable as a callable identifier"), not tracked as a numbered stage here since it's outside Ch. 30's own scope.
 
 ## 5. Deferred, With Reasoning
 
