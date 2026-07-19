@@ -387,16 +387,31 @@ public protocol LassoIncludeLoader: Sendable {
     /// need to change; only `LassoFileSystemIncludeLoader` implements it
     /// for real. See Documentation/web-response-include-plan.md.
     func loadIncludeBytes(path: String, from includingPath: String?) throws -> Data
+
+    /// The confined filesystem root `File_*` tags (`FileOperations.swift`)
+    /// resolve absolute paths against and refuse to escape — deliberately
+    /// reusing the SAME root every `include()`/`library()` call is already
+    /// confined to, rather than introducing a second, potentially-
+    /// inconsistent root concept. Defaulted to `nil` so existing
+    /// conformers (test/smoke loaders, and any loader with no real
+    /// on-disk root) don't need to change and simply leave `File_*` tags
+    /// unconfigured (they throw `fileSystemNotConfigured` — see
+    /// `FileOperations.swift`) — matching `loadIncludeBytes`'s own
+    /// default-then-override pattern above.
+    var fileSystemRoot: URL? { get }
 }
 
 public extension LassoIncludeLoader {
     func loadIncludeBytes(path: String, from includingPath: String?) throws -> Data {
         throw LassoRuntimeError.includeNotConfigured
     }
+
+    var fileSystemRoot: URL? { nil }
 }
 
 public struct LassoFileSystemIncludeLoader: LassoIncludeLoader {
     public let root: URL
+    public var fileSystemRoot: URL? { root }
     public let allowedExtensions: Set<String>
 
     public init(

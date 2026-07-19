@@ -1856,6 +1856,273 @@ import PerfectSessionCore
     #expect(try loader.loadInclude(path: "includes/siteconfig.inc", from: "/includes/b2b/parent.lasso") == "OUTER")
 }
 
+@Test func fileExistsIsDirectoryAndGetSizeReflectRealFilesystemState() async throws {
+    let root = FileManager.default.temporaryDirectory
+        .appendingPathComponent("lasso-file-\(UUID().uuidString)")
+    try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
+    try FileManager.default.createDirectory(at: root.appendingPathComponent("sub"), withIntermediateDirectories: true)
+    try "hello".write(to: root.appendingPathComponent("a.txt"), atomically: true, encoding: .utf8)
+    defer { try? FileManager.default.removeItem(at: root) }
+
+    var context = LassoContext(includeLoader: try LassoFileSystemIncludeLoader(root: root))
+    let output = try await LassoRenderer().render(
+        "[File_Exists: 'a.txt']|[File_Exists: 'missing.txt']|[File_IsDirectory: 'sub']|[File_IsDirectory: 'a.txt']|[File_GetSize: 'a.txt']",
+        context: &context
+    )
+    #expect(output == "true|false|true|false|5")
+}
+
+@Test func fileCreationDateAndModDateReturnRealDateObjects() async throws {
+    let root = FileManager.default.temporaryDirectory
+        .appendingPathComponent("lasso-file-\(UUID().uuidString)")
+    try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
+    try "hello".write(to: root.appendingPathComponent("a.txt"), atomically: true, encoding: .utf8)
+    defer { try? FileManager.default.removeItem(at: root) }
+
+    var context = LassoContext(includeLoader: try LassoFileSystemIncludeLoader(root: root))
+    let output = try await LassoRenderer().render(
+        "[(File_CreationDate: 'a.txt')->year]|[(File_ModDate: 'a.txt')->year]",
+        context: &context
+    )
+    let currentYear = Calendar(identifier: .gregorian).component(.year, from: Date())
+    #expect(output == "\(currentYear)|\(currentYear)")
+}
+
+@Test func fileWriteThenReadRoundTripsAndOverwriteVsAppendBehaveAsDocumented() async throws {
+    // Ch. 31 Table 1: "[File_Write]... Optional -FileOverWrite keyword
+    // specifies that the destination file should be overwritten if it
+    // exists, otherwise the data specified is appended to the end of the
+    // file."
+    let root = FileManager.default.temporaryDirectory
+        .appendingPathComponent("lasso-file-\(UUID().uuidString)")
+    try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
+    defer { try? FileManager.default.removeItem(at: root) }
+
+    var context = LassoContext(includeLoader: try LassoFileSystemIncludeLoader(root: root))
+    let output = try await LassoRenderer().render(
+        """
+        [File_Write: 'out.txt', 'Hello', -FileOverWrite][File_Read: 'out.txt']|\
+        [File_Write: 'out.txt', ' World'][File_Read: 'out.txt']|\
+        [File_Write: 'out.txt', 'Reset', -FileOverWrite][File_Read: 'out.txt']
+        """,
+        context: &context
+    )
+    #expect(output == "Hello|Hello World|Reset")
+}
+
+@Test func fileCreateMakesAFileOrADirectoryDependingOnATrailingSlash() async throws {
+    // "If the file name ends in a / then a directory is created."
+    let root = FileManager.default.temporaryDirectory
+        .appendingPathComponent("lasso-file-\(UUID().uuidString)")
+    try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
+    defer { try? FileManager.default.removeItem(at: root) }
+
+    var context = LassoContext(includeLoader: try LassoFileSystemIncludeLoader(root: root))
+    let output = try await LassoRenderer().render(
+        "[File_Create: 'newfile.txt'][File_Exists: 'newfile.txt']|[File_Create: 'newdir/'][File_IsDirectory: 'newdir']",
+        context: &context
+    )
+    #expect(output == "true|true")
+}
+
+@Test func fileCreateWithoutOverwriteOnAnExistingFileSetsFileAlreadyExistsError() async throws {
+    let root = FileManager.default.temporaryDirectory
+        .appendingPathComponent("lasso-file-\(UUID().uuidString)")
+    try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
+    try "existing".write(to: root.appendingPathComponent("a.txt"), atomically: true, encoding: .utf8)
+    defer { try? FileManager.default.removeItem(at: root) }
+
+    var context = LassoContext(includeLoader: try LassoFileSystemIncludeLoader(root: root))
+    let output = try await LassoRenderer().render(
+        "[File_Create: 'a.txt'][File_CurrentError: -ErrorCode]: [File_CurrentError]",
+        context: &context
+    )
+    #expect(output == "-9983: File already exists.")
+}
+
+@Test func fileDeleteRemovesAFileAndFileCurrentErrorReportsNoErrorAfterASuccessfulOperation() async throws {
+    let root = FileManager.default.temporaryDirectory
+        .appendingPathComponent("lasso-file-\(UUID().uuidString)")
+    try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
+    try "bye".write(to: root.appendingPathComponent("a.txt"), atomically: true, encoding: .utf8)
+    defer { try? FileManager.default.removeItem(at: root) }
+
+    var context = LassoContext(includeLoader: try LassoFileSystemIncludeLoader(root: root))
+    let output = try await LassoRenderer().render(
+        "[File_Delete: 'a.txt'][File_Exists: 'a.txt']|[File_CurrentError: -ErrorCode]",
+        context: &context
+    )
+    #expect(output == "false|0")
+}
+
+@Test func fileListDirectoryMarksSubdirectoriesWithATrailingSlashMatchingTheLanguageGuidesOwnWorkedExample() async throws {
+    let root = FileManager.default.temporaryDirectory
+        .appendingPathComponent("lasso-file-\(UUID().uuidString)")
+    try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
+    try FileManager.default.createDirectory(at: root.appendingPathComponent("Images"), withIntermediateDirectories: true)
+    try "x".write(to: root.appendingPathComponent("default.htm"), atomically: true, encoding: .utf8)
+    defer { try? FileManager.default.removeItem(at: root) }
+
+    var context = LassoContext(includeLoader: try LassoFileSystemIncludeLoader(root: root))
+    let output = try await LassoRenderer().render(
+        "[(File_ListDirectory: '/')->join(',')]",
+        context: &context
+    )
+    #expect(output == "Images/,default.htm")
+}
+
+@Test func fileCopyAndFileMoveAndFileRenameOperateOnRealFiles() async throws {
+    let root = FileManager.default.temporaryDirectory
+        .appendingPathComponent("lasso-file-\(UUID().uuidString)")
+    try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
+    try "content".write(to: root.appendingPathComponent("source.txt"), atomically: true, encoding: .utf8)
+    defer { try? FileManager.default.removeItem(at: root) }
+
+    var context = LassoContext(includeLoader: try LassoFileSystemIncludeLoader(root: root))
+    let output = try await LassoRenderer().render(
+        """
+        [File_Copy: 'source.txt', 'copy.txt'][File_Exists: 'source.txt']|[File_Exists: 'copy.txt']|\
+        [File_Move: 'copy.txt', 'moved.txt'][File_Exists: 'copy.txt']|[File_Exists: 'moved.txt']|\
+        [File_Rename: 'moved.txt', 'renamed.txt'][File_Exists: 'moved.txt']|[File_Exists: 'renamed.txt']
+        """,
+        context: &context
+    )
+    #expect(output == "true|true|false|true|false|true")
+}
+
+@Test func fileTagsConfinePathsToTheSameRootIncludeAlreadyUsesAndDegradeGracefullyRatherThanCrashing() async throws {
+    // File_* tags reuse `LassoIncludeLoader.fileSystemRoot` — the SAME
+    // confinement `include()`/`library()` already rely on — rather than
+    // a second, independently-configured root. A path that escapes it
+    // must degrade gracefully (false/void + a File_CurrentError), never
+    // crash or silently touch the real filesystem outside the root.
+    let root = FileManager.default.temporaryDirectory
+        .appendingPathComponent("lasso-file-\(UUID().uuidString)")
+    try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
+    defer { try? FileManager.default.removeItem(at: root) }
+
+    var context = LassoContext(includeLoader: try LassoFileSystemIncludeLoader(root: root))
+    let output = try await LassoRenderer().render(
+        "[File_Exists: '../../../etc/passwd']",
+        context: &context
+    )
+    #expect(output == "false")
+}
+
+@Test func fileWriteCannotEscapeConfinementThroughASymlinkedIntermediateDirectory() async throws {
+    // Regression test: `resolvedURL`'s "target doesn't exist yet" branch
+    // (the one `File_Create`/`File_Write` use) must still resolve real,
+    // already-existing intermediate directory symlinks before its own
+    // confinement check — an earlier version only did this in the
+    // existing-file branch, so a symlink planted inside root pointing
+    // OUTSIDE it (`root/evil -> outside/`) passed confinement on the
+    // unresolved lexical path (`<root>/evil/newfile.txt` textually
+    // starts with root's own path) while the actual write would have
+    // gone through the symlink to the real, unconfined target — the OS
+    // follows intermediate-directory symlinks regardless of whether the
+    // final path component exists yet.
+    let root = FileManager.default.temporaryDirectory
+        .appendingPathComponent("lasso-file-\(UUID().uuidString)")
+    let outside = FileManager.default.temporaryDirectory
+        .appendingPathComponent("lasso-file-outside-\(UUID().uuidString)")
+    try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
+    try FileManager.default.createDirectory(at: outside, withIntermediateDirectories: true)
+    try FileManager.default.createSymbolicLink(at: root.appendingPathComponent("evil"), withDestinationURL: outside)
+    defer {
+        try? FileManager.default.removeItem(at: root)
+        try? FileManager.default.removeItem(at: outside)
+    }
+
+    var context = LassoContext(includeLoader: try LassoFileSystemIncludeLoader(root: root))
+    let output = try await LassoRenderer().render(
+        "[File_Write: 'evil/newfile.txt', 'leaked']",
+        context: &context
+    )
+    #expect(output == "")
+    #expect(FileManager.default.fileExists(atPath: outside.appendingPathComponent("newfile.txt").path) == false)
+}
+
+@Test func fileRenameCannotEscapeConfinementThroughATraversingNewName() async throws {
+    // Regression test: `File_Rename`'s second parameter is documented
+    // (Ch. 31 Table 1) as a bare NAME, not a path — but an earlier
+    // version trusted that documented contract from untrusted input,
+    // building the destination with plain string concatenation
+    // (`sourceURL.deletingLastPathComponent().appendingPathComponent(newName)`)
+    // with NO confinement check at all. A `newName` containing `../`
+    // traversal components reached a real, unconfined location on the
+    // actual filesystem with no symlink or special setup required — the
+    // single most directly exploitable finding from architect review.
+    let root = FileManager.default.temporaryDirectory
+        .appendingPathComponent("lasso-file-\(UUID().uuidString)")
+    let outside = FileManager.default.temporaryDirectory
+        .appendingPathComponent("lasso-file-outside-\(UUID().uuidString)")
+    try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
+    try FileManager.default.createDirectory(at: outside, withIntermediateDirectories: true)
+    try "secret".write(to: root.appendingPathComponent("source.txt"), atomically: true, encoding: .utf8)
+    defer {
+        try? FileManager.default.removeItem(at: root)
+        try? FileManager.default.removeItem(at: outside)
+    }
+
+    var context = LassoContext(includeLoader: try LassoFileSystemIncludeLoader(root: root))
+    _ = try await LassoRenderer().render(
+        "[File_Rename: 'source.txt', '../\(outside.lastPathComponent)/leaked.txt']",
+        context: &context
+    )
+    #expect(FileManager.default.fileExists(atPath: outside.appendingPathComponent("leaked.txt").path) == false)
+    // The source is untouched since the rename was correctly rejected —
+    // confirms this degraded gracefully rather than partially applying.
+    #expect(FileManager.default.fileExists(atPath: root.appendingPathComponent("source.txt").path) == true)
+}
+
+@Test func fileDeleteRefusesToDeleteTheConfinedRootItself() async throws {
+    // Regression test: an empty/"."/"/" path resolves to the confined
+    // root itself via `resolvedURL`'s own logic (a directory always
+    // exists, so it satisfies the existing-file loop trivially) —
+    // `removeItem` on a directory recurses, so an earlier version would
+    // have recursively deleted the entire confined site root for a
+    // blank/unset `File_Delete` argument (e.g.
+    // `File_Delete($_POST('filename'))` with no field submitted).
+    let root = FileManager.default.temporaryDirectory
+        .appendingPathComponent("lasso-file-\(UUID().uuidString)")
+    try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
+    try "still here".write(to: root.appendingPathComponent("sentinel.txt"), atomically: true, encoding: .utf8)
+    defer { try? FileManager.default.removeItem(at: root) }
+
+    var context = LassoContext(includeLoader: try LassoFileSystemIncludeLoader(root: root))
+    _ = try await LassoRenderer().render("[File_Delete: '']", context: &context)
+    #expect(FileManager.default.fileExists(atPath: root.path) == true)
+    #expect(FileManager.default.fileExists(atPath: root.appendingPathComponent("sentinel.txt").path) == true)
+}
+
+@Test func fileCopyAndFileMoveRefuseToOverwriteTheConfinedRootAsADestination() async throws {
+    // Regression test (found by a second, adversarial review pass on
+    // the fixes above — the same root-destination bug class as
+    // `File_Delete`/`File_Rename`, just on two sibling tags): a blank/
+    // "."/"/" `destination` resolves to the confined root itself, since
+    // the root directory always exists. Without a guard, an ordinary
+    // `-FileOverwrite` on that destination would hit the "destination
+    // exists, overwrite requested" branch and recursively delete the
+    // entire confined root via `removeItem` before the copy/move even
+    // ran — reachable via nothing more unusual than a blank destination
+    // field plus a flag many real callers set as a matter of course.
+    let root = FileManager.default.temporaryDirectory
+        .appendingPathComponent("lasso-file-\(UUID().uuidString)")
+    try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
+    try "still here".write(to: root.appendingPathComponent("sentinel.txt"), atomically: true, encoding: .utf8)
+    try "payload".write(to: root.appendingPathComponent("source.txt"), atomically: true, encoding: .utf8)
+    defer { try? FileManager.default.removeItem(at: root) }
+
+    var context = LassoContext(includeLoader: try LassoFileSystemIncludeLoader(root: root))
+    _ = try await LassoRenderer().render(
+        "[File_Copy: 'source.txt', '', -FileOverwrite][File_Move: 'source.txt', '/', -FileOverwrite]",
+        context: &context
+    )
+    #expect(FileManager.default.fileExists(atPath: root.path) == true)
+    #expect(FileManager.default.fileExists(atPath: root.appendingPathComponent("sentinel.txt").path) == true)
+    #expect(FileManager.default.fileExists(atPath: root.appendingPathComponent("source.txt").path) == true)
+}
+
 @Test func startupDirectoryLoadsMatchingExtensionsAndSkipsOthers() async throws {
     let root = FileManager.default.temporaryDirectory
         .appendingPathComponent("lasso-startup-\(UUID().uuidString)")

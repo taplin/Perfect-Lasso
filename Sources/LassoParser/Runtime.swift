@@ -1085,6 +1085,7 @@ public struct LassoNativeRegistry: Sendable {
             )
             return .void
         }
+        LassoFileOperations.registerDefaultFunctions(into: &self)
     }
 }
 
@@ -1624,6 +1625,7 @@ public enum LassoRuntimeError: Error, Equatable {
     case includeCycle(String)
     case includeDepthExceeded
     case inlineNotConfigured
+    case fileSystemNotConfigured
     case tagCallDepthExceeded
     case unsafeDynamicFieldName(String)
 }
