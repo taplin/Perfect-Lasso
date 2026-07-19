@@ -65,6 +65,12 @@ public indirect enum LassoValue: Equatable, Sendable {
                 LassoBytesValue.string(from: value)
             } else if LassoCollectionValue.typeNames.contains(value.typeName) {
                 LassoCollectionValue.autoStringDescription(for: value)
+            } else if value.typeName == LassoTreeMapValue.typeName {
+                // Ch. 30 p.418's own worked example: `(TreeMap: (1)=
+                // (Sunday), (2)=(Monday), ...)` — a distinct "(key)=
+                // (value)" pair format, not the flat comma-joined shape
+                // the other collection types use.
+                LassoTreeMapValue.autoStringDescription(for: value)
             } else {
                 value.typeName
             }
@@ -760,9 +766,16 @@ public struct LassoNativeRegistry: Sendable {
             .object(LassoCollectionValue.makeObject(typeName: "stack", elements: arguments.map(\.value)))
         }
         register("set") { _, _ in
-            // Table 15's own documented parameter is a `-Comparator`
-            // (Stage 2 concept, not implemented yet) — any argument
-            // given here is ignored this stage; always natural-sorts.
+            // Table 15's own documented parameter is an optional
+            // comparator (Comparator values now exist as of Stage 2's
+            // `Comparators.swift`) — but wiring a per-instance
+            // comparator through Set's own Insert/Difference/
+            // Intersection/Union (which all currently hardcode
+            // `naturalSort`) is real additional work not in Stage 2's
+            // checklist (only PriorityQueue/TreeMap consume comparators
+            // this stage). Any argument given here is still ignored;
+            // Set always natural-sorts. Left as a disclosed gap, not
+            // silently dropped.
             .object(LassoCollectionValue.makeObject(typeName: "set", elements: []))
         }
         register("series") { arguments, _ in
@@ -785,6 +798,65 @@ public struct LassoNativeRegistry: Sendable {
                 current += 1
             }
             return .array(elements)
+        }
+        // Built-in Comparators (Ch. 30 Table 21, p.419) — see
+        // `Comparators.swift`'s own top-level doc comment for why these
+        // ship as ordinary free tags (`(Compare_LessThan)` to get a
+        // passable value, `(Compare_LessThan: 1, 2)` to evaluate
+        // directly) instead of the real `\Compare_LessThan` bareword-
+        // reference syntax, which this parser doesn't support yet
+        // (deferred to Stage 6).
+        for kind in LassoComparatorValue.builtInKinds {
+            register("compare_\(kind)") { arguments, context in
+                guard arguments.count >= 2 else {
+                    return .object(LassoComparatorValue.makeObject(kind: kind))
+                }
+                let left = arguments[0].value
+                let right = arguments.positionalValue(at: 1) ?? .null
+                return .integer(LassoComparatorValue.evaluate(kind: kind, left: left, right: right, context: context))
+            }
+        }
+        // `PriorityQueue`/`TreeMap` (Ch. 30 Tables 10/19) — see
+        // `Collections.swift`'s own `makePriorityQueueType()`/
+        // `makeTreeMapType()` doc comments for the greatest-first-by-
+        // default-comparator semantics and any-type-key storage this
+        // stage adds.
+        register("priorityqueue") { arguments, _ in
+            // "Priority queues are always created empty" (p.405) — the
+            // ONE optional parameter is a comparator, not initial
+            // elements (unlike List/Queue/Stack). Defaults to
+            // `\Compare_LessThan` per its own documented default.
+            let comparatorArgument: LassoValue = arguments.first?.value ?? .null
+            let kind = LassoComparatorValue.kind(of: comparatorArgument) ?? "lessthan"
+            return .object(LassoPriorityQueueValue.makeObject(kind: kind, elements: []))
+        }
+        register("treemap") { arguments, _ in
+            // NOT actually invoked for `treemap(...)` calls anymore —
+            // `Evaluator.evaluate`'s `.call` case special-cases the
+            // name "treemap" ahead of the generic dispatch that would
+            // otherwise reach this closure, specifically to preserve
+            // real (non-string-coerced) key types (see that case's own
+            // doc comment; found missing by architect review). This
+            // registration is kept only so `context.natives
+            // .contains("treemap")` still reports true for
+            // introspection/`HasMethod`-style checks — its own
+            // argument-handling body is now unreachable dead weight
+            // for real construction, left here as a best-effort
+            // fallback rather than deleted outright in case some other
+            // path ever calls `context.natives.function(named:
+            // "treemap")` directly.
+            var kind = "lessthan"
+            var pairs: [EvaluatedArgument] = arguments
+            if let first = arguments.first, LassoComparatorValue.kind(of: first.value) != nil {
+                kind = LassoComparatorValue.kind(of: first.value) ?? "lessthan"
+                pairs = Array(arguments.dropFirst())
+            }
+            let entries = pairs.compactMap { argument -> LassoValue? in
+                if case .pair = argument.value { return argument.value }
+                if let label = argument.label { return .pair(.string(label), argument.value) }
+                return nil
+            }
+            return .object(LassoTreeMapValue.makeObject(kind: kind, entries: entries))
         }
         register("json_serialize") { arguments, _ in
             let value = arguments.first?.value ?? .null

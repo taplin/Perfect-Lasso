@@ -8515,3 +8515,272 @@ struct IncludeURLTests {
     #expect(output == "0|0")
 }
 
+@Test func priorityQueueDefaultComparatorReturnsTheGreatestElementFirst() async throws {
+    // Ch. 30 p.405-406: default comparator (`\Compare_LessThan`) —
+    // insert 'One' then 'Two', `->First` is "Two" (greatest
+    // alphabetically), NOT "One" — the exact greatest-first-by-default
+    // gotcha this stage's own risk assessment flagged as easy to invert
+    // by assuming the comparator's own name is the sort direction.
+    var context = LassoContext()
+    let output = try await LassoRenderer().render(
+        """
+        [var('myPQ' = priorityqueue)][$myPQ->Insert('One')][$myPQ->Insert('Two')]\
+        [$myPQ->First]|[$myPQ->Size]|[string($myPQ)]
+        """,
+        context: &context
+    )
+    #expect(output == "Two|2|PriorityQueue: One, Two")
+}
+
+@Test func priorityQueueGreaterThanComparatorReturnsTheLeastElementFirst() async throws {
+    // Ch. 30 p.406: `(PriorityQueue: (Compare_GreaterThan))` reverses
+    // the default — `->First` is "One" (least), not "Two".
+    var context = LassoContext()
+    let output = try await LassoRenderer().render(
+        """
+        [var('myPQ' = (priorityqueue: (compare_greaterthan)))]\
+        [$myPQ->Insert('One')][$myPQ->Insert('Two')][$myPQ->First]
+        """,
+        context: &context
+    )
+    #expect(output == "One")
+}
+
+@Test func priorityQueueGetPopsTheGreatestElementMatchingTheGuidesTwoThenOneResult() async throws {
+    // Ch. 30 p.406-407: same disclosed atomic-`->Get` pattern as Queue/
+    // Stack — pops "Two" (the current greatest), leaving size 1.
+    var context = LassoContext()
+    let output = try await LassoRenderer().render(
+        """
+        [var('myPQ' = priorityqueue)][$myPQ->Insert('One')][$myPQ->Insert('Two')]\
+        [$myPQ->Get]|[$myPQ->Size]
+        """,
+        context: &context
+    )
+    #expect(output == "Two|1")
+}
+
+@Test func comparatorDirectCallReturnsZeroForAValidComparisonAndNegativeOneOtherwise() async throws {
+    // Table 21's own Note: "Comparators do not return True or False...
+    // A valid comparison is signaled by the return value of 0."
+    var context = LassoContext()
+    let output = try await LassoRenderer().render(
+        "[(compare_lessthan: 1, 2)]|[(compare_lessthan: 2, 1)]|[(compare_greaterthan: 2, 1)]",
+        context: &context
+    )
+    #expect(output == "0|-1|0")
+}
+
+@Test func arraySortWithMatchesTheGuidesAscendingWorkedExampleAndTheMathematicallyCorrectDescendingOrder() async throws {
+    // Ch. 30 p.419-420: sorting `(aaa,bbb,ccc,aa,a,b,c,bb,cc)` with
+    // `\Compare_LessThan` → ascending, matching the Guide's own worked
+    // example exactly: `a,aa,aaa,b,bb,bbb,c,cc,ccc`.
+    //
+    // The Guide's PAIRED `\Compare_GreaterThan` example, however, shows
+    // `aaa,aa,a,bbb,bb,b,ccc,cc,c` — which is NOT the reverse of its own
+    // ascending example (`ccc,cc,c,bbb,bb,b,aaa,aa,a`), even though
+    // GreaterThan is documented as the direct opposite of LessThan
+    // ("Sorts...with higher values first") and both examples sort the
+    // exact same 9-element array. Verified this isn't a `pdftotext`
+    // extraction artifact (checked with and without `-layout`). Since a
+    // real descending sort must be a true reversal of the corresponding
+    // ascending sort — sorting by `>` is definitionally the reverse of
+    // sorting by `<` — the Guide's own paired example is internally
+    // self-contradictory, matching this project's other found-and-
+    // rejected PDF defects (Math_Div, Bytes->Contains, Set's per-
+    // element-parens inconsistency). This test asserts the
+    // mathematically correct reversal instead of the apparently-
+    // mistranscribed PDF text.
+    var context = LassoContext()
+    let output = try await LassoRenderer().render(
+        """
+        [var('arr' = array('aaa','bbb','ccc','aa','a','b','c','bb','cc'))]\
+        [$arr->SortWith(compare_lessthan)][$arr->Join(',')]|\
+        [var('arr2' = array('aaa','bbb','ccc','aa','a','b','c','bb','cc'))]\
+        [$arr2->SortWith(compare_greaterthan)][$arr2->Join(',')]
+        """,
+        context: &context
+    )
+    #expect(output == "a,aa,aaa,b,bb,bbb,c,cc,ccc|ccc,cc,c,bbb,bb,b,aaa,aa,a")
+}
+
+@Test func listSortWithOrdersElementsByTheGivenComparator() async throws {
+    var context = LassoContext()
+    let output = try await LassoRenderer().render(
+        """
+        [var('myList' = (list: 'bb', 'a', 'ccc'))][$myList->SortWith(compare_lessthan)]\
+        [string($myList)]
+        """,
+        context: &context
+    )
+    #expect(output == "List: a, bb, ccc")
+}
+
+@Test func treeMapFindKeysValuesGetAndAutoStringMatchTheDaysOfWeekWorkedExample() async throws {
+    // Ch. 30 pp.417-418: the DaysOfWeek worked example, verified across
+    // ->Find (by key), ->Keys/->Values (sorted-by-key order, same
+    // precedent as Map), ->Get(n) (1-based pair-by-position), and
+    // auto-stringification (`(key)=(value)` pairs — this codebase
+    // doesn't reproduce the PDF's own extra OUTER wrapping parens seen
+    // on `[Variable: 'DaysOfWeek']`'s specific bare-tag output, treated
+    // as that display tag's own formatting rather than part of
+    // TreeMap's `outputString` contract — verified via `string(...)`
+    // instead, matching this file's own established List/Queue/Stack
+    // convention).
+    var context = LassoContext()
+    let output = try await LassoRenderer().render(
+        """
+        [var('DaysOfWeek' = (treemap: 1='Sunday', 2='Monday', 3='Tuesday', 4='Wednesday', \
+        5='Thursday', 6='Friday', 7='Saturday'))]\
+        [$DaysOfWeek->Find(2)]|[$DaysOfWeek->Find(4)]|[$DaysOfWeek->Find(6)]|\
+        [$DaysOfWeek->Keys->Join(',')]|[$DaysOfWeek->Values->Join(',')]|\
+        [$DaysOfWeek->Get(1)->First]=[$DaysOfWeek->Get(1)->Second]|\
+        [string($DaysOfWeek)]
+        """,
+        context: &context
+    )
+    #expect(output == """
+    Monday|Wednesday|Friday|1,2,3,4,5,6,7|Sunday,Monday,Tuesday,Wednesday,Thursday,Friday,Saturday|1=Sunday|\
+    TreeMap: (1)=(Sunday), (2)=(Monday), (3)=(Tuesday), (4)=(Wednesday), (5)=(Thursday), (6)=(Friday), (7)=(Saturday)
+    """)
+}
+
+@Test func treeMapInsertAddsANewKeyAndReplacesAnExistingOneMatchingTheGuidesExtraSaturdayExample() async throws {
+    // Ch. 30 p.418: `->Insert(8='Extra Saturday')` adds a new entry
+    // (confirmed via `->Find(8)`), then `->Insert(8='Extra Sabado')`
+    // REPLACES it rather than adding a duplicate (Tree maps "can only
+    // store one value per key").
+    var context = LassoContext()
+    let output = try await LassoRenderer().render(
+        """
+        [var('DaysOfWeek' = treemap)][$DaysOfWeek->Insert(8='Extra Saturday')]\
+        [$DaysOfWeek->Find(8)]|[$DaysOfWeek->Size]|\
+        [$DaysOfWeek->Insert(8='Extra Sabado')][$DaysOfWeek->Find(8)]|[$DaysOfWeek->Size]
+        """,
+        context: &context
+    )
+    #expect(output == "Extra Saturday|1|Extra Sabado|1")
+}
+
+@Test func treeMapRemoveDeletesByKeyMatchingTheGuidesWorkedExample() async throws {
+    // Ch. 30 p.418: `$DaysOfWeek->(Remove: 8)` removes the Extra
+    // Sabado entry added above.
+    var context = LassoContext()
+    let output = try await LassoRenderer().render(
+        """
+        [var('DaysOfWeek' = treemap)][$DaysOfWeek->Insert(8='Extra Sabado')][$DaysOfWeek->Size]|\
+        [$DaysOfWeek->Remove(8)][$DaysOfWeek->Size]|[$DaysOfWeek->Find(8)]
+        """,
+        context: &context
+    )
+    #expect(output == "1|0|")
+}
+
+@Test func treeMapPreservesRealKeyTypesUnlikeMapWhichStringCoercesEveryKey() async throws {
+    // Ch. 30 p.416: "The keys in a tree map can be any Lasso data type.
+    // In a simple map all keys are converted to string values" — the
+    // real, documented distinction this stage's own architectural
+    // exception (`->Insert` special-cased in `Evaluator.member`,
+    // bypassing the generic `.object` dispatch's argument-pre-
+    // evaluation that would otherwise collapse the key to a `String`
+    // label) exists specifically to preserve. An ARRAY key is the
+    // clearest possible proof this actually works: if the key had been
+    // silently stringified, looking it back up with an equal-but-
+    // distinct array instance could never succeed. Real corpus
+    // precedent for array-valued map entries: Ch. 30 p.400's own
+    // `[Map: (Array: 1, 5) = (Array: 1, 2, 3, 4, 5), ...]` example.
+    var context = LassoContext()
+    let output = try await LassoRenderer().render(
+        """
+        [var('tm' = treemap)][$tm->Insert((array(1, 5))=(array(1, 2, 3, 4, 5)))]\
+        [$tm->Find(array(1, 5))->Join(',')]
+        """,
+        context: &context
+    )
+    #expect(output == "1,2,3,4,5")
+}
+
+@Test func treeMapArrayKeysThatCollideUnderOutputStringConcatenationStayDistinct() async throws {
+    // Regression test for a real bug code review found: `.array`'s own
+    // `outputString` is a bare no-separator concatenation
+    // (`Runtime.swift`'s `LassoValue.outputString`), so DISTINCT arrays
+    // like `(1, 23)` and `(12, 3)` both stringify to `"123"`. The
+    // ORIGINAL key-comparison implementation routed every TreeMap key
+    // comparison through that same lossy `outputString`-based equality
+    // (`LassoCollectionValue.equals`, shared with List/Set/Queue/
+    // Stack's own element comparisons) — which would have silently
+    // collapsed these two keys into one entry (`->Insert`'s second call
+    // "replacing" the first instead of adding a second), exactly
+    // contradicting TreeMap's headline distinction from Map. Fixed via
+    // `LassoTreeMapValue.keysEqual`, which uses real structural
+    // `Equatable` comparison for compound-type keys instead. Without
+    // that fix this test would see `->Size` report `1`, not `2`, and
+    // `->Find(array(1, 23))` would return `'B'` (the second insert's
+    // value) instead of `'A'`.
+    var context = LassoContext()
+    let output = try await LassoRenderer().render(
+        """
+        [var('tm' = treemap)][$tm->Insert((array(1, 23))='A')][$tm->Insert((array(12, 3))='B')]\
+        [$tm->Size]|[$tm->Find(array(1, 23))]|[$tm->Find(array(12, 3))]
+        """,
+        context: &context
+    )
+    #expect(output == "2|A|B")
+}
+
+@Test func treeMapConstructorAlsoPreservesRealKeyTypesNotJustInsert() async throws {
+    // Same proof as the `->Insert`-path test above, but for the
+    // CONSTRUCTOR form itself (`treemap(key=value, ...)`, Table 19's
+    // own documented shape) — architect review flagged that an earlier
+    // version of this fix covered `->Insert`/`->Find`/`->Remove`/
+    // `->RemoveAll` (special-cased in `Evaluator.member`) but left the
+    // constructor going through the same label-collapsing generic
+    // `.call` dispatch those methods were pulled out of, silently
+    // defeating "any Lasso data type" keys for anything typed directly
+    // into a `treemap(...)` call. Now special-cased in `Evaluator
+    // .evaluate`'s `.call` case via `evaluateTreeMapConstructorCall`.
+    // An array key (not just an integer, whose `outputString` happens
+    // to coincidentally match its would-be string label) is the
+    // meaningful proof here too.
+    var context = LassoContext()
+    let output = try await LassoRenderer().render(
+        "[(treemap: (array(1, 5))=(array(1, 2, 3, 4, 5)))->Find(array(1, 5))->Join(',')]",
+        context: &context
+    )
+    #expect(output == "1,2,3,4,5")
+}
+
+@Test func treeMapConstructorAcceptsALeadingComparatorArgument() async throws {
+    // This project's own extrapolation of the Guide's intro text ("the
+    // keys in a tree map can be sorted using a comparator which is
+    // provided when the tree map is created", p.416) — no directly-
+    // cited worked example, so this test verifies the CODE's own
+    // documented behavior (a leading non-pair argument sets the sort
+    // comparator) rather than a primary-source citation. `->Keys` order
+    // with `Compare_GreaterThan` should be descending, not ascending.
+    var context = LassoContext()
+    let output = try await LassoRenderer().render(
+        "[(treemap: (compare_greaterthan), 1='One', 2='Two', 3='Three')->Keys->Join(',')]",
+        context: &context
+    )
+    #expect(output == "3,2,1")
+}
+
+@Test func mapGetReturnsAPairByPositionInTheSameSortedOrderAsKeysAndValues() async throws {
+    // Ch. 30 p.402: "[Map->Get] Returns a pair from the map by integer
+    // position" — using this codebase's existing sorted-by-key
+    // precedent already established for `->Keys`/`->Values`, so
+    // `Get(n)->First` really does correspond to `Keys[n]`.
+    var context = LassoContext()
+    let output = try await LassoRenderer().render(
+        """
+        [var('m' = map(3='Three', 1='One', 2='Two'))]\
+        [$m->Get(1)->First]=[$m->Get(1)->Second]|\
+        [$m->Get(2)->First]=[$m->Get(2)->Second]|\
+        [$m->Get(3)->First]=[$m->Get(3)->Second]
+        """,
+        context: &context
+    )
+    #expect(output == "1=One|2=Two|3=Three")
+}
+

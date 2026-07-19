@@ -71,6 +71,8 @@ public struct LassoNativeTypeRegistry: Sendable {
         register(Self.makeQueueType())
         register(Self.makeStackType())
         register(Self.makeSetType())
+        register(Self.makePriorityQueueType())
+        register(Self.makeTreeMapType())
     }
 }
 

@@ -54,9 +54,14 @@ enum LassoCollectionValue {
         return values
     }
 
-    /// The four collection types' documented type names that get the
+    /// The collection types' documented type names that get the
     /// "TypeName: elem1, elem2, elem3" auto-stringification below.
-    static let typeNames: Set<String> = ["list", "queue", "stack", "set"]
+    /// `priorityqueue` reuses this same helper directly — it's stored
+    /// under the identical `_elements` data key convention (see
+    /// `LassoPriorityQueueValue`) and Table 11's own worked example
+    /// (`PriorityQueue: One, Two`, p.406) uses the exact same flat
+    /// comma-joined, no-per-element-parens format as List/Queue/Stack.
+    static let typeNames: Set<String> = ["list", "queue", "stack", "set", "priorityqueue"]
 
     /// Bare/`String:`-cast auto-stringification — Ch. 30's own worked
     /// examples show this isn't the generic "just the type name"
@@ -87,8 +92,17 @@ enum LassoCollectionValue {
     /// visually identical to the majority format only by coincidence of
     /// having no way to tell "(One, Three)" apart from a would-be
     /// "(One), (Three)" typo, Set uses per-element parens here.
+    /// Naive first-letter capitalization (`list`→`List`) breaks for
+    /// `priorityqueue`, which needs internal capitalization too
+    /// (`PriorityQueue`, confirmed by its own worked example, p.406:
+    /// `➜ PriorityQueue: One, Two`) — a real bug this project's own
+    /// test suite caught (`priorityQueueDefaultComparatorReturns...`
+    /// initially failed with `Priorityqueue: One, Two`).
+    private static let displayNameOverrides: [String: String] = ["priorityqueue": "PriorityQueue"]
+
     static func autoStringDescription(for receiver: LassoObjectInstance) -> String {
-        let prefix = receiver.typeName.prefix(1).uppercased() + receiver.typeName.dropFirst()
+        let prefix = displayNameOverrides[receiver.typeName]
+            ?? receiver.typeName.prefix(1).uppercased() + receiver.typeName.dropFirst()
         let values = elements(from: receiver)
         let joined = receiver.typeName == "set"
             ? values.map { "(\($0.outputString))" }.joined(separator: ", ")
@@ -115,6 +129,169 @@ enum LassoCollectionValue {
     /// List.
     static func naturalSort(_ values: [LassoValue]) -> [LassoValue] {
         values.sorted { Evaluator.lassoLessThan($0, $1) }
+    }
+}
+
+/// `PriorityQueue` (Table 10/11, pp. 404-407) — storage is always kept
+/// sorted (ascending per its own comparator's `isOrderedBefore`), with
+/// `->First`/`->Get` reading from the END (see `makePriorityQueueType()`'s
+/// own doc comment for the verified greatest-first-by-default reasoning).
+enum LassoPriorityQueueValue {
+    static let typeName = "priorityqueue"
+
+    static func makeObject(kind: String, elements: [LassoValue]) -> LassoObjectInstance {
+        let sorted = elements.sorted { LassoComparatorValue.isOrderedBefore(kind: kind, $0, $1) }
+        return LassoObjectInstance(typeName: typeName, data: ["_kind": .string(kind), "_elements": .array(sorted)])
+    }
+
+    static func kind(of receiver: LassoObjectInstance) -> String {
+        let stored = receiver.value(for: "_kind").outputString
+        return stored.isEmpty ? "lessthan" : stored
+    }
+
+    static func elements(from receiver: LassoObjectInstance) -> [LassoValue] {
+        guard case let .array(values) = receiver.value(for: "_elements") else { return [] }
+        return values
+    }
+
+    /// Inserts into the correct sorted position directly (an insertion-
+    /// sort step), rather than appending then re-sorting the whole
+    /// array on every call — matches the Guide's own description: "it
+    /// is automatically placed in the proper position based on its
+    /// value in comparison to the elements already within the queue."
+    static func inserting(_ value: LassoValue, into receiver: LassoObjectInstance) -> [LassoValue] {
+        let comparatorKind = kind(of: receiver)
+        var updated = elements(from: receiver)
+        let insertIndex = updated.firstIndex { !LassoComparatorValue.isOrderedBefore(kind: comparatorKind, $0, value) }
+            ?? updated.count
+        updated.insert(value, at: insertIndex)
+        return updated
+    }
+
+    /// Rebuilds a NEW instance carrying `receiver`'s own comparator kind
+    /// forward — following this file's established value-semantics-via-
+    /// write-back discipline (never mutate `receiver` in place, except
+    /// `->Get`'s own disclosed exception below).
+    static func rebuild(from receiver: LassoObjectInstance, elements: [LassoValue]? = nil) -> LassoObjectInstance {
+        LassoObjectInstance(
+            typeName: typeName,
+            data: ["_kind": .string(kind(of: receiver)), "_elements": .array(elements ?? self.elements(from: receiver))]
+        )
+    }
+}
+
+/// `TreeMap` (Table 19/20, pp. 416-419) — see `makeTreeMapType()`'s own
+/// doc comment for why `->Insert`/`->Find`/`->Remove`/`->RemoveAll` are
+/// NOT registered there and instead special-cased inline in
+/// `Evaluator.member`.
+enum LassoTreeMapValue {
+    static let typeName = "treemap"
+
+    static func makeObject(kind: String, entries: [LassoValue]) -> LassoObjectInstance {
+        LassoObjectInstance(
+            typeName: typeName,
+            data: ["_kind": .string(kind), "_elements": .array(sortEntries(entries, kind: kind))]
+        )
+    }
+
+    static func kind(of receiver: LassoObjectInstance) -> String {
+        let stored = receiver.value(for: "_kind").outputString
+        return stored.isEmpty ? "lessthan" : stored
+    }
+
+    static func entries(from receiver: LassoObjectInstance) -> [LassoValue] {
+        guard case let .array(values) = receiver.value(for: "_elements") else { return [] }
+        return values
+    }
+
+    static func sortEntries(_ entries: [LassoValue], kind: String) -> [LassoValue] {
+        entries.sorted { lhs, rhs in
+            guard case let .pair(lhsKey, _) = lhs, case let .pair(rhsKey, _) = rhs else { return false }
+            return LassoComparatorValue.isOrderedBefore(kind: kind, lhsKey, rhsKey)
+        }
+    }
+
+    /// TreeMap-specific key equality — NOT the same as `LassoCollectionValue
+    /// .equals`'s loose, `outputString`-based coercion (which List/Set/
+    /// Queue/Stack use for their own element comparisons). That
+    /// coercion is exactly right for SCALARS — the DaysOfWeek worked
+    /// example (p.417) genuinely needs `->Find(2)` (an integer
+    /// argument) to match a key that may have been stored as
+    /// `.string("2")` (the constructor's own name/value-pair-labeled
+    /// form) — but is actively WRONG for compound keys: `.array`'s
+    /// `outputString` is a bare no-separator concatenation
+    /// (`Runtime.swift`'s `LassoValue.outputString`), so DISTINCT
+    /// arrays like `(1, 23)` and `(12, 3)` both stringify to `"123"`
+    /// and would be treated as the SAME tree-map key under loose
+    /// comparison — a real bug found by code review, confirmed by
+    /// reproducing it (`->Insert((array(1,23))='A')` followed by
+    /// `->Insert((array(12,3))='B')` collapsed to one entry instead of
+    /// two). Compound types (array/map/pair/object) use `LassoValue`'s
+    /// own structural `Equatable` conformance instead — cross-type
+    /// coercion never makes sense for these anyway (an array key
+    /// "equal to" a string key isn't a meaningful concept the way
+    /// `2 == '2'` is for scalars).
+    static func keysEqual(_ lhs: LassoValue, _ rhs: LassoValue, context: LassoContext) -> Bool {
+        switch (lhs, rhs) {
+        case (.array, .array), (.map, .map), (.pair, .pair), (.object, .object):
+            lhs == rhs
+        default:
+            LassoCollectionValue.equals(lhs, rhs, context: context)
+        }
+    }
+
+    /// Insert-or-replace-by-key — "Tree maps can only store one value
+    /// per key. When a new value with the same key is inserted... it
+    /// replaces the previous value" (p.416), same replace-not-duplicate
+    /// semantics as Map.
+    static func inserting(key: LassoValue, value: LassoValue, into receiver: LassoObjectInstance, context: LassoContext) -> [LassoValue] {
+        var updated = entries(from: receiver)
+        if let index = updated.firstIndex(where: { entry in
+            guard case let .pair(entryKey, _) = entry else { return false }
+            return keysEqual(entryKey, key, context: context)
+        }) {
+            updated[index] = .pair(key, value)
+        } else {
+            updated.append(.pair(key, value))
+        }
+        return sortEntries(updated, kind: kind(of: receiver))
+    }
+
+    static func find(key: LassoValue, in receiver: LassoObjectInstance, context: LassoContext) -> LassoValue {
+        for entry in entries(from: receiver) {
+            if case let .pair(entryKey, entryValue) = entry, keysEqual(entryKey, key, context: context) {
+                return entryValue
+            }
+        }
+        return .null
+    }
+
+    /// Shared by BOTH `->Remove` and `->RemoveAll` — Table 20's own
+    /// wording for `->RemoveAll` ("the value to compare to EACH KEY of
+    /// the map") means it's also key-based, not value-based like Set/
+    /// List's `->RemoveAll`. Since TreeMap keys are always unique (see
+    /// `inserting` above), a single-exact-key `->Remove` and a
+    /// match-every-key `->RemoveAll` remove IDENTICAL results with
+    /// plain-value comparison — they only diverge once `->RemoveAll`
+    /// gains Matcher-awareness (Stage 5, e.g. `Match_Range` could match
+    /// several distinct keys at once, which `->Remove` structurally
+    /// can't express). Implemented identically here, not merged into
+    /// one method, so each keeps its own doc-comment-cited reasoning
+    /// and is ready for `->RemoveAll` to diverge later without touching
+    /// `->Remove`.
+    static func removingByKey(_ needle: LassoValue, from receiver: LassoObjectInstance, context: LassoContext) -> [LassoValue] {
+        entries(from: receiver).filter { entry in
+            guard case let .pair(entryKey, _) = entry else { return true }
+            return !keysEqual(entryKey, needle, context: context)
+        }
+    }
+
+    static func autoStringDescription(for receiver: LassoObjectInstance) -> String {
+        let joined = entries(from: receiver).map { entry -> String in
+            guard case let .pair(key, value) = entry else { return entry.outputString }
+            return "(\(key.outputString))=(\(value.outputString))"
+        }.joined(separator: ", ")
+        return "TreeMap: \(joined)"
     }
 }
 
@@ -255,6 +432,23 @@ extension LassoNativeTypeRegistry {
             let ascending = arguments.first?.value.isTruthy ?? true
             var sorted = LassoCollectionValue.naturalSort(LassoCollectionValue.elements(from: receiver))
             if !ascending { sorted.reverse() }
+            return .object(LassoCollectionValue.makeObject(typeName: "list", elements: sorted))
+        }
+        type.register("sortwith") { receiver, arguments, _ in
+            // Table 21: same Comparator-driven ordering as
+            // `Array->SortWith` (see its own doc comment in
+            // `Evaluator.swift` for the worked-example citation) —
+            // "Reorders the elements of the list in the order defined
+            // by a comparator... Modifies the list in place and returns
+            // no value" (Table 5).
+            let comparatorArgument: LassoValue = arguments.first?.value ?? .null
+            guard let kind = LassoComparatorValue.kind(of: comparatorArgument) else {
+                return .object(LassoCollectionValue.makeObject(
+                    typeName: "list", elements: LassoCollectionValue.elements(from: receiver)
+                ))
+            }
+            let sorted = LassoCollectionValue.elements(from: receiver)
+                .sorted { LassoComparatorValue.isOrderedBefore(kind: kind, $0, $1) }
             return .object(LassoCollectionValue.makeObject(typeName: "list", elements: sorted))
         }
 
@@ -482,6 +676,151 @@ extension LassoNativeTypeRegistry {
             }
             elements = LassoCollectionValue.naturalSort(elements)
             return .object(LassoCollectionValue.makeObject(typeName: "set", elements: elements))
+        }
+
+        return type
+    }
+
+    // MARK: - priorityqueue
+    //
+    // Table 10/11 (pp. 404-407). "When an element is inserted into a
+    // priority queue it is automatically placed in the proper position
+    // based on its value in comparison to the elements already within
+    // the queue. Only the first or greatest value of the queue can be
+    // retrieved" — storage is kept SORTED (via the queue's own
+    // comparator, `\Compare_LessThan` by default) on every insert, and
+    // `->First`/`->Get` always read from the END of that sorted array.
+    //
+    // **The greatest-first-by-default gotcha, verified directly against
+    // the Guide's own worked examples (p.405-406), not assumed from the
+    // comparator's name**: "priority queues pull their next value off
+    // the end of the list of contained elements. Using the
+    // \Compare_LessThan comparator will result in the GREATEST element
+    // being returned first. Using \Compare_GreaterThan will result in
+    // the LEAST element being returned first." Confirmed by both worked
+    // examples: default comparator, insert One then Two → `->First` is
+    // "Two" (greatest, alphabetically); `\Compare_GreaterThan` comparator,
+    // same inserts → `->First` is "One" (least). This is exactly why
+    // `LassoComparatorValue.isOrderedBefore(kind: "greaterthan", ...)`
+    // REVERSES the comparison (produces a descending-sorted array) rather
+    // than naively using GreaterThan's own name as the sort direction —
+    // reversing it is what makes `.last` correctly yield the least value
+    // for that comparator, matching the worked example.
+    static func makePriorityQueueType() -> LassoNativeType {
+        var type = LassoNativeType(name: "priorityqueue")
+
+        type.register("first") { receiver, _, _ in
+            LassoPriorityQueueValue.elements(from: receiver).last ?? .null
+        }
+        type.register("size") { receiver, _, _ in
+            .integer(LassoPriorityQueueValue.elements(from: receiver).count)
+        }
+        type.register("insert") { receiver, arguments, _ in
+            guard let value = arguments.first?.value else {
+                return .object(LassoPriorityQueueValue.rebuild(from: receiver))
+            }
+            let elements = LassoPriorityQueueValue.inserting(value, into: receiver)
+            return .object(LassoPriorityQueueValue.rebuild(from: receiver, elements: elements))
+        }
+        type.register("insertlast") { receiver, arguments, _ in
+            guard let value = arguments.first?.value else {
+                return .object(LassoPriorityQueueValue.rebuild(from: receiver))
+            }
+            let elements = LassoPriorityQueueValue.inserting(value, into: receiver)
+            return .object(LassoPriorityQueueValue.rebuild(from: receiver, elements: elements))
+        }
+        type.register("remove") { receiver, _, _ in
+            var elements = LassoPriorityQueueValue.elements(from: receiver)
+            if !elements.isEmpty { elements.removeLast() }
+            return .object(LassoPriorityQueueValue.rebuild(from: receiver, elements: elements))
+        }
+        type.register("removefirst") { receiver, _, _ in
+            var elements = LassoPriorityQueueValue.elements(from: receiver)
+            if !elements.isEmpty { elements.removeLast() }
+            return .object(LassoPriorityQueueValue.rebuild(from: receiver, elements: elements))
+        }
+        type.register("get") { receiver, _, _ in
+            // Atomic read-pop-write — same lost-update race Queue/
+            // Stack->Get already guard against (see their own comments
+            // in `makeQueueType()`/`makeStackType()` above).
+            receiver.withLock("_elements") { stored in
+                guard case var .array(elements) = stored, !elements.isEmpty else { return .null }
+                let popped = elements.removeLast()
+                stored = .array(elements)
+                return popped
+            }
+        }
+
+        return type
+    }
+
+    // MARK: - treemap
+    //
+    // Table 19/20 (pp. 416-419). Two real, documented distinctions from
+    // plain Map (Evaluator.swift's own `.map` handling): **(1)** keys can
+    // be ANY Lasso data type, not string-coerced — **(2)** entries are
+    // kept sorted by key via a comparator (default `\Compare_LessThan`,
+    // same default as PriorityQueue). Storage mirrors the other
+    // collection types (`_elements` under the shared `_elements` data
+    // key) but holds `.pair(key, value)` entries instead of bare values,
+    // sorted by each pair's `->First` (the key) — reusing
+    // `LassoComparatorValue.isOrderedBefore` gives TreeMap's sort-by-
+    // comparator behavior for free, no new ordering infrastructure.
+    //
+    // **Architectural exception, distinct from Queue/Stack->Get's own**:
+    // `->Insert`/`->Find`/`->Remove`/`->RemoveAll` are NOT registered as
+    // ordinary native-type methods here. The generic `.object` dispatch
+    // path (`Evaluator.member`'s `case let (.object(object), _)`)
+    // pre-evaluates every argument via `evaluate(arguments)` BEFORE
+    // calling a native-type closure — and that pre-evaluation step
+    // ALWAYS collapses a `key = value` argument's key down to a bare
+    // `String` label (`Evaluator.swift`'s own `evaluate(_
+    // arguments:)`, via `assignmentLabel`/the dynamic-field-keyword
+    // path), discarding whatever real type the key literal had. That's
+    // fine for Map (which string-coerces keys anyway, so no information
+    // is lost) but would silently defeat TreeMap's entire "any Lasso
+    // data type" key requirement — an integer key `8` would arrive here
+    // as the STRING `"8"`, indistinguishable from a real string key.
+    // `.map`'s own `->insert`/`->remove` already avoid exactly this trap
+    // by being special-cased INLINE in `Evaluator.member`, ahead of the
+    // generic dispatch, where the RAW unevaluated `[LassoArgument]` is
+    // still available and `.assignment(target, value)`'s `target` can be
+    // evaluated directly to recover its real type. TreeMap's
+    // `->Insert`/`->Find`/`->Remove`/`->RemoveAll` follow that exact
+    // same precedent (see the new cases in `Evaluator.member`, placed
+    // immediately before the generic `.map`/`.object` cases) instead of
+    // being registered here. `->Get`/`->Keys`/`->Values`/`->Size` need
+    // no typed-key argument, so they use the ordinary native-type
+    // pattern like every other type in this file.
+    static func makeTreeMapType() -> LassoNativeType {
+        var type = LassoNativeType(name: "treemap")
+
+        type.register("size") { receiver, _, _ in
+            .integer(LassoTreeMapValue.entries(from: receiver).count)
+        }
+        type.register("keys") { receiver, _, _ in
+            .array(LassoTreeMapValue.entries(from: receiver).compactMap {
+                if case let .pair(key, _) = $0 { return key }
+                return nil
+            })
+        }
+        type.register("values") { receiver, _, _ in
+            .array(LassoTreeMapValue.entries(from: receiver).compactMap {
+                if case let .pair(_, value) = $0 { return value }
+                return nil
+            })
+        }
+        type.register("get") { receiver, arguments, _ in
+            // "Returns a PAIR from the tree map by integer position"
+            // (Table 20) — matching `Map->Get`'s own identical wording
+            // and this codebase's existing sorted-by-key precedent for
+            // `Map->Keys`/`->Values` (Evaluator.swift's own doc comment:
+            // "the order of elements in a map is not defined"). 1-based.
+            let entries = LassoTreeMapValue.entries(from: receiver)
+            let position = (arguments.first?.value.number).map(Int.init) ?? 0
+            let index = position - 1
+            guard entries.indices.contains(index) else { return .null }
+            return entries[index]
         }
 
         return type
