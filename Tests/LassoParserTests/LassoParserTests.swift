@@ -1087,6 +1087,174 @@ import PerfectSessionCore
     #expect(output.contains("d2=2002-05-22"))
 }
 
+@Test func mathArithmeticTagsMatchTheLanguageGuidesOwnWorkedExamples() async throws {
+    // Lasso 8.5 Language Guide Ch. 28 Table 10, confirmed by reading the
+    // PDF directly (including the visual page render, since the raw text
+    // extraction alone looked suspicious around Math_Div -- see the
+    // dedicated math_div test below). None of Math_Add/Sub/Mult/Div/Max/
+    // Min/Mod existed at all before this -- only the bare arithmetic
+    // symbols (+/-/*// /%) worked.
+    var context = LassoContext()
+    let output = try await LassoRenderer().render(
+        "[Math_Add(1, 2, 3, 4, 5)]|" +
+            "[Math_Add(1.0, 100.0)]|" +
+            "[Math_Sub(10, 5)]|" +
+            "[Math_Max(100, 200)]|" +
+            "[Math_Min(100, 200)]|" +
+            "[Math_Mod(10, 3)]|" +
+            "[Math_Mult(3, 4)]",
+        context: &context
+    )
+    let parts = output.components(separatedBy: "|")
+    #expect(parts[0] == "15")
+    #expect(parts[1] == "101.0")
+    #expect(parts[2] == "5")
+    #expect(parts[3] == "200")
+    #expect(parts[4] == "100")
+    #expect(parts[5] == "1")
+    #expect(parts[6] == "12")
+}
+
+@Test func mathDivFollowsTheDocumentedIntegerDecimalCoercionRuleNotTheGuidesOwnOutlierExamples() async throws {
+    // Ch. 28 p.369's own clean, internally-consistent example:
+    // "[Math_Div: 1, 8] -> 0" (all-integer parameters truncate toward
+    // the integer result -- 0.125 rounds down to zero when cast to an
+    // integer) and "[Math_Div: 1.0, 8] -> 0.125000" (a decimal parameter
+    // keeps full precision). Deliberately does NOT match the Guide's own
+    // very next page's two-parameter examples ("[Math_Div: 10, 9] -> 11",
+    // "[Math_Div: 10, 8.0] -> 12.5") -- those don't correspond to any
+    // sensible division of their stated inputs (10/9 != 11, 10/8.0 !=
+    // 12.5) and are almost certainly a real transcription defect in the
+    // PDF itself, verified by reading the actual page image, not just
+    // pdftotext's linearized text (this project has already confirmed at
+    // least one other verbatim doc defect: Valid_CreditCard's "ROT-13"
+    // mislabeling).
+    var context = LassoContext()
+    let output = try await LassoRenderer().render(
+        "[Math_Div(1, 8)]|[Math_Div(1.0, 8)]",
+        context: &context
+    )
+    let parts = output.components(separatedBy: "|")
+    #expect(parts[0] == "0")
+    #expect(parts[1] == "0.125")
+}
+
+@Test func mathCeilFloorRIntAlwaysReturnIntegersRegardlessOfInputType() async throws {
+    // Ch. 28 "Rounding Numbers", confirmed worked examples.
+    var context = LassoContext()
+    let output = try await LassoRenderer().render(
+        "[Math_RInt(37.6)]|[Math_Floor(37.6)]|[Math_Ceil(37.6)]",
+        context: &context
+    )
+    #expect(output == "38|37|38")
+}
+
+@Test func mathRoundSupportsBothTheDecimalPrecisionAndIntegerMultipleForms() async throws {
+    // Ch. 28 "Rounding Numbers" — two documented forms sharing one
+    // formula: a decimal precision argument (e.g. 0.0001) rounds to that
+    // many decimal places; an integer precision argument (e.g. 1000)
+    // rounds to the nearest multiple of it. Confirmed by all seven of
+    // the Guide's own worked examples across both forms.
+    var context = LassoContext()
+    let output = try await LassoRenderer().render(
+        "[Math_Round(3.1415926, 0.0001)]|" +
+            "[Math_Round(3.1415926, 0.001)]|" +
+            "[Math_Round(3.1415926, 0.01)]|" +
+            "[Math_Round(3.1415926, 0.1)]|" +
+            "[Math_Round(1463, 1000)]|" +
+            "[Math_Round(1463, 100)]|" +
+            "[Math_Round(1463, 10)]",
+        context: &context
+    )
+    let parts = output.components(separatedBy: "|")
+    #expect(parts[0] == "3.1416")
+    #expect(parts[1] == "3.142")
+    #expect(parts[2] == "3.14")
+    #expect(parts[3] == "3.1")
+    #expect(parts[4] == "1000")
+    #expect(parts[5] == "1500")
+    #expect(parts[6] == "1460")
+}
+
+@Test func mathRandomRespectsMinMaxAndTheDocumentedExclusiveIntegerUpperBound() async throws {
+    // Ch. 28 "Random Numbers": "-Max: Maximum value to be returned. For
+    // integer results should be one greater than maximum desired value"
+    // -- the real range is [min, max). Confirmed via the Guide's own
+    // worked example ("a random number between 1 and 99" from
+    // -Min=1, -Max=100).
+    var context = LassoContext()
+    for _ in 0..<50 {
+        let output = try await LassoRenderer().render(
+            "[Math_Random(-Min=1, -Max=100)]",
+            context: &context
+        )
+        let value = Int(output) ?? -1
+        #expect(value >= 1 && value <= 99)
+    }
+}
+
+@Test func mathRandomReturnsADecimalWhenMinOrMaxIsADecimal() async throws {
+    var context = LassoContext()
+    let output = try await LassoRenderer().render(
+        "[Math_Random(-Min=0.0, -Max=1.0)]",
+        context: &context
+    )
+    let value = Double(output) ?? -1
+    #expect(value >= 0.0 && value < 1.0)
+    #expect(output.contains("."))
+}
+
+@Test func mathRandomHexReturnsHexadecimalNotation() async throws {
+    var context = LassoContext()
+    let output = try await LassoRenderer().render(
+        "[Math_Random(-Min=16, -Max=256, -Hex)]",
+        context: &context
+    )
+    #expect(output.count == 2)
+    #expect(output.allSatisfy { $0.isHexDigit })
+}
+
+@Test func mathSqrtAndMathPowMatchTheLanguageGuidesOwnWorkedExamples() async throws {
+    // Ch. 28 "Trigonometry and Advanced Math" — confirmed worked
+    // examples: `Math_Pow(3, 3)` -> `27` (integer result for integer
+    // inputs), `Math_Sqrt(100.0)` -> `10.0`.
+    var context = LassoContext()
+    let output = try await LassoRenderer().render(
+        "[Math_Pow(3, 3)]|[Math_Sqrt(100.0)]",
+        context: &context
+    )
+    #expect(output == "27|10.0")
+}
+
+@Test func mathAbsPreservesTheInvocantsIntegerOrDecimalType() async throws {
+    var context = LassoContext()
+    let output = try await LassoRenderer().render(
+        "[Math_Abs(-5)]|[Math_Abs(-5.5)]",
+        context: &context
+    )
+    #expect(output == "5|5.5")
+}
+
+@Test func unaryMinusOnAWholeNumberPreservesIntegerTypeNotAlwaysDecimal() async throws {
+    // Real bug caught by architect review of the Math_* work: `Evaluator.unary`'s
+    // "-"/"+" cases previously returned `.decimal` unconditionally,
+    // regardless of the operand's own type -- the number lexer never
+    // consumes a leading sign, so every negative literal parses as this
+    // unary operator applied to a plain number token, not as part of the
+    // literal itself. That silently downgraded `-5` from an integer to a
+    // decimal purely because of how its sign was written, contradicting
+    // the documented "if all the parameters are integers the result will
+    // be an integer" rule the new Math_* family depends on --
+    // `Math_Add(-5, 3)` printed `-2.0`, not `-2`. Fixed by mirroring
+    // `numeric(_:_:_:)`'s own established whole-number-result convention.
+    var context = LassoContext()
+    let output = try await LassoRenderer().render(
+        "[Math_Add(-5, 3)]|[-5]|[-5.5]|[+5]",
+        context: &context
+    )
+    #expect(output == "-2|-5|-5.5|5")
+}
+
 // lassoguide.com "Byte Streams" — `bytes(...)->decodeBase64`/
 // `->encodeBase64`/`->encodeUrl` are the only three members implemented,
 // matching the only three real corpus ever calls (confirmed by grepping

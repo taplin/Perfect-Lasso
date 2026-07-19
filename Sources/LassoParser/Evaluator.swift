@@ -376,9 +376,26 @@ struct Evaluator {
 
     private func unary(_ op: String, _ value: LassoValue) throws -> LassoValue {
         switch op.lowercased() {
-        case "!", "not": .boolean(!value.isTruthy)
-        case "-": .decimal(-(value.number ?? 0))
-        case "+": .decimal(value.number ?? 0)
+        case "!", "not": return .boolean(!value.isTruthy)
+        // `-5`/`+5` previously always returned `.decimal`, unconditionally
+        // — the number lexer (`ExpressionParser`) never consumes a
+        // leading `-`/`+`, so every negative/explicitly-positive literal
+        // parses as this unary operator applied to a plain number token,
+        // not as part of the literal itself. That silently downgraded an
+        // integer literal to a decimal purely because of how its sign was
+        // written (`Math_Add(-5, 3)` printed `-2.0`, not `-2`, contrary
+        // to the documented "if all the parameters are integers the
+        // result will be an integer" rule the new Math_* family
+        // implements) — caught by architect review of that work. Fixed
+        // by mirroring `numeric(_:_:_:)`'s own established whole-number
+        // convention right below, rather than inventing a stricter,
+        // inconsistent rule.
+        case "-":
+            let result = -(value.number ?? 0)
+            return result.rounded() == result ? .integer(Int(result)) : .decimal(result)
+        case "+":
+            let result = value.number ?? 0
+            return result.rounded() == result ? .integer(Int(result)) : .decimal(result)
         default: throw LassoRuntimeError.unsupportedExpression("Unary \(op)")
         }
     }

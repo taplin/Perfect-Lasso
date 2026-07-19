@@ -272,6 +272,162 @@ public struct LassoNativeRegistry: Sendable {
                 country: arguments.positionalValue(at: 2)?.outputString ?? "US"
             ))
         }
+        // Math_* substitution-tag family (Ch. 28 Tables 10/12) — the
+        // arithmetic symbols (+/-/*// /%) already work via
+        // `Evaluator.binary`; this is the separate free-tag dialect real
+        // corpus commonly uses instead (`Math_Add`, `Math_Round`, ...),
+        // plus rounding/random/trig functions with no symbol equivalent
+        // at all. See MathOperations.swift for the shared operand-
+        // extraction/result-type helpers.
+        register("math_abs") { arguments, _ in
+            switch arguments.positionalValue(at: 0) {
+            case let .integer(value): return .integer(abs(value))
+            default: return .decimal(abs(arguments.positionalValue(at: 0)?.number ?? 0))
+            }
+        }
+        register("math_add") { arguments, _ in
+            let (values, allInteger) = LassoMathOperations.operands(arguments)
+            return LassoMathOperations.result(values.reduce(0, +), allInteger: allInteger)
+        }
+        register("math_sub") { arguments, _ in
+            // "Subtracts each of multiple parameters in order from left
+            // to right" (Table 10) — a chained left-fold, not just a
+            // two-parameter difference.
+            let (values, allInteger) = LassoMathOperations.operands(arguments)
+            guard let first = values.first else { return .integer(0) }
+            let total = values.dropFirst().reduce(first, -)
+            return LassoMathOperations.result(total, allInteger: allInteger)
+        }
+        register("math_mult") { arguments, _ in
+            let (values, allInteger) = LassoMathOperations.operands(arguments)
+            return LassoMathOperations.result(values.reduce(1, *), allInteger: allInteger)
+        }
+        register("math_div") { arguments, _ in
+            // Ch. 28 Table 10: "Divides each of multiple parameters in
+            // order from left to right." All-integer parameters truncate
+            // toward the integer result (confirmed by the Guide's own
+            // clean worked example: `Math_Div(1, 8)` -> `0`, "0.125 rounds
+            // down to zero when cast to an integer"); a decimal parameter
+            // keeps full precision (`Math_Div(1.0, 8)` -> `0.125000`).
+            // Note: the Guide's OWN two-parameter examples immediately
+            // below that rule (`Math_Div(10, 9)` -> `11`, `Math_Div(10,
+            // 8.0)` -> `12.5`) don't correspond to any sensible division
+            // of those inputs — almost certainly a real transcription
+            // defect in the PDF itself (this project has already
+            // confirmed at least one other verbatim doc defect,
+            // Valid_CreditCard's "ROT-13" mislabeling), so this follows
+            // the clean, internally-consistent rule and first example
+            // rather than those two outlier numbers. Division by zero
+            // substitutes 1 rather than crashing/producing NaN, borrowing
+            // the same zero-substitutes-to-1 idea `Evaluator.binary`'s
+            // "%" operator already uses — not full parity: "%" clamps
+            // any non-positive divisor (including negatives) to 1, while
+            // this only special-cases an exact 0 and preserves negative
+            // divisors for real division.
+            let (values, allInteger) = LassoMathOperations.operands(arguments)
+            guard let first = values.first else { return .integer(0) }
+            let total = values.dropFirst().reduce(first) { $0 / ($1 == 0 ? 1 : $1) }
+            return LassoMathOperations.result(total, allInteger: allInteger)
+        }
+        register("math_mod") { arguments, _ in
+            let (values, allInteger) = LassoMathOperations.operands(arguments)
+            guard values.count >= 2 else { return .integer(0) }
+            let divisor = values[1] == 0 ? 1 : values[1]
+            return LassoMathOperations.result(values[0].truncatingRemainder(dividingBy: divisor), allInteger: allInteger)
+        }
+        register("math_max") { arguments, _ in
+            let (values, allInteger) = LassoMathOperations.operands(arguments)
+            return LassoMathOperations.result(values.max() ?? 0, allInteger: allInteger)
+        }
+        register("math_min") { arguments, _ in
+            let (values, allInteger) = LassoMathOperations.operands(arguments)
+            return LassoMathOperations.result(values.min() ?? 0, allInteger: allInteger)
+        }
+        // ->Ceil/->Floor/->RInt always return an integer regardless of
+        // the input's own type (Table 10: "Returns the next higher/lower
+        // integer" / "Rounds to nearest integer") — confirmed by the
+        // worked examples (`Math_RInt(37.6)` -> `38`, `Math_Floor(37.6)`
+        // -> `37`, `Math_Ceil(37.6)` -> `38`).
+        register("math_ceil") { arguments, _ in
+            .integer(Int((arguments.positionalValue(at: 0)?.number ?? 0).rounded(.up)))
+        }
+        register("math_floor") { arguments, _ in
+            .integer(Int((arguments.positionalValue(at: 0)?.number ?? 0).rounded(.down)))
+        }
+        register("math_rint") { arguments, _ in
+            .integer(Int((arguments.positionalValue(at: 0)?.number ?? 0).rounded()))
+        }
+        register("math_round") { arguments, _ in
+            // Two documented forms sharing one formula (Ch. 28 "Rounding
+            // Numbers", confirmed by all four decimal-form worked
+            // examples and all three integer-multiple-form ones):
+            // decimal precision (e.g. 0.0001) rounds to that many decimal
+            // places and stays a decimal; integer precision (e.g. 1000)
+            // rounds to the nearest multiple of it and returns an
+            // integer. Both are `(value / precision).rounded() * precision`
+            // — only the result's TYPE differs, based on the precision
+            // argument's own type.
+            guard let value = arguments.positionalValue(at: 0)?.number else { return .integer(0) }
+            guard let precisionArgument = arguments.positionalValue(at: 1),
+                  let precisionValue = precisionArgument.number, precisionValue != 0 else {
+                return .integer(Int(value.rounded()))
+            }
+            let rounded = (value / precisionValue).rounded() * precisionValue
+            if case .integer = precisionArgument {
+                return .integer(Int(rounded))
+            }
+            return .decimal(rounded)
+        }
+        register("math_random") { arguments, _ in
+            // Ch. 28 "Random Numbers" / Table 11. Decimal vs. integer
+            // result is decided by whether -Min/-Max are decimals; for
+            // the integer form, -Max is documented as "one greater than
+            // maximum desired value" ("[Math_Random: -Min=1, -Max=100]"
+            // returns 1-99), i.e. the real range is [min, max).
+            let minArgument = arguments.firstValue(named: "min")
+            let maxArgument = arguments.firstValue(named: "max")
+            let isDecimalRange: Bool
+            if case .decimal = minArgument { isDecimalRange = true }
+            else if case .decimal = maxArgument { isDecimalRange = true }
+            else { isDecimalRange = false }
+            let minValue = minArgument?.number ?? 0
+            if isDecimalRange {
+                let maxValue = maxArgument?.number ?? 1.0
+                let upperBound = max(maxValue, minValue + .ulpOfOne)
+                return .decimal(Double.random(in: minValue..<upperBound))
+            }
+            let low = Int(minValue)
+            let high = max(Int(maxArgument?.number ?? 100) - 1, low)
+            let result = Int.random(in: low...high)
+            if arguments.hasTruthyFlag("hex") {
+                // Zero-padded to 2 digits — the Guide's own stated
+                // rationale for `-Hex` is HTML color values (`#RRGGBB`),
+                // where a caller stitching together `#[Math_Random(...,
+                // -Hex)]...` three times needs consistent-width
+                // components; an unpadded single digit for a result
+                // under 16 would silently shift the color string's
+                // length. Flagged in architect review.
+                let hex = String(result, radix: 16)
+                return .string(hex.count < 2 ? "0" + hex : hex)
+            }
+            return .integer(result)
+        }
+        register("math_sqrt") { arguments, _ in
+            .decimal(sqrt(arguments.positionalValue(at: 0)?.number ?? 0))
+        }
+        register("math_pow") { arguments, _ in
+            let baseArgument = arguments.positionalValue(at: 0)
+            let exponentArgument = arguments.positionalValue(at: 1)
+            let result = pow(baseArgument?.number ?? 0, exponentArgument?.number ?? 0)
+            // Confirmed worked example: `Math_Pow(3, 3)` -> `27` (an
+            // INTEGER result for integer inputs whose result happens to
+            // be a whole number), matching the same all-integer-
+            // parameters-stay-integer rule as the arithmetic tags above.
+            if case .integer = baseArgument, case .integer = exponentArgument, result.rounded() == result {
+                return .integer(Int(result))
+            }
+            return .decimal(result)
+        }
         // Date and time — Lasso 8.5 Language Guide Chapter 29 "Date and
         // Time Operations". See Documentation/date-format-plan.md for the
         // native "date" object representation and the DateFormatter/ICU
