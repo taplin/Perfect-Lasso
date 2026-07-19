@@ -1268,6 +1268,141 @@ import PerfectSessionCore
     #expect(output == "hello")
 }
 
+@Test func bytesSizeMatchesLassoguideComsOwnWorkedExample() async throws {
+    // http://www.lassoguide.com/operations/byte-streams.html "Return the
+    // Size of a Byte Stream": `bytes('abc…')->size // => 6` — the
+    // ellipsis character is 3 UTF-8 bytes, so 'abc' (3) + '…' (3) = 6.
+    var context = LassoContext()
+    let output = try await LassoRenderer().render("[bytes('abc\u{2026}')->size]", context: &context)
+    #expect(output == "6")
+}
+
+@Test func bytesGetReturnsAnIntegerByteValueMatchingLassoguideComsOwnWorkedExample() async throws {
+    // "Return a Single Byte from a Byte Stream": `bytes('hello
+    // world')->get(2) // => 101` (the ASCII code for the 1-based 2nd
+    // character, 'e').
+    var context = LassoContext()
+    let output = try await LassoRenderer().render("[bytes('hello world')->get(2)]", context: &context)
+    #expect(output == "101")
+}
+
+@Test func bytesGetRangeReturnsASliceAsANewBytesObject() async throws {
+    var context = LassoContext()
+    let output = try await LassoRenderer().render("[bytes('hello')->getRange(2, 3)->asString]", context: &context)
+    #expect(output == "ell")
+}
+
+@Test func bytesFindMatchesLassoguideComsOwnWorkedExample() async throws {
+    // "Find a Value Within a Byte Stream": `bytes('running rhinos risk
+    // rampage')->find('rhino') // => 9`.
+    var context = LassoContext()
+    let output = try await LassoRenderer().render(
+        "[bytes('running rhinos risk rampage')->find('rhino')]|[bytes('abc')->find('zzz')]",
+        context: &context
+    )
+    #expect(output == "9|0")
+}
+
+@Test func bytesContainsBeginsWithAndEndsWithMatchTheirOwnWrittenDescriptionsNotTheBuggyWorkedExample() async throws {
+    // lassoguide.com's "Determine If a Byte Stream Contains a Value"
+    // section's own worked example actually calls `->find` (not
+    // `->contains`) and expects a boolean `false` — which doesn't even
+    // match `->find`'s own documented integer-or-zero return type. This
+    // is a confirmed copy-paste artifact from the `->find` section
+    // directly above it; implemented against `->contains`'s own written
+    // description ("Returns 'true' if the byte stream contains the
+    // specified sequence") instead, per NativeTypes.swift's own doc
+    // comment on this registration.
+    var context = LassoContext()
+    let output = try await LassoRenderer().render(
+        "[bytes('running rhinos risk rampage')->contains('rhino')]|[bytes('running rhinos risk rampage')->contains('zebra')]|[bytes('hello world')->beginsWith('hello')]|[bytes('hello world')->endsWith('world')]|[bytes('hello world')->beginsWith('world')]",
+        context: &context
+    )
+    #expect(output == "true|false|true|true|false")
+}
+
+@Test func bytesAsStringDefaultsToUTF8MatchingLassoguideComsOwnWorkedExample() async throws {
+    // "Export a String from a Byte Stream" uses `->exportString`
+    // (deprecated-sibling form, not implemented this stage) with the
+    // same "This is a string" worked value — `->asString` is its
+    // documented UTF-8-default replacement.
+    var context = LassoContext()
+    let output = try await LassoRenderer().render("[bytes('This is a string')->asString]", context: &context)
+    #expect(output == "This is a string")
+}
+
+@Test func bytesAsStringHonorsAnExplicitISO88591Encoding() async throws {
+    // 0xE9 alone isn't valid UTF-8 (it's a 3-byte-sequence leading byte
+    // with no continuation), but every byte value 0-255 is a valid
+    // ISO-8859-1 character — 0xE9 is 'é'. Built via ->decodeHex since a
+    // Lasso string literal can only produce UTF-8-encoded bytes, not an
+    // arbitrary single non-ASCII byte directly.
+    var context = LassoContext()
+    let output = try await LassoRenderer().render("[bytes('e9')->decodeHex->asString('ISO-8859-1')]", context: &context)
+    #expect(output == "\u{00E9}")
+}
+
+@Test func bytesSplitOnADelimiterAndOnAnEmptyDelimiterSplitsPerByte() async throws {
+    // "If the delimiter provided is an empty byte stream or string, the
+    // byte stream is split on each byte, so the returned array will have
+    // each byte as one of its elements."
+    var context = LassoContext()
+    let output = try await LassoRenderer().render(
+        """
+        [(bytes('a,b,c')->split(','))->size]
+        [(bytes('a,b,c')->split(','))->get(1)->asString]|[(bytes('a,b,c')->split(','))->get(2)->asString]|[(bytes('a,b,c')->split(','))->get(3)->asString]
+        [(bytes('ab')->split(''))->size]
+        """,
+        context: &context
+    )
+    let lines = output
+        .split(separator: "\n")
+        .map { $0.trimmingCharacters(in: .whitespaces) }
+        .filter { !$0.isEmpty }
+    #expect(lines == ["3", "a|b|c", "2"])
+}
+
+@Test func bytesSubReturnsEverythingFromThePositionWhenNumIsOmitted() async throws {
+    // Unlike `->getRange`, `->sub`'s second parameter is optional — "all
+    // of the bytes following the index are returned" when omitted.
+    var context = LassoContext()
+    let output = try await LassoRenderer().render(
+        "[bytes('hello world')->sub(7)->asString]|[bytes('hello world')->sub(1, 5)->asString]",
+        context: &context
+    )
+    #expect(output == "world|hello")
+}
+
+@Test func bytesAppendTrimReplaceAndRemoveMutateTheInvocantInPlaceAsBareStatements() async throws {
+    // Documented "Bytes Manipulation Methods" — "Calling the following
+    // methods will modify the bytes object without returning a value" —
+    // exactly the same self-mutating write-back mechanism
+    // `String->Trim`/`->Append`/`->Replace`/`->Remove` already use
+    // (`Evaluator.selfMutatingMethods` is purely syntactic/name-based,
+    // not type-scoped, so no new entries were needed for `bytes`).
+    var context = LassoContext()
+    let output = try await LassoRenderer().render(
+        """
+        [var(b::bytes=bytes('hello '))][$b->(append('world'))][$b->asString]|\
+        [var(t::bytes=bytes('  hi  '))][$t->(trim)][$t->asString]|\
+        [var(r::bytes=bytes('Blue Red Yellow'))][$r->(replace('Blue', 'Green'))][$r->asString]|\
+        [var(rm::bytes=bytes('hello world'))][$rm->(remove(6, 6))][$rm->asString]|\
+        [var(rmAll::bytes=bytes('abc'))][$rmAll->(remove)][$rmAll->asString]|end
+        """,
+        context: &context
+    )
+    #expect(output == "hello world|hi|Green Red Yellow|hello||end")
+}
+
+@Test func bytesEncodeHexAndDecodeHexRoundTrip() async throws {
+    var context = LassoContext()
+    let output = try await LassoRenderer().render(
+        "[bytes('AB')->encodeHex->asString]|[bytes('4142')->decodeHex->asString]",
+        context: &context
+    )
+    #expect(output == "4142|AB")
+}
+
 @Test func bytesWithNoArgumentIsEmpty() async throws {
     var context = LassoContext()
     let output = try await LassoRenderer().render("[bytes]", context: &context)
