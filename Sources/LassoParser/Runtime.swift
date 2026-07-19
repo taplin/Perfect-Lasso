@@ -343,8 +343,24 @@ public struct LassoNativeRegistry: Sendable {
             }
             return .map(values)
         }
+        // Lasso 8.5 Language Guide p.389 "Creating Arrays": "name/value
+        // pairs ... are interpreted as pairs to be added to the array" —
+        // `[Array: 'Name_One'='Value_One', 'Name_Two'='Value_Two']` builds
+        // an array of two Pairs, not two plain string values. p.396's
+        // "Pair Arrays" worked example additionally mixes pair and
+        // non-string-value forms (`'Alpha'='One', 'Beta'='Two', 'Alpha'=1,
+        // 'Beta'=2`). Previously every labeled argument's label was
+        // silently discarded here (`register("map")` and `register("pair")`
+        // already do the label-aware thing correctly), so
+        // `array('Alpha'='One')` produced `.array([.string("One")])`
+        // instead of `.array([.pair(.string("Alpha"), .string("One"))])`.
         register("array") { arguments, _ in
-            .array(arguments.map { $0.value })
+            .array(arguments.map { argument in
+                if let label = argument.label {
+                    return .pair(.string(label), argument.value)
+                }
+                return argument.value
+            })
         }
         // Real Lasso's Pair constructor (LassoGuide, "Collections"):
         // pair() -> both null; pair(anotherPair) -> copies first/second;
