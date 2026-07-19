@@ -497,13 +497,74 @@ struct Evaluator {
             guard let decoded = LassoEncoding.decodeBase64(value) else { return .void }
             return .string(decoded)
         case let (.string(value), "contains"):
+            // Lasso 8.5 Language Guide Ch. 25 Table 7: "[String->Contains]
+            // Returns True if the string contains the parameter as a
+            // substring. Comparison is case insensitive." An earlier
+            // version used Swift's raw case-SENSITIVE `String.contains`,
+            // contradicting the documented behavior — caught while
+            // verifying `->BeginsWith`/`->EndsWith`/`->Equals` (the same
+            // table's siblings, all explicitly documented case-
+            // insensitive too) directly against this same page.
             let needle: String
             if let argument = arguments.first {
                 needle = try await evaluate(argument.value).outputString
             } else {
                 needle = ""
             }
-            return .boolean(value.contains(needle))
+            return .boolean(needle.isEmpty || value.range(of: needle, options: .caseInsensitive) != nil)
+        case let (.string(value), "beginswith"):
+            // Ch. 25 Table 7: case insensitive.
+            let needle = arguments.first != nil ? try await evaluate(arguments[0].value).outputString : ""
+            return .boolean(value.range(of: needle, options: [.caseInsensitive, .anchored]) != nil || needle.isEmpty)
+        case let (.string(value), "endswith"):
+            let needle = arguments.first != nil ? try await evaluate(arguments[0].value).outputString : ""
+            return .boolean(needle.isEmpty || value.range(of: needle, options: [.caseInsensitive, .backwards, .anchored]) != nil)
+        case let (.string(value), "equals"):
+            // "Equivalent to the == symbol" — reuses the same
+            // case-insensitive comparison `binary(_:"==",_:)` already
+            // uses elsewhere (Evaluator.swift's own `==` doc comment
+            // cites a real production bug this exact rule was needed to
+            // fix: 'Yes' vs 'yes').
+            let other = arguments.first != nil ? try await evaluate(arguments[0].value).outputString : ""
+            return .boolean(value.caseInsensitiveCompare(other) == .orderedSame)
+        case let (.string(value), member) where member == "compare" || member == "comparecodepointorder":
+            // Ch. 25 Table 7: three-way compare — 0 if equal, 1 if the
+            // base string is bitwise greater, -1 if less. Case
+            // insensitive by default; a bare `-Case` flag makes it case
+            // sensitive. Only the single-parameter whole-string form is
+            // implemented — the documented substring-offset/-length
+            // overloads (comparing a slice of either string) are out of
+            // scope here. `->CompareCodePointOrder` is documented as
+            // accepting the same parameters with Unicode-code-point-
+            // accurate ordering for characters above U+10000 — Swift's
+            // native `String` comparison is already Unicode-scalar-aware
+            // by default, so it shares this exact implementation rather
+            // than needing a separate one.
+            let evaluatedArguments = try await evaluate(arguments)
+            let other = evaluatedArguments.positionalValue(at: 0)?.outputString ?? ""
+            let caseSensitive = evaluatedArguments.hasTruthyFlag("case")
+            let ordering = caseSensitive ? value.compare(other) : value.compare(other, options: .caseInsensitive)
+            switch ordering {
+            case .orderedSame: return .integer(0)
+            case .orderedDescending: return .integer(1)
+            case .orderedAscending: return .integer(-1)
+            }
+        case let (.string(value), "find"):
+            // Ch. 25 Table 9: "Returns the position at which the first
+            // parameter is found within the string or 0 if the first
+            // parameter is not found." 1-based, matching `->substring`'s
+            // own established 1-based convention (confirmed by that
+            // member's own doc comment/tests).
+            let needle = arguments.first != nil ? try await evaluate(arguments[0].value).outputString : ""
+            guard !needle.isEmpty, let range = value.range(of: needle) else { return .integer(0) }
+            return .integer(value.distance(from: value.startIndex, to: range.lowerBound) + 1)
+        case let (.string(value), "get"):
+            // Ch. 25 Table 9: a single character at a 1-based position.
+            let position = arguments.first != nil ? Int(try await evaluate(arguments[0].value).number ?? 0) : 0
+            let characters = Array(value)
+            let index = position - 1
+            guard characters.indices.contains(index) else { return .string("") }
+            return .string(String(characters[index]))
         case let (.string(value), "split"):
             let separator: String
             if let argument = arguments.first {
@@ -559,6 +620,59 @@ struct Evaluator {
             // `$email->(trim)` and lost_password.page.lasso's
             // `#new_email->(trim)` — confirmed live 2026-07-18.
             return .string(value.trimmingCharacters(in: .whitespacesAndNewlines))
+        case let (.string(value), "padleading"):
+            // Ch. 25 Table 3: pads the FRONT to a specified length
+            // (default pad character space). A string already at or past
+            // the target length is returned unchanged.
+            let length = arguments.first != nil ? Int(try await evaluate(arguments[0].value).number ?? 0) : 0
+            let padCharacter = arguments.count > 1 ? try await evaluate(arguments[1].value).outputString : " "
+            let padCount = max(length - value.count, 0)
+            let pad = padCharacter.isEmpty ? "" : String(repeating: padCharacter, count: padCount)
+            return .string(String(pad.suffix(padCount)) + value)
+        case let (.string(value), "padtrailing"):
+            let length = arguments.first != nil ? Int(try await evaluate(arguments[0].value).number ?? 0) : 0
+            let padCharacter = arguments.count > 1 ? try await evaluate(arguments[1].value).outputString : " "
+            let padCount = max(length - value.count, 0)
+            let pad = padCharacter.isEmpty ? "" : String(repeating: padCharacter, count: padCount)
+            return .string(value + String(pad.prefix(padCount)))
+        case let (.string(value), "removeleading"):
+            // Ch. 25 Table 3: "Removes all instances of the parameter
+            // from the beginning of the string" — repeated, not just one
+            // occurrence (distinct from `->Trim`, which strips
+            // whitespace specifically).
+            let target = arguments.first != nil ? try await evaluate(arguments[0].value).outputString : ""
+            guard !target.isEmpty else { return .string(value) }
+            var remaining = Substring(value)
+            while remaining.hasPrefix(target) { remaining = remaining.dropFirst(target.count) }
+            return .string(String(remaining))
+        case let (.string(value), "removetrailing"):
+            let target = arguments.first != nil ? try await evaluate(arguments[0].value).outputString : ""
+            guard !target.isEmpty else { return .string(value) }
+            var remaining = Substring(value)
+            while remaining.hasSuffix(target) { remaining = remaining.dropLast(target.count) }
+            return .string(String(remaining))
+        case let (.string(value), "reverse"):
+            // Ch. 25 Table 3 documents optional offset/length parameters
+            // to reverse only a substring range — only the default
+            // (reverse the entire string) is implemented here.
+            return .string(String(value.reversed()))
+        case let (.string(value), "titlecase"):
+            // Ch. 25 Table 5: "Converts the string to titlecase with the
+            // first character of each word capitalized." Word boundaries
+            // here are literal single spaces only, not general
+            // whitespace (tabs/newlines) — low real-corpus risk, but a
+            // real scope limitation, matching this file's own convention
+            // of disclosing narrower-than-documented scope (see
+            // `->reverse`/`->compare` just above and below) rather than
+            // silently under-delivering. No locale parameter support
+            // either.
+            let titled = value.split(separator: " ", omittingEmptySubsequences: false)
+                .map { word -> String in
+                    guard let first = word.first else { return String(word) }
+                    return first.uppercased() + word.dropFirst().lowercased()
+                }
+                .joined(separator: " ")
+            return .string(titled)
         case let (.string(value), member) where member == "substring" || member == "sub":
             // `string->substring(start::integer, size::integer=?)` --
             // LassoGuide: "The starting point is specified by the first
@@ -917,6 +1031,11 @@ struct Evaluator {
         // lists (`->Sort`) and building a list from search results while
         // dropping already-seen SKUs (`->Remove`).
         "sort", "reverse", "remove", "removeall",
+        // `String->PadLeading`/`->PadTrailing`/`->RemoveLeading`/
+        // `->RemoveTrailing`/`->Titlecase` (Ch. 25 Tables 3/5) —
+        // documented "Modifies the string and returns no value",
+        // exactly like `->Trim`/`->Append` above.
+        "padleading", "padtrailing", "removeleading", "removetrailing", "titlecase",
         // `Date->Add`/`Date->Subtract` (Lasso 8.5 Language Guide Ch. 29
         // Table 7) — documented as changing "the values of variables
         // that contain date... data types" when called as a bare

@@ -5206,6 +5206,177 @@ private final class MapIncludeLoader: LassoIncludeLoader, @unchecked Sendable {
     #expect(output == "4|1111")
 }
 
+@Test func stringValidationMembersMatchTheLanguageGuidesOwnWorkedExampleCaseInsensitively() async throws {
+    // Lasso 8.5 Language Guide Ch. 25 Table 7, confirmed via the Guide's
+    // own worked example verbatim (testString = 'A short string'):
+    // BeginsWith/EndsWith/Contains/Equals are all documented case
+    // INSENSITIVE -- an earlier version of `->Contains` used Swift's raw
+    // case-sensitive `String.contains`, contradicting its own sibling
+    // members (`->BeginsWith`/`->EndsWith`/`->Equals`, all newly added
+    // here with the correct case-insensitive behavior); caught while
+    // verifying those siblings against this same page and fixed
+    // alongside them.
+    var context = LassoContext()
+    let output = try await LassoRenderer().render(
+        """
+        [var(testString = 'A short string')]
+        beginsA=[$testString->beginsWith('a')]|
+        beginsPhrase=[$testString->beginsWith('A short')]|
+        beginsFalse=[$testString->beginsWith('string')]|
+        ends=[$testString->endsWith('string')]|
+        contains=[$testString->contains('short')]|
+        containsMixedCase=[$testString->contains('SHORT')]|
+        equals=[$testString->equals('a short string')]
+        """,
+        context: &context
+    )
+    #expect(output.contains("beginsA=true"))
+    #expect(output.contains("beginsPhrase=true"))
+    #expect(output.contains("beginsFalse=false"))
+    #expect(output.contains("ends=true"))
+    #expect(output.contains("contains=true"))
+    #expect(output.contains("containsMixedCase=true"))
+    #expect(output.contains("equals=true"))
+}
+
+@Test func stringCompareIsThreeWayCaseInsensitiveByDefaultCaseSensitiveWithFlag() async throws {
+    // Ch. 25 Table 7: "[String->Compare] ... returns 0 if the parameter
+    // is equal to the string, 1 if the characters in the string are
+    // bitwise greater than the parameter, and -1 if... less... Comparison
+    // is case insensitive by default. An optional -Case parameter makes
+    // the comparison case sensitive." NOT tested against the Guide's own
+    // "[$testString->(Compare: 'a short string', -Case)] -> False" line
+    // for this exact scenario -- that line is internally inconsistent
+    // (an integer-returning tag's worked example showing the literal
+    // word "False", not a 0/1/-1 value) and looks like the same class of
+    // transcription defect already confirmed once in this project
+    // (Math_Div's page-370 examples). Verified instead with
+    // self-computed, unambiguous cases.
+    var context = LassoContext()
+    let output = try await LassoRenderer().render(
+        "[('abc')->compare('abc')]|[('abc')->compare('abd')]|[('abd')->compare('abc')]|" +
+            "[('A short string')->compare('a short string')]|" +
+            "[('A short string')->compare('a short string', -Case)]",
+        context: &context
+    )
+    let parts = output.components(separatedBy: "|")
+    #expect(parts[0] == "0")
+    #expect(parts[1] == "-1")
+    #expect(parts[2] == "1")
+    // Case-insensitive by default: equal.
+    #expect(parts[3] == "0")
+    // -Case forces case-sensitive comparison: 'A' (0x41) sorts before
+    // 'a' (0x61) bitwise, so the base string is "less than" the parameter.
+    #expect(parts[4] == "-1")
+}
+
+@Test func stringFindReturnsAOneBasedPositionOrZeroForAMiss() async throws {
+    // Ch. 25 Table 9: "Returns the position at which the first parameter
+    // is found within the string or 0 if the first parameter is not
+    // found." Distinct from Array->Find (returns an array of all
+    // matches) -- dispatch is keyed on `(base, name)` together so the
+    // two don't collide.
+    var context = LassoContext()
+    let output = try await LassoRenderer().render(
+        "[('A Short String')->find('Short')]|[('A Short String')->find('zzz')]",
+        context: &context
+    )
+    #expect(output == "3|0")
+}
+
+@Test func stringGetReturnsASingleCharacterAtAOneBasedPosition() async throws {
+    // Ch. 25 Table 9 worked example: ['Alpha'->(Get: 3)] -> 'p'.
+    var context = LassoContext()
+    let output = try await LassoRenderer().render("[('Alpha')->get(3)]", context: &context)
+    #expect(output == "p")
+}
+
+@Test func stringPadLeadingAndPadTrailingPadToALengthWithADefaultOrCustomCharacter() async throws {
+    // Ch. 25 Table 3: pads to a specified length with a pad character
+    // (defaults to space); a string already at or past the target
+    // length is left unchanged (mutating members return the invocant
+    // unmodified rather than truncating).
+    var context = LassoContext()
+    let output = try await LassoRenderer().render(
+        """
+        [var(a = 'ab')][$a->padLeading(5, '0')]a=[$a]|
+        [var(b = 'ab')][$b->padTrailing(5, '0')]b=[$b]|
+        [var(c = 'ab')][$c->padLeading(4)]c=[$c]|
+        [var(d = 'abcdef')][$d->padLeading(3, '0')]d=[$d]
+        """,
+        context: &context
+    )
+    #expect(output.contains("a=000ab"))
+    #expect(output.contains("b=ab000"))
+    #expect(output.contains("c=  ab"))
+    #expect(output.contains("d=abcdef"))
+}
+
+@Test func stringRemoveLeadingAndRemoveTrailingStripEveryRepeatedInstance() async throws {
+    // Ch. 25 Table 3: "Removes ALL instances of the parameter from the
+    // beginning/end" -- repeated, not just a single occurrence, distinct
+    // from `->Trim` (whitespace-only).
+    var context = LassoContext()
+    let output = try await LassoRenderer().render(
+        "[var(s = '**A Short String**')][$s->removeLeading('*')][$s->removeTrailing('*')]result=[$s]",
+        context: &context
+    )
+    #expect(output == "result=A Short String")
+}
+
+@Test func stringReverseReversesTheEntireString() async throws {
+    var context = LassoContext()
+    let output = try await LassoRenderer().render("[var(s = 'Hello')][$s->reverse]result=[$s]", context: &context)
+    #expect(output == "result=olleH")
+}
+
+@Test func stringTitlecaseCapitalizesTheFirstLetterOfEachWord() async throws {
+    // Ch. 25 Table 5: "Converts the string to titlecase with the first
+    // character of each word capitalized." Word boundaries are
+    // whitespace (no locale-parameter support implemented here).
+    var context = LassoContext()
+    let output = try await LassoRenderer().render(
+        "[var(s = 'hello WORLD from lasso')][$s->titlecase]result=[$s]",
+        context: &context
+    )
+    #expect(output == "result=Hello World From Lasso")
+}
+
+@Test func stringIsFamilyValidatesTheWholeStringMatchingTheLanguageGuidesOwnWorkedExamples() async throws {
+    // Ch. 25 Table 10, confirmed via the Guide's own worked examples
+    // verbatim. Empty-string inputs deliberately return False (not the
+    // vacuously-true default Swift's `allSatisfy` would give on an empty
+    // collection) -- see the registration's own doc comment for why.
+    var context = LassoContext()
+    let output = try await LassoRenderer().render(
+        "[String_IsAlpha('word')]|[String_IsAlphaNumeric('word')]|[String_IsLower('word')]|" +
+            "[String_IsNumeric('word')]|[String_IsUpper('word')]|" +
+            "[String_IsAlpha('2468')]|[String_IsAlphaNumeric('2468')]|[String_IsNumeric('2468')]|" +
+            "[String_IsDigit('9')]|[String_IsHexDigit('a')]|[String_IsPunctuation('.')]|[String_IsSpace(' ')]|" +
+            "[String_IsAlpha('')]",
+        context: &context
+    )
+    let parts = output.components(separatedBy: "|")
+    #expect(parts == [
+        "true", "true", "true", "false", "false",
+        "false", "true", "true",
+        "true", "true", "true", "true",
+        "false",
+    ])
+}
+
+@Test func stringLengthIsASynonymForSizeAndStringEndsWithMatchesTheMemberForm() async throws {
+    // Ch. 25 Table 10 worked example: String_Length('A Short String') ==
+    // 'A Short String'->Size == 14.
+    var context = LassoContext()
+    let output = try await LassoRenderer().render(
+        "[String_Length('A Short String')]|[('A Short String')->size]|" +
+            "[String_EndsWith('A Short String', -Find='String')]",
+        context: &context
+    )
+    #expect(output == "14|14|true")
+}
+
 @Test func pairConstructorSupportsAllFourRealLassoForms() async throws {
     // LassoGuide, "Collections": pair() -> both null; pair(anotherPair) ->
     // copies first/second; pair(value, value) -> two positional elements;

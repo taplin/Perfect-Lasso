@@ -1,5 +1,12 @@
 import Foundation
 
+/// Shared by the `String_Is*` free-tag family below — a top-level
+/// function (not a local closure) so it can be captured by the
+/// `@Sendable` `register(...)` closures without a Sendable-capture error.
+private func isEveryCharacter(_ text: String, _ predicate: (Character) -> Bool) -> Bool {
+    !text.isEmpty && text.allSatisfy(predicate)
+}
+
 public indirect enum LassoValue: Equatable, Sendable {
     case void
     case null
@@ -581,6 +588,67 @@ public struct LassoNativeRegistry: Sendable {
                 return .string("null")
             }
             return .string(string)
+        }
+        // String_Is* whole-string validation family (Ch. 25 Table 10) —
+        // each returns True only if the string is non-empty AND every
+        // character matches the criterion. The Guide doesn't address the
+        // empty-string case explicitly, but a vacuous "every character
+        // of nothing matches" true (Swift's own `allSatisfy` default on
+        // an empty collection) reads as a wrong answer for an "is this
+        // string alphabetic" style check — most languages' equivalent
+        // predicates (e.g. Python's `str.isalpha()`) special-case empty
+        // as False for the same reason, and it's what this file's own
+        // pre-existing `->IsLower`/`->IsUpper`-shaped checks already do
+        // via their own `.contains { $0.isLetter }` guard.
+        register("string_isalpha") { arguments, _ in
+            .boolean(isEveryCharacter(arguments.positionalValue(at: 0)?.outputString ?? "") { $0.isLetter })
+        }
+        register("string_isalphanumeric") { arguments, _ in
+            .boolean(isEveryCharacter(arguments.positionalValue(at: 0)?.outputString ?? "") { $0.isLetter || $0.isNumber })
+        }
+        register("string_isdigit") { arguments, _ in
+            .boolean(isEveryCharacter(arguments.positionalValue(at: 0)?.outputString ?? "") { $0.isNumber })
+        }
+        register("string_ishexdigit") { arguments, _ in
+            .boolean(isEveryCharacter(arguments.positionalValue(at: 0)?.outputString ?? "") { $0.isHexDigit })
+        }
+        register("string_islower") { arguments, _ in
+            let text = arguments.positionalValue(at: 0)?.outputString ?? ""
+            return .boolean(isEveryCharacter(text) { $0.isLowercase } && text.contains { $0.isLetter })
+        }
+        register("string_isupper") { arguments, _ in
+            let text = arguments.positionalValue(at: 0)?.outputString ?? ""
+            return .boolean(isEveryCharacter(text) { $0.isUppercase } && text.contains { $0.isLetter })
+        }
+        register("string_isnumeric") { arguments, _ in
+            // Ch. 25 Table 10: "only numerals, hyphens, or periods" —
+            // distinct from `->IsDigit`, which is numerals only.
+            .boolean(isEveryCharacter(arguments.positionalValue(at: 0)?.outputString ?? "") { $0.isNumber || $0 == "-" || $0 == "." })
+        }
+        register("string_ispunctuation") { arguments, _ in
+            // Ch. 25 Table 10 says only "contains punctuation characters"
+            // (no mention of symbols like `$`/`+`/`=`) and gives no
+            // worked example that would resolve punctuation-vs-symbol
+            // either way — tracking the doc's literal wording rather
+            // than also matching `Character.isSymbol`, which an earlier
+            // version did with no evidence to justify the broader
+            // reading (flagged in architect review).
+            .boolean(isEveryCharacter(arguments.positionalValue(at: 0)?.outputString ?? "") { $0.isPunctuation })
+        }
+        register("string_isspace") { arguments, _ in
+            .boolean(isEveryCharacter(arguments.positionalValue(at: 0)?.outputString ?? "") { $0.isWhitespace })
+        }
+        register("string_length") { arguments, _ in
+            // Documented synonym for `->Size` (Ch. 25 Table 10).
+            .integer(arguments.positionalValue(at: 0)?.outputString.count ?? 0)
+        }
+        register("string_endswith") { arguments, _ in
+            // Ch. 25 Table 8: `[String_EndsWith]` — a string value plus a
+            // `-Find` keyword parameter, case insensitive (matching the
+            // member form's own documented case-insensitivity).
+            let text = arguments.positionalValue(at: 0)?.outputString ?? ""
+            let suffix = arguments.lastString(named: "find") ?? ""
+            return .boolean(suffix.isEmpty || text.range(of: suffix, options: [.caseInsensitive, .backwards, .anchored]) != nil)
         }
         register("valid_email") { arguments, _ in
             let email = arguments.positionalValue(at: 0)?.outputString ?? ""
