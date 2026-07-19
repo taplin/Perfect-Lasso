@@ -167,11 +167,21 @@ struct Evaluator {
         let boundLocals = try await bindParameters(definition.parameters, to: evaluatedCallArguments)
 
         let savedLocals = context.snapshotLocals()
+        let savedLoopDepth = context.loopDepth
         try context.pushTagCall(definition.name)
         context.replaceLocals(boundLocals)
+        // A tag call starts a fresh scope with no loop of its own yet —
+        // without this, a stray Loop_Abort/Loop_Continue inside this
+        // tag's own body (which has no loop) would be mistaken by
+        // `shouldStopRenderingCurrentBody()` for "some enclosing loop out
+        // there wants this" just because the *caller* happened to be
+        // inside one, and leak back out to abort/skip whatever loop
+        // iteration is calling this tag. See `LassoContext.loopDepth`.
+        context.loopDepth = 0
         defer {
             context.replaceLocals(savedLocals)
             context.popTagCall()
+            context.loopDepth = savedLoopDepth
         }
 
         guard let renderNodes else { return .void }
@@ -268,11 +278,15 @@ struct Evaluator {
         }
         let boundLocals = try await bindParameters(resolved.definition.parameters, to: resolved.evaluatedArguments)
         let savedLocals = context.snapshotLocals()
+        let savedLoopDepth = context.loopDepth
         context.replaceLocals(boundLocals)
         context.pushSelf(object)
+        // See the matching comment in `invokeCustomTag`.
+        context.loopDepth = 0
         defer {
             context.popSelf()
             context.replaceLocals(savedLocals)
+            context.loopDepth = savedLoopDepth
         }
 
         guard let renderNodes else { return .void }

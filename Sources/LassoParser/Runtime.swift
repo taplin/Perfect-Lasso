@@ -422,6 +422,22 @@ public struct LassoNativeRegistry: Sendable {
             context.setReturnSignal(arguments.first?.value ?? .void)
             return .void
         }
+        // Break/continue for the nearest enclosing loop/while/iterate/
+        // records/with block — see `LassoContext.loopControlSignal` and
+        // each block case in `RendererEngine.renderBlock`. A call outside
+        // any loop is simply a no-op: the signal is set, but nothing in
+        // the enclosing `render(_:)` chain ever consumes it before the
+        // page finishes, so it has no observable effect (matching this
+        // codebase's existing "unrecognized/inapplicable construct is a
+        // no-op, not fatal" convention elsewhere).
+        register("loop_abort") { _, context in
+            context.setLoopAbortSignal()
+            return .void
+        }
+        register("loop_continue") { _, context in
+            context.setLoopContinueSignal()
+            return .void
+        }
         register("field") { arguments, context in
             let name = arguments.firstValue(named: "name")?.outputString ??
                 arguments.first?.value.outputString ?? ""
@@ -805,6 +821,13 @@ extension String {
     }
 }
 
+/// `Loop_Abort()`/`Loop_Continue()` — Lasso's break/continue. See
+/// `LassoContext.loopControlSignal`.
+enum LoopControlSignal: Sendable, Equatable {
+    case abort
+    case continueIteration
+}
+
 public struct LassoContext: Sendable {
     private var globals: [String: LassoValue]
     private var locals: [String: LassoValue]
@@ -879,6 +902,35 @@ public struct LassoContext: Sendable {
     /// already bounds `include`.
     var libraryStack: [String]
     var returnSignal: LassoValue?
+    /// Set by `Loop_Abort()`/`Loop_Continue()`, consumed by the nearest
+    /// enclosing loop/while/iterate/records/with block right after each
+    /// iteration's `render(body)` call returns — mirrors `returnSignal`'s
+    /// set/short-circuit pattern (checked in `RendererEngine.render(_:)`
+    /// alongside `returnSignal` so it also unwinds through any nested
+    /// blocks between the call site and the enclosing loop) but is scoped
+    /// to just that one loop rather than the whole page, matching
+    /// break/continue semantics: a loop nested inside another loop
+    /// consumes its own abort/continue signal and never lets it reach the
+    /// outer loop. See `loopDepth` and `shouldStopRenderingCurrentBody()`
+    /// for how a signal with NO enclosing loop at all is handled.
+    var loopControlSignal: LoopControlSignal?
+    /// Count of loop-shaped blocks (`loop`/`while`/`iterate`/`records`/
+    /// `with`) currently on the render call stack — incremented for the
+    /// duration of each one's own body render, decremented after. Lets
+    /// `shouldStopRenderingCurrentBody()` distinguish "a `Loop_Abort()`
+    /// that some enclosing loop still needs to consume" (`loopDepth > 0`,
+    /// so the current node list should stop early and let that unwind
+    /// happen) from "a stray call with no loop left to catch it at all"
+    /// (`loopDepth == 0`), which is otherwise indistinguishable from the
+    /// first case purely by looking at `loopControlSignal` in isolation.
+    /// Saved, reset to `0`, and restored around every custom-tag/member-
+    /// method call (`Evaluator.invokeCustomTag`/`invokeMemberMethod`) —
+    /// a call boundary starts a fresh scope with no loop of its own yet,
+    /// exactly like `snapshotLocals()`/`replaceLocals(_:)` already do for
+    /// `#locals`, so a stray abort inside a called tag's own body can't
+    /// be mistaken for "some enclosing loop out there wants this" just
+    /// because the *caller* happened to be inside one.
+    var loopDepth: Int
     var tagCallStack: [String]
     var selfStack: [LassoObjectInstance]
     /// Real Lasso's request-local `error_currentError` state — reset to
@@ -944,6 +996,8 @@ public struct LassoContext: Sendable {
         loadedLibraries = []
         libraryStack = []
         returnSignal = nil
+        loopControlSignal = nil
+        loopDepth = 0
         tagCallStack = []
         selfStack = []
         currentError = .noError
@@ -1041,6 +1095,46 @@ public struct LassoContext: Sendable {
 
     mutating func clearReturnSignal() {
         returnSignal = nil
+    }
+
+    mutating func setLoopAbortSignal() {
+        loopControlSignal = .abort
+    }
+
+    mutating func setLoopContinueSignal() {
+        loopControlSignal = .continueIteration
+    }
+
+    /// Called by the enclosing loop block right after each iteration's
+    /// `render(body)` returns. Returns `true` (having cleared the signal)
+    /// only for `.abort`, so the caller knows to stop iterating entirely;
+    /// a `.continueIteration` signal is cleared here too but reported as
+    /// "not abort" since that case just lets the enclosing `for`/`while`
+    /// proceed to its next iteration normally.
+    mutating func consumeLoopControlSignal() -> Bool {
+        defer { loopControlSignal = nil }
+        return loopControlSignal == .abort
+    }
+
+    /// The single early-exit check `RendererEngine.render(_:)` runs after
+    /// every node — `return`/`abort()` always stops (regardless of loop
+    /// nesting; that's how `LassoRenderer.render` picks up its value at
+    /// the very top). A `Loop_Abort`/`Loop_Continue` signal only stops
+    /// the current node list if `loopDepth > 0`, i.e. some enclosing
+    /// loop-shaped block is still on the render stack and will consume
+    /// it via `consumeLoopControlSignal()`. A signal set with NO
+    /// enclosing loop at all (`loopDepth == 0`) is discarded right here
+    /// instead of being allowed to persist unconsumed — otherwise a
+    /// stray call earlier on the page (or inside a tag body with no loop
+    /// of its own) would sit in `loopControlSignal` until some
+    /// completely unrelated LATER loop's `consumeLoopControlSignal()`
+    /// call mistakenly treated it as an abort request meant for it.
+    mutating func shouldStopRenderingCurrentBody() -> Bool {
+        if returnSignal != nil { return true }
+        guard loopControlSignal != nil else { return false }
+        if loopDepth > 0 { return true }
+        loopControlSignal = nil
+        return false
     }
 
     func snapshotLocals() -> [String: LassoValue] {

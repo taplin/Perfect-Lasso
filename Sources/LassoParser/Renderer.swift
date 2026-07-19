@@ -87,7 +87,7 @@ private struct RendererEngine {
                 case let .code(expressions, _, _, _):
                     for expression in expressions {
                         output += try await renderExpression(expression)
-                        if evaluator.context.returnSignal != nil { break }
+                        if evaluator.context.shouldStopRenderingCurrentBody() { break }
                     }
                 case let .block(name, arguments, body, alternate, _, _):
                     output += try await renderBlock(
@@ -132,7 +132,7 @@ private struct RendererEngine {
                 }
                 throw error
             }
-            if evaluator.context.returnSignal != nil { break }
+            if evaluator.context.shouldStopRenderingCurrentBody() { break }
         }
         return output
     }
@@ -153,6 +153,8 @@ private struct RendererEngine {
             }
             return condition.isTruthy ? try await render(body) : try await render(alternate ?? [])
         case "loop":
+            evaluator.context.loopDepth += 1
+            defer { evaluator.context.loopDepth -= 1 }
             let count: Int
             if let argument = arguments.first {
                 count = Int(try await evaluator.evaluate(argument.value).number ?? 0)
@@ -164,10 +166,13 @@ private struct RendererEngine {
                 for iteration in 1...count {
                     evaluator.context.set(.integer(iteration), for: "loop_count", scope: .local)
                     output += try await render(body)
+                    if evaluator.context.consumeLoopControlSignal() { break }
                 }
             }
             return output
         case "while":
+            evaluator.context.loopDepth += 1
+            defer { evaluator.context.loopDepth -= 1 }
             var output = ""
             var iterations = 0
             while iterations < 10_000 {
@@ -180,6 +185,7 @@ private struct RendererEngine {
                 if !condition.isTruthy { break }
                 output += try await render(body)
                 iterations += 1
+                if evaluator.context.consumeLoopControlSignal() { break }
             }
             return output
         case "protect":
@@ -257,17 +263,28 @@ private struct RendererEngine {
             return try await render(body)
         case "records", "rows":
             guard let frame = evaluator.context.currentInlineFrame else { return "" }
+            evaluator.context.loopDepth += 1
+            defer { evaluator.context.loopDepth -= 1 }
             var output = ""
             for (index, row) in frame.rows.enumerated() {
                 evaluator.context.setCurrentRow(row)
                 evaluator.context.set(.integer(index + 1), for: "record_count", scope: .local)
                 evaluator.context.set(.integer(index + 1), for: "row_count", scope: .local)
                 output += try await render(body)
+                if evaluator.context.consumeLoopControlSignal() { break }
             }
             evaluator.context.setCurrentRow(nil)
             return output
         case "iterate":
+            evaluator.context.loopDepth += 1
+            defer { evaluator.context.loopDepth -= 1 }
             let values: [LassoValue]
+            // `loop_key()` — the current iteration's key/position: the
+            // map key for a map source (parallel to `values`, built from
+            // the same materialized `items.map { ... }` snapshot so the
+            // two stay in lockstep regardless of Dictionary iteration
+            // order), or the 1-based position for every other source.
+            var mapKeys: [LassoValue]?
             if let argument = arguments.first {
                 switch try await evaluator.evaluate(argument.value) {
                 case let .array(items): values = items
@@ -277,7 +294,10 @@ private struct RendererEngine {
                 // `iterate($skuArrayItem, var(skuItem))` (where
                 // `$skuArrayItem` is a `map`) followed by
                 // `$skuItem->second->get(1)`.
-                case let .map(items): values = items.map { .pair(.string($0.key), $0.value) }
+                case let .map(items):
+                    let pairs = items.map { (key: $0.key, value: $0.value) }
+                    values = pairs.map { .pair(.string($0.key), $0.value) }
+                    mapKeys = pairs.map { .string($0.key) }
                 case .void, .null: values = []
                 case let value: values = [value]
                 }
@@ -298,7 +318,9 @@ private struct RendererEngine {
                     evaluator.context.set(value, for: binding.name, scope: binding.scope)
                 }
                 evaluator.context.set(.integer(index + 1), for: "loop_count", scope: .local)
+                evaluator.context.set(mapKeys?[index] ?? .integer(index + 1), for: "loop_key", scope: .local)
                 output += try await render(body)
+                if evaluator.context.consumeLoopControlSignal() { break }
             }
             return output
         case "with":
@@ -309,6 +331,8 @@ private struct RendererEngine {
             guard arguments.count >= 2, case let .string(variableName) = arguments[0].value else {
                 return ""
             }
+            evaluator.context.loopDepth += 1
+            defer { evaluator.context.loopDepth -= 1 }
             let withValues: [LassoValue]
             switch try await evaluator.evaluate(arguments[1].value) {
             case let .array(items): withValues = items
@@ -320,6 +344,7 @@ private struct RendererEngine {
             for value in withValues {
                 evaluator.context.set(value, for: variableName, scope: .local)
                 withOutput += try await render(body)
+                if evaluator.context.consumeLoopControlSignal() { break }
             }
             return withOutput
         case "output_none":

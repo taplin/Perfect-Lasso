@@ -5294,6 +5294,229 @@ private final class MapIncludeLoader: LassoIncludeLoader, @unchecked Sendable {
     #expect(output.contains("a=1;"))
 }
 
+@Test func loopAbortStopsTheEnclosingLoopBlockWithoutLeakingPastIt() async throws {
+    // Loop_Abort() is Lasso's break — real corpus need: "find the first
+    // matching row, then stop" search-cutoff patterns. `Renderer.swift`
+    // had no early-exit hook in any loop construct at all before this;
+    // confirms both that iteration stops exactly at the abort point and
+    // that the page keeps rendering normally past the loop block itself.
+    var context = LassoContext()
+    let output = try await LassoRenderer().render(
+        "[loop(5)][if(loop_count == 3)][loop_abort][/if][loop_count]|[/loop]after",
+        context: &context
+    )
+    #expect(output == "1|2|after")
+}
+
+@Test func loopContinueSkipsOnlyTheRestOfTheCurrentIterationsBody() async throws {
+    // Loop_Continue() is Lasso's continue — skips the remainder of the
+    // current iteration's body (the `|` never prints for an even
+    // iteration) but keeps looping, unlike Loop_Abort.
+    var context = LassoContext()
+    let output = try await LassoRenderer().render(
+        "[loop(4)][if(loop_count % 2 == 0)][loop_continue][/if][loop_count]|[/loop]",
+        context: &context
+    )
+    #expect(output == "1|3|")
+}
+
+@Test func loopAbortWorksInsideWhileIterateAndWithBlocksToo() async throws {
+    // Same break semantics as the `loop` tests above, exercised across
+    // every other looping construct (`Renderer.swift`'s "while"/
+    // "iterate"/"with" block cases each needed their own
+    // `consumeLoopControlSignal()` check).
+    // Loop_Abort() exits *immediately* — it stops the current iteration's
+    // body right where it's called, not just the loop's next iteration,
+    // so `[#n]|` never prints for the iteration that calls it (n==3).
+    var whileContext = LassoContext()
+    let whileOutput = try await LassoRenderer().render(
+        "[local(n = 0)][while(#n < 10)][#n += 1][if(#n == 3)][loop_abort][/if][#n]|[/while]",
+        context: &whileContext
+    )
+    #expect(whileOutput == "1|2|")
+
+    var iterateContext = LassoContext()
+    let iterateOutput = try await LassoRenderer().render(
+        "[iterate(array(10,20,30,40), var(x))][if($x == 30)][loop_abort][/if][$x]|[/iterate]",
+        context: &iterateContext
+    )
+    #expect(iterateOutput == "10|20|")
+
+    // `with`'s body uses the non-arrow `if(...) ... /if` script-mode form
+    // rather than `if(...) => { ... }` — bisecting a surprising failure
+    // here surfaced a real, pre-existing, unrelated parser quirk: an
+    // arrow-block `if` statement followed by (or combined with) certain
+    // other constructs at top-level script scope doesn't reliably gate
+    // execution the way the identical construct does when nested inside
+    // a `define`d tag body (see `withInDoIteratesOverBareZeroArgTagCallResult`,
+    // which nests an arrow-block `if` inside `with...do` successfully,
+    // but only inside a `define`). Flagged separately for investigation —
+    // not a regression from this change, and the non-arrow form here
+    // exercises the exact same `consumeLoopControlSignal()` code path in
+    // the "with" block case, so it's an equally valid check of this
+    // stage's actual change.
+    var withContext = LassoContext()
+    _ = try await LassoRenderer().render(
+        """
+        <?lasso
+        with x in array(10, 20, 30, 40) do {
+            if(#x == 30)
+                loop_abort
+            /if
+        }
+        ?>
+        """,
+        context: &withContext
+    )
+    #expect(withContext.value(for: "x", scope: .local) == .integer(30))
+}
+
+@Test func loopAbortInANestedLoopOnlyStopsTheInnermostLoop() async throws {
+    // Break/continue semantics, not a labeled/page-wide abort: an inner
+    // `loop`'s own block case consumes its own signal via
+    // `consumeLoopControlSignal()` before the outer loop's `render(body)`
+    // call ever returns, so the outer loop never sees it.
+    var context = LassoContext()
+    let output = try await LassoRenderer().render(
+        """
+        [loop(3)]outer[loop_count]:[loop(3)][if(loop_count == 2)][loop_abort][/if]inner[loop_count],[/loop]|[/loop]
+        """,
+        context: &context
+    )
+    #expect(output == "outer1:inner1,|outer2:inner1,|outer3:inner1,|")
+}
+
+@Test func loopKeyIsThePositionForArraysAndTheMapKeyForMaps() async throws {
+    // `loop_key()` — LassoGuide 9.3's documented default `iterate`
+    // accessor alongside `loop_value`, previously unavailable to code
+    // that doesn't use the `iterate(map, var(x))` binding form. For a map
+    // source, `loop_key` must line up with `loop_value`'s own key half
+    // (both are built from the exact same materialized snapshot so
+    // Dictionary iteration order can't desync them).
+    var arrayContext = LassoContext()
+    let arrayOutput = try await LassoRenderer().render(
+        "[iterate(array('a','b','c'))][loop_key]=[loop_value];[/iterate]",
+        context: &arrayContext
+    )
+    #expect(arrayOutput == "1=a;2=b;3=c;")
+
+    var mapContext = LassoContext()
+    let mapOutput = try await LassoRenderer().render(
+        """
+        [var(m::map = map)]
+        [$m->insert('a' = 1)]
+        [iterate($m, var(item))][loop_key]=[$item->second->asString(-precision=0)];[/iterate]
+        """,
+        context: &mapContext
+    )
+    #expect(mapOutput.contains("a=1;"))
+}
+
+@Test func loopAbortStopsARecordsBlockPartwayThroughTheFoundSet() async throws {
+    // Same break semantics as the other constructs, for `records`/`rows`
+    // (the loop construct driven by `inline`'s query results rather than
+    // an array/count/condition).
+    let executor = PerfectCRUDLassoExecutor(
+        capabilities: { _ in .readOnly },
+        queryHandler: { _, _ in
+            DynamicResult(
+                rows: [
+                    DynamicRow(["size": .string("XS")]),
+                    DynamicRow(["size": .string("SM")]),
+                    DynamicRow(["size": .string("XL")]),
+                ],
+                statement: "SELECT ..."
+            )
+        }
+    )
+    let provider = LassoDynamicInlineProvider(executor: executor, datasourceAliases: ["catalog_mysql": "catalog"])
+    var context = LassoContext(inlineProvider: provider)
+    let output = try await LassoRenderer().render(
+        """
+        <?lasso
+            var('sizes' = array)
+            inline(-database='catalog_mysql', -table='skus', -search)
+                records
+                    if(field('size') == 'SM')
+                        loop_abort
+                    /if
+                    $sizes->insert(field('size'))
+                /records
+            /inline
+        ?>
+        count=[$sizes->size]
+        """,
+        context: &context
+    )
+    #expect(output.contains("count=1"))
+}
+
+@Test func loopAbortWithNoEnclosingLoopIsATrueNoOpNotAPageTruncation() async throws {
+    // Real bug caught by architect + code review of this stage's own
+    // diff: `RendererEngine.render(_:)`'s two shared early-exit checks
+    // (`Renderer.swift`) fire on `loopControlSignal` exactly like they do
+    // on `returnSignal` — but unlike `returnSignal`, nothing consumed
+    // `loopControlSignal` at the top of the render chain, so a stray
+    // `Loop_Abort()`/`Loop_Continue()` with no enclosing loop silently
+    // truncated the rest of the page instead of doing nothing, directly
+    // contradicting this feature's own doc comment. Fixed by
+    // `LassoRenderer.render` discarding any leftover signal via
+    // `clearLoopControlSignal()` once the document finishes rendering.
+    var context = LassoContext()
+    let output = try await LassoRenderer().render("before[loop_abort]after", context: &context)
+    #expect(output == "beforeafter")
+}
+
+@Test func loopAbortInsideACustomTagDoesNotEscapeTheCallToHijackTheCallersLoop() async throws {
+    // Second half of the same bug: `invokeCustomTag`/`invokeMemberMethod`
+    // (Evaluator.swift) already firewall `returnSignal` at the tag-call
+    // boundary (`clearReturnSignal()` before, `consumeReturnSignal()`
+    // after) so a `return` inside a called tag can't leak past the call
+    // site — but had no equivalent firewall for `loopControlSignal`. A
+    // tag with no loop of its own that calls `Loop_Abort()` would leak
+    // that signal back into the *caller's* context, silently aborting
+    // whatever outer loop happened to be calling the tag after only one
+    // iteration — the exact "loop nested inside another loop" containment
+    // this whole feature is supposed to guarantee, defeated by a tag-call
+    // indirection. Fixed by clearing `loopControlSignal` both before and
+    // after `renderNodes(...)` in both functions, mirroring the existing
+    // `returnSignal` firewall exactly.
+    var context = LassoContext()
+    let output = try await LassoRenderer().render(
+        """
+        <?lasso
+        define noisyTag() => { loop_abort }
+        ?>
+        [loop(3)]x[loop_count][noisyTag()]|[/loop]
+        """,
+        context: &context
+    ).trimmingCharacters(in: .whitespacesAndNewlines)
+    #expect(output == "x1|x2|x3|")
+}
+
+@Test func loopAbortInsideAnIncludeCanAbortTheIncludingPagesEnclosingLoopJustLikeReturnCan() async throws {
+    // The mirror image of the previous test: an `include` does NOT get
+    // the same firewall as a custom tag call — `performInclude` never
+    // touches `returnSignal` either, by design (see `LassoRenderer.render`'s
+    // own doc comment: "A return at page/include level... contributes its
+    // value to the page's output"), because an include shares the calling
+    // page's scope instead of creating a new one, the same way a plain
+    // pasted-in file would. `Loop_Abort`/`Loop_Continue` follow that same
+    // precedent deliberately — `performInclude`/`performLibrary` were left
+    // untouched by this fix on purpose, not by oversight.
+    final class InMemoryIncludeLoader: LassoIncludeLoader, @unchecked Sendable {
+        func loadInclude(path: String, from includingPath: String?) throws -> String {
+            "[if(loop_count == 2)][loop_abort][/if]"
+        }
+    }
+    var context = LassoContext(includeLoader: InMemoryIncludeLoader())
+    let output = try await LassoRenderer().render(
+        "[loop(5)]x[loop_count][include('abort_at_2.lasso')]|[/loop]after",
+        context: &context
+    )
+    #expect(output == "x1|x2after")
+}
+
 @Test func renderErrorRecordsTheDeepestLocationAndIncludeStackNotTheOutermostOne() async throws {
     // Real corpus symptom this fixes: the dev server's error page always
     // showed "Include Stack: (empty)" no matter how deep the actual
