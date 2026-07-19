@@ -168,11 +168,45 @@ private func sampleRequestInfo() -> HTTPRequestInfo {
     #expect(config.mysql?.user == "lassouser")
     #expect(config.mysql?.password == "secret")
     #expect(config.mysql?.sessionDatabase == "sessions")
+    #expect(config.mysql?.sessionTable == nil)
     #expect(config.mysql?.allowWrites == true)
     #expect(config.mysql?.allowRawSQL == false)
     #expect(config.filemaker == nil)
     #expect(config.datasources["catalog_mysql"]?.type == .mysql)
     #expect(config.datasources["catalog_mysql"]?.schema == "catalog")
+}
+
+@Test func datasourceFileConfigDecodesSessionTableOverrideFromNestedMySQLBlock() throws {
+    // The real trigger for this field: a sessionDatabase that already has
+    // an unrelated "sessions" table (e.g. another application's own table
+    // in the same schema) -- see MySQLConnectionFileConfig.sessionTable's
+    // doc comment.
+    let json = """
+    {
+        "mysql": {
+            "host": "localhost",
+            "sessionDatabase": "scrubs_mysql",
+            "sessionTable": "lasso_sessions"
+        },
+        "datasources": {}
+    }
+    """
+    let config = try JSONDecoder().decode(DatasourceFileConfig.self, from: Data(json.utf8))
+    #expect(config.mysql?.sessionDatabase == "scrubs_mysql")
+    #expect(config.mysql?.sessionTable == "lasso_sessions")
+}
+
+@Test func datasourceFileConfigDecodesSessionTableOverrideFromLegacyFlatShape() throws {
+    let json = """
+    {
+        "sessionDatabase": "scrubs_mysql",
+        "sessionTable": "lasso_sessions",
+        "datasources": {}
+    }
+    """
+    let config = try JSONDecoder().decode(DatasourceFileConfig.self, from: Data(json.utf8))
+    #expect(config.mysql?.sessionDatabase == "scrubs_mysql")
+    #expect(config.mysql?.sessionTable == "lasso_sessions")
 }
 
 @Test func datasourceFileConfigDecodesNestedMySQLAndFileMakerBlocks() throws {
@@ -324,6 +358,7 @@ private func sampleServerConfig(
         mysqlDatabase: "",
         mysqlUser: nil,
         mysqlPassword: nil,
+        mysqlSessionTable: "sessions",
         mysqlAllowWrites: false,
         mysqlAllowRawSQL: false,
         filemakerDatasourceAliases: filemakerDatasourceAliases,

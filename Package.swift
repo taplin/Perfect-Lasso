@@ -15,6 +15,7 @@ let package = Package(
         .library(name: "LassoPerfectFileMaker", targets: ["LassoPerfectFileMaker"]),
         .executable(name: "lasso-subset-crawler", targets: ["LassoSubsetCrawler"]),
         .executable(name: "lasso-mysql-smoke", targets: ["LassoMySQLSmoke"]),
+        .executable(name: "lasso-session-mysql-smoke", targets: ["LassoSessionMySQLSmoke"]),
         .executable(name: "lasso-filemaker-smoke", targets: ["LassoFileMakerSmoke"]),
         .executable(name: "lasso-perfect-server", targets: ["LassoPerfectServer"]),
     ],
@@ -67,6 +68,15 @@ let package = Package(
                 "LassoPerfectCRUD",
                 .product(name: "PerfectCRUD", package: "Perfect-CRUD"),
                 .product(name: "PerfectMySQL", package: "Perfect-MySQL"),
+            ]
+        ),
+        .executableTarget(
+            name: "LassoSessionMySQLSmoke",
+            dependencies: [
+                "LassoParser",
+                "LassoPerfectSession",
+                .product(name: "PerfectSessionCore", package: "Perfect-Session"),
+                .product(name: "PerfectSessionMySQL", package: "Perfect-Session"),
             ]
         ),
         .executableTarget(
