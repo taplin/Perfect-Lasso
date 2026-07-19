@@ -38,6 +38,16 @@ public enum LassoSMTPAddressListError: Error, Equatable, Sendable {
     /// An entry had no `@`-containing address at all — either a bare
     /// token with no `@`, or an empty/malformed `<...>` payload.
     case missingAddress(String)
+    /// An entry had *some* `@`-containing address, but the surrounding
+    /// structure doesn't fully account for the entry's content — e.g. a
+    /// missing comma left extra text trailing after a `<...>` address
+    /// (`Name <a@example.com> b@example.com`), RFC 5322 comment syntax the
+    /// bare-address branch can't safely interpret (`(John Doe)
+    /// a@example.com`), or nested angle brackets (`<<addr@example.com>>`).
+    /// Thrown instead of silently dropping the extra text or baking stray
+    /// punctuation into `EmailAddress.address` — see this enum's doc
+    /// comment.
+    case malformedAddress(String)
 }
 
 /// See file doc comment. `parse(_:)` is the only public entry point;
@@ -141,6 +151,22 @@ public enum LassoSMTPAddressList {
             guard addressPart.isEmpty == false, addressPart.contains("@") else {
                 throw LassoSMTPAddressListError.missingAddress(entry)
             }
+            // Bug C: nested/duplicated angle brackets (`<<addr@example.com>>`)
+            // -- `firstIndex(of: "<")`/`lastIndex(of: ">")` alone would
+            // happily bake the extra `<`/`>` into `addressPart`.
+            guard addressPart.contains("<") == false, addressPart.contains(">") == false else {
+                throw LassoSMTPAddressListError.malformedAddress(entry)
+            }
+            // Bug A: anything left over after `angleEnd` (once
+            // whitespace-trimmed) means the consumed `<...>` structure
+            // didn't cover the whole entry -- e.g. a missing comma between
+            // two would-be recipients (`Name <a@example.com> b@example.com`)
+            // would otherwise silently discard everything after `angleEnd`.
+            let trailing = trimmed[trimmed.index(after: angleEnd)...]
+                .trimmingCharacters(in: .whitespacesAndNewlines)
+            guard trailing.isEmpty else {
+                throw LassoSMTPAddressListError.malformedAddress(entry)
+            }
             let displayName = try unquote(namePart)
             return EmailAddress(displayName: displayName.isEmpty ? nil : displayName, address: addressPart)
         }
@@ -148,6 +174,17 @@ public enum LassoSMTPAddressList {
         // Bare address, no display name and no angle brackets at all.
         guard trimmed.contains("@") else {
             throw LassoSMTPAddressListError.missingAddress(entry)
+        }
+        // Bug B: no `<...>` structure present at all, so this must be a
+        // single bare address token -- reject RFC 5322 comment syntax
+        // (`(John Doe) a@example.com`) and any other internal whitespace,
+        // rather than folding parens/spaces into `EmailAddress.address`.
+        guard trimmed.contains("(") == false,
+              trimmed.contains(")") == false,
+              trimmed.contains(">") == false,
+              trimmed.contains(where: { $0.isWhitespace }) == false
+        else {
+            throw LassoSMTPAddressListError.malformedAddress(entry)
         }
         return EmailAddress(address: trimmed)
     }

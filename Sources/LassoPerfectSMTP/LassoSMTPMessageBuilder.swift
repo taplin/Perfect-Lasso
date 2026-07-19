@@ -86,6 +86,13 @@
 //  `[protect]`-able error instead of a message that silently doesn't do
 //  what was asked.
 //
+//  **`-attachments`/`-htmlImages` also throw `notYetSupported`, for the
+//  same reason and arguably more urgently** — path-or-inline attachment
+//  resolution is scoped to Phase B (§4.5/§6), not yet implemented in this
+//  builder at all, and a dropped attachment is a correctness failure a
+//  recipient has no way to detect (unlike an unsupported header param,
+//  which at worst fails to change behavior the recipient can observe).
+//
 
 import Foundation
 import LassoParser
@@ -114,6 +121,7 @@ public enum LassoSMTPMessageBuilder {
     /// `-timeout`, handled separately below).
     private static let unsupportedParameterNames: [String] = [
         "date", "tokens", "merge", "contentType", "transferEncoding", "characterSet",
+        "attachments", "htmlImages",
     ]
 
     public static func build(_ arguments: [EvaluatedArgument]) throws -> BuildResult {

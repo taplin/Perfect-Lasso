@@ -108,4 +108,33 @@ struct LassoSMTPAddressListTests {
         // as "no addresses supplied," not malformed content.
         #expect(try LassoSMTPAddressList.parse(",,,") == [])
     }
+
+    // MARK: - Regression tests for the four-way milestone review's three
+    // parseEntry bugs (missing-comma silent drop, comment-syntax
+    // corruption, nested-angle-bracket corruption) -- all now throw
+    // instead of silently losing or corrupting data.
+
+    @Test func missingCommaBetweenAngleAddressAndBareAddressThrowsInsteadOfDroppingRecipient() throws {
+        // Previously parsed to ONE address (a@example.com) with
+        // " b@example.com" silently discarded.
+        #expect(throws: LassoSMTPAddressListError.self) {
+            try LassoSMTPAddressList.parse("Name <a@example.com> b@example.com")
+        }
+    }
+
+    @Test func rfc5322CommentSyntaxThrowsInsteadOfCorruptingTheAddress() throws {
+        // Previously the whole string "(John Doe) a@example.com" -- parens
+        // included -- became EmailAddress.address.
+        #expect(throws: LassoSMTPAddressListError.self) {
+            try LassoSMTPAddressList.parse("(John Doe) a@example.com")
+        }
+    }
+
+    @Test func nestedAngleBracketsThrowInsteadOfCorruptingTheAddress() throws {
+        // Previously addressPart retained a literal "<"/">" baked into
+        // EmailAddress.address: "<addr@example.com>".
+        #expect(throws: LassoSMTPAddressListError.self) {
+            try LassoSMTPAddressList.parse("<<addr@example.com>>")
+        }
+    }
 }

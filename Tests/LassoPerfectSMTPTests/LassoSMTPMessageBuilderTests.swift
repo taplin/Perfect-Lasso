@@ -230,6 +230,18 @@ struct LassoSMTPMessageBuilderTests {
         }
     }
 
+    @Test func attachmentsThrows() throws {
+        #expect(throws: LassoSMTPError.self) {
+            try LassoSMTPMessageBuilder.build(validBaseArguments + [arg("attachments", "report.pdf")])
+        }
+    }
+
+    @Test func htmlImagesThrows() throws {
+        #expect(throws: LassoSMTPError.self) {
+            try LassoSMTPMessageBuilder.build(validBaseArguments + [arg("htmlImages", "logo.png")])
+        }
+    }
+
     // MARK: - Silently-ignored connection-only params (§4.3/§5): recognized,
     // never honored as per-call overrides, never an error either.
 
