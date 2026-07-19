@@ -1086,6 +1086,7 @@ public struct LassoNativeRegistry: Sendable {
             return .void
         }
         LassoFileOperations.registerDefaultFunctions(into: &self)
+        LassoErrorHandling.registerDefaultFunctions(into: &self)
     }
 }
 
@@ -1272,6 +1273,13 @@ public struct LassoContext: Sendable {
     /// catch handler has already reset `currentError` for code that follows.
     public var currentError: LassoErrorState
     public var lastError: LassoErrorState?
+    /// `Error_Push`/`Error_Pop` (Ch. 19 Table 3) — a real stack, distinct
+    /// from `lastError` above (which only ever remembers one prior
+    /// state). Real corpus pattern: pushing before a `Protect` block so
+    /// a preexisting error condition can't bleed into it and mistakenly
+    /// trigger its own error handling, then popping to restore the
+    /// caller's error state afterward.
+    var errorStack: [LassoErrorState] = []
     /// `(sessionName, varName)` pairs registered via `session_addVar` this
     /// request — read back by `finalizeSessions()` at the very end of
     /// render so the persisted value reflects whatever the page last set
@@ -1334,6 +1342,7 @@ public struct LassoContext: Sendable {
         selfStack = []
         currentError = .noError
         lastError = nil
+        errorStack = []
         trackedSessionVariables = []
         suppressedSessionSaves = []
         sessionStartResults = [:]
@@ -1348,6 +1357,22 @@ public struct LassoContext: Sendable {
     public mutating func clearError() {
         lastError = currentError
         currentError = .noError
+    }
+
+    /// `[Error_Push]`: "Pushes the current error condition onto a stack
+    /// and resets the current error code and error message."
+    public mutating func pushError() {
+        errorStack.append(currentError)
+        currentError = .noError
+    }
+
+    /// `[Error_Pop]`: "Restores the last error condition stored using
+    /// [Error_Push]." A pop with nothing pushed is a documented no-op
+    /// rather than an error (the tag has no "stack empty" failure mode
+    /// in the Guide) — leaves `currentError` untouched.
+    public mutating func popError() {
+        guard let restored = errorStack.popLast() else { return }
+        currentError = restored
     }
 
     /// Called once, at the very end of a page's render (`LassoRenderer`),

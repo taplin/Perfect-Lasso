@@ -27,10 +27,11 @@ public struct LassoDataRow: Equatable, Sendable {
 /// Real Lasso's request-local current-error state, exposed to Lasso code via
 /// `error_currentError`. `code: 0`/`kind: "none"` is real Lasso's "No Error"
 /// state — the default for every fresh context and every successful inline
-/// action. Numeric codes beyond 0 are deliberately not assigned yet (see
-/// `Documentation/error-protect-model-plan.md`'s Milestone 1) — real Lasso
-/// 8.5's exact Error Control chapter codes still need extracting from the
-/// local reference PDF before those are hardcoded here.
+/// action. Real Lasso 8.5's Error Control chapter codes (Appendix A Table 1,
+/// verified against the PDF directly) and Lasso 9's own additional named
+/// codes are extracted and assigned in `ErrorHandling.swift`'s `Code` enum —
+/// see that file for the full, sourced list (`Documentation/
+/// error-protect-model-plan.md`'s Milestones 1 and 5, both now done).
 public struct LassoErrorState: Equatable, Sendable {
     public var code: Int
     public var message: String

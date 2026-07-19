@@ -4970,6 +4970,150 @@ final class FullyRecordingResponseSink: LassoResponseSink, @unchecked Sendable {
     #expect(context.currentError.message == "Update failed")
 }
 
+@Test func failThrowsARecoverableErrorProtectCatchesMatchingTheLanguageGuidesOwnWorkedExample() async throws {
+    // Ch. 19 "Fail Tags": `[Fail: -1, 'An unrecoverable error occurred']`
+    // — code+message form. `fail` with no enclosing `protect` propagates
+    // as an unhandled LassoRecoverableError (real Lasso: "To report an
+    // unrecoverable error" — Handle/Handle_Error blocks, which would
+    // otherwise catch it, are a separate, deliberately deferred stage —
+    // see ErrorHandling.swift's own doc comment).
+    var protectedContext = LassoContext()
+    let protectedOutput = try await LassoRenderer().render(
+        "before-[protect]during-[fail(-1, 'An unrecoverable error occurred')]-unreached[/protect]-after-[error_currenterror(-errorcode)]: [error_currenterror]",
+        context: &protectedContext
+    )
+    #expect(protectedOutput == "before--after--1: An unrecoverable error occurred")
+
+    var unprotectedContext = LassoContext()
+    await #expect(throws: LassoRecoverableError(LassoErrorState(code: -1, message: "boom", kind: "fail"))) {
+        _ = try await LassoRenderer().render("[fail(-1, 'boom')]", context: &unprotectedContext)
+    }
+}
+
+@Test func failWithOnlyAMessageDefaultsToTheGenericCustomCode() async throws {
+    // lassoguide.com's Lasso 9 "Error Handling": `fail(msg::string)` —
+    // the message-only alternate form Ch. 19's own 8.5-era doc doesn't
+    // have; defaults to -1, the same generic-custom-error code the
+    // Guide's own two-arg worked example uses.
+    var context = LassoContext()
+    let output = try await LassoRenderer().render(
+        "[protect][fail('just a message')][/protect][error_currenterror(-errorcode)]: [error_currenterror]",
+        context: &context
+    )
+    #expect(output == "-1: just a message")
+}
+
+@Test func failIfOnlyTriggersWhenItsConditionIsTrueMatchingTheLanguageGuidesOwnWorkedExample() async throws {
+    // Ch. 19: `[Fail_If: (Found_Count == 0), (Error_NoRecordsFound:
+    // -ErrorCode), (Error_NoRecordsFound)]` — condition, code, message.
+    // Exercised here with a plain boolean condition rather than
+    // Found_Count specifically, since Error_NoRecordsFound is itself
+    // documented as deprecated in favor of a Found_Count == 0 check
+    // (Ch. 19's own "Note" right after Table 4).
+    var context = LassoContext()
+    let output = try await LassoRenderer().render(
+        "[protect][fail_if(1 == 2, -5, 'should not fire')][/protect][error_currenterror(-errorcode)]|" +
+        "[protect][fail_if(1 == 1, -5, 'should fire')][/protect][error_currenterror(-errorcode)]",
+        context: &context
+    )
+    #expect(output == "0|-5")
+}
+
+@Test func errorPushAndErrorPopRestoreThePreviousErrorConditionMatchingTheirOwnDocumentedContract() async throws {
+    // Ch. 19: "[Error_Push] Pushes the current error condition onto a
+    // stack and resets the current error code and error message."
+    // "[Error_Pop] Restores the last error condition stored using
+    // [Error_Push]." — real corpus pattern: preventing a preexisting
+    // error from bleeding into a protect block.
+    var context = LassoContext()
+    let output = try await LassoRenderer().render(
+        "[error_seterrorcode(99)][error_seterrormessage('outer')]" +
+        "[error_push][error_code]/[error_msg]|" +
+        "[error_seterrorcode(1)][error_seterrormessage('inner')][error_code]/[error_msg]|" +
+        "[error_pop][error_code]/[error_msg]",
+        context: &context
+    )
+    // Resets to the SAME `.noError` state (`code: 0, message: "No
+    // Error"`) `Runtime.swift` already uses everywhere else — not a
+    // truly blank message.
+    #expect(output == "0/No Error|1/inner|99/outer")
+}
+
+@Test func errorResetClearsTheCurrentErrorCaseInsensitivelyMatchingTheLasso9WorkedExample() async throws {
+    // Ch. 19's own prose says "[Error_Reset]... resets the error message
+    // to blank" — but lassoguide.com's Lasso 9 "Error Handling" page has
+    // its OWN worked example for the identical operation showing "No
+    // error" instead (`error_reset; error_code + ': ' + error_msg //
+    // => 0: No error`), directly contradicting the 8.5 prose. Matches
+    // this project's established practice of preferring a worked
+    // example over prose when the two disagree (see e.g. the Math_Div/
+    // String_ReplaceRegExp defects found earlier in this project) —
+    // also keeps this consistent with the already-tested default
+    // `error_currenterror` state (`errorCurrentErrorDefaultsToNoErrorAndInlineFramesUpdateIt`,
+    // "No Error/0"), which `error_reset` reuses via the same shared
+    // `context.clearError()`/`.noError` this codebase already has.
+    var context = LassoContext()
+    let output = try await LassoRenderer().render(
+        "[error_seterrorcode(-1)][error_seterrormessage('Too slow')][error_code]: [error_msg]|" +
+        "[error_reset][error_code]: [error_msg]",
+        context: &context
+    )
+    #expect(output == "-1: Too slow|0: No Error")
+}
+
+@Test func namedErrorTypeTagsReturnTheirOwnFixedCodeOrMessageIndependentOfCurrentErrorState() async throws {
+    // Table 4 "Error Type Tags" are named CONSTANT accessors, not
+    // `currentError` state — bare returns the fixed message, `-ErrorCode`
+    // the fixed code, verified against Appendix A's own numeric table
+    // (p.823 Action/Security Errors) and Table 4's own descriptions.
+    // Matches the Guide's own chaining worked example:
+    // `[Error_SetErrorCode: (Error_AddError: -ErrorCode)]`.
+    var context = LassoContext()
+    let output = try await LassoRenderer().render(
+        "[error_adderror(-errorcode)]|[error_deleteerror(-errorcode)]|[error_updateerror(-errorcode)]|" +
+        "[error_fieldrestriction(-errorcode)]|[error_columnrestriction(-errorcode)]|" +
+        "[error_nopermission(-errorcode)]|[error_invaliddatabase(-errorcode)]|" +
+        "[error_invalidpassword(-errorcode)]|[error_invalidusername(-errorcode)]|[error_noerror(-errorcode)]",
+        context: &context
+    )
+    #expect(output == "-9959|-9957|-9958|-9960|-9960|-9961|-9962|-9963|-9964|0")
+
+    var chainedContext = LassoContext()
+    let chainedOutput = try await LassoRenderer().render(
+        "[error_seterrorcode(error_adderror(-errorcode))][error_seterrormessage(error_adderror)][error_code]: [error_msg]",
+        context: &chainedContext
+    )
+    #expect(chainedOutput == "-9959: An error occurred during an -Add action.")
+}
+
+@Test func lasso9StyleErrorCodeAndErrorMsgConstantsMatchLassoguideComsOwnTable() async throws {
+    var context = LassoContext()
+    let output = try await LassoRenderer().render(
+        "[error_code_divideByzero]/[error_msg_divideByzero]|[error_code_filenotfound]/[error_msg_filenotfound]",
+        context: &context
+    )
+    #expect(output == "-9950/Divide by Zero|404/File not found")
+}
+
+@Test func divisionByZeroThrowsARecoverableErrorInsteadOfCrashingOrProducingInfinity() async throws {
+    // Previously: `.decimal` division silently produced `inf`/`nan`,
+    // `.integer` division crashed the process outright (Swift traps on
+    // integer divide-by-zero) — neither matches the documented,
+    // catchable `error_code_divideByZero`. A non-numeric right operand
+    // (e.g. dividing by an empty string) must ALSO be caught, not just
+    // a literal `0` — regression-guards the `right.number ?? 0` fix
+    // (comparing the raw Optional directly would have let this
+    // specific case slip through).
+    var context = LassoContext()
+    let output = try await LassoRenderer().render(
+        "[protect][10 / 0][/protect][error_currenterror(-errorcode)]: [error_currenterror]|" +
+        "[protect][10.5 / 0][/protect][error_currenterror(-errorcode)]: [error_currenterror]|" +
+        "[protect][10 / '']|[/protect][error_currenterror(-errorcode)]: [error_currenterror]",
+        context: &context
+    )
+    #expect(output == "-9950: Divide by Zero|-9950: Divide by Zero|-9950: Divide by Zero")
+}
+
 private func corpusFixtureContext(
     loader: any LassoIncludeLoader,
     includePath: String

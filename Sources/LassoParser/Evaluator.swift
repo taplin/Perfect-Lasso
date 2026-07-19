@@ -534,7 +534,32 @@ struct Evaluator {
             return numeric(left, right, +)
         case "-": return numeric(left, right, -)
         case "*": return numeric(left, right, *)
-        case "/": return numeric(left, right, /)
+        case "/":
+            // Previously plain Swift division: `.decimal` silently
+            // produced `inf`/`nan`, `.integer` crashed the process
+            // (Swift traps on integer division by zero) — neither
+            // matches Ch. 19's documented, catchable
+            // `error_code_divideByZero`/`error_msg_divideByZero`
+            // (lassoguide.com's Lasso 9 "Error Handling" page; not in
+            // the 8.5 PDF's own Appendix A, which predates that named
+            // constant). `%`'s sibling case below already guards
+            // divide-by-zero with `max(...,1)` rather than throwing —
+            // deliberately left as-is, not revisited here.
+            // `right.number ?? 0`, not `right.number != 0` — a
+            // non-numeric right operand has `right.number == nil`,
+            // which `numeric(_:_:_:)` below resolves to an effective
+            // divisor of 0 via its own `?? 0` — comparing the raw
+            // Optional directly would let that case slip past this
+            // guard (`nil != 0` is true) straight into the exact crash
+            // this fix exists to prevent.
+            guard (right.number ?? 0) != 0 else {
+                throw LassoRecoverableError(LassoErrorState(
+                    code: LassoErrorHandling.Code.divideByZero,
+                    message: "Divide by Zero",
+                    kind: "runtime"
+                ))
+            }
+            return numeric(left, right, /)
         case "%": return .integer(Int(left.number ?? 0) % max(Int(right.number ?? 0), 1))
         case "==":
             // Real Lasso 9 string equality is case-INSENSITIVE by default
