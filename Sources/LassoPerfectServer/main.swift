@@ -4,13 +4,17 @@ import LassoParser
 import LassoPerfectCRUD
 import LassoPerfectFileMaker
 import LassoPerfectSession
+import LassoPerfectSMTP
 import PerfectAdminConsole
 import PerfectCRUD
 import PerfectFileMaker
 import PerfectFileMakerAdminAPI
 import PerfectMySQL
 import PerfectNIO
+import PerfectSMTP
+import NIOCore
 import NIOHTTP1
+import NIOPosix
 import PerfectSessionCore
 import PerfectSessionMySQL
 
@@ -267,6 +271,20 @@ struct ServerConfig: Sendable {
     /// against a server reachable over an untrusted network defeats TLS's
     /// whole purpose.
     let fmAdminAPITrustSelfSignedTLS: Bool
+    /// Named SMTP relays — `Documentation/lasso-perfect-smtp-integration-plan.md`
+    /// §4.6. Empty means no SMTP relay is configured at all: `LassoSiteServer`
+    /// leaves `LassoContext.emailProvider` unset, matching every other
+    /// optional backend's degrade-gracefully-when-unconfigured convention
+    /// (`email_send` then throws `LassoRuntimeError.emailNotConfigured`).
+    /// Populated from `datasourceFile?.smtp` (JSON, supports multiple named
+    /// relays) or, when that block is entirely absent, the legacy
+    /// single-relay `LASSO_SMTP_*` env-var pair (implicitly named `"primary"`)
+    /// — see `SMTPFileConfig`'s doc comment.
+    let smtpRelays: [String: SMTPRelaySettings]
+    /// `nil` only when `smtpRelays` is empty. Always validated (at `load()`
+    /// time) to name a key actually present in `smtpRelays` —
+    /// `ServerConfigError.smtpInvalidDefaultRelay` otherwise.
+    let smtpDefaultRelay: String?
 
     static func load() throws -> ServerConfig {
         let env = ProcessInfo.processInfo.environment
@@ -345,6 +363,46 @@ struct ServerConfig: Sendable {
             .map { $0.trimmingCharacters(in: .whitespacesAndNewlines) }
             .filter { $0.isEmpty == false }
 
+        // `smtp` block resolution (§4.6) — the JSON block, when present at
+        // all, is authoritative and the LASSO_SMTP_* env vars are never
+        // consulted (matching this file's stated convention for the
+        // `filemaker`/`mysql` blocks). Only a wholly absent `smtp` key
+        // falls back to the single-relay env-var smoke-test path.
+        var smtpRelays: [String: SMTPRelaySettings] = [:]
+        var smtpDefaultRelay: String?
+        if let smtpFile = datasourceFile?.smtp {
+            for (name, relay) in smtpFile.relays {
+                guard let host = relay.host, host.isEmpty == false else {
+                    throw ServerConfigError.smtpRelayMissingHost(name)
+                }
+                let port = relay.port ?? 587
+                smtpRelays[name] = SMTPRelaySettings(
+                    host: host,
+                    port: port,
+                    user: relay.user,
+                    password: relay.password,
+                    tls: relay.tls ?? (port == 465 ? "implicit" : "startTLS")
+                )
+            }
+            if smtpRelays.isEmpty == false {
+                let resolved = smtpFile.defaultRelay ?? (smtpRelays.count == 1 ? smtpRelays.keys.first : nil)
+                guard let resolved, smtpRelays[resolved] != nil else {
+                    throw ServerConfigError.smtpInvalidDefaultRelay(smtpFile.defaultRelay ?? "")
+                }
+                smtpDefaultRelay = resolved
+            }
+        } else if let envHost = env["LASSO_SMTP_HOST"] {
+            let port = env["LASSO_SMTP_PORT"].flatMap(Int.init) ?? 587
+            smtpRelays["primary"] = SMTPRelaySettings(
+                host: envHost,
+                port: port,
+                user: env["LASSO_SMTP_USER"],
+                password: env["LASSO_SMTP_PASSWORD"],
+                tls: port == 465 ? "implicit" : "startTLS"
+            )
+            smtpDefaultRelay = "primary"
+        }
+
         return ServerConfig(
             siteRoot: root,
             port: env["LASSO_SERVER_PORT"].flatMap(Int.init) ?? 8181,
@@ -418,7 +476,9 @@ struct ServerConfig: Sendable {
             fmAdminAPIPort: fmAdminAPIPort,
             fmAdminAPIUser: fmAdminAPIUser,
             fmAdminAPIPassword: fmAdminAPIPassword,
-            fmAdminAPITrustSelfSignedTLS: Self.isTruthyEnv(env["LASSO_FM_ADMIN_TRUST_SELF_SIGNED_TLS"])
+            fmAdminAPITrustSelfSignedTLS: Self.isTruthyEnv(env["LASSO_FM_ADMIN_TRUST_SELF_SIGNED_TLS"]),
+            smtpRelays: smtpRelays,
+            smtpDefaultRelay: smtpDefaultRelay
         )
     }
 
@@ -473,10 +533,11 @@ struct DatasourceFileConfig: Decodable {
     var mysql: MySQLConnectionFileConfig?
     var filemaker: FileMakerConnectionFileConfig?
     var adminAPI: FileMakerAdminAPIFileConfig?
+    var smtp: SMTPFileConfig?
     var datasources: [String: DatasourceEntry]
 
     private enum CodingKeys: String, CodingKey {
-        case mysql, filemaker, adminAPI, datasources
+        case mysql, filemaker, adminAPI, smtp, datasources
         case host, port, user, password, sessionDatabase, sessionTable, allowWrites, allowRawSQL
     }
 
@@ -485,6 +546,7 @@ struct DatasourceFileConfig: Decodable {
         datasources = try container.decodeIfPresent([String: DatasourceEntry].self, forKey: .datasources) ?? [:]
         filemaker = try container.decodeIfPresent(FileMakerConnectionFileConfig.self, forKey: .filemaker)
         adminAPI = try container.decodeIfPresent(FileMakerAdminAPIFileConfig.self, forKey: .adminAPI)
+        smtp = try container.decodeIfPresent(SMTPFileConfig.self, forKey: .smtp)
         if let nestedMySQL = try container.decodeIfPresent(MySQLConnectionFileConfig.self, forKey: .mysql) {
             mysql = nestedMySQL
         } else {
@@ -563,6 +625,87 @@ struct FileMakerAdminAPIFileConfig: Decodable {
     var password: String?
 }
 
+/// `smtp` config-file block — `Documentation/lasso-perfect-smtp-integration-plan.md`
+/// §4.6. Named relays, never a single bare host — `email_send`'s `-host`
+/// dash-param selects one of these *names*, it never dials an arbitrary
+/// caller-supplied literal host (§5's SSRF-safe design). Shape:
+/// ```json
+/// {
+///   "smtp": {
+///     "relays": {
+///       "primary": {"host": "...", "port": 587, "user": "...", "password": "...", "tls": "startTLS"},
+///       "marketing": {"host": "...", "port": 587, "user": "...", "password": "..."}
+///     },
+///     "defaultRelay": "primary"
+///   }
+/// }
+/// ```
+/// `defaultRelay` may be omitted only when exactly one relay is configured
+/// (it's then implied); two or more relays with no `defaultRelay` is a
+/// startup error (`ServerConfigError.smtpInvalidDefaultRelay`), same as a
+/// `defaultRelay` naming a relay absent from `relays`.
+///
+/// Deliberately does NOT include `allowDirectMX`/`dkimKeyPath`/
+/// `dkimSelector`/`dkimDomain` yet — Phase A's scope is relay config only;
+/// those are Phase D/F per the plan's phasing (§6), and adding them now
+/// would scope-creep this config block ahead of the DKIM-key-permission
+/// hardening (§4.6) that phase also requires.
+struct SMTPFileConfig: Decodable {
+    var relays: [String: SMTPRelayFileConfig]
+    var defaultRelay: String?
+
+    init(relays: [String: SMTPRelayFileConfig] = [:], defaultRelay: String? = nil) {
+        self.relays = relays
+        self.defaultRelay = defaultRelay
+    }
+
+    init(from decoder: Decoder) throws {
+        let container = try decoder.container(keyedBy: CodingKeys.self)
+        relays = try container.decodeIfPresent([String: SMTPRelayFileConfig].self, forKey: .relays) ?? [:]
+        defaultRelay = try container.decodeIfPresent(String.self, forKey: .defaultRelay)
+    }
+
+    private enum CodingKeys: String, CodingKey { case relays, defaultRelay }
+}
+
+/// One named relay's connection settings. `host` is optional here (not
+/// required by the JSON grammar itself) so a relay entry with a missing
+/// host fails with a clear `ServerConfigError.smtpRelayMissingHost` at
+/// `ServerConfig.load()` time — matching `FileMakerConnectionFileConfig`'s
+/// identical "optional in the Decodable shape, required by a startup
+/// check" convention — rather than an opaque `DecodingError` from
+/// `JSONDecoder` itself.
+///
+/// `tls`: `"none"` | `"startTLS"` | `"implicit"` (case-insensitive).
+/// Unset defaults to `"implicit"` when `port == 465`, `"startTLS"`
+/// otherwise — the same port-465-implies-implicit-TLS convention `-ssl`
+/// itself would use if this design honored it as a per-call override
+/// (see `LassoSMTPMessageBuilder`'s doc comment for why it deliberately
+/// does not).
+struct SMTPRelayFileConfig: Decodable {
+    var host: String?
+    var port: Int?
+    var user: String?
+    var password: String?
+    var tls: String?
+}
+
+/// Resolved (JSON- or env-var-sourced, defaults applied) settings for one
+/// named SMTP relay — `ServerConfig.smtpRelays`' value type.
+/// `LassoPerfectSMTP.LassoSMTPMailerRegistry` is what actually turns these
+/// into a live `RelayConfig`/`SMTPMailer`; this type stays free of any
+/// `PerfectSMTP` import so `ServerConfig`'s own compilation doesn't need
+/// one (`tls` is carried as the same raw string `SMTPRelayFileConfig` uses,
+/// parsed into a real `TLSMode` only where `PerfectSMTP` is already
+/// imported).
+struct SMTPRelaySettings: Sendable {
+    let host: String
+    let port: Int
+    let user: String?
+    let password: String?
+    let tls: String
+}
+
 /// One `datasources` entry. Decodes either the current shape
 /// (`{"type": "mysql"|"filemaker", "schema": "..."}`) or, for back-compat,
 /// a bare schema-name string (`"schemaName"`, implicitly `{type: "mysql",
@@ -623,6 +766,14 @@ enum ServerConfigError: Error, CustomStringConvertible {
     /// were supplied — caught here at startup rather than deferred to a
     /// confusing failure on the first poll.
     case missingCWPJanitorAdminAPIConfig
+    /// A `smtp.relays` entry has no `host` at all — caught here, at
+    /// startup, rather than deferred to a confusing failure the first time
+    /// `email_send` actually tries to use that relay.
+    case smtpRelayMissingHost(String)
+    /// `smtp.defaultRelay` names a relay absent from `smtp.relays`, or was
+    /// left unset while `smtp.relays` has more than one entry (ambiguous —
+    /// there's no single relay to imply as the default).
+    case smtpInvalidDefaultRelay(String)
 
     var description: String {
         switch self {
@@ -633,6 +784,12 @@ enum ServerConfigError: Error, CustomStringConvertible {
             "A FileMaker datasource is configured but no FileMaker host was supplied (set \"filemaker\": {\"host\": ...} in the datasource config file, or LASSO_FILEMAKER_HOST)."
         case .missingCWPJanitorAdminAPIConfig:
             "LASSO_CWP_JANITOR_ENABLED=1 requires Admin API credentials — set \"adminAPI\": {\"host\": ..., \"user\": ..., \"password\": ...} in the datasource config file, or LASSO_FM_ADMIN_HOST/LASSO_FM_ADMIN_USER/LASSO_FM_ADMIN_PASSWORD."
+        case .smtpRelayMissingHost(let name):
+            "SMTP relay '\(name)' has no host (set \"smtp\": {\"relays\": {\"\(name)\": {\"host\": ...}}} in the datasource config file)."
+        case .smtpInvalidDefaultRelay(let name):
+            name.isEmpty
+                ? "smtp.relays has more than one entry but smtp.defaultRelay was not set — name which relay email_send should use by default."
+                : "smtp.defaultRelay ('\(name)') does not name any relay configured in smtp.relays."
         }
     }
 }
@@ -679,6 +836,14 @@ struct LassoSiteServer: Sendable {
     /// real query traffic and the admin console's "switch datasource"
     /// action must always agree on which host an alias currently means.
     let fileMakerRegistry: FileMakerConnectionRegistry?
+    /// The `email_send` dispatch seam's conformer
+    /// (`Documentation/lasso-perfect-smtp-integration-plan.md` §4.0 point 2)
+    /// — `nil` when `config.smtpRelays` is empty (no `smtp` block/
+    /// `LASSO_SMTP_*` env vars configured at all), matching every other
+    /// optional backend's degrade-gracefully-when-unconfigured convention.
+    /// Wired into each request's `LassoContext.emailProvider` exactly like
+    /// `inlineProvider` is today.
+    let emailProvider: (any LassoEmailProvider)?
 
     init(
         config: ServerConfig,
@@ -872,6 +1037,52 @@ struct LassoSiteServer: Sendable {
                 fileMakerProvider: fileMakerProvider,
                 fileMakerAliases: config.filemakerDatasourceAliases
             )
+        }
+
+        // `smtp` wiring (§4.0 point 2/§4.6) — `config.smtpRelays` empty
+        // means no `smtp` block/`LASSO_SMTP_*` env vars were configured at
+        // all; `emailProvider` stays `nil` and `email_send` throws
+        // `LassoRuntimeError.emailNotConfigured`, matching every other
+        // optional backend here. `MultiThreadedEventLoopGroup.singleton`
+        // (not a group this type owns/shuts down) — every other NIO-backed
+        // piece of this server (`PerfectNIO`/`PerfectAdminConsole`) already
+        // runs on the process-wide singleton group; reusing it here avoids
+        // spinning up a second, separately-lifecycled thread pool just for
+        // SMTP.
+        if config.smtpRelays.isEmpty == false, let defaultRelay = config.smtpDefaultRelay {
+            let descriptors = config.smtpRelays.mapValues { settings in
+                LassoSMTPRelayDescriptor(
+                    host: settings.host,
+                    port: settings.port,
+                    user: settings.user,
+                    password: settings.password,
+                    tls: Self.tlsMode(settings.tls, port: settings.port)
+                )
+            }
+            let registry = try LassoSMTPMailerRegistry(
+                relays: descriptors,
+                defaultRelay: defaultRelay,
+                group: MultiThreadedEventLoopGroup.singleton
+            )
+            emailProvider = LassoEmailProviderImpl(registry: registry)
+        } else {
+            emailProvider = nil
+        }
+    }
+
+    /// `SMTPRelaySettings.tls`'s raw string -> `PerfectSMTP.TLSMode` —
+    /// `ServerConfig.load()` already resolves the default ("implicit" at
+    /// port 465, "startTLS" otherwise) and only ever writes one of the
+    /// three recognized strings, so an unrecognized value here (a hand-
+    /// edited config file with a typo) falls back to `.startTLS` — the
+    /// safer of the two "assume some TLS" choices when the string can't be
+    /// interpreted, rather than silently downgrading to `.none`.
+    private static func tlsMode(_ raw: String, port: Int) -> TLSMode {
+        switch raw.lowercased() {
+        case "none": .none
+        case "implicit": .implicit
+        case "starttls": .startTLS
+        default: .startTLS
         }
     }
 
@@ -1163,6 +1374,7 @@ struct LassoSiteServer: Sendable {
             sessionProvider: sessionBridge,
             responseSink: sink,
             inlineProvider: inlineProvider,
+            emailProvider: emailProvider,
             diagnosticLogSink: { [logCapture] (message: String) async -> Void in
                 guard let logCapture else { return }
                 await logCapture.capture("[log_critical] " + message)

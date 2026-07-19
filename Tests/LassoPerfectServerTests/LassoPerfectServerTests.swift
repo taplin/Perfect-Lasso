@@ -396,7 +396,9 @@ private func sampleServerConfig(
         fmAdminAPIPort: 16000,
         fmAdminAPIUser: cwpJanitorEnabled ? "admin" : nil,
         fmAdminAPIPassword: cwpJanitorEnabled ? "secret" : nil,
-        fmAdminAPITrustSelfSignedTLS: false
+        fmAdminAPITrustSelfSignedTLS: false,
+        smtpRelays: [:],
+        smtpDefaultRelay: nil
     )
 }
 
