@@ -5657,7 +5657,7 @@ struct IncludeURLTests {
     }
     struct EmailProvider: LassoEmailProvider {
         let recorder: EmailProviderRecorder
-        func send(_ arguments: [EvaluatedArgument]) async throws -> LassoValue {
+        func send(_ arguments: [EvaluatedArgument], context: LassoContext) async throws -> LassoValue {
             recorder.record(arguments)
             return .string("queued")
         }

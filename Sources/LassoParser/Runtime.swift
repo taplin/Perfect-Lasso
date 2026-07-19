@@ -939,7 +939,7 @@ public struct LassoNativeRegistry: Sendable {
             guard let emailProvider = context.emailProvider else {
                 throw LassoRuntimeError.emailNotConfigured
             }
-            return try await emailProvider.send(arguments)
+            return try await emailProvider.send(arguments, context: context)
         }
         register("redirect_url") { arguments, context in
             let url = arguments.firstValue(named: "url")?.outputString ??

@@ -1008,7 +1008,16 @@ public protocol LassoInlineProvider: Sendable {
 /// and has no side-channel-slot equivalent yet — a harder, separately
 /// scoped problem.
 public protocol LassoEmailProvider: Sendable {
-    func send(_ arguments: [EvaluatedArgument]) async throws -> LassoValue
+    /// `context` is currently unused by any shipped conformer (mirroring
+    /// `LassoInlineProvider.executeInline`'s own `context` parameter,
+    /// which neither of its two conformers touch either) -- included now,
+    /// at zero cost, for family-shape consistency with `inlineProvider`/
+    /// `sessionProvider` and so a future conformer needing request-scoped
+    /// state (e.g. attributing an `email_result`/`email_status` job to the
+    /// requesting page) doesn't require a breaking protocol change once
+    /// `LassoPerfectSMTP`'s real conformer ships (milestone review,
+    /// architecture pass, finding #1).
+    func send(_ arguments: [EvaluatedArgument], context: LassoContext) async throws -> LassoValue
 }
 
 public protocol LassoDynamicQueryExecutor: Sendable {
