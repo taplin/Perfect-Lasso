@@ -74,7 +74,22 @@ public indirect enum LassoValue: Equatable, Sendable {
             } else {
                 value.typeName
             }
-        case let .pair(key, value): "\(key.outputString) = \(value.outputString)"
+        case let .pair(key, value):
+            // Ch. 30 p.404's own worked example (`[Variable: 'Test_Pair']`
+            // on `(Pair: 'First_Name'='John')`) → `(Pair: (First_Name)=
+            // (John))` — the outer `(...)` wrap is that specific
+            // bare-display tag's own formatting (not reproduced here,
+            // matching this codebase's established treatment of the
+            // same outer-wrap quirk on `TreeMap`'s own worked example —
+            // see `LassoTreeMapValue.autoStringDescription`'s doc
+            // comment), but the inner `(key)=(value)` shape — no
+            // surrounding spaces, each half parenthesized — is Pair's
+            // own genuine auto-stringification contract. Previously
+            // `"\(key) = \(value)"` (spaces, no parens) with no
+            // primary-source citation at all — found and fixed while
+            // reading Ch. 30's Pair section for Stage 4's `->First=`/
+            // `->Second=` work.
+            "(\(key.outputString))=(\(value.outputString))"
         }
     }
 

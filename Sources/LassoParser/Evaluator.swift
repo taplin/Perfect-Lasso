@@ -419,7 +419,7 @@ struct Evaluator {
         ],
         "integer": ["asstring", "ceil"],
         "decimal": ["asstring", "ceil"],
-        "pair": ["first", "second"],
+        "pair": ["first", "second", "size", "get"],
         "array": [
             "size", "first", "insert", "get", "last", "second", "reverse", "sort",
             "join", "contains", "find", "findposition", "remove", "removeall",
@@ -533,7 +533,8 @@ struct Evaluator {
             context.set(value, for: name, scope: defaultScope)
         case let .string(name):
             context.set(value, for: name, scope: defaultScope)
-        case let .member(base, name, _):
+        case let .member(base, name, memberArguments):
+            let normalizedName = name.lowercased()
             let baseValue: LassoValue
             if case let .identifier(baseName) = base,
                baseName.caseInsensitiveCompare("self") == .orderedSame,
@@ -541,6 +542,79 @@ struct Evaluator {
                 baseValue = .object(object)
             } else {
                 baseValue = try await evaluate(base)
+            }
+            // `Pair->First=`/`->Second=` (Ch. 30 Table 9, p.404: "Can be
+            // used as the left parameter of an assignment operator to
+            // change the first/second element") and `Queue->First=`/
+            // `Stack->First=` (Tables 13/18: "[Queue->First] returns
+            // the first element of the queue BY REFERENCE so the value
+            // of the element can be changed") — genuinely new
+            // architectural work (§3.6 of the collections plan), not a
+            // generic `object.set(value, for: name)` data-field write.
+            // `Pair` is a VALUE-type `LassoValue` case, not `.object`-
+            // wrapped at all — there is no instance to mutate, so the
+            // only way to make `$myPair->First = X` visible is to
+            // rebuild the WHOLE pair and recursively re-assign it to
+            // whatever expression `base` itself was (mirroring exactly
+            // how `Var(name::type) = value` above recurses into `assign`
+            // again for its own unwrapped target). `Queue`/`Stack` ARE
+            // `.object`-wrapped (reference types) — their `_elements`
+            // array can be mutated in place through the existing
+            // `LassoObjectInstance`, no recursive reassignment needed,
+            // same pattern `Iterator`'s own mutating methods already
+            // use. `Set->Get(n)=` (Table 16: "This tag can be used as
+            // the left parameter of an assignment operator to set an
+            // element of the set") is the third case — position-based,
+            // matching `->Get`'s own read semantics; a direct positional
+            // overwrite, not a re-insert-and-resort (no worked example
+            // exists to check that choice against — Set's sortedness
+            // invariant is not addressed by Table 16's terse wording).
+            if normalizedName == "first" || normalizedName == "second" {
+                if case let .pair(first, second) = baseValue {
+                    let newPair: LassoValue = normalizedName == "first" ? .pair(value, second) : .pair(first, value)
+                    try await assign(newPair, to: base, defaultScope: defaultScope)
+                    return
+                }
+                // Atomic read-modify-write under a single lock hold —
+                // composing separate `LassoCollectionValue.elements(from:)`
+                // (a locked read) and `object.set(_:for:)` (a separate
+                // locked write) reintroduces the exact lost-update race
+                // already found and fixed for `Queue`/`Stack`/
+                // `PriorityQueue->Get` and Iterator's own mutating
+                // methods (see their own comments) — flagged again here
+                // by swift-concurrency-pro/code-reviewer review.
+                if normalizedName == "first", case let .object(object) = baseValue, object.typeName == "queue" {
+                    object.withLock("_elements") { stored in
+                        guard case var .array(elements) = stored, !elements.isEmpty else { return }
+                        elements[0] = value
+                        stored = .array(elements)
+                    }
+                    return
+                }
+                if normalizedName == "first", case let .object(object) = baseValue, object.typeName == "stack" {
+                    object.withLock("_elements") { stored in
+                        guard case var .array(elements) = stored, !elements.isEmpty else { return }
+                        elements[elements.count - 1] = value
+                        stored = .array(elements)
+                    }
+                    return
+                }
+            }
+            if normalizedName == "get", case let .object(object) = baseValue, object.typeName == "set" {
+                // The position argument is evaluated BEFORE acquiring
+                // the lock — it may itself suspend (`await`), and
+                // holding a lock across a suspension point is exactly
+                // the kind of hazard `withLock`'s own synchronous-only
+                // closure shape exists to prevent.
+                let getArguments = memberArguments ?? []
+                let position = getArguments.first != nil ? Int(try await evaluate(getArguments[0].value).number ?? 0) : 0
+                let index = position - 1
+                object.withLock("_elements") { stored in
+                    guard case var .array(elements) = stored, elements.indices.contains(index) else { return }
+                    elements[index] = value
+                    stored = .array(elements)
+                }
+                return
             }
             guard case let .object(object) = baseValue else {
                 throw LassoRuntimeError.invalidAssignment
@@ -942,6 +1016,19 @@ struct Evaluator {
         case let (.integer(value), "ceil"): return .integer(value)
         case let (.pair(key, _), "first"): return key
         case let (.pair(_, value), "second"): return value
+        case (.pair, "size"):
+            // Ch. 30 p.404 Note: "For compatibility with maps and
+            // arrays the [Pair->Size] tag always returns 2".
+            return .integer(2)
+        case let (.pair(key, value), "get"):
+            // Same Note: "[Pair->(Get:1)] and [Pair->(Get:2)] work to
+            // extract the first and second elements from a pair."
+            let position = arguments.first != nil ? Int(try await evaluate(arguments[0].value).number ?? 0) : 0
+            switch position {
+            case 1: return key
+            case 2: return value
+            default: return .null
+            }
         case let (.array(values), "size"): return .integer(values.count)
         case let (.array(values), "first"): return values.first ?? .null
         case let (.array(values), "insert"):

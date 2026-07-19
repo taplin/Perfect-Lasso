@@ -8955,3 +8955,127 @@ struct IncludeURLTests {
     #expect(output == "OneTwo|2")
 }
 
+@Test func pairFirstAndSecondCanBeUsedAsAssignmentTargetsMatchingTheGuidesOwnWorkedExample() async throws {
+    // Ch. 30 Table 9, p.404: "[Pair->First]/[Pair->Second] ... Can be
+    // used as the left parameter of an assignment operator" — verified
+    // against the Guide's own worked example verbatim: create
+    // `(Pair: 'First_Name'='John')`, set `->First = 'Last_Name'` and
+    // `->Second = 'Doe'`, read back "Last_Name: Doe". `Pair` is a
+    // VALUE-type `LassoValue` case (not `.object`-wrapped) — this only
+    // works via the new recursive rebuild-and-reassign path in
+    // `Evaluator.assign`, not a generic object-field write.
+    var context = LassoContext()
+    let output = try await LassoRenderer().render(
+        """
+        [var('Test_Pair' = (pair: 'First_Name'='John'))]\
+        [$Test_Pair->First = 'Last_Name']\
+        [$Test_Pair->Second = 'Doe']\
+        [$Test_Pair->First] + [$Test_Pair->Second]
+        """,
+        context: &context
+    )
+    #expect(output == "Last_Name + Doe")
+}
+
+@Test func pairSizeAlwaysReturnsTwoAndGetExtractsFirstAndSecondByPosition() async throws {
+    // Ch. 30 p.404 Note: "the [Pair->Size] tag always returns 2 and
+    // [Pair->(Get:1)] and [Pair->(Get:2)] work to extract the first and
+    // second elements from a pair."
+    var context = LassoContext()
+    let output = try await LassoRenderer().render(
+        "[(pair: 'First_Name'='John')->Size]|[(pair: 'First_Name'='John')->Get(1)]|[(pair: 'First_Name'='John')->Get(2)]",
+        context: &context
+    )
+    #expect(output == "2|First_Name|John")
+}
+
+@Test func pairAutoStringifiesAsKeyEqualsValueEachHalfParenthesized() async throws {
+    // Ch. 30 p.404's own worked example: `[Variable: 'Test_Pair']` on
+    // `(Pair: 'First_Name'='John')` → `(Pair: (First_Name)=(John))` —
+    // this codebase reproduces the inner `(key)=(value)` shape (no
+    // surrounding spaces) via `string(...)` rather than the outer
+    // wrapping parens, matching the same established treatment as
+    // `TreeMap`'s own bare-display worked example (see
+    // `LassoValue.outputString`'s `.pair` case doc comment).
+    var context = LassoContext()
+    let output = try await LassoRenderer().render(
+        "[string((pair: 'First_Name'='John'))]",
+        context: &context
+    )
+    #expect(output == "(First_Name)=(John)")
+}
+
+@Test func queueFirstCanBeUsedAsAnAssignmentTargetMatchingTheGuidesOwnWorkedExample() async throws {
+    // Ch. 30 p.409-410: "[Queue->First] returns the first element of
+    // the queue BY REFERENCE so the value of the element can be
+    // changed" — insert One, Two; `->First = 'Three'`; `->First` reads
+    // back "Three". Mutates the `.object`-wrapped Queue's own
+    // `_elements` array in place (front position), no recursive
+    // reassignment needed unlike Pair.
+    var context = LassoContext()
+    let output = try await LassoRenderer().render(
+        """
+        [var('myQueue' = queue)][$myQueue->Insert('One')][$myQueue->Insert('Two')]\
+        [$myQueue->First = 'Three'][$myQueue->First]
+        """,
+        context: &context
+    )
+    #expect(output == "Three")
+}
+
+@Test func stackFirstCanBeUsedAsAnAssignmentTargetMatchingTheGuidesOwnWorkedExample() async throws {
+    // Ch. 30 p.415: same shape as Queue's own worked example above, but
+    // Stack's `->First` reads the LIFO top (`.last`), so `->First=`
+    // must write the LAST element, not the first.
+    var context = LassoContext()
+    let output = try await LassoRenderer().render(
+        """
+        [var('myStack' = stack)][$myStack->Insert('One')][$myStack->Insert('Two')]\
+        [$myStack->First = 'Three'][$myStack->First]
+        """,
+        context: &context
+    )
+    #expect(output == "Three")
+}
+
+@Test func setGetCanBeUsedAsAnAssignmentTargetToOverwriteAPositionInPlace() async throws {
+    // Ch. 30 Table 16: "[Set->Get] ... This tag can be used as the left
+    // parameter of an assignment operator to set an element of the
+    // set." No worked example exists to verify against (see
+    // `Evaluator.assign`'s own doc comment) — this is a direct
+    // positional overwrite, not a re-insert-and-resort, since Table 16
+    // doesn't address how (or whether) sortedness should be maintained
+    // through this path.
+    var context = LassoContext()
+    let output = try await LassoRenderer().render(
+        """
+        [var('mySet' = set)][$mySet->Insert('Alpha')][$mySet->Insert('Beta')][$mySet->Insert('Gamma')]\
+        [$mySet->Get(2) = 'Replaced'][string($mySet)]
+        """,
+        context: &context
+    )
+    #expect(output == "Set: (Alpha), (Replaced), (Gamma)")
+}
+
+@Test func pairHasMethodReportsTrueForSizeAndGetNotJustFirstAndSecond() async throws {
+    // Regression test for a real bug architect review found: adding
+    // real `.pair` dispatch cases for `->Size`/`->Get` to
+    // `Evaluator.member` isn't enough on its own — `->HasMethod`
+    // introspection reads a SEPARATE mirror table
+    // (`primitiveMethodNames["pair"]`) that must be kept in sync by
+    // hand (its own doc comment explicitly warns of exactly this drift
+    // risk). The mirror still listed only `["first", "second"]` after
+    // `->Size`/`->Get` were added, so `->HasMethod` silently
+    // under-reported `false` for two methods that actually worked.
+    var context = LassoContext()
+    let output = try await LassoRenderer().render(
+        """
+        [(pair: 'a'='b')->HasMethod('first')]|[(pair: 'a'='b')->HasMethod('second')]|\
+        [(pair: 'a'='b')->HasMethod('size')]|[(pair: 'a'='b')->HasMethod('get')]|\
+        [(pair: 'a'='b')->HasMethod('nonexistent')]
+        """,
+        context: &context
+    )
+    #expect(output == "true|true|true|true|false")
+}
+
