@@ -250,7 +250,7 @@ struct ExpressionParser {
     }
 
     mutating private func parsePrefix() -> LassoExpression {
-        let expression: LassoExpression
+        var expression: LassoExpression
         switch advance() {
         case let .string(value): expression = .string(value)
         case let .integer(value): expression = .integer(value)
@@ -283,8 +283,51 @@ struct ExpressionParser {
             let previousSuppression = suppressArrowPostfix
             suppressArrowPostfix = false
             expression = parseExpression()
-            suppressArrowPostfix = previousSuppression
             _ = consume(")")
+            // Parse this parenthesized expression's OWN postfix chain
+            // (`->member`, `(...)`, `:...`) while suppression is still
+            // off, THEN restore — not the other way around. A `(...)`
+            // group is an unambiguous, self-contained unit; any `->`
+            // immediately following its closing paren can only belong
+            // to IT, never to some enclosing bare colon-call's own
+            // trailing-member ambiguity (`suppressArrowPostfix`'s real
+            // purpose, see `bareColonCallArgumentDoesNotAbsorbATrailing
+            // ArrowMemberAccess`'s own doc comment — that ambiguity is
+            // specifically about an UNPARENTHESIZED argument value like
+            // bare `1` in `$var->get:1->first`, which parens can't even
+            // arise for). Found via a real failure: `(Compare_LessThan:
+            // ('abe')->SubString(1,1), 'bob')` — a colon-call argument
+            // that is itself a parenthesized base with a chained member
+            // call — threw `unsupportedExpression(")")`, because the OLD
+            // ordering restored suppression BEFORE this expression's own
+            // `->SubString(1,1)` postfix chain got a chance to parse,
+            // silently dropping it and leaving the parser to choke on
+            // the leftover `->SubString(1,1)` tokens it never consumed.
+            // The final `return parsePostfix(expression)` below still
+            // runs afterward (with suppression restored) but is a
+            // harmless no-op here — every postfix token this expression
+            // could legitimately absorb was already consumed above.
+            //
+            // **Known, narrower, still-open limitations** (not fixed
+            // here, both predate and are unchanged by this fix): a BARE
+            // (unparenthesized) variable/identifier with a chained
+            // member call as a NON-LAST bare-colon-call argument — e.g.
+            // `(Tag: $x->Member(), 'y')` — still throws
+            // `unsupportedExpression(")")`. The sibling shape, a bare
+            // chained-member-call as the LAST (or only) bare-colon-call
+            // argument — e.g. `(Tag: $x->Member())` — does NOT throw,
+            // but silently MIS-parses as `(Tag: $x)->Member()` instead
+            // of the presumably-intended `Tag($x->Member())` (this
+            // happens entirely inside `parsePostfix`'s own shared
+            // while-loop, after `parseArguments` restores suppression —
+            // code this fix never touches, confirmed unaffected either
+            // way). Only the parenthesized-base case above is fixed; a
+            // bare value has no syntactic boundary of its own to hang
+            // this same "give it back its suppression-free postfix
+            // parse" fix on without risking exactly the regression this
+            // whole mechanism was built to prevent (`$var->get:1->first`).
+            expression = parsePostfix(expression)
+            suppressArrowPostfix = previousSuppression
         case let .named(name): expression = .unknown("-\(name)")
         case let .symbol(value): expression = .unknown(value)
         case .eof: return .unknown("")

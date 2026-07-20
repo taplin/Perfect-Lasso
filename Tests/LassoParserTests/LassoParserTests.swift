@@ -6870,6 +6870,31 @@ struct IncludeURLTests {
     #expect(output.contains("parens=a"))
 }
 
+@Test func colonCallArgumentWithAParenthesizedChainedMemberCallParsesCorrectly() async throws {
+    // Regression test for a real, pre-existing bug found while writing
+    // Collections Stage 7c tests: a colon-call argument that is itself
+    // a parenthesized base with a chained member call —
+    // `('abe')->SubString(1,1)` — threw `unsupportedExpression(")")`
+    // whether it was a non-last argument (followed by a comma and
+    // another argument) or the last argument inside an explicit
+    // `(Tag: ...)` wrap. Root cause: `parsePrefix`'s `.symbol("(")` case
+    // restored `suppressArrowPostfix` to the enclosing bare-colon-call's
+    // suppressed state BEFORE this parenthesized expression's own
+    // `->SubString(1,1)` postfix chain got a chance to parse, silently
+    // dropping it. Fixed by parsing the parenthesized expression's own
+    // postfix chain while suppression is still off, then restoring —
+    // see `ExpressionParser.swift`'s own doc comment on this case for
+    // the full reasoning, including the narrower, still-open case (a
+    // BARE, unparenthesized variable with a chained call as a non-last
+    // argument) this fix does not cover.
+    var context = LassoContext()
+    let output = try await LassoRenderer().render(
+        "[(Compare_LessThan: ('abe')->SubString(1,1), 'bob')]|[(Compare_LessThan: 'bob', ('abe')->SubString(1,1))]",
+        context: &context
+    )
+    #expect(output == "0|-1")
+}
+
 @Test func mapInsertAddsAKeyedEntryMutatingTheInvocantInPlace() async throws {
     // Real corpus: includes/detail_by_size.lasso's
     // `var(skuArrayItem = map)` followed by
@@ -7692,6 +7717,27 @@ struct IncludeURLTests {
         context: &context
     )
     #expect(output == "true|false|false")
+}
+
+@Test func relationalOperatorsCompareStringsAlphabeticallyNotByLength() async throws {
+    // Regression test for a real, pre-existing bug: the raw `<`/`>`/
+    // `<=`/`>=` operators' non-numeric fallback compared
+    // `Double(outputString.count)` — i.e. STRING LENGTH — instead of
+    // actual lexicographic content, so `'a' < 'b'` incorrectly returned
+    // `false` (both length 1). Ch. 5 Table 11 (p.78) documents the real
+    // contract directly: "check whether strings come before or after
+    // each other in alphabetical order," with the Guide's own worked
+    // example verbatim (`'abc' < 'def'` → True) — used as the first
+    // assertion below. `'aa' < 'b'` and `'zz' > 'a'` specifically prove
+    // this isn't accidentally still comparing by length (a longer
+    // string sorting before/after a shorter one purely by alphabetical
+    // content, contradicting what length-based comparison would give).
+    var context = LassoContext()
+    let output = try await LassoRenderer().render(
+        "[('abc' < 'def')]|[('aa' < 'b')]|[('zz' > 'a')]|[('abc' <= 'abc')]|[('abc' >= 'abc')]|[('b' > 'a')]",
+        context: &context
+    )
+    #expect(output == "true|true|true|true|true|true")
 }
 
 @Test func elseWithConditionNestsAsRealIfElseIfNotAnUnconditionalBranch() async throws {

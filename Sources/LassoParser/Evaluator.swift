@@ -812,13 +812,40 @@ struct Evaluator {
             return .boolean(left.outputString.caseInsensitiveCompare(right.outputString) == .orderedSame)
         case "!=":
             return .boolean(left.outputString.caseInsensitiveCompare(right.outputString) != .orderedSame)
-        case ">": return compare(left, right, >)
+        // `<`/`>`/`<=`/`>=` (Ch. 5 Table 11, p.78) — "check whether strings
+        // come before or after each other in alphabetical order," verified
+        // against the Guide's own worked example (`'abc' < 'def'` → True)
+        // — that citation covers the pure-non-numeric-string case
+        // specifically; it says nothing about numeric-looking string
+        // operands. All four derived from the same `Evaluator.lassoLessThan`
+        // this codebase already uses for `Array->Sort`/Set/PriorityQueue/
+        // TreeMap ordering and `Match_Range` — the single existing,
+        // already-reviewed source of truth for "how does Lasso order two
+        // values," reused here instead of inventing a second, parallel
+        // comparison. Note `lassoLessThan`'s own numeric-bucket-first
+        // behavior for mixed/numeric-looking operands (e.g. `'10' < '9'`
+        // compares NUMERICALLY, not alphabetically) is its own doc
+        // comment's disclosed "best-effort" heuristic (invented for
+        // `Array->Sort`'s mixed-array ordering, not verified against a
+        // Guide worked example) — reusing it here inherits that same
+        // unverified-but-pre-existing ambiguity for the raw operators too,
+        // not a new one this fix introduces (the OLD `compare(_:_:_:)`
+        // helper already special-cased "both operands numeric → compare
+        // numerically" before its now-fixed broken fallback, so mixed/
+        // numeric-string comparisons are no better- or worse-defined than
+        // before). Previously these four routed through a private
+        // `compare(_:_:_:)` helper whose non-numeric fallback compared
+        // `Double(outputString.count)` — i.e. STRING LENGTH, not content —
+        // so `'a' < 'b'` incorrectly returned `false` (both length 1).
+        // Confirmed no existing test's expected output depended on that
+        // broken behavior before fixing it.
+        case ">": return .boolean(Evaluator.lassoLessThan(right, left))
         case ">>":
             // Real Lasso 8/9's documented string-contains operator
             // (`left >> right` — "does left contain right") — not a
             // synonym for `>`. Treating it as `>` silently compared
-            // string *lengths* instead of content (`compare`'s
-            // no-numeric-operand fallback), which happened to look
+            // string *lengths* instead of content (the same bug the
+            // `<`/`>`/`<=`/`>=` fix above closes), which happened to look
             // right for some inputs by sheer coincidence (e.g. `'' >>
             // 'www3'` is false either way, since 0 > 4 is also false)
             // but was wrong in general. Real corpus: ~32 files use this
@@ -827,9 +854,9 @@ struct Evaluator {
             // `server_name >> 'www2'` chain) and bot-string matching
             // (site_setup_tags.inc's `excludeBots`).
             return .boolean(left.outputString.contains(right.outputString))
-        case "<": return compare(left, right, <)
-        case ">=": return compare(left, right, >=)
-        case "<=": return compare(left, right, <=)
+        case "<": return .boolean(Evaluator.lassoLessThan(left, right))
+        case ">=": return .boolean(!Evaluator.lassoLessThan(left, right))
+        case "<=": return .boolean(!Evaluator.lassoLessThan(right, left))
         default: throw LassoRuntimeError.unsupportedExpression("Binary \(op)")
         }
     }
@@ -841,15 +868,6 @@ struct Evaluator {
     ) -> LassoValue {
         let result = operation(left.number ?? 0, right.number ?? 0)
         return result.rounded() == result ? .integer(Int(result)) : .decimal(result)
-    }
-
-    private func compare(
-        _ left: LassoValue,
-        _ right: LassoValue,
-        _ operation: (Double, Double) -> Bool
-    ) -> LassoValue {
-        if let lhs = left.number, let rhs = right.number { return .boolean(operation(lhs, rhs)) }
-        return .boolean(operation(Double(left.outputString.count), Double(right.outputString.count)))
     }
 
     private mutating func member(
