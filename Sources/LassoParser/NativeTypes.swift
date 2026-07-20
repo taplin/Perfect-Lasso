@@ -68,6 +68,14 @@ public struct LassoNativeTypeRegistry: Sendable {
         register(Self.makeBytesType())
         register(Self.makeEmailComposeType())
         register(Self.makeEmailSMTPType())
+        register(Self.makeRegExpType())
+        register(Self.makeListType())
+        register(Self.makeQueueType())
+        register(Self.makeStackType())
+        register(Self.makeSetType())
+        register(Self.makePriorityQueueType())
+        register(Self.makeTreeMapType())
+        register(Self.makeIteratorType())
     }
 }
 
@@ -493,11 +501,31 @@ extension LassoNativeTypeRegistry {
     //
     // See BytesType.swift for the storage representation
     // (`LassoBytesValue`, a base64 string stashed in a private-by-
-    // convention `_base64` field). Only the three members real corpus
-    // actually calls are implemented — decodeBase64/encodeBase64/
-    // encodeUrl, always chained straight off a `bytes(value)` constructor
-    // call, never off a bare `Bytes` identifier — so unlike `date`, this
-    // type has no meaningful "bare identifier" fallback to design for.
+    // convention `_base64` field). decodeBase64/encodeBase64/encodeUrl
+    // were the only three members real corpus actually called at the
+    // time `bytes` was first added; this batch adds the next tier of
+    // lassoguide.com's documented "Byte Streams" surface (verified
+    // directly at http://www.lassoguide.com/operations/byte-streams.html,
+    // Lasso 8.5 Language Guide Ch. 27 Table 2 covers the same core
+    // inspection/manipulation members under slightly different names —
+    // e.g. `->ExportString` where lassoguide.com has both `->ExportString`
+    // and the newer `->AsString`) — size/get/getRange/find/contains/
+    // beginsWith/endsWith/asString/split/sub (inspection) and
+    // append/trim/replace/remove (manipulation, "modify the bytes object
+    // without returning a value" per lassoguide.com's own section header
+    // — these ride the SAME `Evaluator.selfMutatingMethods` write-back
+    // mechanism `Date->Add` already established for `.object` types;
+    // "append"/"trim"/"replace"/"remove" are already in that set from
+    // String's own additions, so no change needed there) and
+    // encodeHex/decodeHex. Still open, deliberately deferred (a long
+    // tail with no real-corpus evidence yet, matching how this project
+    // has scoped every prior native-type expansion): removeLeading/
+    // removeTrailing/padLeading/padTrailing, setSize/setRange,
+    // marker/position/setPosition, export*bits/import*bits (binary
+    // integer packing), swapBytes, crc, encodeMd5/encodeQP/decodeQP/
+    // encodeSql/encodeSql92/decodeUrl, bestCharset/detectCharset, and
+    // forEachByte/eachByte (both need Captures — this project's still-
+    // unimplemented block/closure primitive).
     fileprivate static func makeBytesType() -> LassoNativeType {
         var type = LassoNativeType(name: "bytes")
 
@@ -521,6 +549,207 @@ extension LassoNativeTypeRegistry {
             let text = LassoBytesValue.string(from: receiver)
             let encoded = LassoEncoding.url(text)
             return .object(LassoBytesValue.makeObject(rawBytes: Array(encoded.utf8)))
+        }
+        type.register("size") { receiver, _, _ in
+            .integer(LassoBytesValue.rawBytes(from: receiver).count)
+        }
+        type.register("get") { receiver, arguments, _ in
+            // "Returns a single byte from the stream" as an INTEGER, not a
+            // string/bytes fragment — confirmed by the doc's own worked
+            // example (`bytes('hello world')->get(2) => 101`, the ASCII
+            // code for 'e', the 1-based 2nd character). Out-of-range isn't
+            // covered by any worked example; degrades to 0 rather than
+            // throwing, matching this codebase's established "missing/
+            // invalid argument degrades gracefully" convention elsewhere.
+            let rawBytes = LassoBytesValue.rawBytes(from: receiver)
+            let position = (arguments.positionalValue(at: 0)?.number).map(Int.init) ?? 0
+            let index = position - 1
+            guard rawBytes.indices.contains(index) else { return .integer(0) }
+            return .integer(Int(rawBytes[index]))
+        }
+        type.register("getrange") { receiver, arguments, _ in
+            // Both parameters are required per lassoguide.com's own
+            // signature (`getRange(position::integer, num::integer)`,
+            // no `=?` on `num`) — unlike `->sub` below, which makes `num`
+            // optional.
+            let rawBytes = LassoBytesValue.rawBytes(from: receiver)
+            let position = (arguments.positionalValue(at: 0)?.number).map(Int.init) ?? 0
+            let count = (arguments.positionalValue(at: 1)?.number).map(Int.init) ?? 0
+            let startIndex = max(0, position - 1)
+            guard startIndex < rawBytes.count, count > 0 else {
+                return .object(LassoBytesValue.makeObject(rawBytes: []))
+            }
+            let endIndex = min(rawBytes.count, startIndex + count)
+            return .object(LassoBytesValue.makeObject(rawBytes: Array(rawBytes[startIndex..<endIndex])))
+        }
+        type.register("find") { receiver, arguments, _ in
+            // "Returns the position where the sequence first begins... or
+            // '0' if the pattern cannot be found" — 1-based, matching this
+            // codebase's established `String->Find` convention. Only the
+            // single required `find` parameter is implemented; the four
+            // additional optional position/length-limit parameters
+            // lassoguide.com documents (searching a sub-range of either
+            // the instance or the pattern) have no worked example and are
+            // out of scope here, mirroring how `String->Compare`'s
+            // substring-offset overload was similarly deferred.
+            let rawBytes = LassoBytesValue.rawBytes(from: receiver)
+            let needle = LassoBytesValue.rawBytes(from: arguments.positionalValue(at: 0) ?? .string(""))
+            guard !needle.isEmpty, let range = firstRange(of: needle, in: rawBytes) else { return .integer(0) }
+            return .integer(range.lowerBound + 1)
+        }
+        type.register("contains") { receiver, arguments, _ in
+            // Implemented against this method's own written description
+            // ("Returns 'true' if the byte stream contains the specified
+            // sequence") rather than the page's own worked example under
+            // this heading — that example actually calls `->find` (not
+            // `->contains`) and expects `false` as output, which doesn't
+            // even match `->find`'s own documented integer-or-zero return
+            // type. Confirmed copy-paste artifact from the `->find`
+            // section directly above it on the same page, the same class
+            // of documentation defect this project has repeatedly found
+            // and deliberately not followed (Math_Div, String->Compare,
+            // String_ReplaceRegExp).
+            let rawBytes = LassoBytesValue.rawBytes(from: receiver)
+            let needle = LassoBytesValue.rawBytes(from: arguments.positionalValue(at: 0) ?? .string(""))
+            return .boolean(!needle.isEmpty && firstRange(of: needle, in: rawBytes) != nil)
+        }
+        type.register("beginswith") { receiver, arguments, _ in
+            let rawBytes = LassoBytesValue.rawBytes(from: receiver)
+            let needle = LassoBytesValue.rawBytes(from: arguments.positionalValue(at: 0) ?? .string(""))
+            return .boolean(!needle.isEmpty && rawBytes.starts(with: needle))
+        }
+        type.register("endswith") { receiver, arguments, _ in
+            let rawBytes = LassoBytesValue.rawBytes(from: receiver)
+            let needle = LassoBytesValue.rawBytes(from: arguments.positionalValue(at: 0) ?? .string(""))
+            return .boolean(!needle.isEmpty && rawBytes.count >= needle.count && Array(rawBytes.suffix(needle.count)) == needle)
+        }
+        type.register("asstring") { receiver, arguments, _ in
+            // "Returns the entire byte stream as a string using the
+            // specified encoding, defaulting to 'UTF-8'." Only UTF-8 and
+            // ISO-8859-1 are mapped — a new, first-instance scope
+            // decision (no other encoding-name-mapping precedent exists
+            // elsewhere in this codebase); an unrecognized encoding name
+            // falls back to UTF-8 rather than throwing.
+            let rawBytes = LassoBytesValue.rawBytes(from: receiver)
+            let encodingName = arguments.positionalValue(at: 0)?.outputString ?? "UTF-8"
+            let encoding: String.Encoding = encodingName.caseInsensitiveCompare("ISO-8859-1") == .orderedSame
+                ? .isoLatin1 : .utf8
+            return .string(String(data: Data(rawBytes), encoding: encoding) ?? String(decoding: rawBytes, as: UTF8.self))
+        }
+        type.register("split") { receiver, arguments, _ in
+            // "If the delimiter provided is an empty byte stream or
+            // string, the byte stream is split on each byte" — matches
+            // `String->Split`'s own analogous empty-delimiter handling.
+            let rawBytes = LassoBytesValue.rawBytes(from: receiver)
+            let delimiter = LassoBytesValue.rawBytes(from: arguments.positionalValue(at: 0) ?? .string(""))
+            if delimiter.isEmpty {
+                return .array(rawBytes.map { .object(LassoBytesValue.makeObject(rawBytes: [$0])) })
+            }
+            var segments: [LassoValue] = []
+            var remaining = rawBytes[...]
+            while let range = firstRange(of: delimiter, in: Array(remaining)) {
+                let absoluteStart = remaining.startIndex + range.lowerBound
+                let absoluteEnd = remaining.startIndex + range.upperBound
+                segments.append(.object(LassoBytesValue.makeObject(rawBytes: Array(remaining[remaining.startIndex..<absoluteStart]))))
+                remaining = remaining[absoluteEnd...]
+            }
+            segments.append(.object(LassoBytesValue.makeObject(rawBytes: Array(remaining))))
+            return .array(segments)
+        }
+        type.register("sub") { receiver, arguments, _ in
+            // 1-based; `num` optional — "all of the bytes following the
+            // index are returned" when omitted, unlike `->getRange` above.
+            let rawBytes = LassoBytesValue.rawBytes(from: receiver)
+            let position = (arguments.positionalValue(at: 0)?.number).map(Int.init) ?? 0
+            let startIndex = max(0, position - 1)
+            guard startIndex < rawBytes.count else {
+                return .object(LassoBytesValue.makeObject(rawBytes: []))
+            }
+            let endIndex = arguments.positionalValue(at: 1)?.number.map { min(rawBytes.count, startIndex + Int($0)) } ?? rawBytes.count
+            guard endIndex > startIndex else {
+                return .object(LassoBytesValue.makeObject(rawBytes: []))
+            }
+            return .object(LassoBytesValue.makeObject(rawBytes: Array(rawBytes[startIndex..<endIndex])))
+        }
+        type.register("append") { receiver, arguments, _ in
+            let rawBytes = LassoBytesValue.rawBytes(from: receiver)
+            let addition = LassoBytesValue.rawBytes(from: arguments.positionalValue(at: 0) ?? .string(""))
+            return .object(LassoBytesValue.makeObject(rawBytes: rawBytes + addition))
+        }
+        type.register("trim") { receiver, _, _ in
+            // "Removes all whitespace ASCII characters from the beginning
+            // and the end" — ASCII whitespace only (space/tab/newline/
+            // CR/etc., codes <= 0x20's whitespace set plus 0x7F is NOT
+            // whitespace), not a general Unicode-whitespace notion, since
+            // this is raw binary data, not text.
+            let rawBytes = LassoBytesValue.rawBytes(from: receiver)
+            func isAsciiWhitespace(_ byte: UInt8) -> Bool {
+                byte == 0x20 || byte == 0x09 || byte == 0x0A || byte == 0x0D || byte == 0x0B || byte == 0x0C
+            }
+            var start = 0
+            var end = rawBytes.count
+            while start < end, isAsciiWhitespace(rawBytes[start]) { start += 1 }
+            while end > start, isAsciiWhitespace(rawBytes[end - 1]) { end -= 1 }
+            return .object(LassoBytesValue.makeObject(rawBytes: Array(rawBytes[start..<end])))
+        }
+        type.register("replace") { receiver, arguments, _ in
+            let rawBytes = LassoBytesValue.rawBytes(from: receiver)
+            let find = LassoBytesValue.rawBytes(from: arguments.positionalValue(at: 0) ?? .string(""))
+            let replacement = LassoBytesValue.rawBytes(from: arguments.positionalValue(at: 1) ?? .string(""))
+            guard !find.isEmpty else { return .object(LassoBytesValue.makeObject(rawBytes: rawBytes)) }
+            var result: [UInt8] = []
+            var remaining = rawBytes[...]
+            while let range = firstRange(of: find, in: Array(remaining)) {
+                let absoluteStart = remaining.startIndex + range.lowerBound
+                let absoluteEnd = remaining.startIndex + range.upperBound
+                result.append(contentsOf: remaining[remaining.startIndex..<absoluteStart])
+                result.append(contentsOf: replacement)
+                remaining = remaining[absoluteEnd...]
+            }
+            result.append(contentsOf: remaining)
+            return .object(LassoBytesValue.makeObject(rawBytes: result))
+        }
+        type.register("remove") { receiver, arguments, _ in
+            // No-arg form: "removes all bytes, setting the object to an
+            // empty bytes object." Two-arg form: an offset + count range.
+            // A one-arg call is not a documented valid form at all; it
+            // falls through the two-arg path with `count` defaulting to
+            // 0, so the `count > 0` guard below fails and the original
+            // bytes are returned unchanged — graceful degradation
+            // consistent with this type's other defaults, not a
+            // documented behavior.
+            guard let position = arguments.positionalValue(at: 0)?.number.map(Int.init) else {
+                return .object(LassoBytesValue.makeObject(rawBytes: []))
+            }
+            let rawBytes = LassoBytesValue.rawBytes(from: receiver)
+            let count = arguments.positionalValue(at: 1)?.number.map(Int.init) ?? 0
+            let startIndex = max(0, position - 1)
+            guard startIndex < rawBytes.count, count > 0 else {
+                return .object(LassoBytesValue.makeObject(rawBytes: rawBytes))
+            }
+            let endIndex = min(rawBytes.count, startIndex + count)
+            var result = rawBytes
+            result.removeSubrange(startIndex..<endIndex)
+            return .object(LassoBytesValue.makeObject(rawBytes: result))
+        }
+        type.register("encodehex") { receiver, _, _ in
+            let hex = LassoBytesValue.rawBytes(from: receiver).map { String(format: "%02x", $0) }.joined()
+            return .object(LassoBytesValue.makeObject(rawBytes: Array(hex.utf8)))
+        }
+        type.register("decodehex") { receiver, _, _ in
+            // "Converting each pair of characters to a single byte" — an
+            // odd-length or non-hex input degrades to skipping the
+            // unparseable trailing/invalid byte rather than throwing,
+            // matching this type's other graceful-degradation defaults.
+            let hexText = LassoBytesValue.string(from: receiver)
+            var decoded: [UInt8] = []
+            var iterator = hexText.makeIterator()
+            while let high = iterator.next() {
+                guard let low = iterator.next(),
+                      let byte = UInt8(String([high, low]), radix: 16) else { break }
+                decoded.append(byte)
+            }
+            return .object(LassoBytesValue.makeObject(rawBytes: decoded))
         }
 
         return type
@@ -717,4 +946,86 @@ extension LassoNativeTypeRegistry {
         return type
     }
 
+    // MARK: - regexp
+    //
+    // See RegularExpressions.swift for the `NSRegularExpression`-backed
+    // implementation. Stored fields ("find"/"replace"/"input"/
+    // "ignorecase") mirror `RegExp`'s constructor keywords (Ch. 26 Table 7)
+    // exactly. `->FindPattern`/`->ReplacePattern`/`->Input`/`->IgnoreCase`
+    // are documented as getter/setter (a parameter sets a new value) —
+    // deliberately implemented here as READ-ONLY getters that ignore any
+    // argument, not setters. Real Lasso `date` objects taught this
+    // codebase a real lesson (see `Date->Add`'s own doc comment above,
+    // and the aliasing bug that fix resolved): a setter that mutates
+    // `receiver`'s stored fields directly would corrupt any OTHER
+    // variable referencing the same shared `LassoObjectInstance` after a
+    // plain assignment, since assignment here copies the `LassoValue`
+    // enum case but not the class instance it wraps. A correct setter
+    // needs the same build-a-new-instance + `selfMutatingMethods` write-
+    // back treatment `Date->Add`/`->Subtract` use — deferred to a
+    // follow-up along with Table 10's interactive tags, which depend on
+    // genuinely mutable per-call state (`->Find` advancing a match
+    // position) in a way the convenience tags below don't.
+    fileprivate static func makeRegExpType() -> LassoNativeType {
+        var type = LassoNativeType(name: "regexp")
+
+        type.register("findpattern") { receiver, _, _ in .string(regexpStringField("find", receiver)) }
+        type.register("replacepattern") { receiver, _, _ in .string(regexpStringField("replace", receiver)) }
+        type.register("input") { receiver, _, _ in .string(regexpStringField("input", receiver)) }
+        type.register("ignorecase") { receiver, _, _ in receiver.value(for: "ignorecase") }
+        type.register("groupcount") { receiver, _, _ in
+            let regex = LassoRegularExpressions.makeRegex(pattern: regexpStringField("find", receiver), ignoreCase: false)
+            return .integer(regex?.numberOfCaptureGroups ?? 0)
+        }
+        type.register("replaceall") { receiver, arguments, _ in
+            let pattern = arguments.lastString(named: "find") ?? regexpStringField("find", receiver)
+            let replacement = arguments.lastString(named: "replace") ?? regexpStringField("replace", receiver)
+            let input = arguments.lastString(named: "input") ?? regexpStringField("input", receiver)
+            let ignoreCase = receiver.value(for: "ignorecase").isTruthy
+            return .string(LassoRegularExpressions.replaceAll(
+                in: input, pattern: pattern, replacement: replacement, ignoreCase: ignoreCase
+            ))
+        }
+        type.register("replacefirst") { receiver, arguments, _ in
+            let pattern = arguments.lastString(named: "find") ?? regexpStringField("find", receiver)
+            let replacement = arguments.lastString(named: "replace") ?? regexpStringField("replace", receiver)
+            let input = arguments.lastString(named: "input") ?? regexpStringField("input", receiver)
+            let ignoreCase = receiver.value(for: "ignorecase").isTruthy
+            return .string(LassoRegularExpressions.replaceFirst(
+                in: input, pattern: pattern, replacement: replacement, ignoreCase: ignoreCase
+            ))
+        }
+        type.register("split") { receiver, arguments, _ in
+            let pattern = arguments.lastString(named: "find") ?? regexpStringField("find", receiver)
+            let input = arguments.lastString(named: "input") ?? regexpStringField("input", receiver)
+            let ignoreCase = receiver.value(for: "ignorecase").isTruthy
+            return .array(LassoRegularExpressions.split(input, pattern: pattern, ignoreCase: ignoreCase))
+        }
+
+        return type
+    }
+}
+
+/// Reads one of a `regexp` object's stored string fields — a top-level
+/// function (not a local closure) so it can be captured by the
+/// `@Sendable` `type.register(...)` closures above without a
+/// Sendable-capture compile error (the same fix already applied to
+/// `isEveryCharacter` in Runtime.swift).
+private func regexpStringField(_ name: String, _ receiver: LassoObjectInstance) -> String {
+    receiver.value(for: name).outputString
+}
+
+/// The index range of the first occurrence of `needle` within
+/// `haystack`, or `nil` if it doesn't occur — a top-level function (not
+/// a local closure) for the same Sendable-capture-avoidance reason as
+/// `regexpStringField` above, used by `bytes->find`/`->contains`/
+/// `->split`/`->replace`.
+private func firstRange(of needle: [UInt8], in haystack: [UInt8]) -> Range<Int>? {
+    guard !needle.isEmpty, needle.count <= haystack.count else { return nil }
+    for start in 0...(haystack.count - needle.count) {
+        if Array(haystack[start..<(start + needle.count)]) == needle {
+            return start..<(start + needle.count)
+        }
+    }
+    return nil
 }

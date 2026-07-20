@@ -510,6 +510,200 @@ import PerfectSessionCore
     #expect(emptyPassword.hasPrefix("0x"))
 }
 
+@Test func encryptMd5MatchesKnownVectors() async throws {
+    // Independently-verifiable cryptographic test vectors (RFC 1321's
+    // own test suite), not something requiring Lasso doc confirmation:
+    // md5("") and md5("abc").
+    var context = LassoContext()
+    let output = try await LassoRenderer().render(
+        "[Encrypt_MD5('')]|[Encrypt_MD5('abc')]",
+        context: &context
+    )
+    #expect(output == "d41d8cd98f00b204e9800998ecf8427e|900150983cd24fb0d6963f7d28e17f72")
+}
+
+@Test func encryptMd5AndCipherDigestOperateOnRawBytesNotALossyStringDecodeOfABytesObject() async throws {
+    // Regression test (found by architect review): an earlier version
+    // extracted the input via `.outputString`, which for a `.object`
+    // bytes value routes through `LassoBytesValue.string(from:)` — an
+    // explicitly-documented LOSSY UTF-8 decode — silently hashing
+    // mangled data instead of the real bytes. `->decodeHex` builds
+    // genuinely non-UTF-8-safe binary (bytes 0x00/0xFF aren't valid
+    // standalone UTF-8), so hashing it must match hashing those exact
+    // raw bytes directly, not a lossy re-decode of them.
+    // Independently computed (Python hashlib, not this codebase) for
+    // the raw two-byte sequence 0x00 0xFF.
+    var context = LassoContext()
+    let output = try await LassoRenderer().render(
+        "[Encrypt_MD5(bytes('00ff')->decodeHex)]|[Cipher_Digest(bytes('00ff')->decodeHex, -digest='sha256', -hex)]",
+        context: &context
+    )
+    #expect(output == "d07d34efac6328007ad67c7e0a985e00|06eb7d6a69ee19e5fbdf749018d3d2abfa04bcbd1365db312eb86dc7169389b8")
+}
+
+@Test func cipherDigestMatchesKnownVectorsForEachSupportedAlgorithm() async throws {
+    // lassoguide.com "Calculate a Digest Value": `cipher_digest(field('message'), -digest='DSA')`
+    // — DSA itself isn't implemented (see Hashing.swift's own scope
+    // disclosure), but this exercises the same -Digest keyword shape
+    // against algorithms this codebase does support, verified against
+    // independently-known SHA1/SHA256 test vectors.
+    var context = LassoContext()
+    let output = try await LassoRenderer().render(
+        "[Cipher_Digest('abc', -digest='sha1', -hex)]|[Cipher_Digest('abc', -digest='sha256', -hex)]",
+        context: &context
+    )
+    #expect(output == "a9993e364706816aba3e25717850c26c9cd0d89d|ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad")
+}
+
+@Test func cipherDigestReturnsABytesObjectByDefaultWithoutHex() async throws {
+    // "Returns... bytes" (lassoguide.com's own signature) — -Hex is an
+    // explicit opt-in to a string encoding, not the default shape.
+    var context = LassoContext()
+    let output = try await LassoRenderer().render(
+        "[Cipher_Digest('abc', -digest='md5')->type]",
+        context: &context
+    )
+    #expect(output == "bytes")
+}
+
+@Test func cipherDigestWithAnUnsupportedAlgorithmFailsGracefullyRatherThanCrashing() async throws {
+    // DSA/MD2/MD4/RIPEMD160 etc. are real, documented cipher_list(-digest)
+    // entries this codebase doesn't implement (see Hashing.swift's own
+    // disclosed scope) — must degrade to a recoverable error, not throw
+    // an unrelated fatal error or silently return a wrong value.
+    var context = LassoContext()
+    let output = try await LassoRenderer().render(
+        "[protect][Cipher_Digest('abc', -digest='dsa')][/protect][error_currenterror(-errorcode)]",
+        context: &context
+    )
+    #expect(output == "\(LassoErrorHandling.Code.invalidParameter)")
+}
+
+@Test func cipherEncryptAndCipherDecryptRoundTripWithAesAndFailWithAWrongKey() async throws {
+    // Real Lasso's own AES worked example uses `-cipher='DES-EDE3-CBC'`
+    // (3DES, not AES) — this codebase's cipher_encrypt/decrypt only
+    // implements AES via swift-crypto's AES-GCM (disclosed scope, see
+    // Hashing.swift), so this exercises the actual supported algorithm
+    // rather than the Guide's own specific worked example. Round-trip
+    // correctness plus a wrong-key failure are both independently
+    // verifiable properties, not something needing doc confirmation.
+    var context = LassoContext()
+    let roundTrip = try await LassoRenderer().render(
+        "[var(enc = Cipher_Encrypt('a secret message', -cipher='AES', -key='correct horse'))]" +
+        "[Cipher_Decrypt($enc, -cipher='AES', -key='correct horse')->asString]",
+        context: &context
+    )
+    #expect(roundTrip == "a secret message")
+
+    var wrongKeyContext = LassoContext()
+    let wrongKeyOutput = try await LassoRenderer().render(
+        "[var(enc = Cipher_Encrypt('a secret message', -cipher='AES', -key='correct horse'))]" +
+        "[protect][Cipher_Decrypt($enc, -cipher='AES', -key='wrong key')][/protect][error_currenterror(-errorcode)]",
+        context: &wrongKeyContext
+    )
+    #expect(wrongKeyOutput == "\(LassoErrorHandling.Code.invalidParameter)")
+}
+
+@Test func cipherEncryptUsesAFreshRandomNonceEachCallRatherThanAFixedOrReusedOne() async throws {
+    // A real cryptographic property worth locking in with a test, not
+    // just trusting AES.GCM.seal's documented behavior: encrypting the
+    // identical plaintext with the identical key twice must produce
+    // DIFFERENT ciphertext each time. A fixed/reused nonce would be a
+    // real vulnerability (AES-GCM catastrophically leaks the XOR of two
+    // plaintexts encrypted under the same key+nonce), so this isn't a
+    // cosmetic check.
+    var context = LassoContext()
+    let output = try await LassoRenderer().render(
+        "[var(first = Cipher_Encrypt('same message', -cipher='AES', -key='same key'))]" +
+        "[var(second = Cipher_Encrypt('same message', -cipher='AES', -key='same key'))]" +
+        "[$first->encodeHex->asString == $second->encodeHex->asString]",
+        context: &context
+    )
+    #expect(output == "false")
+}
+
+@Test func cipherEncryptAndDecryptRoundTripAnEmptyPlaintext() async throws {
+    // Regression test (caught by architect review): AES-GCM ciphertext
+    // length equals plaintext length exactly (no padding), so
+    // encrypting an empty string produces exactly `nonce + 0 +
+    // tag` bytes — an earlier version's bounds check in
+    // `cipherDecrypt` (`data.count > nonceSize + tagSize`) incorrectly
+    // rejected exactly this valid, minimum-length ciphertext.
+    var context = LassoContext()
+    let output = try await LassoRenderer().render(
+        "[var(enc = Cipher_Encrypt('', -cipher='AES', -key='a key'))]" +
+        "[Cipher_Decrypt($enc, -cipher='AES', -key='a key')->asString]",
+        context: &context
+    )
+    #expect(output == "")
+}
+
+@Test func cipherListReturnsTheActuallySupportedAlgorithmsNotTheFullRealLassoList() async throws {
+    // Deliberately does NOT claim real Lasso's full OpenSSL-backed list
+    // (DES/3DES/RC4/RC2/CAST5/RC5/etc.) — only what Hashing.swift's
+    // digest()/cipherEncrypt() functions actually support, so a script
+    // checking `cipher_list->contains(...)` before calling a cipher
+    // never gets a false positive.
+    var context = LassoContext()
+    let output = try await LassoRenderer().render(
+        "[(Cipher_List)->join(',')]|[(Cipher_List(-digest))->join(',')]",
+        context: &context
+    )
+    #expect(output == "MD5,SHA1,SHA256,SHA384,SHA512,AES|MD5,SHA1,SHA256,SHA384,SHA512")
+}
+
+@Test func jsonDeserializeInvertsJsonSerializeForEveryDocumentedVariableType() async throws {
+    // Documentation/session-upload-support-plan.md's own "Variable
+    // strategy" list — string/integer/decimal/boolean/array/map/null —
+    // is exactly what json_serialize/LassoValue.from(json:) already
+    // round-trip for session persistence; this exercises the same
+    // round trip through the new free tag.
+    // 'f'=0/'g'=1 alongside 'd'=true are the exact combination that
+    // regresses the `LassoValue.from(json:)` fix below if it's ever
+    // reintroduced: `NSNumber as? Bool` only succeeds for a value of
+    // exactly 0 or 1 (per SE-0170), so those two specific integers —
+    // not 42/3.14/-5 — are what a naive `Bool`-checked-first `switch`
+    // would misclassify as booleans instead of integers.
+    var context = LassoContext()
+    let output = try await LassoRenderer().render(
+        "[var(m = Map('a'=1, 'b'='two', 'c'=(Array(1,2,3)), 'd'=true, 'e'=null, 'f'=0, 'g'=1.5))]" +
+        "[var(roundTripped = Json_Deserialize(Json_Serialize($m)))]" +
+        "[$roundTripped->find('a')]/[$roundTripped->find('a')->type]|" +
+        "[$roundTripped->find('b')]|[$roundTripped->find('c')->join(',')]|" +
+        "[$roundTripped->find('d')]/[$roundTripped->find('d')->type]|" +
+        "[$roundTripped->find('e')->isA('null')]|" +
+        "[$roundTripped->find('f')]/[$roundTripped->find('f')->type]|" +
+        "[$roundTripped->find('g')]/[$roundTripped->find('g')->type]",
+        context: &context
+    )
+    #expect(output == "1/Integer|two|1,2,3|true/Boolean|true|0/Integer|1.500000/Decimal")
+}
+
+@Test func lassoValueFromJsonDirectlyDistinguishesBooleansFromZeroAndOneValuedNumbers() async throws {
+    // A direct, isolated unit test on `LassoValue.from(json:)` itself
+    // (not just indirectly via `Json_Deserialize`'s full round trip
+    // through `JSONSerialization`) — a future refactor of this exact
+    // function, or of the session-restore call site that also depends
+    // on it, has a regression guard even if it stops going through
+    // `JSONSerialization` at all.
+    #expect(LassoValue.from(json: NSNumber(value: true)) == .boolean(true))
+    #expect(LassoValue.from(json: NSNumber(value: false)) == .boolean(false))
+    #expect(LassoValue.from(json: NSNumber(value: 0)) == .integer(0))
+    #expect(LassoValue.from(json: NSNumber(value: 1)) == .integer(1))
+    #expect(LassoValue.from(json: NSNumber(value: 42)) == .integer(42))
+    #expect(LassoValue.from(json: NSNumber(value: 3.14)) == .decimal(3.14))
+    #expect(LassoValue.from(json: NSNull()) == .null)
+}
+
+@Test func jsonDeserializeOfMalformedJsonReturnsNullRatherThanThrowing() async throws {
+    var context = LassoContext()
+    let output = try await LassoRenderer().render(
+        "[Json_Deserialize('not valid json{{{')->type]",
+        context: &context
+    )
+    #expect(output == "Null")
+}
+
 @Test func logCriticalIsANoOpWhenNoDiagnosticLogSinkIsWired() async throws {
     // Pre-existing behavior for any host that doesn't wire a sink --
     // log_critical must never throw or produce output of its own.
@@ -1167,7 +1361,7 @@ import PerfectSessionCore
     )
     let parts = output.components(separatedBy: "|")
     #expect(parts[0] == "15")
-    #expect(parts[1] == "101.0")
+    #expect(parts[1] == "101.000000")
     #expect(parts[2] == "5")
     #expect(parts[3] == "200")
     #expect(parts[4] == "100")
@@ -1196,7 +1390,7 @@ import PerfectSessionCore
     )
     let parts = output.components(separatedBy: "|")
     #expect(parts[0] == "0")
-    #expect(parts[1] == "0.125")
+    #expect(parts[1] == "0.125000")
 }
 
 @Test func mathCeilFloorRIntAlwaysReturnIntegersRegardlessOfInputType() async throws {
@@ -1227,10 +1421,10 @@ import PerfectSessionCore
         context: &context
     )
     let parts = output.components(separatedBy: "|")
-    #expect(parts[0] == "3.1416")
-    #expect(parts[1] == "3.142")
-    #expect(parts[2] == "3.14")
-    #expect(parts[3] == "3.1")
+    #expect(parts[0] == "3.141600")
+    #expect(parts[1] == "3.142000")
+    #expect(parts[2] == "3.140000")
+    #expect(parts[3] == "3.100000")
     #expect(parts[4] == "1000")
     #expect(parts[5] == "1500")
     #expect(parts[6] == "1460")
@@ -1283,7 +1477,7 @@ import PerfectSessionCore
         "[Math_Pow(3, 3)]|[Math_Sqrt(100.0)]",
         context: &context
     )
-    #expect(output == "27|10.0")
+    #expect(output == "27|10.000000")
 }
 
 @Test func mathAbsPreservesTheInvocantsIntegerOrDecimalType() async throws {
@@ -1292,7 +1486,7 @@ import PerfectSessionCore
         "[Math_Abs(-5)]|[Math_Abs(-5.5)]",
         context: &context
     )
-    #expect(output == "5|5.5")
+    #expect(output == "5|5.500000")
 }
 
 @Test func unaryMinusOnAWholeNumberPreservesIntegerTypeNotAlwaysDecimal() async throws {
@@ -1312,7 +1506,7 @@ import PerfectSessionCore
         "[Math_Add(-5, 3)]|[-5]|[-5.5]|[+5]",
         context: &context
     )
-    #expect(output == "-2|-5|-5.5|5")
+    #expect(output == "-2|-5|-5.500000|5")
 }
 
 // lassoguide.com "Byte Streams" — `bytes(...)->decodeBase64`/
@@ -1326,6 +1520,141 @@ import PerfectSessionCore
     var context = LassoContext()
     let output = try await LassoRenderer().render("[bytes('hello')]", context: &context)
     #expect(output == "hello")
+}
+
+@Test func bytesSizeMatchesLassoguideComsOwnWorkedExample() async throws {
+    // http://www.lassoguide.com/operations/byte-streams.html "Return the
+    // Size of a Byte Stream": `bytes('abc…')->size // => 6` — the
+    // ellipsis character is 3 UTF-8 bytes, so 'abc' (3) + '…' (3) = 6.
+    var context = LassoContext()
+    let output = try await LassoRenderer().render("[bytes('abc\u{2026}')->size]", context: &context)
+    #expect(output == "6")
+}
+
+@Test func bytesGetReturnsAnIntegerByteValueMatchingLassoguideComsOwnWorkedExample() async throws {
+    // "Return a Single Byte from a Byte Stream": `bytes('hello
+    // world')->get(2) // => 101` (the ASCII code for the 1-based 2nd
+    // character, 'e').
+    var context = LassoContext()
+    let output = try await LassoRenderer().render("[bytes('hello world')->get(2)]", context: &context)
+    #expect(output == "101")
+}
+
+@Test func bytesGetRangeReturnsASliceAsANewBytesObject() async throws {
+    var context = LassoContext()
+    let output = try await LassoRenderer().render("[bytes('hello')->getRange(2, 3)->asString]", context: &context)
+    #expect(output == "ell")
+}
+
+@Test func bytesFindMatchesLassoguideComsOwnWorkedExample() async throws {
+    // "Find a Value Within a Byte Stream": `bytes('running rhinos risk
+    // rampage')->find('rhino') // => 9`.
+    var context = LassoContext()
+    let output = try await LassoRenderer().render(
+        "[bytes('running rhinos risk rampage')->find('rhino')]|[bytes('abc')->find('zzz')]",
+        context: &context
+    )
+    #expect(output == "9|0")
+}
+
+@Test func bytesContainsBeginsWithAndEndsWithMatchTheirOwnWrittenDescriptionsNotTheBuggyWorkedExample() async throws {
+    // lassoguide.com's "Determine If a Byte Stream Contains a Value"
+    // section's own worked example actually calls `->find` (not
+    // `->contains`) and expects a boolean `false` — which doesn't even
+    // match `->find`'s own documented integer-or-zero return type. This
+    // is a confirmed copy-paste artifact from the `->find` section
+    // directly above it; implemented against `->contains`'s own written
+    // description ("Returns 'true' if the byte stream contains the
+    // specified sequence") instead, per NativeTypes.swift's own doc
+    // comment on this registration.
+    var context = LassoContext()
+    let output = try await LassoRenderer().render(
+        "[bytes('running rhinos risk rampage')->contains('rhino')]|[bytes('running rhinos risk rampage')->contains('zebra')]|[bytes('hello world')->beginsWith('hello')]|[bytes('hello world')->endsWith('world')]|[bytes('hello world')->beginsWith('world')]",
+        context: &context
+    )
+    #expect(output == "true|false|true|true|false")
+}
+
+@Test func bytesAsStringDefaultsToUTF8MatchingLassoguideComsOwnWorkedExample() async throws {
+    // "Export a String from a Byte Stream" uses `->exportString`
+    // (deprecated-sibling form, not implemented this stage) with the
+    // same "This is a string" worked value — `->asString` is its
+    // documented UTF-8-default replacement.
+    var context = LassoContext()
+    let output = try await LassoRenderer().render("[bytes('This is a string')->asString]", context: &context)
+    #expect(output == "This is a string")
+}
+
+@Test func bytesAsStringHonorsAnExplicitISO88591Encoding() async throws {
+    // 0xE9 alone isn't valid UTF-8 (it's a 3-byte-sequence leading byte
+    // with no continuation), but every byte value 0-255 is a valid
+    // ISO-8859-1 character — 0xE9 is 'é'. Built via ->decodeHex since a
+    // Lasso string literal can only produce UTF-8-encoded bytes, not an
+    // arbitrary single non-ASCII byte directly.
+    var context = LassoContext()
+    let output = try await LassoRenderer().render("[bytes('e9')->decodeHex->asString('ISO-8859-1')]", context: &context)
+    #expect(output == "\u{00E9}")
+}
+
+@Test func bytesSplitOnADelimiterAndOnAnEmptyDelimiterSplitsPerByte() async throws {
+    // "If the delimiter provided is an empty byte stream or string, the
+    // byte stream is split on each byte, so the returned array will have
+    // each byte as one of its elements."
+    var context = LassoContext()
+    let output = try await LassoRenderer().render(
+        """
+        [(bytes('a,b,c')->split(','))->size]
+        [(bytes('a,b,c')->split(','))->get(1)->asString]|[(bytes('a,b,c')->split(','))->get(2)->asString]|[(bytes('a,b,c')->split(','))->get(3)->asString]
+        [(bytes('ab')->split(''))->size]
+        """,
+        context: &context
+    )
+    let lines = output
+        .split(separator: "\n")
+        .map { $0.trimmingCharacters(in: .whitespaces) }
+        .filter { !$0.isEmpty }
+    #expect(lines == ["3", "a|b|c", "2"])
+}
+
+@Test func bytesSubReturnsEverythingFromThePositionWhenNumIsOmitted() async throws {
+    // Unlike `->getRange`, `->sub`'s second parameter is optional — "all
+    // of the bytes following the index are returned" when omitted.
+    var context = LassoContext()
+    let output = try await LassoRenderer().render(
+        "[bytes('hello world')->sub(7)->asString]|[bytes('hello world')->sub(1, 5)->asString]",
+        context: &context
+    )
+    #expect(output == "world|hello")
+}
+
+@Test func bytesAppendTrimReplaceAndRemoveMutateTheInvocantInPlaceAsBareStatements() async throws {
+    // Documented "Bytes Manipulation Methods" — "Calling the following
+    // methods will modify the bytes object without returning a value" —
+    // exactly the same self-mutating write-back mechanism
+    // `String->Trim`/`->Append`/`->Replace`/`->Remove` already use
+    // (`Evaluator.selfMutatingMethods` is purely syntactic/name-based,
+    // not type-scoped, so no new entries were needed for `bytes`).
+    var context = LassoContext()
+    let output = try await LassoRenderer().render(
+        """
+        [var(b::bytes=bytes('hello '))][$b->(append('world'))][$b->asString]|\
+        [var(t::bytes=bytes('  hi  '))][$t->(trim)][$t->asString]|\
+        [var(r::bytes=bytes('Blue Red Yellow'))][$r->(replace('Blue', 'Green'))][$r->asString]|\
+        [var(rm::bytes=bytes('hello world'))][$rm->(remove(6, 6))][$rm->asString]|\
+        [var(rmAll::bytes=bytes('abc'))][$rmAll->(remove)][$rmAll->asString]|end
+        """,
+        context: &context
+    )
+    #expect(output == "hello world|hi|Green Red Yellow|hello||end")
+}
+
+@Test func bytesEncodeHexAndDecodeHexRoundTrip() async throws {
+    var context = LassoContext()
+    let output = try await LassoRenderer().render(
+        "[bytes('AB')->encodeHex->asString]|[bytes('4142')->decodeHex->asString]",
+        context: &context
+    )
+    #expect(output == "4142|AB")
 }
 
 @Test func bytesWithNoArgumentIsEmpty() async throws {
@@ -1779,6 +2108,273 @@ import PerfectSessionCore
     let loader = try LassoFileSystemIncludeLoader(root: root)
     #expect(try loader.loadInclude(path: "siteconfig_cookies.inc", from: "/includes/b2b/parent.lasso") == "INNER")
     #expect(try loader.loadInclude(path: "includes/siteconfig.inc", from: "/includes/b2b/parent.lasso") == "OUTER")
+}
+
+@Test func fileExistsIsDirectoryAndGetSizeReflectRealFilesystemState() async throws {
+    let root = FileManager.default.temporaryDirectory
+        .appendingPathComponent("lasso-file-\(UUID().uuidString)")
+    try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
+    try FileManager.default.createDirectory(at: root.appendingPathComponent("sub"), withIntermediateDirectories: true)
+    try "hello".write(to: root.appendingPathComponent("a.txt"), atomically: true, encoding: .utf8)
+    defer { try? FileManager.default.removeItem(at: root) }
+
+    var context = LassoContext(includeLoader: try LassoFileSystemIncludeLoader(root: root))
+    let output = try await LassoRenderer().render(
+        "[File_Exists: 'a.txt']|[File_Exists: 'missing.txt']|[File_IsDirectory: 'sub']|[File_IsDirectory: 'a.txt']|[File_GetSize: 'a.txt']",
+        context: &context
+    )
+    #expect(output == "true|false|true|false|5")
+}
+
+@Test func fileCreationDateAndModDateReturnRealDateObjects() async throws {
+    let root = FileManager.default.temporaryDirectory
+        .appendingPathComponent("lasso-file-\(UUID().uuidString)")
+    try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
+    try "hello".write(to: root.appendingPathComponent("a.txt"), atomically: true, encoding: .utf8)
+    defer { try? FileManager.default.removeItem(at: root) }
+
+    var context = LassoContext(includeLoader: try LassoFileSystemIncludeLoader(root: root))
+    let output = try await LassoRenderer().render(
+        "[(File_CreationDate: 'a.txt')->year]|[(File_ModDate: 'a.txt')->year]",
+        context: &context
+    )
+    let currentYear = Calendar(identifier: .gregorian).component(.year, from: Date())
+    #expect(output == "\(currentYear)|\(currentYear)")
+}
+
+@Test func fileWriteThenReadRoundTripsAndOverwriteVsAppendBehaveAsDocumented() async throws {
+    // Ch. 31 Table 1: "[File_Write]... Optional -FileOverWrite keyword
+    // specifies that the destination file should be overwritten if it
+    // exists, otherwise the data specified is appended to the end of the
+    // file."
+    let root = FileManager.default.temporaryDirectory
+        .appendingPathComponent("lasso-file-\(UUID().uuidString)")
+    try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
+    defer { try? FileManager.default.removeItem(at: root) }
+
+    var context = LassoContext(includeLoader: try LassoFileSystemIncludeLoader(root: root))
+    let output = try await LassoRenderer().render(
+        """
+        [File_Write: 'out.txt', 'Hello', -FileOverWrite][File_Read: 'out.txt']|\
+        [File_Write: 'out.txt', ' World'][File_Read: 'out.txt']|\
+        [File_Write: 'out.txt', 'Reset', -FileOverWrite][File_Read: 'out.txt']
+        """,
+        context: &context
+    )
+    #expect(output == "Hello|Hello World|Reset")
+}
+
+@Test func fileCreateMakesAFileOrADirectoryDependingOnATrailingSlash() async throws {
+    // "If the file name ends in a / then a directory is created."
+    let root = FileManager.default.temporaryDirectory
+        .appendingPathComponent("lasso-file-\(UUID().uuidString)")
+    try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
+    defer { try? FileManager.default.removeItem(at: root) }
+
+    var context = LassoContext(includeLoader: try LassoFileSystemIncludeLoader(root: root))
+    let output = try await LassoRenderer().render(
+        "[File_Create: 'newfile.txt'][File_Exists: 'newfile.txt']|[File_Create: 'newdir/'][File_IsDirectory: 'newdir']",
+        context: &context
+    )
+    #expect(output == "true|true")
+}
+
+@Test func fileCreateWithoutOverwriteOnAnExistingFileSetsFileAlreadyExistsError() async throws {
+    let root = FileManager.default.temporaryDirectory
+        .appendingPathComponent("lasso-file-\(UUID().uuidString)")
+    try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
+    try "existing".write(to: root.appendingPathComponent("a.txt"), atomically: true, encoding: .utf8)
+    defer { try? FileManager.default.removeItem(at: root) }
+
+    var context = LassoContext(includeLoader: try LassoFileSystemIncludeLoader(root: root))
+    let output = try await LassoRenderer().render(
+        "[File_Create: 'a.txt'][File_CurrentError: -ErrorCode]: [File_CurrentError]",
+        context: &context
+    )
+    #expect(output == "-9983: File already exists.")
+}
+
+@Test func fileDeleteRemovesAFileAndFileCurrentErrorReportsNoErrorAfterASuccessfulOperation() async throws {
+    let root = FileManager.default.temporaryDirectory
+        .appendingPathComponent("lasso-file-\(UUID().uuidString)")
+    try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
+    try "bye".write(to: root.appendingPathComponent("a.txt"), atomically: true, encoding: .utf8)
+    defer { try? FileManager.default.removeItem(at: root) }
+
+    var context = LassoContext(includeLoader: try LassoFileSystemIncludeLoader(root: root))
+    let output = try await LassoRenderer().render(
+        "[File_Delete: 'a.txt'][File_Exists: 'a.txt']|[File_CurrentError: -ErrorCode]",
+        context: &context
+    )
+    #expect(output == "false|0")
+}
+
+@Test func fileListDirectoryMarksSubdirectoriesWithATrailingSlashMatchingTheLanguageGuidesOwnWorkedExample() async throws {
+    let root = FileManager.default.temporaryDirectory
+        .appendingPathComponent("lasso-file-\(UUID().uuidString)")
+    try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
+    try FileManager.default.createDirectory(at: root.appendingPathComponent("Images"), withIntermediateDirectories: true)
+    try "x".write(to: root.appendingPathComponent("default.htm"), atomically: true, encoding: .utf8)
+    defer { try? FileManager.default.removeItem(at: root) }
+
+    var context = LassoContext(includeLoader: try LassoFileSystemIncludeLoader(root: root))
+    let output = try await LassoRenderer().render(
+        "[(File_ListDirectory: '/')->join(',')]",
+        context: &context
+    )
+    #expect(output == "Images/,default.htm")
+}
+
+@Test func fileCopyAndFileMoveAndFileRenameOperateOnRealFiles() async throws {
+    let root = FileManager.default.temporaryDirectory
+        .appendingPathComponent("lasso-file-\(UUID().uuidString)")
+    try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
+    try "content".write(to: root.appendingPathComponent("source.txt"), atomically: true, encoding: .utf8)
+    defer { try? FileManager.default.removeItem(at: root) }
+
+    var context = LassoContext(includeLoader: try LassoFileSystemIncludeLoader(root: root))
+    let output = try await LassoRenderer().render(
+        """
+        [File_Copy: 'source.txt', 'copy.txt'][File_Exists: 'source.txt']|[File_Exists: 'copy.txt']|\
+        [File_Move: 'copy.txt', 'moved.txt'][File_Exists: 'copy.txt']|[File_Exists: 'moved.txt']|\
+        [File_Rename: 'moved.txt', 'renamed.txt'][File_Exists: 'moved.txt']|[File_Exists: 'renamed.txt']
+        """,
+        context: &context
+    )
+    #expect(output == "true|true|false|true|false|true")
+}
+
+@Test func fileTagsConfinePathsToTheSameRootIncludeAlreadyUsesAndDegradeGracefullyRatherThanCrashing() async throws {
+    // File_* tags reuse `LassoIncludeLoader.fileSystemRoot` — the SAME
+    // confinement `include()`/`library()` already rely on — rather than
+    // a second, independently-configured root. A path that escapes it
+    // must degrade gracefully (false/void + a File_CurrentError), never
+    // crash or silently touch the real filesystem outside the root.
+    let root = FileManager.default.temporaryDirectory
+        .appendingPathComponent("lasso-file-\(UUID().uuidString)")
+    try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
+    defer { try? FileManager.default.removeItem(at: root) }
+
+    var context = LassoContext(includeLoader: try LassoFileSystemIncludeLoader(root: root))
+    let output = try await LassoRenderer().render(
+        "[File_Exists: '../../../etc/passwd']",
+        context: &context
+    )
+    #expect(output == "false")
+}
+
+@Test func fileWriteCannotEscapeConfinementThroughASymlinkedIntermediateDirectory() async throws {
+    // Regression test: `resolvedURL`'s "target doesn't exist yet" branch
+    // (the one `File_Create`/`File_Write` use) must still resolve real,
+    // already-existing intermediate directory symlinks before its own
+    // confinement check — an earlier version only did this in the
+    // existing-file branch, so a symlink planted inside root pointing
+    // OUTSIDE it (`root/evil -> outside/`) passed confinement on the
+    // unresolved lexical path (`<root>/evil/newfile.txt` textually
+    // starts with root's own path) while the actual write would have
+    // gone through the symlink to the real, unconfined target — the OS
+    // follows intermediate-directory symlinks regardless of whether the
+    // final path component exists yet.
+    let root = FileManager.default.temporaryDirectory
+        .appendingPathComponent("lasso-file-\(UUID().uuidString)")
+    let outside = FileManager.default.temporaryDirectory
+        .appendingPathComponent("lasso-file-outside-\(UUID().uuidString)")
+    try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
+    try FileManager.default.createDirectory(at: outside, withIntermediateDirectories: true)
+    try FileManager.default.createSymbolicLink(at: root.appendingPathComponent("evil"), withDestinationURL: outside)
+    defer {
+        try? FileManager.default.removeItem(at: root)
+        try? FileManager.default.removeItem(at: outside)
+    }
+
+    var context = LassoContext(includeLoader: try LassoFileSystemIncludeLoader(root: root))
+    let output = try await LassoRenderer().render(
+        "[File_Write: 'evil/newfile.txt', 'leaked']",
+        context: &context
+    )
+    #expect(output == "")
+    #expect(FileManager.default.fileExists(atPath: outside.appendingPathComponent("newfile.txt").path) == false)
+}
+
+@Test func fileRenameCannotEscapeConfinementThroughATraversingNewName() async throws {
+    // Regression test: `File_Rename`'s second parameter is documented
+    // (Ch. 31 Table 1) as a bare NAME, not a path — but an earlier
+    // version trusted that documented contract from untrusted input,
+    // building the destination with plain string concatenation
+    // (`sourceURL.deletingLastPathComponent().appendingPathComponent(newName)`)
+    // with NO confinement check at all. A `newName` containing `../`
+    // traversal components reached a real, unconfined location on the
+    // actual filesystem with no symlink or special setup required — the
+    // single most directly exploitable finding from architect review.
+    let root = FileManager.default.temporaryDirectory
+        .appendingPathComponent("lasso-file-\(UUID().uuidString)")
+    let outside = FileManager.default.temporaryDirectory
+        .appendingPathComponent("lasso-file-outside-\(UUID().uuidString)")
+    try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
+    try FileManager.default.createDirectory(at: outside, withIntermediateDirectories: true)
+    try "secret".write(to: root.appendingPathComponent("source.txt"), atomically: true, encoding: .utf8)
+    defer {
+        try? FileManager.default.removeItem(at: root)
+        try? FileManager.default.removeItem(at: outside)
+    }
+
+    var context = LassoContext(includeLoader: try LassoFileSystemIncludeLoader(root: root))
+    _ = try await LassoRenderer().render(
+        "[File_Rename: 'source.txt', '../\(outside.lastPathComponent)/leaked.txt']",
+        context: &context
+    )
+    #expect(FileManager.default.fileExists(atPath: outside.appendingPathComponent("leaked.txt").path) == false)
+    // The source is untouched since the rename was correctly rejected —
+    // confirms this degraded gracefully rather than partially applying.
+    #expect(FileManager.default.fileExists(atPath: root.appendingPathComponent("source.txt").path) == true)
+}
+
+@Test func fileDeleteRefusesToDeleteTheConfinedRootItself() async throws {
+    // Regression test: an empty/"."/"/" path resolves to the confined
+    // root itself via `resolvedURL`'s own logic (a directory always
+    // exists, so it satisfies the existing-file loop trivially) —
+    // `removeItem` on a directory recurses, so an earlier version would
+    // have recursively deleted the entire confined site root for a
+    // blank/unset `File_Delete` argument (e.g.
+    // `File_Delete($_POST('filename'))` with no field submitted).
+    let root = FileManager.default.temporaryDirectory
+        .appendingPathComponent("lasso-file-\(UUID().uuidString)")
+    try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
+    try "still here".write(to: root.appendingPathComponent("sentinel.txt"), atomically: true, encoding: .utf8)
+    defer { try? FileManager.default.removeItem(at: root) }
+
+    var context = LassoContext(includeLoader: try LassoFileSystemIncludeLoader(root: root))
+    _ = try await LassoRenderer().render("[File_Delete: '']", context: &context)
+    #expect(FileManager.default.fileExists(atPath: root.path) == true)
+    #expect(FileManager.default.fileExists(atPath: root.appendingPathComponent("sentinel.txt").path) == true)
+}
+
+@Test func fileCopyAndFileMoveRefuseToOverwriteTheConfinedRootAsADestination() async throws {
+    // Regression test (found by a second, adversarial review pass on
+    // the fixes above — the same root-destination bug class as
+    // `File_Delete`/`File_Rename`, just on two sibling tags): a blank/
+    // "."/"/" `destination` resolves to the confined root itself, since
+    // the root directory always exists. Without a guard, an ordinary
+    // `-FileOverwrite` on that destination would hit the "destination
+    // exists, overwrite requested" branch and recursively delete the
+    // entire confined root via `removeItem` before the copy/move even
+    // ran — reachable via nothing more unusual than a blank destination
+    // field plus a flag many real callers set as a matter of course.
+    let root = FileManager.default.temporaryDirectory
+        .appendingPathComponent("lasso-file-\(UUID().uuidString)")
+    try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
+    try "still here".write(to: root.appendingPathComponent("sentinel.txt"), atomically: true, encoding: .utf8)
+    try "payload".write(to: root.appendingPathComponent("source.txt"), atomically: true, encoding: .utf8)
+    defer { try? FileManager.default.removeItem(at: root) }
+
+    var context = LassoContext(includeLoader: try LassoFileSystemIncludeLoader(root: root))
+    _ = try await LassoRenderer().render(
+        "[File_Copy: 'source.txt', '', -FileOverwrite][File_Move: 'source.txt', '/', -FileOverwrite]",
+        context: &context
+    )
+    #expect(FileManager.default.fileExists(atPath: root.path) == true)
+    #expect(FileManager.default.fileExists(atPath: root.appendingPathComponent("sentinel.txt").path) == true)
+    #expect(FileManager.default.fileExists(atPath: root.appendingPathComponent("source.txt").path) == true)
 }
 
 @Test func startupDirectoryLoadsMatchingExtensionsAndSkipsOthers() async throws {
@@ -4628,6 +5224,150 @@ final class FullyRecordingResponseSink: LassoResponseSink, @unchecked Sendable {
     #expect(context.currentError.message == "Update failed")
 }
 
+@Test func failThrowsARecoverableErrorProtectCatchesMatchingTheLanguageGuidesOwnWorkedExample() async throws {
+    // Ch. 19 "Fail Tags": `[Fail: -1, 'An unrecoverable error occurred']`
+    // — code+message form. `fail` with no enclosing `protect` propagates
+    // as an unhandled LassoRecoverableError (real Lasso: "To report an
+    // unrecoverable error" — Handle/Handle_Error blocks, which would
+    // otherwise catch it, are a separate, deliberately deferred stage —
+    // see ErrorHandling.swift's own doc comment).
+    var protectedContext = LassoContext()
+    let protectedOutput = try await LassoRenderer().render(
+        "before-[protect]during-[fail(-1, 'An unrecoverable error occurred')]-unreached[/protect]-after-[error_currenterror(-errorcode)]: [error_currenterror]",
+        context: &protectedContext
+    )
+    #expect(protectedOutput == "before--after--1: An unrecoverable error occurred")
+
+    var unprotectedContext = LassoContext()
+    await #expect(throws: LassoRecoverableError(LassoErrorState(code: -1, message: "boom", kind: "fail"))) {
+        _ = try await LassoRenderer().render("[fail(-1, 'boom')]", context: &unprotectedContext)
+    }
+}
+
+@Test func failWithOnlyAMessageDefaultsToTheGenericCustomCode() async throws {
+    // lassoguide.com's Lasso 9 "Error Handling": `fail(msg::string)` —
+    // the message-only alternate form Ch. 19's own 8.5-era doc doesn't
+    // have; defaults to -1, the same generic-custom-error code the
+    // Guide's own two-arg worked example uses.
+    var context = LassoContext()
+    let output = try await LassoRenderer().render(
+        "[protect][fail('just a message')][/protect][error_currenterror(-errorcode)]: [error_currenterror]",
+        context: &context
+    )
+    #expect(output == "-1: just a message")
+}
+
+@Test func failIfOnlyTriggersWhenItsConditionIsTrueMatchingTheLanguageGuidesOwnWorkedExample() async throws {
+    // Ch. 19: `[Fail_If: (Found_Count == 0), (Error_NoRecordsFound:
+    // -ErrorCode), (Error_NoRecordsFound)]` — condition, code, message.
+    // Exercised here with a plain boolean condition rather than
+    // Found_Count specifically, since Error_NoRecordsFound is itself
+    // documented as deprecated in favor of a Found_Count == 0 check
+    // (Ch. 19's own "Note" right after Table 4).
+    var context = LassoContext()
+    let output = try await LassoRenderer().render(
+        "[protect][fail_if(1 == 2, -5, 'should not fire')][/protect][error_currenterror(-errorcode)]|" +
+        "[protect][fail_if(1 == 1, -5, 'should fire')][/protect][error_currenterror(-errorcode)]",
+        context: &context
+    )
+    #expect(output == "0|-5")
+}
+
+@Test func errorPushAndErrorPopRestoreThePreviousErrorConditionMatchingTheirOwnDocumentedContract() async throws {
+    // Ch. 19: "[Error_Push] Pushes the current error condition onto a
+    // stack and resets the current error code and error message."
+    // "[Error_Pop] Restores the last error condition stored using
+    // [Error_Push]." — real corpus pattern: preventing a preexisting
+    // error from bleeding into a protect block.
+    var context = LassoContext()
+    let output = try await LassoRenderer().render(
+        "[error_seterrorcode(99)][error_seterrormessage('outer')]" +
+        "[error_push][error_code]/[error_msg]|" +
+        "[error_seterrorcode(1)][error_seterrormessage('inner')][error_code]/[error_msg]|" +
+        "[error_pop][error_code]/[error_msg]",
+        context: &context
+    )
+    // Resets to the SAME `.noError` state (`code: 0, message: "No
+    // Error"`) `Runtime.swift` already uses everywhere else — not a
+    // truly blank message.
+    #expect(output == "0/No Error|1/inner|99/outer")
+}
+
+@Test func errorResetClearsTheCurrentErrorCaseInsensitivelyMatchingTheLasso9WorkedExample() async throws {
+    // Ch. 19's own prose says "[Error_Reset]... resets the error message
+    // to blank" — but lassoguide.com's Lasso 9 "Error Handling" page has
+    // its OWN worked example for the identical operation showing "No
+    // error" instead (`error_reset; error_code + ': ' + error_msg //
+    // => 0: No error`), directly contradicting the 8.5 prose. Matches
+    // this project's established practice of preferring a worked
+    // example over prose when the two disagree (see e.g. the Math_Div/
+    // String_ReplaceRegExp defects found earlier in this project) —
+    // also keeps this consistent with the already-tested default
+    // `error_currenterror` state (`errorCurrentErrorDefaultsToNoErrorAndInlineFramesUpdateIt`,
+    // "No Error/0"), which `error_reset` reuses via the same shared
+    // `context.clearError()`/`.noError` this codebase already has.
+    var context = LassoContext()
+    let output = try await LassoRenderer().render(
+        "[error_seterrorcode(-1)][error_seterrormessage('Too slow')][error_code]: [error_msg]|" +
+        "[error_reset][error_code]: [error_msg]",
+        context: &context
+    )
+    #expect(output == "-1: Too slow|0: No Error")
+}
+
+@Test func namedErrorTypeTagsReturnTheirOwnFixedCodeOrMessageIndependentOfCurrentErrorState() async throws {
+    // Table 4 "Error Type Tags" are named CONSTANT accessors, not
+    // `currentError` state — bare returns the fixed message, `-ErrorCode`
+    // the fixed code, verified against Appendix A's own numeric table
+    // (p.823 Action/Security Errors) and Table 4's own descriptions.
+    // Matches the Guide's own chaining worked example:
+    // `[Error_SetErrorCode: (Error_AddError: -ErrorCode)]`.
+    var context = LassoContext()
+    let output = try await LassoRenderer().render(
+        "[error_adderror(-errorcode)]|[error_deleteerror(-errorcode)]|[error_updateerror(-errorcode)]|" +
+        "[error_fieldrestriction(-errorcode)]|[error_columnrestriction(-errorcode)]|" +
+        "[error_nopermission(-errorcode)]|[error_invaliddatabase(-errorcode)]|" +
+        "[error_invalidpassword(-errorcode)]|[error_invalidusername(-errorcode)]|[error_noerror(-errorcode)]",
+        context: &context
+    )
+    #expect(output == "-9959|-9957|-9958|-9960|-9960|-9961|-9962|-9963|-9964|0")
+
+    var chainedContext = LassoContext()
+    let chainedOutput = try await LassoRenderer().render(
+        "[error_seterrorcode(error_adderror(-errorcode))][error_seterrormessage(error_adderror)][error_code]: [error_msg]",
+        context: &chainedContext
+    )
+    #expect(chainedOutput == "-9959: An error occurred during an -Add action.")
+}
+
+@Test func lasso9StyleErrorCodeAndErrorMsgConstantsMatchLassoguideComsOwnTable() async throws {
+    var context = LassoContext()
+    let output = try await LassoRenderer().render(
+        "[error_code_divideByzero]/[error_msg_divideByzero]|[error_code_filenotfound]/[error_msg_filenotfound]",
+        context: &context
+    )
+    #expect(output == "-9950/Divide by Zero|404/File not found")
+}
+
+@Test func divisionByZeroThrowsARecoverableErrorInsteadOfCrashingOrProducingInfinity() async throws {
+    // Previously: `.decimal` division silently produced `inf`/`nan`,
+    // `.integer` division crashed the process outright (Swift traps on
+    // integer divide-by-zero) — neither matches the documented,
+    // catchable `error_code_divideByZero`. A non-numeric right operand
+    // (e.g. dividing by an empty string) must ALSO be caught, not just
+    // a literal `0` — regression-guards the `right.number ?? 0` fix
+    // (comparing the raw Optional directly would have let this
+    // specific case slip through).
+    var context = LassoContext()
+    let output = try await LassoRenderer().render(
+        "[protect][10 / 0][/protect][error_currenterror(-errorcode)]: [error_currenterror]|" +
+        "[protect][10.5 / 0][/protect][error_currenterror(-errorcode)]: [error_currenterror]|" +
+        "[protect][10 / '']|[/protect][error_currenterror(-errorcode)]: [error_currenterror]",
+        context: &context
+    )
+    #expect(output == "-9950: Divide by Zero|-9950: Divide by Zero|-9950: Divide by Zero")
+}
+
 private func corpusFixtureContext(
     loader: any LassoIncludeLoader,
     includePath: String
@@ -5264,6 +6004,354 @@ private final class MapIncludeLoader: LassoIncludeLoader, @unchecked Sendable {
         context: &context
     )
     #expect(output == "4|1111")
+}
+
+@Test func stringValidationMembersMatchTheLanguageGuidesOwnWorkedExampleCaseInsensitively() async throws {
+    // Lasso 8.5 Language Guide Ch. 25 Table 7, confirmed via the Guide's
+    // own worked example verbatim (testString = 'A short string'):
+    // BeginsWith/EndsWith/Contains/Equals are all documented case
+    // INSENSITIVE -- an earlier version of `->Contains` used Swift's raw
+    // case-sensitive `String.contains`, contradicting its own sibling
+    // members (`->BeginsWith`/`->EndsWith`/`->Equals`, all newly added
+    // here with the correct case-insensitive behavior); caught while
+    // verifying those siblings against this same page and fixed
+    // alongside them.
+    var context = LassoContext()
+    let output = try await LassoRenderer().render(
+        """
+        [var(testString = 'A short string')]
+        beginsA=[$testString->beginsWith('a')]|
+        beginsPhrase=[$testString->beginsWith('A short')]|
+        beginsFalse=[$testString->beginsWith('string')]|
+        ends=[$testString->endsWith('string')]|
+        contains=[$testString->contains('short')]|
+        containsMixedCase=[$testString->contains('SHORT')]|
+        equals=[$testString->equals('a short string')]
+        """,
+        context: &context
+    )
+    #expect(output.contains("beginsA=true"))
+    #expect(output.contains("beginsPhrase=true"))
+    #expect(output.contains("beginsFalse=false"))
+    #expect(output.contains("ends=true"))
+    #expect(output.contains("contains=true"))
+    #expect(output.contains("containsMixedCase=true"))
+    #expect(output.contains("equals=true"))
+}
+
+@Test func stringCompareIsThreeWayCaseInsensitiveByDefaultCaseSensitiveWithFlag() async throws {
+    // Ch. 25 Table 7: "[String->Compare] ... returns 0 if the parameter
+    // is equal to the string, 1 if the characters in the string are
+    // bitwise greater than the parameter, and -1 if... less... Comparison
+    // is case insensitive by default. An optional -Case parameter makes
+    // the comparison case sensitive." NOT tested against the Guide's own
+    // "[$testString->(Compare: 'a short string', -Case)] -> False" line
+    // for this exact scenario -- that line is internally inconsistent
+    // (an integer-returning tag's worked example showing the literal
+    // word "False", not a 0/1/-1 value) and looks like the same class of
+    // transcription defect already confirmed once in this project
+    // (Math_Div's page-370 examples). Verified instead with
+    // self-computed, unambiguous cases.
+    var context = LassoContext()
+    let output = try await LassoRenderer().render(
+        "[('abc')->compare('abc')]|[('abc')->compare('abd')]|[('abd')->compare('abc')]|" +
+            "[('A short string')->compare('a short string')]|" +
+            "[('A short string')->compare('a short string', -Case)]",
+        context: &context
+    )
+    let parts = output.components(separatedBy: "|")
+    #expect(parts[0] == "0")
+    #expect(parts[1] == "-1")
+    #expect(parts[2] == "1")
+    // Case-insensitive by default: equal.
+    #expect(parts[3] == "0")
+    // -Case forces case-sensitive comparison: 'A' (0x41) sorts before
+    // 'a' (0x61) bitwise, so the base string is "less than" the parameter.
+    #expect(parts[4] == "-1")
+}
+
+@Test func stringFindReturnsAOneBasedPositionOrZeroForAMiss() async throws {
+    // Ch. 25 Table 9: "Returns the position at which the first parameter
+    // is found within the string or 0 if the first parameter is not
+    // found." Distinct from Array->Find (returns an array of all
+    // matches) -- dispatch is keyed on `(base, name)` together so the
+    // two don't collide.
+    var context = LassoContext()
+    let output = try await LassoRenderer().render(
+        "[('A Short String')->find('Short')]|[('A Short String')->find('zzz')]",
+        context: &context
+    )
+    #expect(output == "3|0")
+}
+
+@Test func stringGetReturnsASingleCharacterAtAOneBasedPosition() async throws {
+    // Ch. 25 Table 9 worked example: ['Alpha'->(Get: 3)] -> 'p'.
+    var context = LassoContext()
+    let output = try await LassoRenderer().render("[('Alpha')->get(3)]", context: &context)
+    #expect(output == "p")
+}
+
+@Test func stringPadLeadingAndPadTrailingPadToALengthWithADefaultOrCustomCharacter() async throws {
+    // Ch. 25 Table 3: pads to a specified length with a pad character
+    // (defaults to space); a string already at or past the target
+    // length is left unchanged (mutating members return the invocant
+    // unmodified rather than truncating).
+    var context = LassoContext()
+    let output = try await LassoRenderer().render(
+        """
+        [var(a = 'ab')][$a->padLeading(5, '0')]a=[$a]|
+        [var(b = 'ab')][$b->padTrailing(5, '0')]b=[$b]|
+        [var(c = 'ab')][$c->padLeading(4)]c=[$c]|
+        [var(d = 'abcdef')][$d->padLeading(3, '0')]d=[$d]
+        """,
+        context: &context
+    )
+    #expect(output.contains("a=000ab"))
+    #expect(output.contains("b=ab000"))
+    #expect(output.contains("c=  ab"))
+    #expect(output.contains("d=abcdef"))
+}
+
+@Test func stringRemoveLeadingAndRemoveTrailingStripEveryRepeatedInstance() async throws {
+    // Ch. 25 Table 3: "Removes ALL instances of the parameter from the
+    // beginning/end" -- repeated, not just a single occurrence, distinct
+    // from `->Trim` (whitespace-only).
+    var context = LassoContext()
+    let output = try await LassoRenderer().render(
+        "[var(s = '**A Short String**')][$s->removeLeading('*')][$s->removeTrailing('*')]result=[$s]",
+        context: &context
+    )
+    #expect(output == "result=A Short String")
+}
+
+@Test func stringReverseReversesTheEntireString() async throws {
+    var context = LassoContext()
+    let output = try await LassoRenderer().render("[var(s = 'Hello')][$s->reverse]result=[$s]", context: &context)
+    #expect(output == "result=olleH")
+}
+
+@Test func stringTitlecaseCapitalizesTheFirstLetterOfEachWord() async throws {
+    // Ch. 25 Table 5: "Converts the string to titlecase with the first
+    // character of each word capitalized." Word boundaries are
+    // whitespace (no locale-parameter support implemented here).
+    var context = LassoContext()
+    let output = try await LassoRenderer().render(
+        "[var(s = 'hello WORLD from lasso')][$s->titlecase]result=[$s]",
+        context: &context
+    )
+    #expect(output == "result=Hello World From Lasso")
+}
+
+@Test func stringIsFamilyValidatesTheWholeStringMatchingTheLanguageGuidesOwnWorkedExamples() async throws {
+    // Ch. 25 Table 10, confirmed via the Guide's own worked examples
+    // verbatim. Empty-string inputs deliberately return False (not the
+    // vacuously-true default Swift's `allSatisfy` would give on an empty
+    // collection) -- see the registration's own doc comment for why.
+    var context = LassoContext()
+    let output = try await LassoRenderer().render(
+        "[String_IsAlpha('word')]|[String_IsAlphaNumeric('word')]|[String_IsLower('word')]|" +
+            "[String_IsNumeric('word')]|[String_IsUpper('word')]|" +
+            "[String_IsAlpha('2468')]|[String_IsAlphaNumeric('2468')]|[String_IsNumeric('2468')]|" +
+            "[String_IsDigit('9')]|[String_IsHexDigit('a')]|[String_IsPunctuation('.')]|[String_IsSpace(' ')]|" +
+            "[String_IsAlpha('')]",
+        context: &context
+    )
+    let parts = output.components(separatedBy: "|")
+    #expect(parts == [
+        "true", "true", "true", "false", "false",
+        "false", "true", "true",
+        "true", "true", "true", "true",
+        "false",
+    ])
+}
+
+@Test func stringLengthIsASynonymForSizeAndStringEndsWithMatchesTheMemberForm() async throws {
+    // Ch. 25 Table 10 worked example: String_Length('A Short String') ==
+    // 'A Short String'->Size == 14.
+    var context = LassoContext()
+    let output = try await LassoRenderer().render(
+        "[String_Length('A Short String')]|[('A Short String')->size]|" +
+            "[String_EndsWith('A Short String', -Find='String')]",
+        context: &context
+    )
+    #expect(output == "14|14|true")
+}
+
+@Test func regExpConstructorAndAccessorsMatchTheLanguageGuidesOwnWorkedExample() async throws {
+    // Lasso 8.5 Language Guide Ch. 26 Table 7/8 (pp. 350-351), verified
+    // directly against the PDF including its own worked example
+    // (`$MyRegExp` built from `-Find='[aeiou]', -Replace='x', -IgnoreCase`).
+    // `->FindPattern`/`->ReplacePattern`/`->Input`/`->IgnoreCase` are
+    // implemented as read-only getters here (see NativeTypes.swift's own
+    // doc comment on `makeRegExpType()` for why a setter needs the same
+    // treatment `Date->Add`/`->Subtract` required after their aliasing
+    // bug, deferred to a follow-up).
+    var context = LassoContext()
+    let output = try await LassoRenderer().render(
+        """
+        [var(re = RegExp(-Find='[aeiou]', -Replace='x', -IgnoreCase))]
+        FindPattern: [$re->findPattern]
+        ReplacePattern: [$re->replacePattern]
+        IgnoreCase: [$re->ignoreCase]
+        GroupCount: [$re->groupCount]
+        """,
+        context: &context
+    )
+    #expect(output.contains("FindPattern: [aeiou]"))
+    #expect(output.contains("ReplacePattern: x"))
+    #expect(output.contains("IgnoreCase: true"))
+    #expect(output.contains("GroupCount: 0"))
+}
+
+@Test func regExpReplaceAllMatchesTheLanguageGuidesOwnVowelReplacementWorkedExample() async throws {
+    // Ch. 26 p.352, exact worked example (vowel-to-x substitution).
+    var context = LassoContext()
+    let output = try await LassoRenderer().render(
+        """
+        [var(re = RegExp(-Find='[aeiou]', -Replace='x', -IgnoreCase))]
+        [$re->replaceAll(-Input='The quick brown fox jumped over the lazy dog.')]
+        """,
+        context: &context
+    )
+    #expect(output.trimmingCharacters(in: .whitespacesAndNewlines) == "Thx qxxck brxwn fxx jxmpxd xvxr thx lxzy dxg.")
+}
+
+@Test func regExpReplaceAllSupportsGroupPlaceholders() async throws {
+    // Ch. 26 p.352: "The replacement pattern can reference groups from
+    // the input using \\1 through \\9." Uses a simpler pattern than the
+    // Guide's own phone-number example (which needs several `\d`/`\(`
+    // escapes) purely to keep the Swift-literal -> Lasso-source-literal
+    // -> regex-template escaping chain in this test legible, but
+    // exercises the identical group-reference mechanism: two groups,
+    // swapped in the replacement.
+    var context = LassoContext()
+    let output = try await LassoRenderer().render(
+        "[var(re = RegExp(-Find='(a+)(b+)', -Replace='\\\\2\\\\1'))][$re->replaceAll(-Input='xxaaabbbyy')]",
+        context: &context
+    )
+    #expect(output == "xxbbbaaayy")
+}
+
+@Test func regExpReplaceAllSupportsTheDollarSignGroupPlaceholderAlternateForm() async throws {
+    // Ch. 26 Table 5, p.349, second Note: "The [RegExp] type also
+    // supports $0 and $1 through $9 as replacement symbols" — an
+    // alternate to `\1`-`\9`, so it must produce identical output to
+    // `regExpReplaceAllSupportsGroupPlaceholders`'s `\2\1` case above.
+    var context = LassoContext()
+    let output = try await LassoRenderer().render(
+        "[var(re = RegExp(-Find='(a+)(b+)', -Replace='$2$1'))][$re->replaceAll(-Input='xxaaabbbyy')]",
+        context: &context
+    )
+    #expect(output == "xxbbbaaayy")
+}
+
+@Test func regExpReplaceAllSupportsTheDollarSignLiteralEscapeEvenWhenFollowedByADigit() async throws {
+    // Ch. 26 Table 5, p.349, second Note: "In order to place a literal
+    // $ in a replacement string it is necessary to escape it as \$."
+    // Regression test for a real bug: the escaped `$` was previously
+    // emitted raw into the NSRegularExpression template, so a digit
+    // immediately following it (a realistic case, e.g. escaping a
+    // dollar amount) was misread as a `$<digit>` group reference
+    // instead of literal text. `\\$5.00` here is the Lasso source
+    // text's own `\$` escape (see the Swift-literal -> Lasso-source
+    // -> lexer chain documented on `regExpReplaceAllSupportsGroupPlaceholders`
+    // above) producing a literal `$5.00`, not a group-1 reference.
+    var context = LassoContext()
+    let output = try await LassoRenderer().render(
+        "[var(re = RegExp(-Find='[aeiou]', -Replace='\\\\$5.00'))][$re->replaceFirst(-Input='banana')]",
+        context: &context
+    )
+    #expect(output == "b$5.00nana")
+}
+
+@Test func regExpReplaceFirstOnlyReplacesTheFirstMatch() async throws {
+    // Ch. 26 Table 9: "[RegExp->ReplaceFirst] Replaces the first
+    // occurence of the current find pattern... Uses the same parameters
+    // as [RegExp->ReplaceAll]."
+    var context = LassoContext()
+    let output = try await LassoRenderer().render(
+        "[var(re = RegExp(-Find='[aeiou]', -Replace='x', -IgnoreCase))][$re->replaceFirst(-Input='banana')]",
+        context: &context
+    )
+    #expect(output == "bxnana")
+}
+
+@Test func regExpSplitMatchesTheLanguageGuidesOwnWordSplittingWorkedExample() async throws {
+    // Ch. 26 p.353, exact worked example: splitting on runs of
+    // non-word characters yields just the words, no empty/punctuation
+    // elements.
+    var context = LassoContext()
+    let output = try await LassoRenderer().render(
+        "[var(re = RegExp(-Find='[aeiou]'))][$re->split(-Find='\\\\W+', -Input='The quick brown fox jumped over the lazy dog.')->join(',')]",
+        context: &context
+    )
+    #expect(output == "The,quick,brown,fox,jumped,over,the,lazy,dog")
+}
+
+@Test func regExpSplitInterleavesCaptureGroupsBetweenSegmentsWhenTheFindPatternHasGroups() async throws {
+    // Ch. 26 p.353, exact worked example: wrapping the split pattern in
+    // parentheses interleaves the matched delimiter text itself into the
+    // result array between each pair of word segments.
+    var context = LassoContext()
+    let output = try await LassoRenderer().render(
+        "[var(re = RegExp(-Find='[aeiou]'))][$re->split(-Find='(\\\\W+)', -Input='ab cd')->join('|')]",
+        context: &context
+    )
+    #expect(output == "ab| |cd")
+}
+
+@Test func stringFindRegExpReturnsAFlatArrayOfFullMatchThenEachCaptureGroupPerMatch() async throws {
+    // Ch. 26 Table 11 / p.356, exact worked example: a 2-group pattern
+    // matching one email address in the source text yields a 3-element
+    // flat array (full match, then each group) -- not a nested
+    // array-of-arrays-per-match.
+    var context = LassoContext()
+    let output = try await LassoRenderer().render(
+        "[String_FindRegExp('Send email to documentation@lassosoft.com.', " +
+            "-Find='([A-Za-z0-9_]+)@([A-Za-z0-9_]+\\\\.[A-Za-z0-9_]+)')->join('|')]",
+        context: &context
+    )
+    #expect(output == "documentation@lassosoft.com|documentation|lassosoft.com")
+}
+
+@Test func stringFindRegExpFlattensMultipleMatchesIntoOneArrayInOrder() async throws {
+    // Ch. 26 p.356, exact worked example: a 1-group pattern ("first
+    // character of each word") matching 9 words in the source yields an
+    // 18-element flat array (full+group1, full+group1, ... per match, in
+    // order) -- confirms the "flat, not nested" contract holds across
+    // multiple matches, not just one.
+    var context = LassoContext()
+    let output = try await LassoRenderer().render(
+        "[String_FindRegExp('The quick brown fox jumped over a lazy dog.', -Find='([A-Za-z])[A-Za-z]*')->join('|')]",
+        context: &context
+    )
+    #expect(output == "The|T|quick|q|brown|b|fox|f|jumped|j|over|o|a|a|lazy|l|dog|d")
+}
+
+@Test func stringReplaceRegExpReturnsAStringMatchingTheLanguageGuidesOwnWorkedExampleNotAnArray() async throws {
+    // Ch. 26 Table 11's own description text says this tag "Returns an
+    // array..." -- almost certainly a copy-paste artifact from the
+    // FindRegExp row just above it (see the registration's own doc
+    // comment), since the Guide's own worked example output (p.357) is
+    // unambiguously a plain string.
+    var context = LassoContext()
+    let output = try await LassoRenderer().render(
+        "[String_ReplaceRegExp('Blue Lake sure is blue today.', " +
+            "-Find='[Bb]lue', -Replace='<b>x</b>')]",
+        context: &context
+    )
+    #expect(output == "<b>x</b> Lake sure is <b>x</b> today.")
+}
+
+@Test func stringReplaceRegExpOnlyOneFlagLimitsToTheFirstMatch() async throws {
+    // Ch. 26 Table 11: "Optional -ReplaceOnlyOne parameter replaces only
+    // the first pattern match."
+    var context = LassoContext()
+    let output = try await LassoRenderer().render(
+        "[String_ReplaceRegExp('aaa', -Find='a', -Replace='b', -ReplaceOnlyOne)]",
+        context: &context
+    )
+    #expect(output == "baa")
 }
 
 @Test func pairConstructorSupportsAllFourRealLassoForms() async throws {
@@ -6008,6 +7096,237 @@ struct IncludeURLTests {
     #expect(output.contains("parens=a"))
 }
 
+@Test func colonCallArgumentWithAParenthesizedChainedMemberCallParsesCorrectly() async throws {
+    // Regression test for a real, pre-existing bug found while writing
+    // Collections Stage 7c tests: a colon-call argument that is itself
+    // a parenthesized base with a chained member call —
+    // `('abe')->SubString(1,1)` — threw `unsupportedExpression(")")`
+    // whether it was a non-last argument (followed by a comma and
+    // another argument) or the last argument inside an explicit
+    // `(Tag: ...)` wrap. Fixed as part of the broader `ArrowGiveback`
+    // redesign (`ExpressionParser.swift`) — see its own doc comment,
+    // and `colonCallArgumentWithABareChainedMemberCallParsesCorrectly`
+    // below for the sibling case (a BARE, unparenthesized base) this
+    // fix was initially narrower than, now also fixed.
+    var context = LassoContext()
+    let output = try await LassoRenderer().render(
+        "[(Compare_LessThan: ('abe')->SubString(1,1), 'bob')]|[(Compare_LessThan: 'bob', ('abe')->SubString(1,1))]",
+        context: &context
+    )
+    #expect(output == "0|-1")
+}
+
+@Test func colonCallArgumentWithABareChainedMemberCallParsesCorrectly() async throws {
+    // Sibling to the parenthesized-base test above, for a BARE
+    // (unparenthesized) base — `$x->SubString(1,1)` as a colon-call
+    // argument. Previously: as a non-last argument (followed by a
+    // comma and another argument), this threw
+    // `unsupportedExpression(")")`; as the sole/last argument, it
+    // silently MIS-parsed as `(Compare_LessThan: $x)->SubString(1,1)`
+    // instead of the intended `Compare_LessThan($x->SubString(1,1))`.
+    // Fixed by the `ArrowGiveback` redesign: every argument's `->`
+    // chain is now parsed greedily (no suppression), then GIVEN BACK
+    // to the enclosing call only when genuinely ambiguous — neither a
+    // comma nor a `)` follows (see `ExpressionParser.swift`'s own doc
+    // comment on `ArrowGiveback` for the full reasoning). A comma or a
+    // `)` following the chain proves it unambiguously belongs to the
+    // argument, exactly as it does for the already-fixed parenthesized
+    // case.
+    //
+    // `$x`/`'zap'` are chosen deliberately (found by architect review
+    // to matter): the FULL string and the SUBSTRING must compare
+    // DIFFERENTLY against the other operand, or a version of this test
+    // that silently used `$x` instead of `$x->SubString(1,1)` would
+    // pass "by luck" — `'zoo' < 'zap'` is FALSE (`'o' > 'a'` at the
+    // second character) while `'z' < 'zap'` is TRUE (`'z'` is a strict
+    // prefix of `'zap'`), so the two forms are only both correct if the
+    // substring genuinely got applied.
+    var context = LassoContext()
+    let output = try await LassoRenderer().render(
+        """
+        [var('x' = 'zoo')]
+        [(Compare_LessThan: $x->SubString(1,1), 'zap')]|\
+        [(Compare_LessThan: 'zap', $x->SubString(1,1))]
+        """,
+        context: &context
+    ).trimmingCharacters(in: .whitespacesAndNewlines)
+    #expect(output == "0|-1")
+}
+
+@Test func bareColonCallStillCorrectlyBindsATrailingArrowToTheCallResultWhenGenuinelyAmbiguous() async throws {
+    // Companion to `bareColonCallArgumentDoesNotAbsorbATrailingArrowMember
+    // Access` above (the original motivating case for this whole
+    // mechanism) — confirms the `ArrowGiveback` redesign didn't regress
+    // it, using the exact same proof technique: with NOTHING safe (no
+    // comma, no `)`) following a bare argument's own trailing `->`
+    // chain, that chain must still bind to the CALL's result, not the
+    // argument. `MakeArray` wraps its argument in a 1-element array —
+    // if `->first` incorrectly bound to the bare `5` argument itself
+    // (`MakeArray(5->first)`), it would throw
+    // `unsupportedExpression("Member first")` (integers have no
+    // `first` member, same crash the original motivating test's own
+    // bug produced); binding correctly to the call's result
+    // (`MakeArray(5)->first`, i.e. `array(5)->first`) evaluates cleanly
+    // to `5`.
+    var context = LassoContext()
+    let output = try await LassoRenderer().render(
+        """
+        [
+        Define_Tag('MakeArray', -Required='Value');
+            Return(Array((Local: 'Value')));
+        /Define_Tag;
+        ]\
+        [MakeArray:5->first]
+        """,
+        context: &context
+    ).trimmingCharacters(in: .whitespacesAndNewlines)
+    #expect(output == "5")
+}
+
+@Test func bareColonCallArgumentWithATrailingChainInACompoundExpressionIsNotCorrupted() async throws {
+    // Safety-guard test: `ArrowGiveback` must NEVER apply when the
+    // argument's own top-level shape is a compound expression
+    // (`.binary`/`.ternary`/etc.) wrapping a trailing chain, since
+    // giving back just the chain would silently discard the rest of
+    // the expression. `1 + $arr->first` as a bare colon-call's sole
+    // argument must keep its `+` intact regardless of what
+    // (non-)ambiguity the trailing `->first` might otherwise have.
+    var context = LassoContext()
+    let output = try await LassoRenderer().render(
+        """
+        [
+        Define_Tag('Describe', -Required='Value');
+            Return('got:' + (Local: 'Value'));
+        /Define_Tag;
+        var('arr' = array('first-element', 'unused'));
+        ]\
+        [Describe:1 + $arr->first]
+        """,
+        context: &context
+    ).trimmingCharacters(in: .whitespacesAndNewlines)
+    #expect(output == "got:1first-element")
+}
+
+@Test func nestedBareColonCallUnderAnExplicitParenWrapStillResolvesItsOwnAmbiguityCorrectly() async throws {
+    // Regression test for a real bug found by architect review during
+    // the `ArrowGiveback` redesign: `(Outer: $arr->get:2->first)` — a
+    // BARE colon-call (`get:2`) nested, with no wrap of its own, inside
+    // ANOTHER bare colon-call (`Outer:`) that IS explicitly wrapped in
+    // parens. `get`'s own giveback check must NOT treat the upcoming
+    // `)` as a safe terminator for ITS OWN ambiguity — that `)` belongs
+    // to `Outer`'s wrap, two levels up, not to `get`'s own (nonexistent)
+    // wrap. Before the fix, `get`'s own check saw ANY upcoming `)` as
+    // universally safe, incorrectly leaving `2->first` bound together as
+    // `get`'s own argument (`get(2->first)`) — which crashes at
+    // evaluation (integers have no `first` member) instead of correctly
+    // resolving to `($arr->get:2)->first`, embedded as `Outer`'s single
+    // argument. Fixed via `enclosingCallArgumentListDepth` — an upcoming
+    // `)` is only trusted when THIS bare call is the outermost one
+    // currently active, not nested inside another still-open call frame.
+    var context = LassoContext()
+    let output = try await LassoRenderer().render(
+        """
+        [
+        Define_Tag('Identity', -Required='Value');
+            Return((Local: 'Value'));
+        /Define_Tag;
+        var(items::array = array);
+        $items->insert('a' = array(1, 2, 3));
+        $items->insert('b' = array(4, 5, 6));
+        ]\
+        [(Identity: $items->get:1->first)]
+        """,
+        context: &context
+    ).trimmingCharacters(in: .whitespacesAndNewlines)
+    #expect(output == "a")
+}
+
+@Test func giveBackDoesNotLeakPastAnEmbeddedCallWithinTheSameChain() async throws {
+    // Regression test for a real bug found by code review during the
+    // `ArrowGiveback` redesign: a chain containing an embedded bare
+    // colon-call (`->get:1`) followed by FURTHER `->` chaining
+    // (`->first`) — e.g. `$items->get:1->first`, the exact shape the
+    // ORIGINAL motivating fix targeted — used as ANOTHER bare colon-
+    // call's sole/trailing argument. The `giveback` captured at the
+    // FIRST eligible `->` step (before `->get`) must NOT survive past
+    // the embedded `:`-triggered call that follows it — that call
+    // already resolved its OWN internal ambiguity independently,
+    // producing a new, self-contained value; the earlier, now-stale
+    // giveback point would otherwise cause the OUTER call to rewind too
+    // far back, discarding `->get:1->first` entirely and re-attaching
+    // it to the OUTER call's own result instead.
+    //
+    // **`MakeArray` must be a genuinely TRANSFORMING tag, not a
+    // passthrough.** Two earlier versions of this test were found
+    // non-decisive on review: (1) wrapping `MakeArray:...` directly in
+    // parens (`(MakeArray:...)->join(',')`) made `MakeArray:`'s own
+    // giveback check see itself as the OUTERMOST bare call, independently
+    // masking the bug via the depth-tracking fix's own guard; (2) nesting
+    // it unwrapped under another bare call (`Outer: Inner:...`) fixed
+    // that, but using a no-op passthrough `Inner` meant the corrupted and
+    // correct parse trees evaluate to the SAME final value regardless of
+    // which one runs — a stale giveback causes `Inner`'s whole
+    // `->get:1->first` chain to get re-parsed OUTSIDE `Inner`'s call
+    // instead of resolved inside it (`Inner($items)->get:1->first` vs.
+    // `Inner($items->get:1->first)`), and since `Inner(x) == x`, member
+    // access commutes straight through either way, producing `10` either
+    // way — found by architect re-verification: this version would have
+    // passed even with the fix fully reverted. `MakeArray` genuinely
+    // transforms (wraps its argument in a 1-element array), so the two
+    // parse trees evaluate to visibly different results (`"10,20,30"` if
+    // broken vs. `"10"` if correct) — architect-verified decisive by
+    // reverting the fix and confirming the output actually changes.
+    var context = LassoContext()
+    let output = try await LassoRenderer().render(
+        """
+        [
+        Define_Tag('Outer', -Required='Value');
+            Return((Local: 'Value'));
+        /Define_Tag;
+        Define_Tag('MakeArray', -Required='Value');
+            Return(Array((Local: 'Value')));
+        /Define_Tag;
+        var('items' = array(array(10, 20, 30)));
+        ]\
+        [(Outer: MakeArray:$items->get:1->first)->join(',')]
+        """,
+        context: &context
+    ).trimmingCharacters(in: .whitespacesAndNewlines)
+    #expect(output == "10")
+}
+
+@Test func bareColonCallNestedInsideAWrappedCallArgumentStillResolvesItsOwnAmbiguityCorrectly() async throws {
+    // Regression test for a real bug found by architect re-verification:
+    // the depth counter guarding the giveback boundary check originally
+    // only tracked BARE (`closing == nil`) `parseArguments` calls, so a
+    // bare colon-call nested directly inside an ordinary WRAPPED call's
+    // argument — `Identity($items->get:1->first)`, where `Identity(...)`
+    // uses regular parens as ITS OWN call syntax, not a bare colon-call —
+    // never had that wrap counted. `get:`'s own frame incorrectly saw
+    // itself as depth 0 (outermost) and wrongly trusted `Identity`'s own
+    // closing `)` as a safe terminator for its own ambiguity, leaving
+    // `1->first` bound together as `get`'s own argument (`get(1->first)`)
+    // — which crashes at evaluation (integers have no `first` member) —
+    // instead of correctly resolving to `($items->get:1)->first` as
+    // `Identity`'s single argument. Fixed by having
+    // `enclosingCallArgumentListDepth` count EVERY `parseArguments` call,
+    // wrapped or bare, not just bare ones.
+    var context = LassoContext()
+    let output = try await LassoRenderer().render(
+        """
+        [
+        Define_Tag('Identity', -Required='Value');
+            Return((Local: 'Value'));
+        /Define_Tag;
+        var('items' = array(array(10, 20, 30)));
+        ]\
+        [Identity($items->get:1->first)]
+        """,
+        context: &context
+    ).trimmingCharacters(in: .whitespacesAndNewlines)
+    #expect(output == "10")
+}
+
 @Test func mapInsertAddsAKeyedEntryMutatingTheInvocantInPlace() async throws {
     // Real corpus: includes/detail_by_size.lasso's
     // `var(skuArrayItem = map)` followed by
@@ -6456,7 +7775,7 @@ struct IncludeURLTests {
         "[$html += 'b'][$html]|[local(n = 10)][#n -= 3][#n]|[local(m = 4)][#m *= 2][#m]|[local(d = 10)][#d /= 4][#d]",
         context: &context
     )
-    #expect(output == "ab|7|8|2.5")
+    #expect(output == "ab|7|8|2.500000")
 }
 
 @Test func stringLiteralInterpretsBackslashNTAndRAsRealControlCharacters() async throws {
@@ -6832,6 +8151,27 @@ struct IncludeURLTests {
     #expect(output == "true|false|false")
 }
 
+@Test func relationalOperatorsCompareStringsAlphabeticallyNotByLength() async throws {
+    // Regression test for a real, pre-existing bug: the raw `<`/`>`/
+    // `<=`/`>=` operators' non-numeric fallback compared
+    // `Double(outputString.count)` — i.e. STRING LENGTH — instead of
+    // actual lexicographic content, so `'a' < 'b'` incorrectly returned
+    // `false` (both length 1). Ch. 5 Table 11 (p.78) documents the real
+    // contract directly: "check whether strings come before or after
+    // each other in alphabetical order," with the Guide's own worked
+    // example verbatim (`'abc' < 'def'` → True) — used as the first
+    // assertion below. `'aa' < 'b'` and `'zz' > 'a'` specifically prove
+    // this isn't accidentally still comparing by length (a longer
+    // string sorting before/after a shorter one purely by alphabetical
+    // content, contradicting what length-based comparison would give).
+    var context = LassoContext()
+    let output = try await LassoRenderer().render(
+        "[('abc' < 'def')]|[('aa' < 'b')]|[('zz' > 'a')]|[('abc' <= 'abc')]|[('abc' >= 'abc')]|[('b' > 'a')]",
+        context: &context
+    )
+    #expect(output == "true|true|true|true|true|true")
+}
+
 @Test func elseWithConditionNestsAsRealIfElseIfNotAnUnconditionalBranch() async throws {
     // Real Lasso 8's if-else-if chaining (`if(A) ... else(B) ... else(C)
     // ... else ... /if`) must become nested if/else, not a flat
@@ -7098,5 +8438,2010 @@ struct IncludeURLTests {
     for (name, forms) in expected {
         #expect(TagCatalog.entry(name)?.openForms == forms, "\(name) openForms mismatch")
     }
+}
+
+@Test func typeReturnsCapitalizedTypeNameMatchingTheLanguageGuidesOwnWorkedExamples() async throws {
+    // Lasso 8.5 Language Guide Ch. 43 Table 6 / p.560, exact worked
+    // examples: `[123->Type] -> Integer`, `[Output: 123.456->Type] ->
+    // Decimal`, `['String'->Type] -> String`, `[Null->Type] -> Null`,
+    // `[(Array: 1, 2, 3)->Type] -> Array`.
+    var context = LassoContext()
+    let output = try await LassoRenderer().render(
+        "[123->type]|[123.456->type]|['String'->type]|[Null->type]|[(Array(1,2,3))->type]",
+        context: &context
+    )
+    #expect(output == "Integer|Decimal|String|Null|Array")
+}
+
+@Test func typeReturnsTheRegisteredNativeTypeNameUnmodifiedForObjectInstances() async throws {
+    // lassoguide.com's Lasso 9 "Type/Object Introspection Methods":
+    // "Returns the type name for any type instance. The value is the
+    // name that was used when the type was defined" — native types are
+    // registered lowercase (see NativeTypes.swift's `makeRegExpType`),
+    // so unlike the primitive-literal capitalization above, this is
+    // returned as-is, not capitalized.
+    var context = LassoContext()
+    let output = try await LassoRenderer().render(
+        "[var(re = RegExp(-Find='a'))][$re->type]",
+        context: &context
+    )
+    #expect(output.trimmingCharacters(in: .whitespacesAndNewlines) == "regexp")
+}
+
+@Test func isAMatchesTheValuesOwnTypeNameCaseInsensitivelyAndIsNotAIsItsOpposite() async throws {
+    // Ch. 43 Table 6: "[Null->IsA] Requires a type name as a parameter.
+    // Returns true if the object is of that type or inherits from that
+    // type." This interpreter has no type-inheritance model (see the
+    // doc comment on `member()`'s "isa"/"isnota" case), so only the
+    // exact-type-name half is exercised here. `->IsNotA` per
+    // lassoguide.com: "The opposite of null->isA."
+    var context = LassoContext()
+    let output = try await LassoRenderer().render(
+        "[('hello')->isA('string')]|[('hello')->isA('String')]|[(123)->isA('integer')]|[(123)->isA('string')]|[('hello')->isNotA('string')]|[('hello')->isNotA('integer')]",
+        context: &context
+    )
+    #expect(output == "true|true|true|false|false|true")
+}
+
+@Test func hasMethodReportsTrueForRealMemberMethodsAndFalseForUnknownOnes() async throws {
+    var context = LassoContext()
+    let output = try await LassoRenderer().render(
+        "[('hello')->hasMethod('uppercase')]|[('hello')->hasMethod('notarealmethod')]|[(Array(1,2))->hasMethod('sort')]|[(Array(1,2))->hasMethod('notarealmethod')]",
+        context: &context
+    )
+    #expect(output == "true|false|true|false")
+}
+
+@Test func typeIsAAndHasMethodAreThemselvesAlwaysReportedAvailable() async throws {
+    // "the null data type is the base type for all other data types...
+    // All of the tags of the null data type are available for use with
+    // values of any data type" (Ch. 43, introducing Table 6) — so
+    // ->HasMethod must report its own sibling introspection tags as
+    // present on every type, not just the type-specific methods listed
+    // in `Evaluator.primitiveMethodNames`.
+    var context = LassoContext()
+    let output = try await LassoRenderer().render(
+        "[(123)->hasMethod('type')]|[(123)->hasMethod('isA')]|[(123)->hasMethod('isNotA')]|[(123)->hasMethod('hasMethod')]",
+        context: &context
+    )
+    #expect(output == "true|true|true|true")
+}
+
+@Test func hasMethodTypeAndIsAWorkOnACustomUserDefinedType() async throws {
+    // Scrubbed down from the same js_timer.inc shape used by
+    // `legacyDefineTypeColonCallRegistersTypeAndMethods` above.
+    // `->HasMethod` for `.object` instances consults the user-defined
+    // type's own registered methods (not the hand-maintained primitive
+    // table), and `->Type` returns the name exactly as it was passed to
+    // `Define_Type` (case preserved, not capitalized like the
+    // primitive-literal worked examples above).
+    var context = LassoContext()
+    let output = try await LassoRenderer().render(
+        """
+        [
+        define_type: 'Ex_Timer', 'integer', -prototype;
+            local: 'ticks'=0;
+            define_tag: 'bump';
+                (self->'ticks') = (self->'ticks') + 1;
+            /define_tag;
+        /define_type;
+        ]
+        [Local(t = Ex_Timer())][#t->type]|[#t->isA('Ex_Timer')]|[#t->hasMethod('bump')]|[#t->hasMethod('notarealmethod')]
+        """,
+        context: &context
+    ).trimmingCharacters(in: .whitespacesAndNewlines)
+
+    #expect(output == "Ex_Timer|true|true|false")
+}
+
+@Test func typeIsAAndHasMethodReachTheOuterDefaultFallbackForBooleanAndPair() async throws {
+    // `.boolean` and `.pair` have no dedicated case anywhere in
+    // `member()`'s own switch, so these three tags are ONLY reachable
+    // for them via the outer switch's final `default:` fallback —
+    // locking that path in directly (architect review flagged it as
+    // otherwise unverified by any test) rather than relying on it being
+    // exercised incidentally by the primitive-literal tests above.
+    var context = LassoContext()
+    let output = try await LassoRenderer().render(
+        "[(true)->type]|[(true)->isA('boolean')]|[(true)->hasMethod('type')]|[(Pair(1,2))->type]|[(Pair(1,2))->isA('pair')]",
+        context: &context
+    )
+    #expect(output == "Boolean|true|true|Pair|true")
+}
+
+@Test func typeWorksOnAMapWithNoKeyCollidingWithTheTagName() async throws {
+    // The other `.map` coverage above (`hasMethodReportsTrueForRealMemberMethodsAndFalseForUnknownOnes`
+    // and the pre-existing `fileUploadsExposeMetadataUnderBothLasso9And8KeyNames`)
+    // only exercises the key-collision side of `.map`'s key-first
+    // priority. This locks in the OTHER side: a map with no `"type"`
+    // key must still reach `introspectionResult`'s fallback rather than
+    // falling all the way through to the unconditional `.null` the
+    // `.map` case returns for any other genuinely unknown member.
+    var context = LassoContext()
+    let output = try await LassoRenderer().render(
+        "[(Map('a'=1))->type]|[(Map('a'=1))->hasMethod('type')]",
+        context: &context
+    )
+    #expect(output == "Map|true")
+}
+
+@Test func voidTypeDegradesGracefullyLikeItsOtherMemberAccessesInsteadOfThrowing() async throws {
+    // Regression-locks a deliberate, disclosed extension of the
+    // existing void-degrades-to-empty-string convention (see the
+    // `(.void, _)` case's own doc comment) rather than leaving it as an
+    // unexamined side effect of adding these tags, per architect
+    // review. `action_param('missing')` is the same real-corpus
+    // lookup-miss source `voidLookupMissBehavesLikeEmptyStringButNullStaysStrict`
+    // already uses above.
+    var context = LassoContext()
+    let output = try await LassoRenderer().render(
+        "[action_param('missing')->type]|[action_param('missing')->hasMethod('uppercase')]",
+        context: &context
+    )
+    #expect(output == "String|true")
+}
+
+@Test func varResetAndLocalResetSetAVariableMatchingTheLanguageGuidesOwnWorkedExample() async throws {
+    // Lasso 8.5 Language Guide Ch. 15 p.226, exact worked example:
+    // `Var_Reset: 'VariableName'='New Value'; $VariableName;` -> "New
+    // Value". This codebase has no `@`/`[Reference]` variable-aliasing
+    // system (deferred — see `Evaluator.declarationScope(for:)`'s own
+    // doc comment), so "detaching any references" has nothing to do;
+    // `Var_Reset`/`Local_Reset` are implemented as plain synonyms for
+    // `Var`/`Local`, verified here to at least match the documented
+    // set-and-read behavior.
+    var context = LassoContext()
+    let output = try await LassoRenderer().render(
+        "[Var_Reset: 'VariableName'='New Value'][$VariableName][Local('l' = 1)][Local_Reset('l' = 2)][#l]",
+        context: &context
+    )
+    #expect(output == "New Value2")
+}
+
+@Test func globalSetAndGetMatchesTheLanguageGuidesOwnWorkedExample() async throws {
+    // Ch. 15 p.227, exact worked example:
+    // `[Global: 'Administrator_Email' = 'administrator@example.com']`
+    // then `[Global: 'Administrator_Email']` ->
+    // "administrator@example.com".
+    var context = LassoContext()
+    let output = try await LassoRenderer().render(
+        "[Global: 'Administrator_Email' = 'administrator@example.com'][Global: 'Administrator_Email']",
+        context: &context
+    )
+    #expect(output == "administrator@example.com")
+}
+
+@Test func dollarSymbolFallsBackToAGlobalOnlyWhenNoPageVariableOfTheSameNameExists() async throws {
+    // Ch. 15 p.227: "The $ symbol will return a global variable if no
+    // page variable of the same name has been created." Also verifies
+    // the two namespaces stay genuinely separate (a page `Variable` and
+    // a true `Global` sharing a name are different variables, matching
+    // real Lasso) rather than colliding in shared storage.
+    var context = LassoContext()
+    let fallbackOutput = try await LassoRenderer().render(
+        "[Global: 'g_only' = 'from global'][$g_only]",
+        context: &context
+    )
+    #expect(fallbackOutput == "from global")
+
+    var shadowedContext = LassoContext()
+    let shadowedOutput = try await LassoRenderer().render(
+        "[Global: 'shared' = 'global value'][Variable: 'shared' = 'page value'][$shared]|[Global: 'shared']",
+        context: &shadowedContext
+    )
+    #expect(shadowedOutput == "page value|global value")
+}
+
+@Test func globalResetGlobalDefinedGlobalRemoveAndGlobalsMap() async throws {
+    var context = LassoContext()
+    let output = try await LassoRenderer().render(
+        """
+        [Global_Reset: 'g' = 1]
+        [Global_Defined: 'g']|[Global_Defined: 'never_set']
+        [Global: 'g2' = 2]
+        [(Globals)->size]
+        [Global_Remove: 'g']
+        [Global_Defined: 'g']|[(Globals)->size]
+        """,
+        context: &context
+    )
+    let lines = output
+        .split(separator: "\n")
+        .map { $0.trimmingCharacters(in: .whitespaces) }
+        .filter { !$0.isEmpty }
+    #expect(lines == ["true|false", "2", "false|1"])
+}
+
+@Test func varDefinedStaysScopedToThePageAndIsNotFooledByAnUnrelatedTrueGlobal() async throws {
+    // Ch. 15 p.225: "The [Variable_Defined] tag can be used to check if
+    // a variable has been created and used in THE CURRENT LASSO PAGE."
+    // Regression test for a real bug caught by architect review: an
+    // earlier version of the `$name`-falls-back-to-a-global fix
+    // (`LassoContext.value(for:scope:)`'s `.global` case, see its own
+    // doc comment) mistakenly also placed the fallback on `.unscoped`
+    // — which `var_defined`'s free-function registration reads through
+    // — making `Var_Defined('x')` silently report `true` whenever an
+    // unrelated true Global named "x" existed, even with no page
+    // variable ever created.
+    var context = LassoContext()
+    let output = try await LassoRenderer().render(
+        "[Global: 'onlyglobal' = 'g'][Var_Defined: 'onlyglobal']",
+        context: &context
+    )
+    #expect(output == "false")
+}
+
+@Test func nullSuppressesOutputWhileStillEvaluatingItsArgument() async throws {
+    // Ch. 30 pp.422-426's canonical Iterator idiom relies on exactly
+    // this: `Null: $myIterator->Forward;` must silently swallow the
+    // boolean return value while still actually advancing the iterator.
+    // Previously "null" always hard-committed to the `.null` literal
+    // expression in `parsePrefix` before `parsePostfix` ever saw a
+    // trailing `(` or `:`, so both call syntaxes below threw
+    // `unsupportedExpression("Dynamic call")` — a `.call` node whose
+    // callee was `.null` instead of `.identifier("null")`, which
+    // `Evaluator.evaluate`'s `.call` case has no path for.
+    //
+    // Proven here via a divide-by-zero inside the argument (caught by
+    // `[protect]`): if the argument were silently discarded rather than
+    // actually evaluated, no error would ever surface.
+    var context = LassoContext()
+    let output = try await LassoRenderer().render(
+        "[null(1+1)]|[protect][Null: 10 / 0][/protect][error_currenterror(-errorcode)]",
+        context: &context
+    )
+    #expect(output == "|-9950")
+}
+
+@Test func bareNullStillParsesAsTheLiteralNullValueNotACall() async throws {
+    // Guards the other half of the fix: "null" with no following call
+    // syntax must keep parsing as the `.null` literal, so ordinary
+    // comparisons against it are unaffected by the new callable path.
+    var context = LassoContext()
+    let output = try await LassoRenderer().render(
+        "[Var: 'x' = null][$x == null]|[null == null]",
+        context: &context
+    )
+    #expect(output == "true|true")
+}
+
+@Test func listFirstAndLastMatchTheLanguageGuidesWorkedExample() async throws {
+    // Ch. 30 p.399: `Var('MyList' = (List: 'Uno', 'Dos', 'Tres',
+    // 'Quatro'))` then `$myList->First + ', ' + $myList->Last` → "Uno,
+    // Quatro". Also covers `->Size` → 4 from the same page.
+    var context = LassoContext()
+    let output = try await LassoRenderer().render(
+        """
+        [var('myList' = (list: 'Uno', 'Dos', 'Tres', 'Quatro'))]\
+        [$myList->First] + [$myList->Last]|[$myList->Size]
+        """,
+        context: &context
+    )
+    #expect(output == "Uno + Quatro|4")
+}
+
+@Test func listInsertFirstInsertLastThenAutoStringMatchesTheGuidesSixElementResult() async throws {
+    // Ch. 30 p.399: `->InsertFirst('Cero')` + `->InsertLast('Cinco')`
+    // on the same list, then `[String: $myList]` → "List: Cero, Uno,
+    // Dos, Tres, Quatro, Cinco" — a bare-statement self-mutating
+    // write-back, no reassignment.
+    var context = LassoContext()
+    let output = try await LassoRenderer().render(
+        """
+        [var('myList' = (list: 'Uno', 'Dos', 'Tres', 'Quatro'))]\
+        [$myList->InsertFirst('Cero')][$myList->InsertLast('Cinco')]\
+        [string($myList)]
+        """,
+        context: &context
+    )
+    #expect(output == "List: Cero, Uno, Dos, Tres, Quatro, Cinco")
+}
+
+@Test func listRemoveFirstAndRemoveLastReturnToTheOriginalFourElements() async throws {
+    // Ch. 30 p.399: continuing from the six-element list above,
+    // `->RemoveFirst` + `->RemoveLast` → "List: Uno, Dos, Tres, Quatro".
+    var context = LassoContext()
+    let output = try await LassoRenderer().render(
+        """
+        [var('myList' = (list: 'Cero', 'Uno', 'Dos', 'Tres', 'Quatro', 'Cinco'))]\
+        [$myList->RemoveFirst][$myList->RemoveLast]\
+        [string($myList)]
+        """,
+        context: &context
+    )
+    #expect(output == "List: Uno, Dos, Tres, Quatro")
+}
+
+@Test func listDifferenceIntersectionAndUnionSelfMutateOnABareStatementLikeSetDoes() async throws {
+    // Extrapolation test, NOT a primary-source-verified worked example
+    // — unlike Set, the Guide has no dedicated List->Difference/
+    // ->Intersection/->Union worked example to confirm bare-statement
+    // behavior against. This is included in `Evaluator
+    // .selfMutatingMethods` on the (disclosed, name-based-not-type-
+    // scoped) theory that List's own Table 5 wording ("returning a new
+    // list"/"Returns a new list") is JUST as inconsistent with actual
+    // bare-statement-mutates behavior as Set's identically-worded Table
+    // 16 turned out to be (verified by Set's own worked example, see
+    // `setDifferenceIntersectionAndUnionMatchTheGuidesFirstSetSecondSetWorkedExamples`
+    // above) — flagged explicitly by architect review as an
+    // unverified-for-List extrapolation, kept as the most consistent
+    // reading available, and captured here as a regression test of the
+    // actual implemented behavior rather than left silently untested.
+    var context = LassoContext()
+    let output = try await LassoRenderer().render(
+        """
+        [var('FirstList' = (list: 'Alpha', 'Beta', 'Gamma'))]\
+        [var('SecondList' = (list: 'Beta', 'Gamma', 'Delta'))]\
+        [var('ResultList' = $FirstList)][$ResultList->Difference($SecondList)][$ResultList->Size]|\
+        [var('ResultList' = $FirstList)][$ResultList->Intersection($SecondList)][$ResultList->Size]|\
+        [var('ResultList' = $FirstList)][$ResultList->Union($SecondList)][$ResultList->Size]
+        """,
+        context: &context
+    )
+    #expect(output == "1|2|4")
+}
+
+@Test func listConstructorWithNoArgumentsIsEmptyAndBareIdentifierResolvesToAnEmptyList() async throws {
+    // `List` constructor "Any parameters passed to the tag are used as
+    // the initial values" (Table 4) implies zero parameters is a valid
+    // empty list. Also confirms the real-corpus bare-identifier path
+    // (`var('x' = list)`, mirroring `includes/detail_a_sku.lasso`'s
+    // `var('skuArrayColor' = set)`) resolves to an empty instance with
+    // no separate free-function registration needed for that shape.
+    var context = LassoContext()
+    let output = try await LassoRenderer().render(
+        "[(list)->size]|[var('x' = list)][$x->size]",
+        context: &context
+    )
+    #expect(output == "0|0")
+}
+
+@Test func queueFirstSizeAndAutoStringMatchTheLanguageGuidesWorkedExamples() async throws {
+    // Ch. 30 pp.408-409: Insert('One'), Insert('Two') then `->First` →
+    // "One" (FIFO peek, no mutation), `->Size` → 2, `[String: $myQueue]`
+    // → "Queue: One, Two".
+    var context = LassoContext()
+    let output = try await LassoRenderer().render(
+        """
+        [var('myQueue' = queue)][$myQueue->Insert('One')][$myQueue->Insert('Two')]\
+        [$myQueue->First]|[$myQueue->Size]|[string($myQueue)]
+        """,
+        context: &context
+    )
+    #expect(output == "One|2|Queue: One, Two")
+}
+
+@Test func queueAndStackConstructorsAcceptInitialElementsLikeListDoes() async throws {
+    // The 8.5 PDF's own Table 12/17 say "Creates an empty queue"/
+    // "Creates an empty stack" with no constructor parameters
+    // documented at all, but lassoguide.com's Lasso 9 docs explicitly
+    // say "Creates a queue/stack object using the parameters passed to
+    // it as the elements" (cross-checked directly against
+    // lassoguide.com/operations/collections.html, flagged as a real gap
+    // by architect review, not left as the PDF's narrower "always
+    // empty" reading). Argument order becomes insertion order, so
+    // Queue's FIFO `->First` is the first argument and Stack's LIFO
+    // `->First` is the last argument.
+    var context = LassoContext()
+    let output = try await LassoRenderer().render(
+        "[(queue: 'One', 'Two')->First]|[(stack: 'One', 'Two')->First]",
+        context: &context
+    )
+    #expect(output == "One|Two")
+}
+
+@Test func queueGetPopsAndDisplaysTheFirstElementMatchingTheGuidesOneThenOneResult() async throws {
+    // Ch. 30 p.409: the exact worked example this project's disclosed
+    // `->Get` exception exists for — a bare `$myQueue->Get;` statement
+    // both DISPLAYS "One" and MUTATES the queue (confirmed by `->Size`
+    // afterward reporting 1, not 2).
+    var context = LassoContext()
+    let output = try await LassoRenderer().render(
+        """
+        [var('myQueue' = queue)][$myQueue->Insert('One')][$myQueue->Insert('Two')]\
+        [$myQueue->Get]|[$myQueue->Size]
+        """,
+        context: &context
+    )
+    #expect(output == "One|1")
+}
+
+@Test func queueRemoveDiscardsTheFirstElementWithoutReturningItsValue() async throws {
+    // Ch. 30 p.409: `[Queue->Remove]` "does not return any value so
+    // only the size is output" — 1, after removing one of two elements.
+    // Also confirms it's FIFO removal specifically (not just "any
+    // element"): `->First` afterward is the surviving 'Two', not 'One'
+    // — code review flagged the original version of this test as
+    // unable to distinguish `removeFirst` from `removeLast` since
+    // either leaves size 1 on a 2-element queue.
+    var context = LassoContext()
+    let output = try await LassoRenderer().render(
+        """
+        [var('myQueue' = queue)][$myQueue->Insert('One')][$myQueue->Insert('Two')]\
+        [$myQueue->Remove][$myQueue->First]|[$myQueue->Size]
+        """,
+        context: &context
+    )
+    #expect(output == "Two|1")
+}
+
+@Test func stackFirstSizeAndAutoStringMatchTheLanguageGuidesWorkedExamplesLIFOOrder() async throws {
+    // Ch. 30 pp.413-414: Insert('One'), Insert('Two') then `->First` →
+    // "Two" (LIFO peek — the most recently inserted, unlike Queue's
+    // FIFO "One"), `->Size` → 2, `[String: $myStack]` → "Stack: One,
+    // Two" (still insertion order for the auto-string dump, per the
+    // Guide's own worked example — NOT peek order).
+    var context = LassoContext()
+    let output = try await LassoRenderer().render(
+        """
+        [var('myStack' = stack)][$myStack->Insert('One')][$myStack->Insert('Two')]\
+        [$myStack->First]|[$myStack->Size]|[string($myStack)]
+        """,
+        context: &context
+    )
+    #expect(output == "Two|2|Stack: One, Two")
+}
+
+@Test func stackGetPopsAndDisplaysTheMostRecentlyInsertedElementMatchingTheGuidesTwoThenOneResult() async throws {
+    // Ch. 30 p.415: same disclosed `->Get` exception as Queue, but LIFO
+    // — pops "Two" (not "One"), leaving size 1.
+    var context = LassoContext()
+    let output = try await LassoRenderer().render(
+        """
+        [var('myStack' = stack)][$myStack->Insert('One')][$myStack->Insert('Two')]\
+        [$myStack->Get]|[$myStack->Size]
+        """,
+        context: &context
+    )
+    #expect(output == "Two|1")
+}
+
+@Test func stackRemoveDiscardsTheMostRecentlyInsertedElementSpecificallyNotJustAnyElement() async throws {
+    // Same order-verification gap code review flagged for Queue->Remove
+    // above, mirrored for Stack: `->Remove` is LIFO (removes 'Two', not
+    // 'One'), confirmed via `->First` on the survivor afterward rather
+    // than size alone.
+    var context = LassoContext()
+    let output = try await LassoRenderer().render(
+        """
+        [var('myStack' = stack)][$myStack->Insert('One')][$myStack->Insert('Two')]\
+        [$myStack->Remove][$myStack->First]|[$myStack->Size]
+        """,
+        context: &context
+    )
+    #expect(output == "One|1")
+}
+
+@Test func listContainsMatchesAnElementByValueEqualityNotReferenceIdentity() async throws {
+    var context = LassoContext()
+    let output = try await LassoRenderer().render(
+        "[(list: 'Uno', 'Dos', 'Tres')->Contains('Dos')]|[(list: 'Uno', 'Dos', 'Tres')->Contains('Cero')]",
+        context: &context
+    )
+    #expect(output == "true|false")
+}
+
+@Test func setFindReturnsANewSetOfMatchesNotAnArrayUnlikeListFind() async throws {
+    // Table 16: "[Set->Find] Returns a SET of elements that match" —
+    // deliberately distinct from List->Find, which returns a plain
+    // array (Table 5). Asserting the auto-string prefix is "Set:" (not
+    // bare/array-shaped output) is what actually distinguishes this
+    // from a copy-pasted List->Find implementation, which is exactly
+    // the regression code review flagged this as having zero coverage
+    // against.
+    var context = LassoContext()
+    let output = try await LassoRenderer().render(
+        """
+        [var('mySet' = set)][$mySet->Insert('Alpha')][$mySet->Insert('Beta')][$mySet->Insert('Gamma')]\
+        [string($mySet->Find('Beta'))]
+        """,
+        context: &context
+    )
+    #expect(output == "Set: (Beta)")
+}
+
+@Test func setContainsGetAndRemoveAllMatchTheirOwnTableDescriptions() async throws {
+    // Table 16: `->Contains` (boolean membership test), `->Get` (1-
+    // based positional getter — sets are always sorted, so position 1
+    // of {Alpha,Beta,Gamma} is 'Alpha'), `->RemoveAll` (VALUE-based,
+    // unlike `->Remove`'s position-based removal — removes every
+    // matching element, "Returns no value").
+    var context = LassoContext()
+    let output = try await LassoRenderer().render(
+        """
+        [var('mySet' = set)][$mySet->Insert('Alpha')][$mySet->Insert('Beta')][$mySet->Insert('Gamma')]\
+        [$mySet->Contains('Beta')]|[$mySet->Get(1)]|\
+        [$mySet->RemoveAll('Beta')][$mySet->Size]|[string($mySet)]
+        """,
+        context: &context
+    )
+    #expect(output == "true|Alpha|2|Set: (Alpha), (Gamma)")
+}
+
+@Test func seriesConstructorProducesAnInclusiveAscendingArrayMatchingTheGuidesTenElementExample() async throws {
+    // Ch. 30 p.413: `[Series(1, 10)]` produces 10 elements from 1 to 10
+    // inclusive. Implemented as a plain `.array` (not object-wrapped)
+    // per the same page's "supports the same member tags as the array
+    // data type" — so this test exercises `->join` (an existing Array
+    // member) rather than the Guide's own bare-cast "Series: (1),
+    // (2)..." per-element-parens format, which is deliberately not
+    // reproduced (see `LassoCollectionValue.autoStringDescription`'s
+    // doc comment).
+    var context = LassoContext()
+    let output = try await LassoRenderer().render(
+        "[(series(1, 10))->size]|[(series(1, 10))->join(',')]",
+        context: &context
+    )
+    #expect(output == "10|1,2,3,4,5,6,7,8,9,10")
+}
+
+@Test func setDeduplicatesRepeatedInsertsMatchingTheGuidesOneThreeWorkedExample() async throws {
+    // Ch. 30 p.411: inserting 'Three' three times still yields only two
+    // elements — "the multiple inserts of Three are ignored since the
+    // set can only contain unique values" — dedup via `lassoEquals`,
+    // no new Hashable infrastructure.
+    var context = LassoContext()
+    let output = try await LassoRenderer().render(
+        """
+        [var('mySet' = set)][$mySet->Insert('One')][$mySet->Insert('Three')]\
+        [$mySet->Insert('Three')][$mySet->Insert('Three')]\
+        [$mySet->Size]|[string($mySet)]
+        """,
+        context: &context
+    )
+    #expect(output == "2|Set: (One), (Three)")
+}
+
+@Test func setDifferenceIntersectionAndUnionMatchTheGuidesFirstSetSecondSetWorkedExamples() async throws {
+    // Ch. 30 p.412: FirstSet={Alpha,Beta,Gamma}, SecondSet={Beta,Gamma,
+    // Delta}. Each of Difference/Intersection/Union duplicates FirstSet
+    // as ResultSet, calls the operation as a bare statement (no
+    // reassignment), then displays $ResultSet — exercising the same
+    // self-mutating write-back mechanism as everything else in this
+    // set, now widened to cover these three method names too.
+    var context = LassoContext()
+    let output = try await LassoRenderer().render(
+        """
+        [var('FirstSet' = set)][$FirstSet->Insert('Alpha')][$FirstSet->Insert('Beta')][$FirstSet->Insert('Gamma')]\
+        [var('SecondSet' = set)][$SecondSet->Insert('Beta')][$SecondSet->Insert('Gamma')][$SecondSet->Insert('Delta')]\
+        [var('ResultSet' = $FirstSet)][$ResultSet->Difference($SecondSet)][$ResultSet]|\
+        [var('ResultSet' = $FirstSet)][$ResultSet->Intersection($SecondSet)][$ResultSet]|\
+        [var('ResultSet' = $FirstSet)][$ResultSet->Union($SecondSet)][$ResultSet]
+        """,
+        context: &context
+    )
+    #expect(output == "Set: (Alpha)|Set: (Beta), (Gamma)|Set: (Alpha), (Beta), (Delta), (Gamma)")
+}
+
+@Test func setConstructorWithNoArgumentsIsEmptyAndBareIdentifierResolvesToAnEmptySet() async throws {
+    // Same bare-identifier confirmation as List above, but for `set` —
+    // the exact real-corpus shape `includes/detail_a_sku.lasso` used
+    // (`var('skuArrayColor' = set)`) that originally motivated this
+    // whole file (the old placeholder `set(...)` registration didn't
+    // dedup at all; see this file's own top-level doc comment).
+    var context = LassoContext()
+    let output = try await LassoRenderer().render(
+        "[(set)->size]|[var('x' = set)][$x->size]",
+        context: &context
+    )
+    #expect(output == "0|0")
+}
+
+@Test func priorityQueueDefaultComparatorReturnsTheGreatestElementFirst() async throws {
+    // Ch. 30 p.405-406: default comparator (`\Compare_LessThan`) —
+    // insert 'One' then 'Two', `->First` is "Two" (greatest
+    // alphabetically), NOT "One" — the exact greatest-first-by-default
+    // gotcha this stage's own risk assessment flagged as easy to invert
+    // by assuming the comparator's own name is the sort direction.
+    var context = LassoContext()
+    let output = try await LassoRenderer().render(
+        """
+        [var('myPQ' = priorityqueue)][$myPQ->Insert('One')][$myPQ->Insert('Two')]\
+        [$myPQ->First]|[$myPQ->Size]|[string($myPQ)]
+        """,
+        context: &context
+    )
+    #expect(output == "Two|2|PriorityQueue: One, Two")
+}
+
+@Test func priorityQueueGreaterThanComparatorReturnsTheLeastElementFirst() async throws {
+    // Ch. 30 p.406: `(PriorityQueue: (Compare_GreaterThan))` reverses
+    // the default — `->First` is "One" (least), not "Two".
+    var context = LassoContext()
+    let output = try await LassoRenderer().render(
+        """
+        [var('myPQ' = (priorityqueue: (compare_greaterthan)))]\
+        [$myPQ->Insert('One')][$myPQ->Insert('Two')][$myPQ->First]
+        """,
+        context: &context
+    )
+    #expect(output == "One")
+}
+
+@Test func backslashTagReferenceToABuiltInComparatorWorksIdenticallyToTheFreeTagForm() async throws {
+    // Stage 6: real `\Compare_GreaterThan` bareword-reference syntax
+    // (Table 21's own actual documented form) now supported — sibling
+    // test to `priorityQueueGreaterThanComparatorReturnsTheLeastElementFirst`
+    // above, which uses the `(compare_greaterthan)` free-tag stand-in
+    // this codebase shipped in Stage 2 pending this exact parser work.
+    // Same worked example, real syntax this time.
+    var context = LassoContext()
+    let output = try await LassoRenderer().render(
+        """
+        [var('myPQ' = (priorityqueue: \\Compare_GreaterThan))]\
+        [$myPQ->Insert('One')][$myPQ->Insert('Two')][$myPQ->First]
+        """,
+        context: &context
+    )
+    #expect(output == "One")
+}
+
+@Test func backslashTagReferenceToAnUndefinedTagThrows() async throws {
+    var context = LassoContext()
+    await #expect(throws: LassoRuntimeError.unknownFunction("NoSuchTagAtAll")) {
+        _ = try await LassoRenderer().render("[\\NoSuchTagAtAll]", context: &context)
+    }
+}
+
+@Test func backslashTagReferenceToACustomDefinedTagIsValidButNotYetDispatchedAsAComparator() async throws {
+    // A `\TagName` reference to a real, user-`Define_Tag`'d custom tag
+    // must be accepted (it names something real) but, per this stage's
+    // own disclosed scope limit (`TagReference.swift`'s doc comment),
+    // does NOT yet dispatch as a real comparator when passed to
+    // PriorityQueue's constructor — falls back to the exact same
+    // "unrecognized comparator value" natural-order behavior any other
+    // non-comparator argument already gets. Proves this degrades
+    // gracefully (no crash, no silently-wrong-but-plausible ordering
+    // claim) rather than being asserted only by doc comment.
+    var context = LassoContext()
+    let output = try await LassoRenderer().render(
+        """
+        [
+        Define_Tag('MyComparator', -Required='Left', -Required='Right');
+            Return(-1);
+        /Define_Tag;
+        var('myPQ' = (priorityqueue: \\MyComparator));
+        $myPQ->Insert('Two');
+        $myPQ->Insert('One');
+        ]\
+        [$myPQ->First]|[$myPQ->Size]
+        """,
+        context: &context
+    )
+    #expect(output == "Two|2")
+}
+
+@Test func backslashTagReferenceToACustomDefinedTypeIsValidNotJustCustomTags() async throws {
+    // Regression test for a real bug architect review found: the
+    // `.tagReference` existence guard originally checked
+    // `context.natives.contains`/`context.tagRegistry.containsTag`/
+    // `context.nativeTypes.containsType` — but `context.nativeTypes`
+    // only covers BUILT-IN types; a genuinely `Define_Type`-defined
+    // custom type lives in `context.tagRegistry`'s own separate `types`
+    // dictionary (`containsType(named:)`), which the guard omitted
+    // entirely. `\MyCustomType` on a real, defined custom type
+    // incorrectly threw `unknownFunction` — worse than the disclosed
+    // "valid reference, not yet dispatched" behavior `\MyCustomTag`
+    // already gets above. This matters concretely, not just for
+    // completeness: Ch. 30 p.420 documents custom comparators as
+    // buildable "as custom tags or as custom types by overriding the
+    // onCompare callback tag" — `\MyComparatorType` is a real,
+    // documented shape. Must not throw.
+    var context = LassoContext()
+    let output = try await LassoRenderer().render(
+        """
+        [
+        Define_Type('MyComparatorType');
+        /Define_Type;
+        var('ref' = \\MyComparatorType);
+        ]OK
+        """,
+        context: &context
+    )
+    #expect(output == "OK")
+}
+
+@Test func priorityQueueGetPopsTheGreatestElementMatchingTheGuidesTwoThenOneResult() async throws {
+    // Ch. 30 p.406-407: same disclosed atomic-`->Get` pattern as Queue/
+    // Stack — pops "Two" (the current greatest), leaving size 1.
+    var context = LassoContext()
+    let output = try await LassoRenderer().render(
+        """
+        [var('myPQ' = priorityqueue)][$myPQ->Insert('One')][$myPQ->Insert('Two')]\
+        [$myPQ->Get]|[$myPQ->Size]
+        """,
+        context: &context
+    )
+    #expect(output == "Two|1")
+}
+
+@Test func comparatorDirectCallReturnsZeroForAValidComparisonAndNegativeOneOtherwise() async throws {
+    // Table 21's own Note: "Comparators do not return True or False...
+    // A valid comparison is signaled by the return value of 0."
+    var context = LassoContext()
+    let output = try await LassoRenderer().render(
+        "[(compare_lessthan: 1, 2)]|[(compare_lessthan: 2, 1)]|[(compare_greaterthan: 2, 1)]",
+        context: &context
+    )
+    #expect(output == "0|-1|0")
+}
+
+@Test func arraySortWithMatchesTheGuidesAscendingWorkedExampleAndTheMathematicallyCorrectDescendingOrder() async throws {
+    // Ch. 30 p.419-420: sorting `(aaa,bbb,ccc,aa,a,b,c,bb,cc)` with
+    // `\Compare_LessThan` → ascending, matching the Guide's own worked
+    // example exactly: `a,aa,aaa,b,bb,bbb,c,cc,ccc`.
+    //
+    // The Guide's PAIRED `\Compare_GreaterThan` example, however, shows
+    // `aaa,aa,a,bbb,bb,b,ccc,cc,c` — which is NOT the reverse of its own
+    // ascending example (`ccc,cc,c,bbb,bb,b,aaa,aa,a`), even though
+    // GreaterThan is documented as the direct opposite of LessThan
+    // ("Sorts...with higher values first") and both examples sort the
+    // exact same 9-element array. Verified this isn't a `pdftotext`
+    // extraction artifact (checked with and without `-layout`). Since a
+    // real descending sort must be a true reversal of the corresponding
+    // ascending sort — sorting by `>` is definitionally the reverse of
+    // sorting by `<` — the Guide's own paired example is internally
+    // self-contradictory, matching this project's other found-and-
+    // rejected PDF defects (Math_Div, Bytes->Contains, Set's per-
+    // element-parens inconsistency). This test asserts the
+    // mathematically correct reversal instead of the apparently-
+    // mistranscribed PDF text.
+    var context = LassoContext()
+    let output = try await LassoRenderer().render(
+        """
+        [var('arr' = array('aaa','bbb','ccc','aa','a','b','c','bb','cc'))]\
+        [$arr->SortWith(compare_lessthan)][$arr->Join(',')]|\
+        [var('arr2' = array('aaa','bbb','ccc','aa','a','b','c','bb','cc'))]\
+        [$arr2->SortWith(compare_greaterthan)][$arr2->Join(',')]
+        """,
+        context: &context
+    )
+    #expect(output == "a,aa,aaa,b,bb,bbb,c,cc,ccc|ccc,cc,c,bbb,bb,b,aaa,aa,a")
+}
+
+@Test func listSortWithOrdersElementsByTheGivenComparator() async throws {
+    var context = LassoContext()
+    let output = try await LassoRenderer().render(
+        """
+        [var('myList' = (list: 'bb', 'a', 'ccc'))][$myList->SortWith(compare_lessthan)]\
+        [string($myList)]
+        """,
+        context: &context
+    )
+    #expect(output == "List: a, bb, ccc")
+}
+
+@Test func arraySortWithDispatchesARealCustomComparatorTagBody() async throws {
+    // Stage 7c: Array->SortWith with a genuine custom (`\TagName`-
+    // referenced) comparator now actually sorts by the tag's own
+    // return value, via the hand-rolled async merge sort — not just
+    // the built-in-comparator path. `ReverseOrder` hand-implements the
+    // same descending order `\Compare_GreaterThan` gives, independently
+    // confirming the sort algorithm itself (not just single-comparison
+    // dispatch, already proven by Stage 7b's Match_Comparator tests).
+    var context = LassoContext()
+    let output = try await LassoRenderer().render(
+        """
+        [
+        Define_Tag('ReverseOrder', -Required='Left', -Required='Right');
+            Return((Local: 'Left') > (Local: 'Right') ? 0 | -1);
+        /Define_Tag;
+        var('arr' = array(3, 1, 4, 1, 5, 9, 2, 6));
+        ]\
+        [$arr->SortWith(\\ReverseOrder)][$arr->Join(',')]
+        """,
+        context: &context
+    )
+    #expect(output == "9,6,5,4,3,2,1,1")
+}
+
+@Test func listSortWithDispatchesARealCustomComparatorTagBody() async throws {
+    var context = LassoContext()
+    let output = try await LassoRenderer().render(
+        """
+        [
+        Define_Tag('ReverseOrder', -Required='Left', -Required='Right');
+            Return((Local: 'Left') > (Local: 'Right') ? 0 | -1);
+        /Define_Tag;
+        var('myList' = (list: 'bb', 'a', 'ccc'));
+        ]\
+        [$myList->SortWith(\\ReverseOrder)][string($myList)]
+        """,
+        context: &context
+    )
+    #expect(output == "List: ccc, bb, a")
+}
+
+@Test func arraySortWithCustomComparatorIsStableForTiedElements() async throws {
+    // A custom comparator that only distinguishes by even/odd leaves
+    // genuine ties (both parity groups have more than one element) —
+    // the merge sort must preserve each tied group's original relative
+    // order, matching Swift's own `sorted(by:)` stability guarantee
+    // the pre-existing sync path already relies on. Uses `%`/`<` on
+    // plain NUMBERS deliberately, not strings — the raw `<` operator
+    // has an unrelated, real, pre-existing bug for non-numeric (string)
+    // operands, spawned as its own separate follow-up task, out of
+    // scope here.
+    var context = LassoContext()
+    let output = try await LassoRenderer().render(
+        """
+        [
+        Define_Tag('ByParity', -Required='Left', -Required='Right');
+            Return((Local: 'Left') % 2 < (Local: 'Right') % 2 ? 0 | -1);
+        /Define_Tag;
+        var('arr' = array(3, 4, 1, 6));
+        ]\
+        [$arr->SortWith(\\ByParity)][$arr->Join(',')]
+        """,
+        context: &context
+    )
+    #expect(output == "4,6,3,1")
+}
+
+@Test func listSortWithCustomComparatorIsStableForTiedElements() async throws {
+    // Sibling to the Array test above — both routes share the same
+    // `LassoComparatorValue.sortedByCustomComparator`, but List's own
+    // `->SortWith` registration is a separate call site (`Collections.swift`)
+    // worth its own direct proof, not just inferred from Array's.
+    var context = LassoContext()
+    let output = try await LassoRenderer().render(
+        """
+        [
+        Define_Tag('ByParity', -Required='Left', -Required='Right');
+            Return((Local: 'Left') % 2 < (Local: 'Right') % 2 ? 0 | -1);
+        /Define_Tag;
+        var('myList' = (list: 3, 4, 1, 6));
+        ]\
+        [$myList->SortWith(\\ByParity)][string($myList)]
+        """,
+        context: &context
+    )
+    #expect(output == "List: 4, 6, 3, 1")
+}
+
+@Test func treeMapFindKeysValuesGetAndAutoStringMatchTheDaysOfWeekWorkedExample() async throws {
+    // Ch. 30 pp.417-418: the DaysOfWeek worked example, verified across
+    // ->Find (by key), ->Keys/->Values (sorted-by-key order, same
+    // precedent as Map), ->Get(n) (1-based pair-by-position), and
+    // auto-stringification (`(key)=(value)` pairs — this codebase
+    // doesn't reproduce the PDF's own extra OUTER wrapping parens seen
+    // on `[Variable: 'DaysOfWeek']`'s specific bare-tag output, treated
+    // as that display tag's own formatting rather than part of
+    // TreeMap's `outputString` contract — verified via `string(...)`
+    // instead, matching this file's own established List/Queue/Stack
+    // convention).
+    var context = LassoContext()
+    let output = try await LassoRenderer().render(
+        """
+        [var('DaysOfWeek' = (treemap: 1='Sunday', 2='Monday', 3='Tuesday', 4='Wednesday', \
+        5='Thursday', 6='Friday', 7='Saturday'))]\
+        [$DaysOfWeek->Find(2)]|[$DaysOfWeek->Find(4)]|[$DaysOfWeek->Find(6)]|\
+        [$DaysOfWeek->Keys->Join(',')]|[$DaysOfWeek->Values->Join(',')]|\
+        [$DaysOfWeek->Get(1)->First]=[$DaysOfWeek->Get(1)->Second]|\
+        [string($DaysOfWeek)]
+        """,
+        context: &context
+    )
+    #expect(output == """
+    Monday|Wednesday|Friday|1,2,3,4,5,6,7|Sunday,Monday,Tuesday,Wednesday,Thursday,Friday,Saturday|1=Sunday|\
+    TreeMap: (1)=(Sunday), (2)=(Monday), (3)=(Tuesday), (4)=(Wednesday), (5)=(Thursday), (6)=(Friday), (7)=(Saturday)
+    """)
+}
+
+@Test func treeMapInsertAddsANewKeyAndReplacesAnExistingOneMatchingTheGuidesExtraSaturdayExample() async throws {
+    // Ch. 30 p.418: `->Insert(8='Extra Saturday')` adds a new entry
+    // (confirmed via `->Find(8)`), then `->Insert(8='Extra Sabado')`
+    // REPLACES it rather than adding a duplicate (Tree maps "can only
+    // store one value per key").
+    var context = LassoContext()
+    let output = try await LassoRenderer().render(
+        """
+        [var('DaysOfWeek' = treemap)][$DaysOfWeek->Insert(8='Extra Saturday')]\
+        [$DaysOfWeek->Find(8)]|[$DaysOfWeek->Size]|\
+        [$DaysOfWeek->Insert(8='Extra Sabado')][$DaysOfWeek->Find(8)]|[$DaysOfWeek->Size]
+        """,
+        context: &context
+    )
+    #expect(output == "Extra Saturday|1|Extra Sabado|1")
+}
+
+@Test func treeMapRemoveDeletesByKeyMatchingTheGuidesWorkedExample() async throws {
+    // Ch. 30 p.418: `$DaysOfWeek->(Remove: 8)` removes the Extra
+    // Sabado entry added above.
+    var context = LassoContext()
+    let output = try await LassoRenderer().render(
+        """
+        [var('DaysOfWeek' = treemap)][$DaysOfWeek->Insert(8='Extra Sabado')][$DaysOfWeek->Size]|\
+        [$DaysOfWeek->Remove(8)][$DaysOfWeek->Size]|[$DaysOfWeek->Find(8)]
+        """,
+        context: &context
+    )
+    #expect(output == "1|0|")
+}
+
+@Test func treeMapPreservesRealKeyTypesUnlikeMapWhichStringCoercesEveryKey() async throws {
+    // Ch. 30 p.416: "The keys in a tree map can be any Lasso data type.
+    // In a simple map all keys are converted to string values" — the
+    // real, documented distinction this stage's own architectural
+    // exception (`->Insert` special-cased in `Evaluator.member`,
+    // bypassing the generic `.object` dispatch's argument-pre-
+    // evaluation that would otherwise collapse the key to a `String`
+    // label) exists specifically to preserve. An ARRAY key is the
+    // clearest possible proof this actually works: if the key had been
+    // silently stringified, looking it back up with an equal-but-
+    // distinct array instance could never succeed. Real corpus
+    // precedent for array-valued map entries: Ch. 30 p.400's own
+    // `[Map: (Array: 1, 5) = (Array: 1, 2, 3, 4, 5), ...]` example.
+    var context = LassoContext()
+    let output = try await LassoRenderer().render(
+        """
+        [var('tm' = treemap)][$tm->Insert((array(1, 5))=(array(1, 2, 3, 4, 5)))]\
+        [$tm->Find(array(1, 5))->Join(',')]
+        """,
+        context: &context
+    )
+    #expect(output == "1,2,3,4,5")
+}
+
+@Test func treeMapArrayKeysThatCollideUnderOutputStringConcatenationStayDistinct() async throws {
+    // Regression test for a real bug code review found: `.array`'s own
+    // `outputString` is a bare no-separator concatenation
+    // (`Runtime.swift`'s `LassoValue.outputString`), so DISTINCT arrays
+    // like `(1, 23)` and `(12, 3)` both stringify to `"123"`. The
+    // ORIGINAL key-comparison implementation routed every TreeMap key
+    // comparison through that same lossy `outputString`-based equality
+    // (`LassoCollectionValue.equals`, shared with List/Set/Queue/
+    // Stack's own element comparisons) — which would have silently
+    // collapsed these two keys into one entry (`->Insert`'s second call
+    // "replacing" the first instead of adding a second), exactly
+    // contradicting TreeMap's headline distinction from Map. Fixed via
+    // `LassoTreeMapValue.keysEqual`, which uses real structural
+    // `Equatable` comparison for compound-type keys instead. Without
+    // that fix this test would see `->Size` report `1`, not `2`, and
+    // `->Find(array(1, 23))` would return `'B'` (the second insert's
+    // value) instead of `'A'`.
+    var context = LassoContext()
+    let output = try await LassoRenderer().render(
+        """
+        [var('tm' = treemap)][$tm->Insert((array(1, 23))='A')][$tm->Insert((array(12, 3))='B')]\
+        [$tm->Size]|[$tm->Find(array(1, 23))]|[$tm->Find(array(12, 3))]
+        """,
+        context: &context
+    )
+    #expect(output == "2|A|B")
+}
+
+@Test func treeMapRemoveAllWithLiteralKeyDoesNotCollideOnOutputStringConcatenation() async throws {
+    // Sibling regression test to the one above, for `->RemoveAll`
+    // specifically: code review found `removingAllMatchingKey` routed a
+    // plain literal key through `LassoMatcherValue.matches`'s own
+    // generic fallback (`LassoCollectionValue.equals`, lossy
+    // `outputString`-based), bypassing `keysEqual` entirely and
+    // reintroducing the exact collision the `->Insert`/`->Find` fix
+    // above already closed. `RemoveAll((array(1,23)))` must remove only
+    // that one key, leaving `(array(12,3))` untouched.
+    var context = LassoContext()
+    let output = try await LassoRenderer().render(
+        """
+        [var('tm' = treemap)][$tm->Insert((array(1, 23))='A')][$tm->Insert((array(12, 3))='B')]\
+        [$tm->RemoveAll(array(1, 23))][$tm->Size]|[$tm->Find(array(12, 3))]
+        """,
+        context: &context
+    )
+    #expect(output == "1|B")
+}
+
+@Test func treeMapConstructorAlsoPreservesRealKeyTypesNotJustInsert() async throws {
+    // Same proof as the `->Insert`-path test above, but for the
+    // CONSTRUCTOR form itself (`treemap(key=value, ...)`, Table 19's
+    // own documented shape) — architect review flagged that an earlier
+    // version of this fix covered `->Insert`/`->Find`/`->Remove`/
+    // `->RemoveAll` (special-cased in `Evaluator.member`) but left the
+    // constructor going through the same label-collapsing generic
+    // `.call` dispatch those methods were pulled out of, silently
+    // defeating "any Lasso data type" keys for anything typed directly
+    // into a `treemap(...)` call. Now special-cased in `Evaluator
+    // .evaluate`'s `.call` case via `evaluateTreeMapConstructorCall`.
+    // An array key (not just an integer, whose `outputString` happens
+    // to coincidentally match its would-be string label) is the
+    // meaningful proof here too.
+    var context = LassoContext()
+    let output = try await LassoRenderer().render(
+        "[(treemap: (array(1, 5))=(array(1, 2, 3, 4, 5)))->Find(array(1, 5))->Join(',')]",
+        context: &context
+    )
+    #expect(output == "1,2,3,4,5")
+}
+
+@Test func treeMapConstructorAcceptsALeadingComparatorArgument() async throws {
+    // This project's own extrapolation of the Guide's intro text ("the
+    // keys in a tree map can be sorted using a comparator which is
+    // provided when the tree map is created", p.416) — no directly-
+    // cited worked example, so this test verifies the CODE's own
+    // documented behavior (a leading non-pair argument sets the sort
+    // comparator) rather than a primary-source citation. `->Keys` order
+    // with `Compare_GreaterThan` should be descending, not ascending.
+    var context = LassoContext()
+    let output = try await LassoRenderer().render(
+        "[(treemap: (compare_greaterthan), 1='One', 2='Two', 3='Three')->Keys->Join(',')]",
+        context: &context
+    )
+    #expect(output == "3,2,1")
+}
+
+@Test func mapGetReturnsAPairByPositionInTheSameSortedOrderAsKeysAndValues() async throws {
+    // Ch. 30 p.402: "[Map->Get] Returns a pair from the map by integer
+    // position" — using this codebase's existing sorted-by-key
+    // precedent already established for `->Keys`/`->Values`, so
+    // `Get(n)->First` really does correspond to `Keys[n]`.
+    var context = LassoContext()
+    let output = try await LassoRenderer().render(
+        """
+        [var('m' = map(3='Three', 1='One', 2='Two'))]\
+        [$m->Get(1)->First]=[$m->Get(1)->Second]|\
+        [$m->Get(2)->First]=[$m->Get(2)->Second]|\
+        [$m->Get(3)->First]=[$m->Get(3)->Second]
+        """,
+        context: &context
+    )
+    #expect(output == "1=One|2=Two|3=Three")
+}
+
+@Test func iteratorWalksAnArrayForwardMatchingTheGuidesOwnWhileLoopWorkedExample() async throws {
+    // Ch. 30 p.423: `Var('myIterator' = Iterator($myArray))` then a
+    // `While($myIterator->atEnd == False)` loop outputting `->Value`
+    // and advancing via `->Forward` — reproduction of the Guide's own
+    // four-element example. The Guide's own idiom is `Null:
+    // $myIterator->Forward` to suppress `->Forward`'s own boolean
+    // return value — found, while writing this test, to be completely
+    // unreachable in this codebase (`"null"` is hardcoded as the
+    // literal `.null` VALUE token at parse time, never as a callable
+    // identifier — confirmed via a minimal repro, flagged as a
+    // separate out-of-scope follow-up). `[var('_' = ...)]` is used
+    // instead — an assignment's own return is already void/undisplayed
+    // via this codebase's existing, unrelated `Var` handling, achieving
+    // the identical suppression effect through a mechanism that
+    // actually works.
+    var context = LassoContext()
+    let output = try await LassoRenderer().render(
+        """
+        [var('myArray' = array('One', 'Two', 'Three', 'Four'))]\
+        [var('myIterator' = iterator($myArray))]\
+        [while($myIterator->atEnd == false)]\
+        [$myIterator->Value] [var('_' = $myIterator->Forward)][/while]
+        """,
+        context: &context
+    )
+    #expect(output == "One Two Three Four ")
+}
+
+@Test func reverseIteratorWalksAnArrayBackwardMatchingTheGuidesOwnWorkedExample() async throws {
+    // Ch. 30 pp.424-425: identical loop, but `ReverseIterator` instead
+    // of `Iterator` — outputs Four, Three, Two, One.
+    var context = LassoContext()
+    let output = try await LassoRenderer().render(
+        """
+        [var('myArray' = array('One', 'Two', 'Three', 'Four'))]\
+        [var('myIterator' = reverseiterator($myArray))]\
+        [while($myIterator->atEnd == false)]\
+        [$myIterator->Value] [var('_' = $myIterator->Forward)][/while]
+        """,
+        context: &context
+    )
+    #expect(output == "Four Three Two One ")
+}
+
+@Test func iteratorOverAMapExposesBothKeyAndValueMatchingTheGuidesOwnWorkedExample() async throws {
+    // Ch. 30 p.425: same `While`/`atEnd`/`Forward` shape, but reads
+    // `->Key` alongside `->Value` — "1 = Sunday", "2 = Monday", etc.
+    var context = LassoContext()
+    let output = try await LassoRenderer().render(
+        """
+        [var('myMap' = map(1='Sunday', 2='Monday', 3='Tuesday'))]\
+        [var('myIterator' = iterator($myMap))]\
+        [while($myIterator->atEnd == false)]\
+        [$myIterator->Key] = [$myIterator->Value] [var('_' = $myIterator->Forward)][/while]
+        """,
+        context: &context
+    )
+    #expect(output == "1 = Sunday 2 = Monday 3 = Tuesday ")
+}
+
+@Test func iteratorKeyIsNullForNonMapSourcesSinceThereIsNoKeyDefined() async throws {
+    // Table 24: "[Iterator->Key] Returns the key for the current
+    // element IF DEFINED" — array-sourced iterators have no keys.
+    var context = LassoContext()
+    let output = try await LassoRenderer().render(
+        "[var('it' = iterator(array('a', 'b')))][$it->Key]",
+        context: &context
+    )
+    #expect(output == "")
+}
+
+@Test func iteratorAtBeginBackwardAndResetTrackPositionCorrectly() async throws {
+    var context = LassoContext()
+    let output = try await LassoRenderer().render(
+        """
+        [var('it' = iterator(array('a', 'b', 'c')))]\
+        [$it->AtBegin]|[var('_' = $it->Forward)][$it->AtBegin]|[var('_' = $it->Backward)][$it->AtBegin]|\
+        [var('_' = $it->Forward)][var('_' = $it->Forward)][var('_' = $it->Forward)][$it->AtEnd]|\
+        [var('_' = $it->Reset)][$it->AtBegin][$it->Value]
+        """,
+        context: &context
+    )
+    #expect(output == "true|false|true|true|truea")
+}
+
+@Test func iteratorLeftRightUpDownAlwaysNoOpAndTheirAtTagsAlwaysReportTrue() async throws {
+    // Ch. 30 p.424, verbatim: "The left/right and up/down tags will
+    // return False if a move is attempted and the test tags will
+    // return True since moving in that dimension is not possible" —
+    // the documented terminal behavior for every built-in type, not a
+    // stub pending future work.
+    var context = LassoContext()
+    let output = try await LassoRenderer().render(
+        """
+        [var('it' = iterator(array('a')))]\
+        [$it->Left]|[$it->Right]|[$it->Up]|[$it->Down]|\
+        [$it->AtFarLeft]|[$it->AtFarRight]|[$it->AtTop]|[$it->AtBottom]
+        """,
+        context: &context
+    )
+    #expect(output == "false|false|false|false|true|true|true|true")
+}
+
+@Test func iteratorRemoveCurrentDeletesTheCurrentElementFromItsOwnSnapshot() async throws {
+    // No worked example exists for `->RemoveCurrent` (see
+    // `Iterator.swift`'s own doc comment) — this test verifies the
+    // implemented behavior (remove, then advance) rather than a
+    // primary-source citation.
+    var context = LassoContext()
+    let output = try await LassoRenderer().render(
+        """
+        [var('it' = iterator(array('a', 'b', 'c')))]\
+        [var('_' = $it->RemoveCurrent)][$it->Value]
+        """,
+        context: &context
+    )
+    #expect(output == "c")
+}
+
+@Test func iteratorInsertAtCurrentInsertsAtTheCurrentPositionInItsOwnSnapshot() async throws {
+    // Same "no worked example" caveat as `->RemoveCurrent` above.
+    var context = LassoContext()
+    let output = try await LassoRenderer().render(
+        """
+        [var('it' = iterator(array('a', 'b', 'c')))]\
+        [var('_' = $it->Forward)][var('_' = $it->InsertAtCurrent('X'))][$it->Value]
+        """,
+        context: &context
+    )
+    #expect(output == "X")
+}
+
+@Test func listSetTreeMapIteratorsMatchTheirOwnCollectionsTraversalOrder() async throws {
+    // Table 23's own "e.g." list names array/list/map/set/treemap as
+    // built-in `->Iterator`-supporting types — this codebase
+    // implements it uniformly across every collection type from
+    // Stages 1-2 instead (see `Iterator.swift`'s own doc comment for
+    // why), but this test focuses on the three Table-23-named compound
+    // types specifically. Set/TreeMap both iterate in their own
+    // natural sorted order (never insertion order).
+    var context = LassoContext()
+    let output = try await LassoRenderer().render(
+        """
+        [var('l' = (list: 'x', 'y'))][var('li' = $l->Iterator)]\
+        [$li->Value][var('_' = $li->Forward)][$li->Value]|\
+        [var('s' = set)][$s->Insert('Beta')][$s->Insert('Alpha')][var('si' = $s->Iterator)]\
+        [$si->Value][var('_' = $si->Forward)][$si->Value]|\
+        [var('tm' = (treemap: 2='Two', 1='One'))][var('tmi' = $tm->Iterator)]\
+        [$tmi->Key]=[$tmi->Value]
+        """,
+        context: &context
+    )
+    #expect(output == "xy|AlphaBeta|1=One")
+}
+
+@Test func queueAndStackIteratorsWalkTheirOwnStoredOrderWithoutMutatingTheSource() async throws {
+    // Not among Table 23's own "e.g." list, but implemented uniformly
+    // (disclosed design choice, see `Iterator.swift`'s own doc
+    // comment) — importantly, unlike `->Get`, obtaining an iterator
+    // must NOT drain the queue/stack (`->Size` stays 2 afterward).
+    var context = LassoContext()
+    let output = try await LassoRenderer().render(
+        """
+        [var('q' = queue)][$q->Insert('One')][$q->Insert('Two')][var('qi' = $q->Iterator)]\
+        [$qi->Value][var('_' = $qi->Forward)][$qi->Value]|[$q->Size]
+        """,
+        context: &context
+    )
+    #expect(output == "OneTwo|2")
+}
+
+@Test func pairFirstAndSecondCanBeUsedAsAssignmentTargetsMatchingTheGuidesOwnWorkedExample() async throws {
+    // Ch. 30 Table 9, p.404: "[Pair->First]/[Pair->Second] ... Can be
+    // used as the left parameter of an assignment operator" — verified
+    // against the Guide's own worked example verbatim: create
+    // `(Pair: 'First_Name'='John')`, set `->First = 'Last_Name'` and
+    // `->Second = 'Doe'`, read back "Last_Name: Doe". `Pair` is a
+    // VALUE-type `LassoValue` case (not `.object`-wrapped) — this only
+    // works via the new recursive rebuild-and-reassign path in
+    // `Evaluator.assign`, not a generic object-field write.
+    var context = LassoContext()
+    let output = try await LassoRenderer().render(
+        """
+        [var('Test_Pair' = (pair: 'First_Name'='John'))]\
+        [$Test_Pair->First = 'Last_Name']\
+        [$Test_Pair->Second = 'Doe']\
+        [$Test_Pair->First] + [$Test_Pair->Second]
+        """,
+        context: &context
+    )
+    #expect(output == "Last_Name + Doe")
+}
+
+@Test func pairSizeAlwaysReturnsTwoAndGetExtractsFirstAndSecondByPosition() async throws {
+    // Ch. 30 p.404 Note: "the [Pair->Size] tag always returns 2 and
+    // [Pair->(Get:1)] and [Pair->(Get:2)] work to extract the first and
+    // second elements from a pair."
+    var context = LassoContext()
+    let output = try await LassoRenderer().render(
+        "[(pair: 'First_Name'='John')->Size]|[(pair: 'First_Name'='John')->Get(1)]|[(pair: 'First_Name'='John')->Get(2)]",
+        context: &context
+    )
+    #expect(output == "2|First_Name|John")
+}
+
+@Test func pairAutoStringifiesAsKeyEqualsValueEachHalfParenthesized() async throws {
+    // Ch. 30 p.404's own worked example: `[Variable: 'Test_Pair']` on
+    // `(Pair: 'First_Name'='John')` → `(Pair: (First_Name)=(John))` —
+    // this codebase reproduces the inner `(key)=(value)` shape (no
+    // surrounding spaces) via `string(...)` rather than the outer
+    // wrapping parens, matching the same established treatment as
+    // `TreeMap`'s own bare-display worked example (see
+    // `LassoValue.outputString`'s `.pair` case doc comment).
+    var context = LassoContext()
+    let output = try await LassoRenderer().render(
+        "[string((pair: 'First_Name'='John'))]",
+        context: &context
+    )
+    #expect(output == "(First_Name)=(John)")
+}
+
+@Test func queueFirstCanBeUsedAsAnAssignmentTargetMatchingTheGuidesOwnWorkedExample() async throws {
+    // Ch. 30 p.409-410: "[Queue->First] returns the first element of
+    // the queue BY REFERENCE so the value of the element can be
+    // changed" — insert One, Two; `->First = 'Three'`; `->First` reads
+    // back "Three". Mutates the `.object`-wrapped Queue's own
+    // `_elements` array in place (front position), no recursive
+    // reassignment needed unlike Pair.
+    var context = LassoContext()
+    let output = try await LassoRenderer().render(
+        """
+        [var('myQueue' = queue)][$myQueue->Insert('One')][$myQueue->Insert('Two')]\
+        [$myQueue->First = 'Three'][$myQueue->First]
+        """,
+        context: &context
+    )
+    #expect(output == "Three")
+}
+
+@Test func stackFirstCanBeUsedAsAnAssignmentTargetMatchingTheGuidesOwnWorkedExample() async throws {
+    // Ch. 30 p.415: same shape as Queue's own worked example above, but
+    // Stack's `->First` reads the LIFO top (`.last`), so `->First=`
+    // must write the LAST element, not the first.
+    var context = LassoContext()
+    let output = try await LassoRenderer().render(
+        """
+        [var('myStack' = stack)][$myStack->Insert('One')][$myStack->Insert('Two')]\
+        [$myStack->First = 'Three'][$myStack->First]
+        """,
+        context: &context
+    )
+    #expect(output == "Three")
+}
+
+@Test func setGetCanBeUsedAsAnAssignmentTargetToOverwriteAPositionInPlace() async throws {
+    // Ch. 30 Table 16: "[Set->Get] ... This tag can be used as the left
+    // parameter of an assignment operator to set an element of the
+    // set." No worked example exists to verify against (see
+    // `Evaluator.assign`'s own doc comment) — this is a direct
+    // positional overwrite, not a re-insert-and-resort, since Table 16
+    // doesn't address how (or whether) sortedness should be maintained
+    // through this path.
+    var context = LassoContext()
+    let output = try await LassoRenderer().render(
+        """
+        [var('mySet' = set)][$mySet->Insert('Alpha')][$mySet->Insert('Beta')][$mySet->Insert('Gamma')]\
+        [$mySet->Get(2) = 'Replaced'][string($mySet)]
+        """,
+        context: &context
+    )
+    #expect(output == "Set: (Alpha), (Replaced), (Gamma)")
+}
+
+@Test func pairHasMethodReportsTrueForSizeAndGetNotJustFirstAndSecond() async throws {
+    // Regression test for a real bug architect review found: adding
+    // real `.pair` dispatch cases for `->Size`/`->Get` to
+    // `Evaluator.member` isn't enough on its own — `->HasMethod`
+    // introspection reads a SEPARATE mirror table
+    // (`primitiveMethodNames["pair"]`) that must be kept in sync by
+    // hand (its own doc comment explicitly warns of exactly this drift
+    // risk). The mirror still listed only `["first", "second"]` after
+    // `->Size`/`->Get` were added, so `->HasMethod` silently
+    // under-reported `false` for two methods that actually worked.
+    var context = LassoContext()
+    let output = try await LassoRenderer().render(
+        """
+        [(pair: 'a'='b')->HasMethod('first')]|[(pair: 'a'='b')->HasMethod('second')]|\
+        [(pair: 'a'='b')->HasMethod('size')]|[(pair: 'a'='b')->HasMethod('get')]|\
+        [(pair: 'a'='b')->HasMethod('nonexistent')]
+        """,
+        context: &context
+    )
+    #expect(output == "true|true|true|true|false")
+}
+
+@Test func mapGetCanBeUsedAsAnAssignmentTargetToOverwriteAValueAtAPosition() async throws {
+    // Cross-checked directly against lassoguide.com's Lasso 9
+    // documentation for `map->get`/`->get=` — that real contract turns
+    // out to be a much bigger redesign than "add a setter" (key-based,
+    // returns a bare value not a pair, fails on a missing key), which
+    // would break the already-shipped, worked-example-verified 8.5
+    // `->Get(n)` behavior (position-based, pair-returning) with no
+    // user sign-off on such a disruptive change. Implemented instead as
+    // the narrower reading: `->Get(n) = value` reassigns the VALUE half
+    // of the pair at that position, same shape as `Set->Get(n)=`. `.map`
+    // is a value type, so this only works via the same recursive
+    // rebuild-and-reassign path `Pair->First=` already established.
+    var context = LassoContext()
+    let output = try await LassoRenderer().render(
+        """
+        [var('m' = map(1='One', 2='Two', 3='Three'))]\
+        [$m->Get(2) = 'Replaced']\
+        [$m->Get(1)->Second]|[$m->Get(2)->Second]|[$m->Get(3)->Second]
+        """,
+        context: &context
+    )
+    #expect(output == "One|Replaced|Three")
+}
+
+@Test func mapGetAssignmentOutOfRangePositionIsANoOp() async throws {
+    var context = LassoContext()
+    let output = try await LassoRenderer().render(
+        """
+        [var('m' = map(1='One'))][$m->Get(99) = 'X'][$m->Get(0) = 'Y']\
+        [$m->Size]|[$m->Get(1)->Second]
+        """,
+        context: &context
+    )
+    #expect(output == "1|One")
+}
+
+@Test func mapGetAssignmentOnANegativePositionOrAnEmptyMapIsAlsoANoOp() async throws {
+    // Widens the out-of-range coverage above per code review's own
+    // nit — a negative position (not just 0/beyond-count) and an
+    // entirely empty map (where `sortedKeys` itself is empty) are
+    // both distinct edge cases worth exercising explicitly rather than
+    // trusting they're covered by inspection alone.
+    var context = LassoContext()
+    let output = try await LassoRenderer().render(
+        """
+        [var('m' = map(1='One'))][$m->Get(-1) = 'X'][$m->Size]|[$m->Get(1)->Second]|\
+        [var('empty' = map)][$empty->Get(1) = 'Y'][$empty->Size]
+        """,
+        context: &context
+    )
+    #expect(output == "1|One|0")
+}
+
+@Test func containsOperatorFixedBugWhereArrayMembershipDegradedToStringConcatenation() async throws {
+    // Regression test for the real, pre-existing bug this stage's own
+    // scoping pass found and fixed: `>>`'s old implementation was pure
+    // `left.outputString.contains(right.outputString)` with no
+    // `.array` branching at all — `(Array: 12, 3) >> 23` would have
+    // false-positived, since the array's own concatenated
+    // `outputString` ("123") coincidentally contains "23" as a
+    // substring even though no element of the array is literally 23.
+    var context = LassoContext()
+    let output = try await LassoRenderer().render(
+        "[(array: 12, 3) >> 23]|[(array: 1, 2, 3, 4, 5, 6, 7) >> 7]",
+        context: &context
+    )
+    #expect(output == "false|true")
+}
+
+@Test func matchRangeAndNotRangeWorkWithTheContainsOperatorMatchingTheGuidesOwnWorkedExamples() async throws {
+    // Ch. 30 p.421: `(Array: 1..7) >> (Match_Range: 1, 4)` → True;
+    // `>> (Match_Range: 8, 10)` → False. Range is inclusive both ends
+    // ("equal to either end-value or within the specified range").
+    var context = LassoContext()
+    let output = try await LassoRenderer().render(
+        """
+        [(array: 1, 2, 3, 4, 5, 6, 7) >> (match_range: 1, 4)]|\
+        [(array: 1, 2, 3, 4, 5, 6, 7) >> (match_range: 8, 10)]|\
+        [(array: 1, 2, 3, 4, 5, 6, 7) >> (match_notrange: 8, 10)]
+        """,
+        context: &context
+    )
+    #expect(output == "true|false|true")
+}
+
+@Test func matchRegExpAndNotRegExpWorkWithTheContainsOperatorMatchingTheGuidesOwnWorkedExamples() async throws {
+    // Ch. 30 p.421: `(Array: 'one','two') >> (Match_RegExp: 'o')` →
+    // True (both contain 'o'); `>> (Match_RegExp: 'f')` → False
+    // (neither word contains an 'f').
+    var context = LassoContext()
+    let output = try await LassoRenderer().render(
+        """
+        [(array: 'one', 'two') >> (match_regexp: 'o')]|\
+        [(array: 'one', 'two') >> (match_regexp: 'f')]|\
+        [(array: 'one', 'two') >> (match_notregexp: 'f')]
+        """,
+        context: &context
+    )
+    #expect(output == "true|false|true")
+}
+
+@Test func matchComparatorRhsAndLhsFormsMatchTheGuidesOwnWorkedExamples() async throws {
+    // Ch. 30 p.421-422, all four worked examples verbatim:
+    // `(Array:1,2,3) >> (Match_Comparator: \Compare_LessThan, -RHS=5)`
+    // → True (every element < 5); `-LHS=5` → False (5 is not less than
+    // any of 1,2,3); `\Compare_EqualTo, -RHS=3` → True (array contains
+    // 3); `\Compare_StrictEqualTo, -RHS='3'` → False (no element is
+    // strictly, type-wise, equal to the STRING '3').
+    var context = LassoContext()
+    let output = try await LassoRenderer().render(
+        """
+        [(array: 1, 2, 3) >> (match_comparator: (compare_lessthan), -rhs=5)]|\
+        [(array: 1, 2, 3) >> (match_comparator: (compare_lessthan), -lhs=5)]|\
+        [(array: 1, 2, 3) >> (match_comparator: (compare_equalto), -rhs=3)]|\
+        [(array: 1, 2, 3) >> (match_comparator: (compare_strictequalto), -rhs='3')]
+        """,
+        context: &context
+    )
+    #expect(output == "true|false|true|false")
+}
+
+@Test func removeAllWithMatchRangeMatchRegExpAndMatchComparatorMatchTheGuidesOwnWorkedExamples() async throws {
+    // Ch. 30 p.421-422, all three ->RemoveAll-with-a-matcher worked
+    // examples: `Match_Range(2,4)` on `(1..7)` leaves `(1,5,6,7)`;
+    // `Match_RegExp('\bT')` removes weekday names starting with T;
+    // `Match_Comparator(\Compare_LessThan, -RHS=5)` on `(1..7)` leaves
+    // `(5,6,7)`.
+    var context = LassoContext()
+    let output = try await LassoRenderer().render(
+        """
+        [var('a' = array(1, 2, 3, 4, 5, 6, 7))][$a->RemoveAll(match_range(2, 4))][$a->Join(',')]|\
+        [var('days' = array('Monday', 'Tuesday', 'Wednesday', 'Thursday', 'Friday'))]\
+        [$days->RemoveAll(match_regexp('\\\\bT'))][$days->Join(',')]|\
+        [var('b' = array(1, 2, 3, 4, 5, 6, 7))]\
+        [$b->RemoveAll(match_comparator((compare_lessthan), -rhs=5))][$b->Join(',')]
+        """,
+        context: &context
+    )
+    #expect(output == "1,5,6,7|Monday,Wednesday,Friday|5,6,7")
+}
+
+@Test func matchComparatorDispatchesARealCustomTagBodyNotJustBuiltIns() async throws {
+    // Stage 7b: `Match_Comparator` wrapping a `\TagName` reference to a
+    // genuine user-`Define_Tag`'d comparator now actually RUNS that
+    // tag's own body (via LassoTagInvocationService, Stage 7a) rather
+    // than falling back to "unrecognized comparator" behavior. `IsEven`
+    // ignores its `-RHS`/`-LHS` operand entirely and only inspects
+    // `Left` — proves real per-element dispatch, not a fixed/cached
+    // result, since different elements must genuinely produce different
+    // outcomes.
+    var context = LassoContext()
+    let output = try await LassoRenderer().render(
+        """
+        [
+        Define_Tag('IsEven', -Required='Left', -Required='Right');
+            Return((Local: 'Left') % 2 == 0 ? 0 | -1);
+        /Define_Tag;
+        var('a' = array(1, 2, 3, 4, 5));
+        ]\
+        [(array: 1, 2, 3, 4, 5) >> (match_comparator: \\IsEven)]|\
+        [$a->Contains(match_comparator(\\IsEven))]|\
+        [var('found' = $a->Find(match_comparator(\\IsEven)))][$found->Join(',')]|\
+        [$a->RemoveAll(match_comparator(\\IsEven))][$a->Join(',')]
+        """,
+        context: &context
+    )
+    #expect(output == "true|true|2,4|1,3,5")
+}
+
+@Test func matchComparatorCustomDispatchHonorsRhsAndLhsFormsLikeBuiltIns() async throws {
+    // Same -RHS/-LHS asymmetry the built-in-comparator worked example
+    // proves (matchComparatorRhsAndLhsFormsMatchTheGuidesOwnWorkedExamples
+    // above), but for a genuine custom tag: `IsLessThan` mirrors
+    // \Compare_LessThan's own semantics by hand, confirming -RHS means
+    // evaluate(element, RHS) and -LHS means evaluate(LHS, element) for
+    // a REAL dispatched tag body too, not just the built-in path.
+    var context = LassoContext()
+    let output = try await LassoRenderer().render(
+        """
+        [
+        Define_Tag('IsLessThan', -Required='Left', -Required='Right');
+            Return((Local: 'Left') < (Local: 'Right') ? 0 | -1);
+        /Define_Tag;
+        ]\
+        [(array: 1, 2, 3) >> (match_comparator: \\IsLessThan, -rhs=5)]|\
+        [(array: 1, 2, 3) >> (match_comparator: \\IsLessThan, -lhs=5)]
+        """,
+        context: &context
+    )
+    #expect(output == "true|false")
+}
+
+@Test func matchComparatorCustomDispatchOnAnEmptyCollectionNeverInvokesTheTag() async throws {
+    // No element means the comparator tag body never runs at all — not
+    // "runs zero times but somehow still returns a sane default,"
+    // genuinely never invoked. Uses a comparator that would throw if
+    // ever actually called, so a wrong invocation would fail the test
+    // rather than silently passing.
+    var context = LassoContext()
+    let output = try await LassoRenderer().render(
+        """
+        [
+        Define_Tag('AlwaysThrows', -Required='Left', -Required='Right');
+            NoSuchTagAtAll();
+        /Define_Tag;
+        var('empty' = array);
+        ]\
+        [$empty->Contains(match_comparator(\\AlwaysThrows))]
+        """,
+        context: &context
+    )
+    #expect(output == "false")
+}
+
+@Test func matchComparatorCustomDispatchPropagatesAnErrorThrownInsideTheTagBody() async throws {
+    // A custom comparator tag that itself throws mid-evaluation must
+    // abort the whole ->Contains/->Find/->RemoveAll/`>>` operation, not
+    // get silently swallowed or treated as "no match."
+    var context = LassoContext()
+    await #expect(throws: LassoRuntimeError.unknownFunction("NoSuchTagAtAll")) {
+        _ = try await LassoRenderer().render(
+            """
+            [
+            Define_Tag('Broken', -Required='Left', -Required='Right');
+                NoSuchTagAtAll();
+            /Define_Tag;
+            ]\
+            [(array: 1, 2, 3) >> (match_comparator: \\Broken)]
+            """,
+            context: &context
+        )
+    }
+}
+
+@Test func matchComparatorCustomDispatchWithTooFewDeclaredArgumentsThrowsArityMismatch() async throws {
+    // A comparator tag declaring MORE required parameters than the
+    // fixed [left, right] this dispatch path always supplies must fail
+    // loudly (LassoTagInvocationService's own disclosed scope limit —
+    // no default-parameter-expression evaluation), not silently bind a
+    // wrong/missing value.
+    var context = LassoContext()
+    await #expect(throws: LassoRuntimeError.tagInvocationArityMismatch("NeedsThree")) {
+        _ = try await LassoRenderer().render(
+            """
+            [
+            Define_Tag('NeedsThree', -Required='Left', -Required='Right', -Required='Extra');
+                Return(-1);
+            /Define_Tag;
+            ]\
+            [(array: 1, 2, 3) >> (match_comparator: \\NeedsThree)]
+            """,
+            context: &context
+        )
+    }
+}
+
+@Test func iteratorWithAMatcherFiltersElementsMatchingTheGuidesOwnWorkedExample() async throws {
+    // Ch. 30 p.426: `Iterator($myArray, (Match_Range: 'a', 'm'))` on
+    // `('One','Two','Three','Four')` — the Guide's own stated result
+    // is "Four" alone, taken as ground truth rather than re-derived.
+    var context = LassoContext()
+    let output = try await LassoRenderer().render(
+        """
+        [var('myArray' = array('One', 'Two', 'Three', 'Four'))]\
+        [var('myIterator' = iterator($myArray, (match_range: 'a', 'm')))]\
+        [while($myIterator->atEnd == false)]\
+        [$myIterator->Value] [var('_' = $myIterator->Forward)][/while]
+        """,
+        context: &context
+    )
+    #expect(output == "Four ")
+}
+
+@Test func listAndSetContainsAndRemoveAllAreMatcherAwareTooNotJustArray() async throws {
+    // Not a Table-22-specific worked example (those all use Array),
+    // but Table 22's own intro says Matchers work "with the
+    // […->Iterator], […->RemoveAll]" tags "of a compound data type" —
+    // generically, not Array-only — this test verifies List/Set's own
+    // already-existing ->Contains/->RemoveAll actually got the same
+    // extension, not just Array's.
+    var context = LassoContext()
+    let output = try await LassoRenderer().render(
+        """
+        [var('l' = (list: 1, 2, 3, 4, 5))][$l->Contains(match_range(2, 4))]|\
+        [$l->RemoveAll(match_range(2, 4))][$l->Join(',')]|\
+        [var('s' = set)][$s->Insert('one')][$s->Insert('two')]\
+        [$s->Contains(match_regexp('o'))]|[$s->RemoveAll(match_regexp('o'))][string($s)]
+        """,
+        context: &context
+    )
+    #expect(output == "true|1,5|true|Set: ")
+}
+
+@Test func tagInvocationServiceInvokesADefinedTagWithPositionalArguments() async throws {
+    // Direct Swift-level test of the new `LassoTagInvocationService`
+    // plumbing (Providers.swift/Renderer.swift) — nothing in Lasso
+    // source can reach it yet (no comparator/matcher dispatch wired to
+    // it in this pass), so this exercises it the only way currently
+    // possible: define a tag via a real render (populating
+    // context.tagRegistry AND wiring context.tagInvocationService via
+    // RendererEngine.init), then invoke it directly with pre-evaluated
+    // positional arguments, bypassing Evaluator.invokeCustomTag's own
+    // AST-argument-evaluation path entirely.
+    var context = LassoContext()
+    _ = try await LassoRenderer().render(
+        """
+        [
+        Define_Tag('AddTwo', -Required='A', -Required='B');
+            Return((Local: 'A') + (Local: 'B'));
+        /Define_Tag;
+        ]
+        """,
+        context: &context
+    )
+    let definition = try #require(context.tagRegistry.tag(named: "AddTwo"))
+    let service = try #require(context.tagInvocationService)
+    let result = try await service.invoke(definition, positionalArguments: [.integer(3), .integer(4)], context: &context)
+    #expect(result == .integer(7))
+}
+
+@Test func tagInvocationServiceThrowsOnArityMismatchRatherThanSilentlyDefaulting() async throws {
+    // Deliberate scope limit (see LassoTagInvocationService's own doc
+    // comment): unlike Evaluator.invokeCustomTag's general call-site
+    // binding, this narrower path does not evaluate default-parameter
+    // expressions — supplying fewer positional arguments than the
+    // definition declares must fail loudly, not silently bind the
+    // missing parameter to .null or some other default.
+    var context = LassoContext()
+    _ = try await LassoRenderer().render(
+        """
+        [
+        Define_Tag('NeedsTwo', -Required='A', -Required='B');
+            Return((Local: 'A') + (Local: 'B'));
+        /Define_Tag;
+        ]
+        """,
+        context: &context
+    )
+    let definition = try #require(context.tagRegistry.tag(named: "NeedsTwo"))
+    let service = try #require(context.tagInvocationService)
+    await #expect(throws: LassoRuntimeError.tagInvocationArityMismatch("NeedsTwo")) {
+        _ = try await service.invoke(definition, positionalArguments: [.integer(3)], context: &context)
+    }
+}
+
+@Test func tagInvocationServiceRestoresCallerLocalsAfterInvocation() async throws {
+    // The narrower invoker must still honor the same fresh-local-scope
+    // isolation Evaluator.invokeCustomTag provides — a called tag's own
+    // #locals must not leak into or clobber the caller's. Sets the
+    // "before" local directly via `LassoContext.set(...)` (Swift-level)
+    // rather than through a rendered `Local(...)` statement, since this
+    // is testing the invocation SERVICE's own scope isolation, not
+    // Lasso-source parsing.
+    var context = LassoContext()
+    _ = try await LassoRenderer().render(
+        """
+        [
+        Define_Tag('SetLocal');
+            Local('untouched' = 'inside');
+            Return('done');
+        /Define_Tag;
+        ]
+        """,
+        context: &context
+    )
+    context.set(.string("before"), for: "untouched", scope: .local)
+    let definition = try #require(context.tagRegistry.tag(named: "SetLocal"))
+    let service = try #require(context.tagInvocationService)
+    let result = try await service.invoke(definition, positionalArguments: [], context: &context)
+    #expect(result == .string("done"))
+    #expect(context.value(for: "untouched", scope: .local) == .string("before"))
+}
+
+@Test func tagInvocationServiceDoesNotDriftBindingsWhenAParameterNameIsUnresolvable() async throws {
+    // Regression test for a real gap code review found: the binding
+    // loop originally used its `enumerated()` loop index directly into
+    // `positionalArguments`, rather than a separate counter that only
+    // advances on an actual bind (matching Evaluator.bindParameters's
+    // own defensive shape). A declared parameter whose name can't be
+    // resolved (unreachable for well-formed `-Required=`/`-Optional=`
+    // declarations, but structurally legal — e.g. a bare literal) would
+    // have silently shifted every SUBSEQUENT parameter's binding one
+    // position off, a wrong-value bug that wouldn't throw. Simulates
+    // that shape directly by prepending a nameless parameter
+    // (`LassoMethodDispatcher.parameterMetadata` only resolves a name
+    // for identifier/string/variable/`::`-typed shapes, so a bare
+    // integer literal parameter resolves to `name == nil`) ahead of two
+    // real, named parameters.
+    var context = LassoContext()
+    _ = try await LassoRenderer().render(
+        """
+        [
+        Define_Tag('AddTwo', -Required='A', -Required='B');
+            Return((Local: 'A') + (Local: 'B'));
+        /Define_Tag;
+        ]
+        """,
+        context: &context
+    )
+    let original = try #require(context.tagRegistry.tag(named: "AddTwo"))
+    let withLeadingUnnamedParameter = LassoCustomTagDefinition(
+        name: original.name,
+        parameters: [LassoArgument(label: nil, value: .integer(999))] + original.parameters,
+        body: original.body
+    )
+    let service = try #require(context.tagInvocationService)
+    let result = try await service.invoke(
+        withLeadingUnnamedParameter, positionalArguments: [.integer(3), .integer(4)], context: &context
+    )
+    #expect(result == .integer(7))
+}
+
+@Test func elseLessArrowIfNestedInALargerIfElseChainDoesNotSwallowTheOuterElse() async throws {
+    // Real corpus: includes/efs_process.lasso's PayPal branch is a
+    // self-contained, else-less `if(...) => { ... }` nested inside a
+    // larger if(gift)/else(if(invoice)/else(paypal)/else(creditcard)/if)
+    // chain. ScriptBodyParser's peekIsElseKeyword() used to defer the
+    // inner arrow-if's closing brace whenever ANY `else` followed it,
+    // even one that belonged to the outer chain -- permanently leaving
+    // the inner if unpopped, so BlockBuilder's later re-nesting pass
+    // attached the outer's real else (and everything after it) to the
+    // wrong, inner if instead. This silently truncated the outer
+    // chain, dropping the whole "creditcard" branch below.
+    var context = LassoContext()
+    let output = try await LassoRenderer().render(
+        """
+        <?lasso
+        if($mode == 'gift')
+          'gift'
+        else($mode == 'paypal')
+          if($paypal_ready) => {
+            'entering paypal'
+          }
+          'after paypal block'
+        else
+          'entering creditcard'
+        /if
+        ?>
+        """,
+        context: &context
+    )
+    #expect(output.contains("entering creditcard"))
+}
+
+@Test func selfContainedArrowIfElseNestedInALargerChainStillWorksBothWays() async throws {
+    // Companion case to the above -- an arrow-if that DOES have its own
+    // arrow-style else must still correctly attach that else to ITSELF,
+    // not to the outer chain, in both the entered and not-entered state.
+    var context = LassoContext()
+    let entered = try await LassoRenderer().render(
+        """
+        <?lasso
+        if('x' == 'x')
+          if(true) => {
+            'inner-true'
+          } else => {
+            'inner-false'
+          }
+          'after-inner'
+        else
+          'outer-false-branch'
+        /if
+        ?>
+        """,
+        context: &context
+    )
+    #expect(entered.contains("inner-true"))
+    #expect(!entered.contains("inner-false"))
+    #expect(entered.contains("after-inner"))
+
+    var context2 = LassoContext()
+    let notEntered = try await LassoRenderer().render(
+        """
+        <?lasso
+        if('x' == 'x')
+          if(false) => {
+            'inner-true'
+          } else => {
+            'inner-false'
+          }
+          'after-inner'
+        else
+          'outer-false-branch'
+        /if
+        ?>
+        """,
+        context: &context2
+    )
+    #expect(notEntered.contains("inner-false"))
+    #expect(!notEntered.contains("inner-true"))
+    #expect(notEntered.contains("after-inner"))
+}
+
+@Test func leadingDotDecimalLiteralsParseAsNumbersNotSelfShorthandMemberAccess() async throws {
+    // Real corpus: includes/efs_process.lasso calls
+    // `math_round(field('order_grandtotal'), .01)` -- the bare `.01`
+    // argument. The lexer only recognized numbers starting with a
+    // digit, so `.01` fell through to `.symbol(".")`, which
+    // parsePrimary's self-shorthand member-access case
+    // (`.methodName` -> `self->methodName`) happily accepted, producing
+    // a nonsense `.member(self, "<unknown>")` node instead of a number.
+    var context = LassoContext()
+    let output = try await LassoRenderer().render(
+        "[math_round(14.018374999999999, .01)]|[.5]|[-.25]",
+        context: &context
+    )
+    #expect(output == "14.020000|0.500000|-0.250000")
+}
+
+@Test func selfShorthandMemberAccessStillWorksAlongsideTheLeadingDotDecimalFix() async throws {
+    // Guards against the leading-dot-decimal fix regressing the actual
+    // legitimate construct it could be confused with: `.methodName`
+    // inside a custom type's method body, shorthand for
+    // `self->methodName`.
+    var context = LassoContext()
+    let output = try await LassoRenderer().render(
+        """
+        <?lassoscript
+        define Widget => type {
+            data public name::string
+            public onCreate(name::string) => {
+                self->name = #name
+            }
+            public shout() => {
+                return .name + '!'
+            }
+        }
+        local(widget::Widget = Widget('Ada'))
+        ?>
+        [#widget->shout()]
+        """,
+        context: &context
+    )
+    #expect(output.trimmingCharacters(in: .whitespacesAndNewlines) == "Ada!")
+}
+
+@Test func blockTagPastTheFirstStatementInASquareBracketSpanStillBecomesARealBlock() async throws {
+    // Real corpus: includes/mini_cart.lasso's `[var(What_Action::string =
+    // $function) if(var_defined('cart_id') && $cart_id != '') ...
+    // records ... /if]` — an ordinary `var(...)` assignment precedes the
+    // real `if`, and both the `if` and the nested `records` loop opened
+    // here don't close until much later, in their own separate
+    // single-tag bracket spans (`[/records]`, `[/if]`) after intervening
+    // literal HTML. `emitCode`'s square-bracket dispatch only checked
+    // whether the span's FIRST statement was itself a block-tag call
+    // (the already-handled `[if(...) ... else ... /if]` shape) — a block
+    // tag appearing anywhere past the first position fell through to the
+    // flat `ExpressionParser` + `.code(...)` path, which has no concept
+    // of blocks: "if"/"records" parsed as ordinary calls, never became
+    // `.tag(...)` nodes `BlockBuilder` could pair with their real
+    // closers, and evaluation crashed trying to call them as functions
+    // (`unknownFunction("if")`).
+    var context = LassoContext()
+    let output = try await LassoRenderer().render(
+        """
+        [
+          var(marker::string = 'seen')
+          if(true)
+            'body-before-close'
+        ]
+        <div>middle html</div>
+        [
+          if(true)
+            'nested-yes'
+          else
+            'nested-no'
+          /if
+        ]
+        tail
+        [
+        /if
+        ]
+        """,
+        context: &context
+    )
+    #expect(output.contains("body-before-close"))
+    #expect(output.contains("nested-yes"))
+    #expect(!output.contains("nested-no"))
+    #expect(output.contains("middle html"))
+    #expect(output.contains("tail"))
+}
+
+@Test func recordsLoopPastTheFirstStatementInASquareBracketSpanStillClosesAcrossLaterSpans() async throws {
+    // Companion case to the above, using `records`/`/records` (a bare
+    // `.bareIdentifier`-form block, unlike `if`'s `.bareCondition` form)
+    // instead of `if` — matching mini_cart.lasso's actual inner loop,
+    // which is the specific construct BlockBuilder reported as an
+    // "Unexpected closing tag records" diagnostic before this fix (the
+    // bare-opened `records` never became a `.tag(...)` node, so its
+    // later, separate `[/records]` span had no open to match). The
+    // ordinary `var(...)` statement preceding the bare `records` here
+    // (matching mini_cart.lasso's own `var(marker...) records` shape) is
+    // what makes `records` NOT the span's first statement.
+    let executor = PerfectCRUDLassoExecutor { _, _ in
+        DynamicResult(
+            rows: [
+                DynamicRow(["mfr_style_no": .string("A")]),
+                DynamicRow(["mfr_style_no": .string("B")]),
+            ],
+            statement: "SELECT ..."
+        )
+    }
+    var context = LassoContext(inlineProvider: LassoDynamicInlineProvider(
+        executor: executor,
+        datasourceAliases: ["catalog_mysql": "catalog"]
+    ))
+    let output = try await LassoRenderer().render(
+        """
+        [inline(-database='catalog_mysql', -table='skus', -findall)]
+        [
+          var(marker::string = 'seen')
+          records
+        ]
+        [field('mfr_style_no')]|
+        [
+          /records
+        ]
+        [/inline]
+        """,
+        context: &context
+    )
+    let compact = output.components(separatedBy: .whitespacesAndNewlines).joined()
+    #expect(compact == "A|B|")
+}
+
+@Test func decimalToStringDefaultsToSixDecimalPlacesMatchingTheLanguageGuidesOwnDocumentedRule() async throws {
+    // lassoguide.com Math chapter, "Creating Decimal Objects": "The
+    // precision of a decimal value when converted to a string is always
+    // displayed as six decimal places even though the actual precision
+    // of the number may vary based on the size of the number and its
+    // internal representation." This governs `string()`, bare bracket
+    // output, and `+` string concatenation (all of which route through
+    // `LassoValue.outputString`), and `decimal->asString` with no
+    // `-precision` argument (`formattedNumber`'s default). Both
+    // previously fell back to Swift's raw `String(Double)`, which prints
+    // the shortest round-trippable representation instead -- leaking
+    // IEEE-754 binary-fraction noise straight through for any value not
+    // exactly representable in binary (almost every two-decimal money
+    // amount). Found live: a real order's `order_grandtotal`
+    // (`14.018374999999999`, after round-tripping through ordinary Lasso
+    // arithmetic) leaked this exact noise into a payment gateway's
+    // amount field via a bare `$order_grandtotal` reference.
+    var context = LassoContext()
+    let output = try await LassoRenderer().render(
+        "[string(14.018374999999999)]|[string(0.1 + 0.2)]|[14.02->asString]|[(59.99 * 0.89)->asString]",
+        context: &context
+    )
+    #expect(output == "14.018375|0.300000|14.020000|53.391100")
+}
+
+@Test func integerAsStringWithNoPrecisionPrintsABareIntegerNotADoubleWithATrailingDotZero() async throws {
+    // Companion regression to the decimal default above -- `formattedNumber`
+    // is shared by both `integer->asString` and `decimal->asString`, and
+    // integers have no six-decimal-place rule at all (real Lasso just
+    // prints the bare whole number). Previously the shared fallback
+    // (`String(value)` on the `Double` both branches flatten to) applied
+    // uniformly regardless of invocant type, so `123->asString` produced
+    // `"123.0"`, not `"123"`.
+    var context = LassoContext()
+    let output = try await LassoRenderer().render("[123->asString]", context: &context)
+    #expect(output == "123")
 }
 
