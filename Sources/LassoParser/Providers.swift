@@ -27,10 +27,11 @@ public struct LassoDataRow: Equatable, Sendable {
 /// Real Lasso's request-local current-error state, exposed to Lasso code via
 /// `error_currentError`. `code: 0`/`kind: "none"` is real Lasso's "No Error"
 /// state — the default for every fresh context and every successful inline
-/// action. Numeric codes beyond 0 are deliberately not assigned yet (see
-/// `Documentation/error-protect-model-plan.md`'s Milestone 1) — real Lasso
-/// 8.5's exact Error Control chapter codes still need extracting from the
-/// local reference PDF before those are hardcoded here.
+/// action. Real Lasso 8.5's Error Control chapter codes (Appendix A Table 1,
+/// verified against the PDF directly) and Lasso 9's own additional named
+/// codes are extracted and assigned in `ErrorHandling.swift`'s `Code` enum —
+/// see that file for the full, sourced list (`Documentation/
+/// error-protect-model-plan.md`'s Milestones 1 and 5, both now done).
 public struct LassoErrorState: Equatable, Sendable {
     public var code: Int
     public var message: String
@@ -387,16 +388,31 @@ public protocol LassoIncludeLoader: Sendable {
     /// need to change; only `LassoFileSystemIncludeLoader` implements it
     /// for real. See Documentation/web-response-include-plan.md.
     func loadIncludeBytes(path: String, from includingPath: String?) throws -> Data
+
+    /// The confined filesystem root `File_*` tags (`FileOperations.swift`)
+    /// resolve absolute paths against and refuse to escape — deliberately
+    /// reusing the SAME root every `include()`/`library()` call is already
+    /// confined to, rather than introducing a second, potentially-
+    /// inconsistent root concept. Defaulted to `nil` so existing
+    /// conformers (test/smoke loaders, and any loader with no real
+    /// on-disk root) don't need to change and simply leave `File_*` tags
+    /// unconfigured (they throw `fileSystemNotConfigured` — see
+    /// `FileOperations.swift`) — matching `loadIncludeBytes`'s own
+    /// default-then-override pattern above.
+    var fileSystemRoot: URL? { get }
 }
 
 public extension LassoIncludeLoader {
     func loadIncludeBytes(path: String, from includingPath: String?) throws -> Data {
         throw LassoRuntimeError.includeNotConfigured
     }
+
+    var fileSystemRoot: URL? { nil }
 }
 
 public struct LassoFileSystemIncludeLoader: LassoIncludeLoader {
     public let root: URL
+    public var fileSystemRoot: URL? { root }
     public let allowedExtensions: Set<String>
 
     public init(
@@ -534,6 +550,59 @@ public protocol LassoIncludeRenderService: Sendable {
     /// `loadedLibraries` dedup — the same dedup the bare `library(...)`
     /// free tag already applies unconditionally.
     func performLibrary(path: String, once: Bool, context: inout LassoContext) async throws
+}
+
+/// Lets a `LassoNativeType.register(...)` closure (`NativeTypes.swift`'s
+/// `LassoNativeMethod` — receiver/arguments/`inout context` only, no
+/// access to `Evaluator.renderNodes`) invoke an already-resolved custom
+/// tag with already-evaluated positional arguments. Wired the same way
+/// as `LassoIncludeRenderService` above: `(any LassoTagInvocationService)?`
+/// on `LassoContext`, set imperatively by `RendererEngine.init`. The
+/// concrete conformer, `RendererTagInvocationService`, lives in
+/// `Renderer.swift` for the same reason `RendererIncludeService` does.
+///
+/// Every call site MUST extract `context.tagInvocationService` to a
+/// local `let` before calling into it with `&context` — same Swift
+/// exclusivity-checking reason `LassoIncludeRenderService`'s own doc
+/// comment gives.
+///
+/// **Deliberately NARROWER than `Evaluator.invokeCustomTag`** (the
+/// call-site invocation path used for ordinary `MyTag(...)` calls):
+/// this exists for internal dispatch — custom Comparators/Matchers
+/// (Ch. 30 Tables 21/22) referenced via `\TagName` — where the caller
+/// always supplies a FIXED, small number of already-evaluated
+/// arguments (e.g. exactly `left`/`right` for a comparator) and binds
+/// them positionally to the definition's own declared parameter names.
+/// Default-parameter EXPRESSIONS (`-Optional='x'` with a default value)
+/// are NOT evaluated here — every declared parameter must be
+/// satisfiable by a supplied positional value, or this throws
+/// `LassoRuntimeError.tagInvocationArityMismatch` rather than silently
+/// defaulting through. This matches Ch. 30's own worked custom-
+/// comparator example (p.420), which declares exactly 2 required
+/// parameters with no defaults. A comparator/matcher tag that declares
+/// optional/defaulted parameters beyond what's supplied is a real
+/// authoring error worth failing loudly on, not a case this narrower
+/// path tries to support generally.
+///
+/// **Why the conformer's snapshot/push-tag-call/restore scaffolding is
+/// its own separate copy, not shared with `Evaluator.invokeCustomTag`**:
+/// only the *binding* step genuinely needs `Evaluator` (default-
+/// parameter-expression evaluation is recursive `Evaluator.evaluate`,
+/// which a bare `LassoContext` can't do) — the surrounding scope-
+/// management (`snapshotLocals`/`pushTagCall`/`replaceLocals`/
+/// `loopDepth`/`clearReturnSignal`/`consumeReturnSignal`/`popTagCall`)
+/// is pure `LassoContext` and has no such dependency. Flagged by
+/// architect review as a real, if non-blocking, opportunity: that
+/// scaffolding COULD be factored into one shared `LassoContext` helper
+/// both paths call. Not done in this pass (kept as two verified-
+/// equivalent, independently-tested copies) — left as a disclosed
+/// follow-up rather than expanding this stage's scope.
+public protocol LassoTagInvocationService: Sendable {
+    func invoke(
+        _ definition: LassoCustomTagDefinition,
+        positionalArguments: [LassoValue],
+        context: inout LassoContext
+    ) async throws -> LassoValue
 }
 
 /// A single ordered name/value pair from a request's query string or POST

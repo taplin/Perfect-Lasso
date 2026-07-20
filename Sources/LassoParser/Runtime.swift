@@ -1,5 +1,12 @@
 import Foundation
 
+/// Shared by the `String_Is*` free-tag family below — a top-level
+/// function (not a local closure) so it can be captured by the
+/// `@Sendable` `register(...)` closures without a Sendable-capture error.
+private func isEveryCharacter(_ text: String, _ predicate: (Character) -> Bool) -> Bool {
+    !text.isEmpty && text.allSatisfy(predicate)
+}
+
 public indirect enum LassoValue: Equatable, Sendable {
     case void
     case null
@@ -39,19 +46,67 @@ public indirect enum LassoValue: Equatable, Sendable {
         case .void, .null: ""
         case let .boolean(value): value ? "true" : "false"
         case let .integer(value): String(value)
-        case let .decimal(value): String(value)
+        // Real Lasso's documented default: "The precision of a decimal
+        // value when converted to a string is always displayed as six
+        // decimal places" (lassoguide.com Math chapter, "Creating
+        // Decimal Objects") -- this governs `string()`, bracket output,
+        // and `+` string concatenation, all of which route through this
+        // property. Swift's raw `String(Double)` instead prints the
+        // shortest round-trippable representation, leaking IEEE-754
+        // binary-fraction noise straight through for any value not
+        // exactly representable in binary -- almost every two-decimal
+        // money amount (`string(0.1 + 0.2)` produced
+        // `"0.30000000000000004"`, not the six-place `"0.300000"` real
+        // Lasso guarantees). Found live: FileMaker's own CR_web
+        // order_grandtotal field, after round-tripping through ordinary
+        // Lasso arithmetic (subtotal + tax + shipping - discount),
+        // carried exactly this kind of raw-noise value, which then
+        // leaked through this exact case into a payment gateway's
+        // amount field.
+        case let .decimal(value): String(format: "%.6f", value)
         case let .string(value): value
         case let .array(value): value.map(\.outputString).joined()
         case let .map(value): String(describing: value)
         case let .object(value):
-            // `bytes` is the one native type whose bare output is
-            // meaningful content, not a type-name placeholder (matching
-            // real Lasso's auto-stringification of a byte stream) — every
-            // other native type (web_request/web_response/date) has no
-            // documented bare-output contract, so they keep the existing
-            // type-name fallback.
-            value.typeName == LassoBytesValue.typeName ? LassoBytesValue.string(from: value) : value.typeName
-        case let .pair(key, value): "\(key.outputString) = \(value.outputString)"
+            // `bytes` is one native type whose bare output is meaningful
+            // content, not a type-name placeholder (matching real
+            // Lasso's auto-stringification of a byte stream). List/
+            // Queue/Stack/Set are a second such group — Ch. 30's own
+            // worked examples show a documented "TypeName: elem1, elem2"
+            // auto-stringification (see `LassoCollectionValue
+            // .autoStringDescription`'s own doc comment for citations).
+            // Every other native type (web_request/web_response/date)
+            // has no documented bare-output contract, so they keep the
+            // existing type-name fallback.
+            if value.typeName == LassoBytesValue.typeName {
+                LassoBytesValue.string(from: value)
+            } else if LassoCollectionValue.typeNames.contains(value.typeName) {
+                LassoCollectionValue.autoStringDescription(for: value)
+            } else if value.typeName == LassoTreeMapValue.typeName {
+                // Ch. 30 p.418's own worked example: `(TreeMap: (1)=
+                // (Sunday), (2)=(Monday), ...)` — a distinct "(key)=
+                // (value)" pair format, not the flat comma-joined shape
+                // the other collection types use.
+                LassoTreeMapValue.autoStringDescription(for: value)
+            } else {
+                value.typeName
+            }
+        case let .pair(key, value):
+            // Ch. 30 p.404's own worked example (`[Variable: 'Test_Pair']`
+            // on `(Pair: 'First_Name'='John')`) → `(Pair: (First_Name)=
+            // (John))` — the outer `(...)` wrap is that specific
+            // bare-display tag's own formatting (not reproduced here,
+            // matching this codebase's established treatment of the
+            // same outer-wrap quirk on `TreeMap`'s own worked example —
+            // see `LassoTreeMapValue.autoStringDescription`'s doc
+            // comment), but the inner `(key)=(value)` shape — no
+            // surrounding spaces, each half parenthesized — is Pair's
+            // own genuine auto-stringification contract. Previously
+            // `"\(key) = \(value)"` (spaces, no parens) with no
+            // primary-source citation at all — found and fixed while
+            // reading Ch. 30's Pair section for Stage 4's `->First=`/
+            // `->Second=` work.
+            "(\(key.outputString))=(\(value.outputString))"
         }
     }
 
@@ -146,6 +201,13 @@ public struct LassoNativeRegistry: Sendable {
         register("decimal") { arguments, _ in
             .decimal(arguments.first?.value.number ?? 0)
         }
+        // `null(expr)` / `[Null: expr]` (Ch. 30 pp.422-426's canonical
+        // Iterator idiom, e.g. `Null: $myIterator->Forward;`) — evaluates
+        // its argument for side effects but suppresses the output. By the
+        // time this closure runs, `arguments` is already evaluated (see
+        // the `.call` case in Evaluator.evaluate), so simply discarding
+        // the result and returning `.void` is sufficient.
+        register("null") { _, _ in .void }
         register("var_defined") { arguments, context in
             let name = arguments.first?.value.outputString ?? ""
             switch context.value(for: name) {
@@ -159,6 +221,22 @@ public struct LassoNativeRegistry: Sendable {
             case .void, .null: return .boolean(false)
             default: return .boolean(true)
             }
+        }
+        // `[Global_Defined]`/`[Global_Remove]`/`[Globals]` (Ch. 15 Table
+        // 3) — the read/write `[Global]`/`[Global_Reset]` tags are
+        // special-cased alongside `Var`/`Local` in `Evaluator.evaluate`
+        // (see `declarationScope(for:)`) since, like them, they need
+        // assignment-target-aware argument handling a plain
+        // evaluated-arguments free function can't provide.
+        register("global_defined") { arguments, context in
+            .boolean(context.trueGlobalDefined(arguments.first?.value.outputString ?? ""))
+        }
+        register("global_remove") { arguments, context in
+            context.removeTrueGlobal(arguments.first?.value.outputString ?? "")
+            return .void
+        }
+        register("globals") { _, context in
+            .map(context.trueGlobalsSnapshot())
         }
         let tagExists: LassoNativeFunction = { arguments, context in
             let name = arguments.first?.value.outputString ?? ""
@@ -250,6 +328,91 @@ public struct LassoNativeRegistry: Sendable {
                 return .string("0x" + raw.map { String(format: "%02x", $0) }.joined())
             }
             return .string(String(decoding: raw, as: UTF8.self))
+        }
+        // `Encrypt_MD5`/`Cipher_Digest`/`Cipher_Encrypt`/`Cipher_Decrypt`/
+        // `Cipher_List` — lassoguide.com `operations/encryption.html`.
+        // See `Hashing.swift`'s own doc comments for exactly which
+        // algorithms are supported and why (swift-crypto's real,
+        // available surface — not real Lasso's much larger OpenSSL-
+        // backed list) and the AES-GCM/SHA-256-key-derivation design
+        // decisions `Cipher_Encrypt`/`Cipher_Decrypt` make.
+        register("encrypt_md5") { arguments, _ in
+            let data = LassoBytesValue.rawBytes(from: arguments.positionalValue(at: 0) ?? .string(""))
+            return .string(LassoHashing.md5Hex(Data(data)))
+        }
+        register("cipher_digest") { arguments, _ in
+            let data = Data(LassoBytesValue.rawBytes(from: arguments.positionalValue(at: 0) ?? .string("")))
+            let algorithm = arguments.lastString(named: "digest") ?? ""
+            guard let digest = LassoHashing.digest(data, algorithm: algorithm) else {
+                throw LassoRecoverableError(LassoErrorState(
+                    code: LassoErrorHandling.Code.invalidParameter,
+                    message: "Invalid parameter",
+                    kind: "encryption"
+                ))
+            }
+            if arguments.hasTruthyFlag("hex") {
+                return .string(digest.map { String(format: "%02x", $0) }.joined())
+            }
+            return .object(LassoBytesValue.makeObject(rawBytes: Array(digest)))
+        }
+        register("cipher_encrypt") { arguments, _ in
+            let data = Data(LassoBytesValue.rawBytes(from: arguments.positionalValue(at: 0) ?? .string("")))
+            let cipher = arguments.lastString(named: "cipher") ?? ""
+            let key = Data((arguments.lastString(named: "key") ?? "").utf8)
+            guard let encrypted = LassoHashing.cipherEncrypt(data, cipher: cipher, keyMaterial: key) else {
+                throw LassoRecoverableError(LassoErrorState(
+                    code: LassoErrorHandling.Code.invalidParameter,
+                    message: "Invalid parameter",
+                    kind: "encryption"
+                ))
+            }
+            return .object(LassoBytesValue.makeObject(rawBytes: Array(encrypted)))
+        }
+        register("cipher_decrypt") { arguments, _ in
+            let data = LassoBytesValue.rawBytes(from: arguments.positionalValue(at: 0) ?? .string(""))
+            let cipher = arguments.lastString(named: "cipher") ?? ""
+            let key = Data((arguments.lastString(named: "key") ?? "").utf8)
+            guard let decrypted = LassoHashing.cipherDecrypt(Data(data), cipher: cipher, keyMaterial: key) else {
+                throw LassoRecoverableError(LassoErrorState(
+                    code: LassoErrorHandling.Code.invalidParameter,
+                    message: "Invalid parameter",
+                    kind: "encryption"
+                ))
+            }
+            return .object(LassoBytesValue.makeObject(rawBytes: Array(decrypted)))
+        }
+        register("cipher_list") { arguments, _ in
+            // Real Lasso returns a `staticarray` (this codebase's
+            // `Array` is the closest existing equivalent — `StaticArray`
+            // itself is a separate, already-tracked gap). With
+            // `-digest`, real Lasso limits the list to digest
+            // algorithms specifically — this adapter's own cipher
+            // support IS entirely digest algorithms plus AES, so
+            // `-digest` here just excludes "AES".
+            if arguments.hasTruthyFlag("digest") {
+                return .array(LassoHashing.cipherDigestNames.map(LassoValue.string))
+            }
+            return .array((LassoHashing.cipherDigestNames + ["AES"]).map(LassoValue.string))
+        }
+        // `Json_Deserialize` — the natural inverse of the pre-existing
+        // `Json_Serialize` above, reusing its exact underlying
+        // machinery (`JSONSerialization` + `LassoValue.from(json:)`,
+        // already used elsewhere to restore JSON-safe session
+        // variables). Unlike every other tag added this batch, this
+        // one's real-Lasso documentation couldn't be independently
+        // re-verified against lassoguide.com's public reference (no
+        // `json_deserialize`/`json_serialize` hits found anywhere on
+        // the site) — implemented as the obvious, standard inverse of
+        // the already-implemented `Json_Serialize` instead, which this
+        // exact name/shape was already presumably verified against
+        // when it was first added.
+        register("json_deserialize") { arguments, _ in
+            let jsonString = arguments.first?.value.outputString ?? ""
+            guard let data = jsonString.data(using: .utf8),
+                  let object = try? JSONSerialization.jsonObject(with: data, options: [.fragmentsAllowed]) else {
+                return .null
+            }
+            return LassoValue.from(json: object)
         }
         // [Currency]/[Percent] — Lasso 8.5 Chapter 28 "Math Operations",
         // Table 13. Positional (not -flag=) language/country parameters,
@@ -432,6 +595,50 @@ public struct LassoNativeRegistry: Sendable {
         // Time Operations". See Documentation/date-format-plan.md for the
         // native "date" object representation and the DateFormatter/ICU
         // rendering approach.
+        // `RegExp(...)` constructor (Ch. 26 Table 7) — `-Find` is
+        // documented as required; defaulting to an empty pattern rather
+        // than throwing when omitted matches this codebase's general
+        // "missing argument degrades gracefully" convention elsewhere
+        // (e.g. `->replace`/`->contains` defaulting to `""`).
+        register("regexp") { arguments, _ in
+            .object(LassoObjectInstance(typeName: "regexp", data: [
+                "find": .string(arguments.lastString(named: "find") ?? ""),
+                "replace": .string(arguments.lastString(named: "replace") ?? ""),
+                "input": .string(arguments.lastString(named: "input") ?? ""),
+                "ignorecase": .boolean(arguments.hasTruthyFlag("ignorecase")),
+            ]))
+        }
+        register("string_findregexp") { arguments, _ in
+            // Ch. 26 Table 11 — returns a single FLAT array across every
+            // match: full match text then each capture group's text, per
+            // match, concatenated (see LassoRegularExpressions.findAll's
+            // own doc comment for the worked-example evidence).
+            let text = arguments.positionalValue(at: 0)?.outputString ?? ""
+            let pattern = arguments.lastString(named: "find") ?? ""
+            let ignoreCase = arguments.hasTruthyFlag("ignorecase")
+            return .array(LassoRegularExpressions.findAll(in: text, pattern: pattern, ignoreCase: ignoreCase))
+        }
+        register("string_replaceregexp") { arguments, _ in
+            // Table 11's own description text says this "Returns an
+            // array with each instance... replaced" — almost certainly a
+            // copy-paste artifact from the FindRegExp row just above it,
+            // since every one of the Guide's own worked examples for
+            // this exact tag shows a plain STRING result (e.g.
+            // `<font color="blue">Blue</font> lake...`), never an array
+            // representation. Implemented against the worked examples.
+            let text = arguments.positionalValue(at: 0)?.outputString ?? ""
+            let pattern = arguments.lastString(named: "find") ?? ""
+            let replacement = arguments.lastString(named: "replace") ?? ""
+            let ignoreCase = arguments.hasTruthyFlag("ignorecase")
+            if arguments.hasTruthyFlag("replaceonlyone") {
+                return .string(LassoRegularExpressions.replaceFirst(
+                    in: text, pattern: pattern, replacement: replacement, ignoreCase: ignoreCase
+                ))
+            }
+            return .string(LassoRegularExpressions.replaceAll(
+                in: text, pattern: pattern, replacement: replacement, ignoreCase: ignoreCase
+            ))
+        }
         register("date") { arguments, _ in
             // -Year/-Month/-Day/-Hour/-Minute/-Second construction keywords
             // (Chapter 29 Table 1) take priority when present — cheap to
@@ -557,20 +764,196 @@ public struct LassoNativeRegistry: Sendable {
             let second = arguments.count > 1 ? arguments[1].value : .null
             return .pair(first.value, second)
         }
-        // Real Lasso 9's `set` (an ordered, unique-valued collection) —
-        // real corpus: includes/detail_a_sku.lasso's
-        // `var('skuArrayColor' = set)` followed by
-        // `$skuArrayColor->insert(field('color'))`, building "a special
-        // 'color' array that contains every color/print found" (per that
-        // file's own comment) across a loop of skus, several sharing the
-        // same color. Modeled as a plain `.array` for now — real `set`
-        // additionally skips inserting a value already present, which
-        // this doesn't reproduce (a real gap: the resulting color list
-        // can contain duplicates this way), but an unrecognized bare
-        // `set` identifier previously evaluated to `.void`, so
-        // `->insert` threw outright and the whole page failed to render.
-        register("set") { arguments, _ in
-            .array(arguments.map { $0.value })
+        // `Set`/`List`/`Queue`/`Stack`/`Series` (Ch. 30 Tables 4/12/14/15/17)
+        // — see `Collections.swift` for the native-type method tables.
+        // A bare `set`/`list`/`queue`/`stack` identifier (no parens —
+        // real corpus: includes/detail_a_sku.lasso's `var('skuArrayColor'
+        // = set)`, building "a special 'color' array that contains every
+        // color/print found" per that file's own comment) already
+        // resolves to an empty instance of the right type via the
+        // generic bare-identifier-to-native-type path
+        // (`Evaluator.evaluate`'s `.identifier` case, `context.nativeTypes.containsType`)
+        // with no registration needed here — this is only for the
+        // PAREN-CALL form (`(Set)`/`(List: 'a', 'b')`), matching the
+        // dual free-function-plus-native-type registration pattern
+        // `date`/`bytes`/`regexp` already established. Real Set replaces
+        // the previous `.array`-alias placeholder, which admitted (in
+        // its own comment, now resolved) that it couldn't dedup —
+        // `Collections.swift`'s `->Insert` now does via the same
+        // `lassoEquals` this project already uses for `Array->Contains`.
+        register("list") { arguments, _ in
+            .object(LassoCollectionValue.makeObject(typeName: "list", elements: arguments.map(\.value)))
+        }
+        // The 8.5 PDF's own Table 12/17 say "Creates an empty queue"/
+        // "Creates an empty stack" (Ch. 30 pp.408, 413) with no
+        // parameters documented at all — but lassoguide.com's Lasso 9
+        // docs explicitly say "Creates a queue/stack object using the
+        // parameters passed to it as the elements of the queue/stack",
+        // matching List's own documented constructor behavior. Cross-
+        // checked directly against lassoguide.com/operations/
+        // collections.html, not inferred. Following the newer/more
+        // complete source here, same as this project's established
+        // practice elsewhere of preferring lassoguide.com over 8.5 PDF
+        // gaps. Argument order is preserved as insertion order, so
+        // `queue('One', 'Two')`'s `->First` is 'One' (FIFO) and
+        // `stack('One', 'Two')`'s `->First` is 'Two' (LIFO) — identical
+        // to what sequential `->Insert` calls would produce.
+        register("queue") { arguments, _ in
+            .object(LassoCollectionValue.makeObject(typeName: "queue", elements: arguments.map(\.value)))
+        }
+        register("stack") { arguments, _ in
+            .object(LassoCollectionValue.makeObject(typeName: "stack", elements: arguments.map(\.value)))
+        }
+        register("set") { _, _ in
+            // Table 15's own documented parameter is an optional
+            // comparator (Comparator values now exist as of Stage 2's
+            // `Comparators.swift`) — but wiring a per-instance
+            // comparator through Set's own Insert/Difference/
+            // Intersection/Union (which all currently hardcode
+            // `naturalSort`) is real additional work not in Stage 2's
+            // checklist (only PriorityQueue/TreeMap consume comparators
+            // this stage). Any argument given here is still ignored;
+            // Set always natural-sorts. Left as a disclosed gap, not
+            // silently dropped.
+            .object(LassoCollectionValue.makeObject(typeName: "set", elements: []))
+        }
+        register("series") { arguments, _ in
+            // "The start value is incremented until it equals the end
+            // value" — ascending only; no worked example covers a
+            // start > end descending series, deferred/unverified.
+            // Per-element whole-number rounding mirrors this codebase's
+            // established `.integer`-vs-`.decimal` convention
+            // (`numeric(_:_:_:)`), matching the Guide's own worked
+            // example (`Series(1,10)` → all integers).
+            guard let start = arguments.first?.value.number,
+                  let end = arguments.positionalValue(at: 1)?.number,
+                  start <= end else {
+                return .array([])
+            }
+            var elements: [LassoValue] = []
+            var current = start
+            while current <= end {
+                elements.append(current.rounded() == current ? .integer(Int(current)) : .decimal(current))
+                current += 1
+            }
+            return .array(elements)
+        }
+        // Built-in Comparators (Ch. 30 Table 21, p.419) — see
+        // `Comparators.swift`'s own top-level doc comment for why these
+        // ALSO ship as ordinary free tags (`(Compare_LessThan)` to get a
+        // passable value, `(Compare_LessThan: 1, 2)` to evaluate
+        // directly), alongside the real `\Compare_LessThan` bareword-
+        // reference syntax Stage 6 (`TagReference.swift`) added — both
+        // forms are equivalent and kept, not one deprecated in favor of
+        // the other.
+        for kind in LassoComparatorValue.builtInKinds {
+            register("compare_\(kind)") { arguments, context in
+                guard arguments.count >= 2 else {
+                    return .object(LassoComparatorValue.makeObject(kind: kind))
+                }
+                let left = arguments[0].value
+                let right = arguments.positionalValue(at: 1) ?? .null
+                return .integer(LassoComparatorValue.evaluate(kind: kind, left: left, right: right, context: context))
+            }
+        }
+        // `PriorityQueue`/`TreeMap` (Ch. 30 Tables 10/19) — see
+        // `Collections.swift`'s own `makePriorityQueueType()`/
+        // `makeTreeMapType()` doc comments for the greatest-first-by-
+        // default-comparator semantics and any-type-key storage this
+        // stage adds.
+        register("priorityqueue") { arguments, _ in
+            // "Priority queues are always created empty" (p.405) — the
+            // ONE optional parameter is a comparator, not initial
+            // elements (unlike List/Queue/Stack). Defaults to
+            // `\Compare_LessThan` per its own documented default.
+            let comparatorArgument: LassoValue = arguments.first?.value ?? .null
+            let kind = LassoComparatorValue.kind(of: comparatorArgument) ?? "lessthan"
+            return .object(LassoPriorityQueueValue.makeObject(kind: kind, elements: []))
+        }
+        register("treemap") { arguments, _ in
+            // NOT actually invoked for `treemap(...)` calls anymore —
+            // `Evaluator.evaluate`'s `.call` case special-cases the
+            // name "treemap" ahead of the generic dispatch that would
+            // otherwise reach this closure, specifically to preserve
+            // real (non-string-coerced) key types (see that case's own
+            // doc comment; found missing by architect review). This
+            // registration is kept only so `context.natives
+            // .contains("treemap")` still reports true for
+            // introspection/`HasMethod`-style checks — its own
+            // argument-handling body is now unreachable dead weight
+            // for real construction, left here as a best-effort
+            // fallback rather than deleted outright in case some other
+            // path ever calls `context.natives.function(named:
+            // "treemap")` directly.
+            var kind = "lessthan"
+            var pairs: [EvaluatedArgument] = arguments
+            if let first = arguments.first, LassoComparatorValue.kind(of: first.value) != nil {
+                kind = LassoComparatorValue.kind(of: first.value) ?? "lessthan"
+                pairs = Array(arguments.dropFirst())
+            }
+            let entries = pairs.compactMap { argument -> LassoValue? in
+                if case .pair = argument.value { return argument.value }
+                if let label = argument.label { return .pair(.string(label), argument.value) }
+                return nil
+            }
+            return .object(LassoTreeMapValue.makeObject(kind: kind, entries: entries))
+        }
+        // Matchers (Ch. 30 Table 22) — see `Matchers.swift`'s own doc
+        // comment for the full design. All five are ordinary
+        // constructors (unlike Comparators, which double as a 0-or-2-arg
+        // value/evaluator — Matchers have no analogous documented
+        // "call directly with a test value" form).
+        register("match_regexp") { arguments, _ in
+            .object(LassoMatcherValue.makeObject(kind: "regexp", data: [
+                "_pattern": arguments.first?.value ?? .string(""),
+            ]))
+        }
+        register("match_notregexp") { arguments, _ in
+            .object(LassoMatcherValue.makeObject(kind: "notregexp", data: [
+                "_pattern": arguments.first?.value ?? .string(""),
+            ]))
+        }
+        register("match_range") { arguments, _ in
+            .object(LassoMatcherValue.makeObject(kind: "range", data: [
+                "_low": arguments.first?.value ?? .null,
+                "_high": arguments.positionalValue(at: 1) ?? .null,
+            ]))
+        }
+        register("match_notrange") { arguments, _ in
+            .object(LassoMatcherValue.makeObject(kind: "notrange", data: [
+                "_low": arguments.first?.value ?? .null,
+                "_high": arguments.positionalValue(at: 1) ?? .null,
+            ]))
+        }
+        register("match_comparator") { arguments, _ in
+            guard let comparatorValue = arguments.first?.value else { return .null }
+            var data: [String: LassoValue] = ["_comparator": comparatorValue]
+            if let rhs = arguments.first(where: { $0.label?.caseInsensitiveCompare("rhs") == .orderedSame }) {
+                data["_rhs"] = rhs.value
+                data["_haslhs"] = .boolean(false)
+            } else if let lhs = arguments.first(where: { $0.label?.caseInsensitiveCompare("lhs") == .orderedSame }) {
+                data["_lhs"] = lhs.value
+                data["_haslhs"] = .boolean(true)
+            }
+            return .object(LassoMatcherValue.makeObject(kind: "comparator", data: data))
+        }
+        // `Iterator`/`ReverseIterator` (Ch. 30 Table 23) — "Requires a
+        // compound data type as a parameter... A second optional
+        // parameter allows a matcher to be specified" — now wired
+        // through to `LassoIteratorValue.build(from:reverse:matcher:)`,
+        // which pre-filters the snapshot to only matcher-matching
+        // elements (verified against the p.426 worked example:
+        // `Iterator($myArray, (Match_Range: 'a', 'm'))` on
+        // `('One','Two','Three','Four')` yields only "Four").
+        register("iterator") { arguments, context in
+            guard let source = arguments.first?.value else { return .null }
+            let matcher = arguments.positionalValue(at: 1)
+            return try await LassoIteratorValue.build(from: source, reverse: false, matcher: matcher, context: context) ?? .null
+        }
+        register("reverseiterator") { arguments, context in
+            guard let source = arguments.first?.value else { return .null }
+            let matcher = arguments.positionalValue(at: 1)
+            return try await LassoIteratorValue.build(from: source, reverse: true, matcher: matcher, context: context) ?? .null
         }
         register("json_serialize") { arguments, _ in
             let value = arguments.first?.value ?? .null
@@ -581,6 +964,67 @@ public struct LassoNativeRegistry: Sendable {
                 return .string("null")
             }
             return .string(string)
+        }
+        // String_Is* whole-string validation family (Ch. 25 Table 10) —
+        // each returns True only if the string is non-empty AND every
+        // character matches the criterion. The Guide doesn't address the
+        // empty-string case explicitly, but a vacuous "every character
+        // of nothing matches" true (Swift's own `allSatisfy` default on
+        // an empty collection) reads as a wrong answer for an "is this
+        // string alphabetic" style check — most languages' equivalent
+        // predicates (e.g. Python's `str.isalpha()`) special-case empty
+        // as False for the same reason, and it's what this file's own
+        // pre-existing `->IsLower`/`->IsUpper`-shaped checks already do
+        // via their own `.contains { $0.isLetter }` guard.
+        register("string_isalpha") { arguments, _ in
+            .boolean(isEveryCharacter(arguments.positionalValue(at: 0)?.outputString ?? "") { $0.isLetter })
+        }
+        register("string_isalphanumeric") { arguments, _ in
+            .boolean(isEveryCharacter(arguments.positionalValue(at: 0)?.outputString ?? "") { $0.isLetter || $0.isNumber })
+        }
+        register("string_isdigit") { arguments, _ in
+            .boolean(isEveryCharacter(arguments.positionalValue(at: 0)?.outputString ?? "") { $0.isNumber })
+        }
+        register("string_ishexdigit") { arguments, _ in
+            .boolean(isEveryCharacter(arguments.positionalValue(at: 0)?.outputString ?? "") { $0.isHexDigit })
+        }
+        register("string_islower") { arguments, _ in
+            let text = arguments.positionalValue(at: 0)?.outputString ?? ""
+            return .boolean(isEveryCharacter(text) { $0.isLowercase } && text.contains { $0.isLetter })
+        }
+        register("string_isupper") { arguments, _ in
+            let text = arguments.positionalValue(at: 0)?.outputString ?? ""
+            return .boolean(isEveryCharacter(text) { $0.isUppercase } && text.contains { $0.isLetter })
+        }
+        register("string_isnumeric") { arguments, _ in
+            // Ch. 25 Table 10: "only numerals, hyphens, or periods" —
+            // distinct from `->IsDigit`, which is numerals only.
+            .boolean(isEveryCharacter(arguments.positionalValue(at: 0)?.outputString ?? "") { $0.isNumber || $0 == "-" || $0 == "." })
+        }
+        register("string_ispunctuation") { arguments, _ in
+            // Ch. 25 Table 10 says only "contains punctuation characters"
+            // (no mention of symbols like `$`/`+`/`=`) and gives no
+            // worked example that would resolve punctuation-vs-symbol
+            // either way — tracking the doc's literal wording rather
+            // than also matching `Character.isSymbol`, which an earlier
+            // version did with no evidence to justify the broader
+            // reading (flagged in architect review).
+            .boolean(isEveryCharacter(arguments.positionalValue(at: 0)?.outputString ?? "") { $0.isPunctuation })
+        }
+        register("string_isspace") { arguments, _ in
+            .boolean(isEveryCharacter(arguments.positionalValue(at: 0)?.outputString ?? "") { $0.isWhitespace })
+        }
+        register("string_length") { arguments, _ in
+            // Documented synonym for `->Size` (Ch. 25 Table 10).
+            .integer(arguments.positionalValue(at: 0)?.outputString.count ?? 0)
+        }
+        register("string_endswith") { arguments, _ in
+            // Ch. 25 Table 8: `[String_EndsWith]` — a string value plus a
+            // `-Find` keyword parameter, case insensitive (matching the
+            // member form's own documented case-insensitivity).
+            let text = arguments.positionalValue(at: 0)?.outputString ?? ""
+            let suffix = arguments.lastString(named: "find") ?? ""
+            return .boolean(suffix.isEmpty || text.range(of: suffix, options: [.caseInsensitive, .backwards, .anchored]) != nil)
         }
         register("valid_email") { arguments, _ in
             let email = arguments.positionalValue(at: 0)?.outputString ?? ""
@@ -999,6 +1443,8 @@ public struct LassoNativeRegistry: Sendable {
             )
             return .void
         }
+        LassoFileOperations.registerDefaultFunctions(into: &self)
+        LassoErrorHandling.registerDefaultFunctions(into: &self)
     }
 }
 
@@ -1035,12 +1481,41 @@ extension LassoValue {
         switch value {
         case is NSNull:
             .null
-        case let value as Bool:
-            .boolean(value)
-        case let value as Int:
-            .integer(value)
-        case let value as Double:
-            .decimal(value)
+        // `JSONSerialization` boxes every JSON boolean AND every JSON
+        // number as `NSNumber` — a real, previously-undiscovered bug
+        // here matched `Bool` FIRST via a plain `as?` cast. Per SE-0170
+        // (the Swift proposal governing `NSNumber` bridging, in effect
+        // since Swift 4), `NSNumber as? Bool` only succeeds for a value
+        // of EXACTLY 0 or 1 — converting to `false`/`true` respectively
+        // and failing (`nil`) for any other value — confirmed
+        // empirically, not just from the proposal text. So the real,
+        // narrower bug: any JSON integer/decimal valued exactly 0 or 1
+        // (a very plausible real value — flags, counts, ids) was
+        // silently misclassified as `.boolean` instead of `.integer`/
+        // `.decimal` by this function the whole time it's existed;
+        // other values (42, 3.14, -5, ...) were already routed
+        // correctly by the old code, since the `as? Bool` cast failed
+        // for them and fell through to the `Int`/`Double` cases below.
+        // `CFGetTypeID(_:) == CFBooleanGetTypeID()` is the standard,
+        // reliable way to tell a real JSON boolean apart from a real
+        // JSON number that merely also bridges to `NSNumber` — both are
+        // backed by different underlying CoreFoundation types
+        // (`CFBoolean` vs `CFNumber`) despite Swift's `as? Bool`/`as?
+        // Int`/`as? Double` casts not respecting that distinction for
+        // the 0/1 case. `CFNumberIsFloatType(_:)` is the equally
+        // standard way to tell whether a JSON number literal had a
+        // decimal point (found by testing this exact function's new
+        // `json_deserialize` caller — a Map containing both an integer
+        // valued 1 and a boolean `true` together surfaced the
+        // corruption immediately).
+        case let value as NSNumber:
+            if CFGetTypeID(value) == CFBooleanGetTypeID() {
+                .boolean(value.boolValue)
+            } else if CFNumberIsFloatType(value) {
+                .decimal(value.doubleValue)
+            } else {
+                .integer(value.intValue)
+            }
         case let value as String:
             .string(value)
         case let value as [Any]:
@@ -1073,6 +1548,9 @@ enum LoopControlSignal: Sendable, Equatable {
 public struct LassoContext: Sendable {
     private var globals: [String: LassoValue]
     private var locals: [String: LassoValue]
+    // Genuinely separate namespace from `globals` above — see
+    // `VariableScope.trueGlobal`'s own doc comment for why.
+    private var trueGlobals: [String: LassoValue] = [:]
     private var inlineFrames: [ActiveInlineFrame]
     public var natives: LassoNativeRegistry
     public var nativeTypes: LassoNativeTypeRegistry
@@ -1109,6 +1587,14 @@ public struct LassoContext: Sendable {
     /// `Evaluator`) trigger a full node render. See
     /// `LassoIncludeRenderService` in `Providers.swift`.
     public var includeRenderService: (any LassoIncludeRenderService)?
+    /// Same wiring convention as `includeRenderService` immediately
+    /// above — lets native-type methods that only see `LassoContext`
+    /// (not a full `Evaluator`) invoke an already-resolved custom tag
+    /// (e.g. a `\TagName` reference, `TagReference.swift`) with
+    /// already-evaluated positional arguments. See
+    /// `LassoTagInvocationService` in `Providers.swift` for the full
+    /// design and its deliberate scope limits.
+    public var tagInvocationService: (any LassoTagInvocationService)?
     /// Paths already processed by `web_response->includeOnce` this
     /// request's render. Deliberately separate from `loadedLibraries` so
     /// an `include` path and a `library` path sharing a string don't
@@ -1190,6 +1676,13 @@ public struct LassoContext: Sendable {
     /// catch handler has already reset `currentError` for code that follows.
     public var currentError: LassoErrorState
     public var lastError: LassoErrorState?
+    /// `Error_Push`/`Error_Pop` (Ch. 19 Table 3) — a real stack, distinct
+    /// from `lastError` above (which only ever remembers one prior
+    /// state). Real corpus pattern: pushing before a `Protect` block so
+    /// a preexisting error condition can't bleed into it and mistakenly
+    /// trigger its own error handling, then popping to restore the
+    /// caller's error state afterward.
+    var errorStack: [LassoErrorState] = []
     /// `(sessionName, varName)` pairs registered via `session_addVar` this
     /// request — read back by `finalizeSessions()` at the very end of
     /// render so the persisted value reflects whatever the page last set
@@ -1254,6 +1747,7 @@ public struct LassoContext: Sendable {
         selfStack = []
         currentError = .noError
         lastError = nil
+        errorStack = []
         trackedSessionVariables = []
         suppressedSessionSaves = []
         sessionStartResults = [:]
@@ -1268,6 +1762,22 @@ public struct LassoContext: Sendable {
     public mutating func clearError() {
         lastError = currentError
         currentError = .noError
+    }
+
+    /// `[Error_Push]`: "Pushes the current error condition onto a stack
+    /// and resets the current error code and error message."
+    public mutating func pushError() {
+        errorStack.append(currentError)
+        currentError = .noError
+    }
+
+    /// `[Error_Pop]`: "Restores the last error condition stored using
+    /// [Error_Push]." A pop with nothing pushed is a documented no-op
+    /// rather than an error (the tag has no "stack empty" failure mode
+    /// in the Guide) — leaves `currentError` untouched.
+    public mutating func popError() {
+        guard let restored = errorStack.popLast() else { return }
+        currentError = restored
     }
 
     /// Called once, at the very end of a page's render (`LassoRenderer`),
@@ -1293,15 +1803,66 @@ public struct LassoContext: Sendable {
         switch scope {
         case .local: locals[name.lowercased()] = value
         case .global, .unscoped: globals[name.lowercased()] = value
+        case .trueGlobal: trueGlobals[name.lowercased()] = value
         }
     }
 
+    // Ch. 15 p.227: "The $ symbol will return a global variable if no
+    // page variable of the same name has been created" — `$name` parses
+    // straight to `.variable(name, .global)` (ExpressionParser.swift),
+    // not `.unscoped`, so the fallback belongs on `.global` itself: a
+    // page variable of the same name still wins (checked first), true-
+    // global is the fallback. `[Variable: 'name']`'s own read form maps
+    // to this same `.global` scope (see `Evaluator.declarationScope(for:)`),
+    // so it gets this fallback too — matching the Guide's parallel
+    // wording for both: "use the [Variable] tag to retrieve the value
+    // of the global variable" when no page variable overrides it.
+    // `.unscoped` deliberately does NOT get this fallback: p.225 scopes
+    // `Variable_Defined`/`Var_Defined` to "the current Lasso page", and
+    // `var_defined`'s free-function registration (this file, above)
+    // reads through the `.unscoped` default — an earlier version of
+    // this fallback lived on `.unscoped` too and silently made
+    // `Var_Defined('x')` report true whenever an unrelated true Global
+    // named "x" existed, even with no page variable ever created
+    // (caught by architect review, no test previously exercised this).
     public func value(for name: String, scope: VariableScope = .unscoped) -> LassoValue {
         switch scope {
         case .local: locals[name.lowercased()] ?? .null
-        case .global: globals[name.lowercased()] ?? .null
+        case .global: globals[name.lowercased()] ?? trueGlobals[name.lowercased()] ?? .null
+        case .trueGlobal: trueGlobals[name.lowercased()] ?? .null
         case .unscoped: locals[name.lowercased()] ?? globals[name.lowercased()] ?? .null
         }
+    }
+
+    /// `[Global_Remove]` (Ch. 15 Table 3): "Removes the specified
+    /// variable from the globals."
+    public mutating func removeTrueGlobal(_ name: String) {
+        trueGlobals.removeValue(forKey: name.lowercased())
+    }
+
+    /// `[Global_Defined]` (Ch. 15 Table 3): "Returns True if the global
+    /// variable has been defined or False otherwise." Mirrors
+    /// `var_defined`/`local_defined`'s existing (Runtime.swift,
+    /// `registerDefaultFunctions`) treatment of a variable holding
+    /// `.null` as "not defined" — the Guide's prose for the page-
+    /// variable sibling `[Variable_Defined]` says a Null-valued
+    /// variable should still count as defined, but this codebase's
+    /// storage can't currently distinguish "never created" from
+    /// "created and set to Null" (both collapse to `.null` in
+    /// `value(for:)`), and `var_defined`/`local_defined` already made
+    /// this same simplification — kept consistent here rather than
+    /// introducing a third, differently-behaved variant.
+    public func trueGlobalDefined(_ name: String) -> Bool {
+        switch trueGlobals[name.lowercased()] {
+        case nil, .void, .null: false
+        default: true
+        }
+    }
+
+    /// `[Globals]` (Ch. 15 Table 3): "Returns a map of all global
+    /// variables that are currently defined."
+    public func trueGlobalsSnapshot() -> [String: LassoValue] {
+        trueGlobals
     }
 
     public var currentInlineFrame: LassoInlineFrame? {
@@ -1510,8 +2071,32 @@ public enum LassoRuntimeError: Error, Equatable {
     /// Phase D resolves the shared native-type-mutation design (§4.8 point
     /// 2) for `email_compose` and `email_smtp` together.
     case emailComposeMutationNotYetSupported(String)
+    case fileSystemNotConfigured
     case tagCallDepthExceeded
     case unsafeDynamicFieldName(String)
+    /// A custom tag invoked via `LassoTagInvocationService` (internal
+    /// dispatch — custom Comparators/Matchers, `Providers.swift`) was
+    /// supplied fewer already-evaluated positional arguments than its
+    /// own declared parameter count. This narrower invocation path
+    /// doesn't evaluate default-parameter expressions (see
+    /// `LassoTagInvocationService`'s own doc comment) — an arity
+    /// mismatch here is a real authoring error worth failing loudly on,
+    /// not silently defaulting through.
+    case tagInvocationArityMismatch(String)
+    /// `LassoTagInvocationService` (`Providers.swift`) was needed but
+    /// `context.tagInvocationService` was `nil` — matches the
+    /// established `includeRenderService`/`includeNotConfigured`
+    /// convention (`NativeTypes.swift`'s `web_response->include*`
+    /// methods): a missing service throws rather than silently
+    /// degrading. Found by architect review — `evaluateCustom`
+    /// (`Comparators.swift`) originally returned `-1` ("not a valid
+    /// comparison") on a nil service, which is indistinguishable from a
+    /// legitimately non-matching comparator and would silently make
+    /// every `Match_Comparator` wrapping a custom `\TagName` reference
+    /// report "no match" for any `LassoContext` built outside
+    /// `LassoRenderer`/`RendererEngine` (the only place that wires this
+    /// service up).
+    case tagInvocationNotConfigured
     /// Thrown by `Evaluator.assign(_:to:defaultScope:)`'s `.member` case
     /// when a raw field assignment (`$obj->fieldName = value`) targets a
     /// NATIVE (Swift-implemented) type instance — `date`/`bytes`/

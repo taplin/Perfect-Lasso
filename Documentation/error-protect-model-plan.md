@@ -16,12 +16,34 @@ LassoParserTests.swift`: `protectCatchesRecoverableErrorAndSetsCurrentError`,
 `protectDoesNotCatchReturnOrFatalErrors`,
 `errorCurrentErrorDefaultsToNoErrorAndInlineFramesUpdateIt`).
 
+**Update (`language-primitives-batch3` branch)**: Milestones 1 and 5 are now
+done — `Sources/LassoParser/ErrorHandling.swift`'s `Code` enum extracts and
+assigns the real Lasso 8.5 Appendix A Table 1 codes (verified via
+`pdftotext -layout` against column-interleaving artifacts) plus the handful
+of additional named codes only documented on lassoguide.com's Lasso 9 side
+(`error_code_divideByZero`, `error_code_fileNotFound`, etc. — confirmed
+genuinely absent from the 8.5 PDF's own Appendix A, not just missed). The
+same work also added `fail`/`fail_if` (throwing the existing
+`LassoRecoverableError`, so already catchable by `protect`), the general
+`Error_*` tag family (`error_code`/`error_msg`/`error_push`/`error_pop`/
+`error_reset`/`error_setErrorCode`/`error_setErrorMessage`), ten of Table 4's
+14 named-constant tags (`Error_DatabaseConnectionUnavailable`/
+`Error_DatabaseTimeout`/`Error_FileNotFound`/`Error_OutOfMemory`/
+`Error_RequiredFieldMissing` don't map to a single clean Appendix A code and
+are deliberately left out, disclosed in `ErrorHandling.swift`'s own comment),
+and a fix making integer/decimal division by zero throw a catchable
+`LassoRecoverableError` (`error_code_divideByZero`) instead of crashing or
+producing `inf`/`nan`. Still explicitly NOT implemented, disclosed in
+`ErrorHandling.swift`'s own top-of-file comment: `Handle`/`Handle_Error`
+container-tag blocks and `Protect`'s own queued-callback-at-block-end
+execution of them — a materially different mechanism (a per-container
+deferred-callback queue, plus a new "halt current container and jump to its
+handlers" control-flow signal for `Fail`) than `protect`'s existing simple
+try/catch, comparable in scope to this project's other deferred structural
+gaps (Captures, the RegExp Table 10 stateful tags).
+
 Still open, deferred to the `inline-write-raw-sql-plan` pass per the
 architect's dependency analysis:
-- Milestone 1 (extracting the Lasso 8.5 Error Control chapter's exact error
-  codes/constants from `References/Lasso/Lasso 8.5 Language Guide.pdf`).
-- Milestone 5's constant list (`error_noError`, `error_addError`, etc.) —
-  only `error_currentError` itself is implemented so far.
 - Milestone 7 (the dynamic inline executor actually constructing
   `LassoInlineFrame`s with real connector-failure error state — currently
   only reachable via a synthetic test native, not real database failures).

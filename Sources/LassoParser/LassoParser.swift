@@ -388,10 +388,39 @@ private struct TemplateScanner {
         var parser = ExpressionParser(body)
         let expressions = parser.parseList()
         if delimiter == .square, let first = expressions.first {
-            if expressions.count > 1,
-               case let .call(callee, _) = first,
-               case let .identifier(name) = callee,
-               TagCatalog.isBlock(name, in: .lassoParser) {
+            // A block-tag statement — condition, body, `else`, closing
+            // `/name` — embedded in ONE square-bracket span can appear
+            // ANYWHERE in that span's statement list, not just as its
+            // very first statement, e.g. real corpus's
+            // includes/mini_cart.lasso: `[var(What_Action::string =
+            // $function) if(var_defined('cart_id') && $cart_id != '')
+            // ... records ... /if]`, where an ordinary `var(...)`
+            // assignment precedes the real `if`. This used to only check
+            // whether `first` itself was a block-tag call (see
+            // `pages/subcats.page.lasso`'s case below, where it does
+            // start with `if`) — anything past the first position fell
+            // through to the flat `ExpressionParser` + `.code(...)` path,
+            // which has no concept of blocks at all: "if"/"records"
+            // parsed fine as an ordinary call syntactically, but never
+            // became a `.tag(...)` node `BlockBuilder` could pair with
+            // its real `[/if]`/`[/records]` closer (each its own,
+            // separate single-tag bracket span further down the page).
+            // `BlockBuilder` then never saw them as open (surfacing as
+            // "Unexpected closing tag" diagnostics for the orphaned
+            // closers), and the evaluator later tried to call
+            // "if"/"records" as ordinary functions instead
+            // (`unknownFunction("if")`).
+            let containsBlockTag = expressions.count > 1 && expressions.contains { expression in
+                switch expression {
+                case let .call(.identifier(name), _):
+                    return TagCatalog.isBlock(name, in: .lassoParser)
+                case let .identifier(name):
+                    return TagCatalog.allowsBareOpen(name, in: .lassoParser)
+                default:
+                    return false
+                }
+            }
+            if containsBlockTag {
                 // A whole block-tag statement — condition, body, `else`,
                 // closing `/name` — embedded in ONE square-bracket span,
                 // e.g. real corpus's `[if($product_subset == 'all')
@@ -404,9 +433,7 @@ private struct TemplateScanner {
                 // whatever `[/if]`/`[else]` happens to appear *later* in
                 // the page, silently swallowing real content in between
                 // (confirmed live: this exact page's category list and
-                // product thumbnails never rendered). `expressions.count
-                // > 1` is the signal that more than just the opening call
-                // was parsed from this one span — needs the same
+                // product thumbnails never rendered). Needs the same
                 // statement/block-aware `ScriptBodyParser` treatment
                 // `bodyOpensWithDefine`/`bodyOpensWithLegacyDefinition`
                 // above already get for the same reason.
