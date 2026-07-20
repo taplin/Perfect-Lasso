@@ -129,9 +129,10 @@ This is real, new work in `Evaluator.assign`, not something that falls out of `.
 - [x] `Evaluator.assign` new case for `Pair->First=`/`->Second=`, `Stack->First=`, `Queue->First=` (§3.6) — genuinely new mechanism, isolated to its own stage given the risk profile (§6). `Pair` (a value type) rebuilds-and-recursively-reassigns; `Queue`/`Stack` (object-wrapped) mutate `_elements` in place.
 - Also done, beyond the original checklist: `Set->Get(n)=` (flagged as deferred-to-here in Stage 2's own `makeSetType()` comment); `Pair->Size`/`->Get(1)`/`->Get(2)` (documented alongside `->First`/`->Second` in the same table); fixed `Pair`'s own bare-stringification format to match its documented `(key)=(value)` shape (was an uncited `"key = value"`).
 
-**Stage 5 — Matchers** — not started
-- [ ] Matcher value family (`Match_RegExp`/`Match_NotRegExp`/`Match_Range`/`Match_NotRange`/`Match_Comparator`, §3.4).
-- [ ] Extend `>>` and `->Contains`/`->Find`/`->RemoveAll`/`->Iterator` across all types to matcher-check their argument, fixing the adjacent `>>`-on-array string-concatenation bug (§1.11) in the same pass.
+**Stage 5 — Matchers** ✅ done (`d5266e3`)
+- [x] Matcher value family (`Match_RegExp`/`Match_NotRegExp`/`Match_Range`/`Match_NotRange`/`Match_Comparator`, §3.4) — `Matchers.swift`, verified against every Table 22 worked example.
+- [x] Extend `>>` and `->Contains`/`->Find`/`->RemoveAll`/`->Iterator` across all types to matcher-check their argument, fixing the adjacent `>>`-on-array string-concatenation bug (§1.11) in the same pass.
+- Also found and fixed along the way: `Evaluator.lassoLessThan` (backs `->Sort`/Set/PriorityQueue/TreeMap ordering) was case-sensitive while `==` is case-insensitive by established convention — the Ch. 30 p.426 `Match_Range` worked example only reproduces under case-insensitive comparison, proving the inconsistency via primary source. Unified rather than adding a second comparison function (flagged by user review); no existing Sort/ordering test exercised a case-collision, so no previously-verified behavior changed. Code review also caught `TreeMap->RemoveAll`'s literal-key path bypassing `keysEqual`, reintroducing the compound-key `outputString`-concatenation collision `keysEqual` exists to prevent — fixed, with a regression test. 472/472 tests passing.
 
 **Stage 6 — `\TagName` bareword reference + custom Comparators/Matchers (explicitly separate, deferred design decision — see §5)** — not started
 - [ ] New lexer/parser support for `\identifier` as an expression (§3.3).
