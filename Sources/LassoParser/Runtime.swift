@@ -153,6 +153,13 @@ public struct LassoNativeRegistry: Sendable {
         register("decimal") { arguments, _ in
             .decimal(arguments.first?.value.number ?? 0)
         }
+        // `null(expr)` / `[Null: expr]` (Ch. 30 pp.422-426's canonical
+        // Iterator idiom, e.g. `Null: $myIterator->Forward;`) — evaluates
+        // its argument for side effects but suppresses the output. By the
+        // time this closure runs, `arguments` is already evaluated (see
+        // the `.call` case in Evaluator.evaluate), so simply discarding
+        // the result and returning `.void` is sufficient.
+        register("null") { _, _ in .void }
         register("var_defined") { arguments, context in
             let name = arguments.first?.value.outputString ?? ""
             switch context.value(for: name) {
