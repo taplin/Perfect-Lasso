@@ -85,6 +85,23 @@ public struct LassoEmailProviderImpl: LassoEmailProvider {
     /// sweeps the exact same registry every request's context dispatches
     /// through).
     let connectionRegistry: LassoSMTPConnectionRegistry
+    /// Off-by-default operator gate for `email_smtp->open` (Phase D
+    /// milestone review, BLOCKING #2) — real Lasso's own documented
+    /// `email_smtp` behavior lets `->open` dial ANY literal caller-given
+    /// `-host`/`-port` with zero address-routability filtering, unlike
+    /// `email_send`/`email_compose`'s SSRF-safe named-relay-only design.
+    /// Since this server renders arbitrary Lasso source from a site's own
+    /// codebase, a compromised/malicious template author (or any template
+    /// with an injection bug elsewhere) could otherwise reach internal-
+    /// network addresses (e.g. `-host='169.254.169.254'`) with zero
+    /// operator-facing safety gate. Mirrors this codebase's exact existing
+    /// precedent for gating dangerous, low-level, opt-in-only access —
+    /// `ServerConfig.mysqlAllowRawSQL` (`main.swift`) — rather than
+    /// inventing a new pattern: default `false`, threaded through from
+    /// `ServerConfig.smtpAllowEmailSMTP` / `LASSO_SMTP_ALLOW_EMAIL_SMTP`.
+    /// See `LassoEmailSMTPType.swift`'s `smtpOpen` for the actual gate
+    /// check (the one place real network dialing happens).
+    let allowEmailSMTP: Bool
     /// `email_smtp->open` dials directly via `SMTPBootstrap.connect`,
     /// bypassing `LassoSMTPMailerRegistry`'s pooled, named-relay
     /// `SMTPMailer`s entirely (§4.8b: real Lasso's `email_smtp` is a raw,
@@ -103,7 +120,8 @@ public struct LassoEmailProviderImpl: LassoEmailProvider {
         mxResolver: (any MXResolving)? = nil,
         mxLookupCache: LassoMXLookupCache? = nil,
         connectionRegistry: LassoSMTPConnectionRegistry = LassoSMTPConnectionRegistry(),
-        group: any EventLoopGroup = MultiThreadedEventLoopGroup.singleton
+        group: any EventLoopGroup = MultiThreadedEventLoopGroup.singleton,
+        allowEmailSMTP: Bool = false
     ) {
         self.registry = registry
         self.siteRoot = siteRoot
@@ -111,6 +129,7 @@ public struct LassoEmailProviderImpl: LassoEmailProvider {
         self.mxLookupCache = mxLookupCache
         self.connectionRegistry = connectionRegistry
         self.group = group
+        self.allowEmailSMTP = allowEmailSMTP
     }
 
     public func send(_ arguments: [EvaluatedArgument], context: LassoContext) async throws -> LassoValue {

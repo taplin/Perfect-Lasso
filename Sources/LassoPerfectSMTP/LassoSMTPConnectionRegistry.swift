@@ -24,6 +24,36 @@
 //  the same "shared, safely-concurrent state" justification
 //  `LassoSMTPMailerRegistry`/`LassoMXLookupCache` already use.
 //
+//  ## Why the map's value also retains `receiver` (milestone review, real
+//  security finding, fixed)
+//
+//  `ObjectIdentifier` is only a stable, unique key for as long as the
+//  object it was derived from stays alive — nothing about the type itself
+//  keeps that object alive. Earlier revisions of this actor stored only
+//  the bare `SMTPConnection` under `ObjectIdentifier(receiver)`, with
+//  nothing in this actor retaining `receiver` itself. A page that opens an
+//  `email_smtp` connection and then errors out or returns without calling
+//  `->close` (a routine control-flow pattern — early scope exit, a
+//  `[protect]`-caught error, a loop-scoped local) let ARC deallocate that
+//  `LassoObjectInstance` while this actor still held a live, already-
+//  authenticated `SMTPConnection` under its now-stale `ObjectIdentifier`.
+//  If a *different*, unrelated `email_smtp` object from a totally
+//  unrelated request happened to get allocated at that same freed
+//  address before the idle reaper swept it, a subsequent `->command`/
+//  `->send` call on that unrelated object would silently resolve to
+//  someone else's still-open, already-authenticated connection — sending
+//  mail through another request's SMTP session without ever
+//  authenticating. Storing `(receiver, connection)` together fixes this
+//  structurally, not just for the specific scenario found during review:
+//  for as long as any entry is alive, this actor holds a strong reference
+//  to its exact original `receiver`, so no *other* object can ever be
+//  allocated at that same address and collide with the stale
+//  `ObjectIdentifier` — the whole class of bug is gone, not merely
+//  mitigated. This doesn't change the *lifetime* of a leaked connection
+//  (an entry is only retained until `->close` or the idle reaper evicts
+//  it, both of which already remove it from the dictionary today) — it
+//  only closes the identity-collision hole.
+//
 //  ## Idle-timeout reaper
 //
 //  A page that errors out mid-sequence, or simply forgets `->close`,
@@ -39,11 +69,15 @@
 //  `while !Task.isCancelled { ...; try? await Task.sleep(...) }` loop and
 //  the cancellable `Task` handle) this actor does NOT start its own
 //  background `Task` — `main.swift`'s `smtp` wiring block does, storing
-//  the handle on `LassoSiteServer` so it can be cancelled (`deinit`)
-//  rather than leaked. Five minutes (matching `SMTPConnection`'s own
-//  default `replyTimeout`) is `sweepIdleConnections`'s documented default,
-//  per §4.8b's own suggestion — a reasonable starting point, not a value
-//  either doc source confirms.
+//  the handle on `LassoSiteServer` so it can be exposed to
+//  `LassoAdminDelegate` and genuinely cancelled on a "Restart Server"
+//  admin action (`AdminConsoleIntegration.swift`'s restart action cancels
+//  it alongside `cwpJanitorTask`/`siteServerTask` — `LassoSiteServer` is a
+//  `struct` with no `deinit`, so this real cancellation path, not a
+//  hypothetical future one, is what actually reaps it on restart). Five
+//  minutes (matching `SMTPConnection`'s own default `replyTimeout`) is
+//  `sweepIdleConnections`'s documented default, per §4.8b's own suggestion
+//  — a reasonable starting point, not a value either doc source confirms.
 //
 
 import Foundation
@@ -51,7 +85,12 @@ import LassoParser
 import PerfectSMTP
 
 public actor LassoSMTPConnectionRegistry {
-    private var connections: [ObjectIdentifier: SMTPConnection] = [:]
+    /// The value retains `receiver` alongside its `connection` — see this
+    /// file's header doc comment for why: as long as an entry lives here,
+    /// this actor holds a strong reference to the *exact* `LassoObjectInstance`
+    /// that `ObjectIdentifier` was derived from, so no other object can ever
+    /// be allocated at that freed address and collide with a stale key.
+    private var connections: [ObjectIdentifier: (receiver: LassoObjectInstance, connection: SMTPConnection)] = [:]
     /// Touched on every `insert`/`connection(for:)` lookup — "used," for
     /// this purpose, means "a `->open`/`->command`/`->send` call touched
     /// it," not merely "still present in the map." `remove(for:)`
@@ -70,7 +109,7 @@ public actor LassoSMTPConnectionRegistry {
     /// `->close`.
     public func insert(_ connection: SMTPConnection, for receiver: LassoObjectInstance) {
         let key = ObjectIdentifier(receiver)
-        connections[key] = connection
+        connections[key] = (receiver: receiver, connection: connection)
         lastUsed[key] = Date()
     }
 
@@ -79,9 +118,9 @@ public actor LassoSMTPConnectionRegistry {
     /// catchable "no open connection" error rather than crashing.
     public func connection(for receiver: LassoObjectInstance) -> SMTPConnection? {
         let key = ObjectIdentifier(receiver)
-        guard let connection = connections[key] else { return nil }
+        guard let entry = connections[key] else { return nil }
         lastUsed[key] = Date()
-        return connection
+        return entry.connection
     }
 
     /// Called by `->close`. Returns the removed connection (if any) so the
@@ -90,12 +129,15 @@ public actor LassoSMTPConnectionRegistry {
     /// need to await internally (the one call site, `LassoEmailSMTPType.swift`'s
     /// `smtpClose`, awaits it directly). Returns `nil` — a safe no-op, not
     /// an error — for a never-`->open`ed or already-`->close`d receiver,
-    /// per §4.8b's explicit "must not crash" requirement.
+    /// per §4.8b's explicit "must not crash" requirement. Releasing this
+    /// entry's retained `receiver` here is exactly the "close/evict removes
+    /// it from the dictionary" postcondition this file's header doc comment
+    /// promises — no separate cleanup step needed.
     @discardableResult
     public func remove(for receiver: LassoObjectInstance) -> SMTPConnection? {
         let key = ObjectIdentifier(receiver)
         lastUsed.removeValue(forKey: key)
-        return connections.removeValue(forKey: key)
+        return connections.removeValue(forKey: key)?.connection
     }
 
     /// Closes and evicts every entry untouched for at least `idleTimeout`
@@ -115,8 +157,8 @@ public actor LassoSMTPConnectionRegistry {
             .map(\.key)
         for key in staleKeys {
             lastUsed.removeValue(forKey: key)
-            guard let connection = connections.removeValue(forKey: key) else { continue }
-            try? await connection.channel.close()
+            guard let entry = connections.removeValue(forKey: key) else { continue }
+            try? await entry.connection.channel.close()
         }
         return staleKeys.count
     }

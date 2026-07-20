@@ -344,7 +344,8 @@ private func sampleServerConfig(
     cwpJanitorDurationThresholdSeconds: Int? = 150,
     cwpJanitorMaxSessions: Int? = nil,
     cwpJanitorMinFloor: Int = 5,
-    cwpJanitorMaxDisconnectsPerSweep: Int? = nil
+    cwpJanitorMaxDisconnectsPerSweep: Int? = nil,
+    smtpAllowEmailSMTP: Bool = false
 ) -> ServerConfig {
     ServerConfig(
         siteRoot: URL(fileURLWithPath: "/tmp/sample-site"),
@@ -398,7 +399,8 @@ private func sampleServerConfig(
         fmAdminAPIPassword: cwpJanitorEnabled ? "secret" : nil,
         fmAdminAPITrustSelfSignedTLS: false,
         smtpRelays: [:],
-        smtpDefaultRelay: nil
+        smtpDefaultRelay: nil,
+        smtpAllowEmailSMTP: smtpAllowEmailSMTP
     )
 }
 

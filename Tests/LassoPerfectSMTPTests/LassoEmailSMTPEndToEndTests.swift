@@ -52,7 +52,12 @@ struct LassoEmailSMTPEndToEndTests {
     private static func makeContext(
         siteRoot: URL = FileManager.default.temporaryDirectory,
         connectionRegistry: LassoSMTPConnectionRegistry = LassoSMTPConnectionRegistry(),
-        group: any EventLoopGroup = MultiThreadedEventLoopGroup.singleton
+        group: any EventLoopGroup = MultiThreadedEventLoopGroup.singleton,
+        // Every test below exercises real `->open` behavior, so the gate
+        // (milestone review, BLOCKING #2 — off by `false` in real
+        // deployments) is explicitly enabled here; `emailSMTPGateTests`
+        // below cover the default-`false`/off behavior specifically.
+        allowEmailSMTP: Bool = true
     ) throws -> LassoContext {
         struct UnusedTransport: SMTPTransport {
             func send(_ envelope: SMTPEnvelope, _ message: SignedMessage) async throws -> [DeliveryResult] {
@@ -68,7 +73,8 @@ struct LassoEmailSMTPEndToEndTests {
             registry: registry,
             siteRoot: siteRoot,
             connectionRegistry: connectionRegistry,
-            group: group
+            group: group,
+            allowEmailSMTP: allowEmailSMTP
         ))
     }
 
@@ -343,6 +349,105 @@ struct LassoEmailSMTPEndToEndTests {
 
         #expect(evicted > 0 || evictedAfterWait > 0)
         #expect(await registry.openConnectionCount == 0)
+    }
+
+    // MARK: - Connection-hijack regression (milestone review, BLOCKING #1)
+
+    /// Can't literally force an address-reuse collision in a test (ARC/the
+    /// allocator give no reliable hook for that), so this proves the fix
+    /// structurally instead: the abandoned object's registry entry
+    /// survives ONLY because the registry retains its own `receiver`
+    /// (proving the retain actually happens, not just compiles), and a
+    /// completely separate, never-`->open`ed object never resolves to that
+    /// live connection -- the exact "no accidental success" guarantee the
+    /// review asked for.
+    @Test func abandonedConnectionNeverLeaksToAnUnrelatedNeverOpenedObject() async throws {
+        let group = MultiThreadedEventLoopGroup(numberOfThreads: 1)
+        let server = try await FakeSMTPServer.start(group: group, authBehavior: .succeed, rcptBehavior: .accept)
+        let registry = LassoSMTPConnectionRegistry()
+        let context = try Self.makeContext(connectionRegistry: registry, group: group)
+        guard let emailProvider = context.emailProvider else {
+            Issue.record("expected a configured emailProvider")
+            return
+        }
+
+        // Mirrors the routine control-flow pattern the review flagged
+        // (early scope exit / `[protect]`-caught error / loop-scoped
+        // local): open a real, authenticated connection, then never
+        // reference the receiver again -- this test itself holds no
+        // reference to it once this block ends.
+        _ = try await emailProvider.smtpOpen(
+            LassoObjectInstance(typeName: "email_smtp"),
+            [
+                EvaluatedArgument(label: "host", value: .string("127.0.0.1")),
+                EvaluatedArgument(label: "port", value: .integer(Int(server.port))),
+                EvaluatedArgument(label: "timeout", value: .integer(5)),
+            ],
+            context: context
+        )
+        // The entry survives -- proving the registry itself retained the
+        // receiver (pre-fix, nothing did, and this would be indistinguishable
+        // from a leak either way, which is exactly why the fix needs the
+        // next assertion too, not just this one).
+        #expect(await registry.openConnectionCount == 1)
+
+        // A brand-new, never-`->open`ed `LassoObjectInstance` must resolve
+        // to `nil` -- never to the abandoned connection above. Pre-fix,
+        // this couldn't be forced to collide in a test (no reliable
+        // address-reuse hook), but the map's value type retaining `receiver`
+        // makes the collision structurally impossible regardless: this
+        // object and the abandoned one are simultaneously alive right here,
+        // so they provably have distinct `ObjectIdentifier`s.
+        let unrelated = LassoObjectInstance(typeName: "email_smtp")
+        let resolved = await registry.connection(for: unrelated)
+        #expect(resolved == nil)
+
+        await #expect(throws: Error.self) {
+            _ = try await emailProvider.smtpSend(
+                unrelated,
+                [
+                    EvaluatedArgument(label: "from", value: .string("a@example.com")),
+                    EvaluatedArgument(label: "recipients", value: .array([.string("b@example.com")])),
+                    EvaluatedArgument(label: "message", value: .string("x")),
+                ],
+                context: context
+            )
+        }
+
+        try await server.channel.close()
+        try await group.shutdownGracefully()
+    }
+
+    // MARK: - Off-by-default operator gate (milestone review, BLOCKING #2)
+
+    @Test func openThrowsAClearNotEnabledErrorWhenTheGateIsOff() async throws {
+        var context = try Self.makeContext(allowEmailSMTP: false)
+
+        let output = try await LassoRenderer().render(
+            "[protect][local(smtp) = email_smtp][#smtp->open(-host='127.0.0.1', -port=25)][/protect]after-[error_currenterror]",
+            context: &context
+        )
+
+        #expect(output.hasPrefix("after-"))
+        #expect(output.contains("email_smtp is not enabled"))
+    }
+
+    @Test func openReachesTheRealDialAttemptWhenTheGateIsExplicitlyEnabled() async throws {
+        let group = MultiThreadedEventLoopGroup(numberOfThreads: 1)
+        let server = try await FakeSMTPServer.start(group: group, authBehavior: .succeed, rcptBehavior: .accept)
+        var context = try Self.makeContext(group: group, allowEmailSMTP: true)
+
+        let output = try await LassoRenderer().render(
+            "[local(smtp) = email_smtp]" +
+            "[#smtp->open(-host='127.0.0.1', -port=\(server.port), -timeout=5)]" +
+            "[#smtp->close]done",
+            context: &context
+        )
+
+        try await server.channel.close()
+        try await group.shutdownGracefully()
+
+        #expect(output == "done")
     }
 }
 

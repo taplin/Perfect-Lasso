@@ -65,6 +65,14 @@ final class LassoAdminDelegate: AdminConsoleDelegate {
     /// in-flight Admin API call doesn't linger past it. `nil` when the
     /// janitor is disabled.
     private let cwpJanitorTask: Task<Void, Never>?
+    /// Handle to `main.swift`'s `email_smtp` idle-connection reaper Task
+    /// (`LassoSiteServer.smtpConnectionReaperTask`), cancelled alongside
+    /// `cwpJanitorTask`/`siteServerTask` on a successful restart handoff
+    /// (milestone review, BLOCKING #3 — this Task was previously never
+    /// referenced here at all, a real task leak on every "Restart Server"
+    /// admin action). `nil` when no `smtp` block is configured at all (see
+    /// that property's own doc comment for when it's `nil`).
+    private let smtpConnectionReaperTask: Task<Void, Never>?
 
     init(
         config: ServerConfig,
@@ -78,7 +86,8 @@ final class LassoAdminDelegate: AdminConsoleDelegate {
         datasourceFailureTracker: DatasourceFailureTracker = DatasourceFailureTracker(),
         janitorTracker: CWPSessionJanitorTracker = CWPSessionJanitorTracker(),
         cwpAdminAPIClient: FMAdminClient? = nil,
-        cwpJanitorTask: Task<Void, Never>? = nil
+        cwpJanitorTask: Task<Void, Never>? = nil,
+        smtpConnectionReaperTask: Task<Void, Never>? = nil
     ) {
         self.config = config
         self.startTime = startTime
@@ -92,6 +101,7 @@ final class LassoAdminDelegate: AdminConsoleDelegate {
         self.janitorTracker = janitorTracker
         self.cwpAdminAPIClient = cwpAdminAPIClient
         self.cwpJanitorTask = cwpJanitorTask
+        self.smtpConnectionReaperTask = smtpConnectionReaperTask
     }
 
     // MARK: - Phase 1: status display
@@ -314,6 +324,7 @@ final class LassoAdminDelegate: AdminConsoleDelegate {
             await logCapture?.capture("[admin] restart-server: new instance (pid \(pid)) confirmed healthy — handing off")
             let siteServerTask = self.siteServerTask
             let cwpJanitorTask = self.cwpJanitorTask
+            let smtpConnectionReaperTask = self.smtpConnectionReaperTask
             let logCapture = self.logCapture
             // Fire-and-forget with a brief delay, matching the crawl-report action's
             // own pattern — this action's HTTP response (below) needs to actually
@@ -323,6 +334,10 @@ final class LassoAdminDelegate: AdminConsoleDelegate {
                 // Stop the janitor's poll loop too, so it can't leave an
                 // in-flight Admin API call running past this process's exit.
                 cwpJanitorTask?.cancel()
+                // Same reasoning for `email_smtp`'s idle-connection reaper
+                // (BLOCKING #3) — previously never cancelled here at all,
+                // a real task leak on every restart.
+                smtpConnectionReaperTask?.cancel()
                 siteServerTask.cancel()
                 // Bounded: an actively-executing request or a WebSocket connection has
                 // no drain deadline of its own (see main.swift's siteServerTask doc

@@ -30,11 +30,20 @@
 //  quietly reintroduced: it matches real Lasso's own documented
 //  `email_smtp` behavior byte for byte (this is, after all, "the point" of
 //  a low-level SMTP connection type), and the plan's own §4.8b never asked
-//  for `DirectMXTransport`-style filtering here. An operator who wants to
-//  close this off entirely should simply not expose `email_smtp` to
-//  untrusted template authors (there's no per-tag ACL in this codebase to
-//  do it more surgically) — worth another look if real corpus usage of
-//  `email_smtp` ever surfaces from an untrusted-authoring context.
+//  for `DirectMXTransport`-style filtering here.
+//
+//  RESOLVED (milestone review, BLOCKING #2): real Lasso operators had an
+//  actual enforced mitigation for this — a per-tag/per-group permission
+//  system ("Setup > Global > Tags and Security > Groups > Tags" per the
+//  Lasso 8.5 Language Guide) — that this codebase had no equivalent of.
+//  `smtpOpen` below now gates ALL dialing behind `LassoEmailProviderImpl.
+//  allowEmailSMTP`, an off-by-default config flag (`ServerConfig.
+//  smtpAllowEmailSMTP` / `LASSO_SMTP_ALLOW_EMAIL_SMTP`) mirroring this
+//  codebase's exact `mysqlAllowRawSQL` precedent. An operator who wants
+//  `email_smtp` off entirely simply leaves the flag unset (the default);
+//  one who needs it enables it explicitly and accepts the SSRF exposure
+//  described above as the documented cost of real Lasso's own `email_smtp`
+//  design. See Documentation/lasso-perfect-smtp-integration-plan.md §4.8b.
 //
 
 import Foundation
@@ -48,6 +57,18 @@ extension LassoEmailProviderImpl {
         _ arguments: [EvaluatedArgument],
         context: LassoContext
     ) async throws -> LassoValue {
+        // Off-by-default operator gate (milestone review, BLOCKING #2) —
+        // see `LassoEmailProviderImpl.allowEmailSMTP`'s doc comment for the
+        // full SSRF rationale. Checked before any network dialing happens;
+        // `->command`/`->send`/`->close` don't need their own gate since
+        // they already fail cleanly (a clear "no open connection" error)
+        // against a connection that was never opened.
+        guard allowEmailSMTP else {
+            throw LassoRecoverableError(LassoSMTPError(
+                kind: .invalidParameter,
+                message: "email_smtp is not enabled on this server (set smtp.allowEmailSMTP / LASSO_SMTP_ALLOW_EMAIL_SMTP to enable — see Documentation/lasso-perfect-smtp-integration-plan.md §4.8b's SSRF discussion)."
+            ).state)
+        }
         guard let host = Self.resolvedString(arguments, "host", receiver, "_host"), host.isEmpty == false else {
             throw LassoRecoverableError(LassoSMTPError(
                 kind: .invalidParameter,
@@ -79,10 +100,18 @@ extension LassoEmailProviderImpl {
             // already chooses for `email_send`'s `-username`/`-password`
             // (`LassoSMTPMailerRegistry.swift`) — is reused here rather
             // than introducing a second convention for the identical
-            // "plain username+password" shape; neither doc source
-            // distinguishes which SASL mechanism `email_smtp`'s
-            // `-username`/`-password` should use, so this is a documented
-            // judgment call, not a confirmed contract.
+            // "plain username+password" shape. Milestone review correction:
+            // reference.lassosoft.com's `[Email_SMTP]` page actually says
+            // real Lasso "opens a connection... using the best available
+            // authentication method" and references `[Email_DigestChallenge]`/
+            // `[Email_DigestResponse]` (DIGEST-MD5 helper tags) — real Lasso
+            // appears to prefer DIGEST-MD5 when available, not an
+            // unspecified mechanism as an earlier revision of this comment
+            // claimed. Perfect-SMTP has no DIGEST-MD5/CRAM-MD5 mechanism
+            // implemented at all (`SASLMechanism.swift`'s own doc comment
+            // confirms this is deliberately deferred), so `SASLPlain` is the
+            // pragmatic fallback given what's actually available here, not
+            // an arbitrary guess.
             if let username, let password, username.isEmpty == false {
                 try await connection.authenticate(SASLPlain(username: username, password: password))
             }
@@ -155,6 +184,16 @@ extension LassoEmailProviderImpl {
         // surprise) but is a documented no-op, not silently ignored by
         // omission.
         _ = arguments.hasTruthyFlag("multi")
+
+        // `-timeout` is likewise accepted but currently a documented no-op,
+        // not silently unaddressed (milestone review, cheap fix A):
+        // `SMTPConnection.replyTimeout` is fixed at construction time
+        // (inside `->open`, before any `->command` call could ever supply
+        // its own) and isn't adjustable per-command without deeper changes
+        // to `SMTPConnection` itself — out of scope for this pass. An
+        // extra `-timeout` keyword argument here never throws an unknown-
+        // arg surprise; it simply has no effect yet.
+        _ = arguments.lastInt(named: "timeout")
 
         let wantsText = arguments.hasTruthyFlag("read")
         let expected = arguments.lastInt(named: "expect")

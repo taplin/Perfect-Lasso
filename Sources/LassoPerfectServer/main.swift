@@ -285,6 +285,18 @@ struct ServerConfig: Sendable {
     /// time) to name a key actually present in `smtpRelays` —
     /// `ServerConfigError.smtpInvalidDefaultRelay` otherwise.
     let smtpDefaultRelay: String?
+    /// `LASSO_SMTP_ALLOW_EMAIL_SMTP` / `smtp.allowEmailSMTP` — off-by-default
+    /// gate for `email_smtp->open` (Phase D milestone review, BLOCKING #2),
+    /// mirroring `mysqlAllowRawSQL`'s exact "dangerous, low-level, opt-in-
+    /// only" precedent. Unlike `email_send`/`email_compose` (named-relay
+    /// only, no literal `-host`), `email_smtp->open` dials ANY literal
+    /// caller-given `-host`/`-port` with zero address-routability filtering
+    /// — matching real Lasso's own documented behavior, but a real SSRF
+    /// vector against a server that renders arbitrary Lasso source from a
+    /// site's own codebase. Default `false`: an operator must explicitly
+    /// opt in before any template can use `email_smtp` at all. See
+    /// `LassoEmailSMTPType.swift`'s `smtpOpen` for the actual gate check.
+    let smtpAllowEmailSMTP: Bool
 
     static func load() throws -> ServerConfig {
         let env = ProcessInfo.processInfo.environment
@@ -402,6 +414,12 @@ struct ServerConfig: Sendable {
             )
             smtpDefaultRelay = "primary"
         }
+        // Read independently of whether relays came from the JSON block or
+        // the legacy env-var pair — same "always check the JSON block
+        // first, fall back to its own dedicated env var" shape
+        // `mysqlAllowRawSQL` uses just below, not tied to the relay-source
+        // branching above.
+        let smtpAllowEmailSMTP = datasourceFile?.smtp?.allowEmailSMTP ?? Self.isTruthyEnv(env["LASSO_SMTP_ALLOW_EMAIL_SMTP"])
 
         return ServerConfig(
             siteRoot: root,
@@ -478,7 +496,8 @@ struct ServerConfig: Sendable {
             fmAdminAPIPassword: fmAdminAPIPassword,
             fmAdminAPITrustSelfSignedTLS: Self.isTruthyEnv(env["LASSO_FM_ADMIN_TRUST_SELF_SIGNED_TLS"]),
             smtpRelays: smtpRelays,
-            smtpDefaultRelay: smtpDefaultRelay
+            smtpDefaultRelay: smtpDefaultRelay,
+            smtpAllowEmailSMTP: smtpAllowEmailSMTP
         )
     }
 
@@ -636,7 +655,8 @@ struct FileMakerAdminAPIFileConfig: Decodable {
 ///       "primary": {"host": "...", "port": 587, "user": "...", "password": "...", "tls": "startTLS"},
 ///       "marketing": {"host": "...", "port": 587, "user": "...", "password": "..."}
 ///     },
-///     "defaultRelay": "primary"
+///     "defaultRelay": "primary",
+///     "allowEmailSMTP": false
 ///   }
 /// }
 /// ```
@@ -644,6 +664,11 @@ struct FileMakerAdminAPIFileConfig: Decodable {
 /// (it's then implied); two or more relays with no `defaultRelay` is a
 /// startup error (`ServerConfigError.smtpInvalidDefaultRelay`), same as a
 /// `defaultRelay` naming a relay absent from `relays`.
+///
+/// `allowEmailSMTP` (Phase D milestone review, BLOCKING #2) gates
+/// `email_smtp->open` specifically — see `ServerConfig.smtpAllowEmailSMTP`'s
+/// doc comment for the full rationale. Default `false`, same
+/// off-by-default policy as `mysql.allowRawSQL`/`mysql.allowWrites`.
 ///
 /// Deliberately does NOT include `allowDirectMX`/`dkimKeyPath`/
 /// `dkimSelector`/`dkimDomain` yet — Phase A's scope is relay config only;
@@ -653,19 +678,22 @@ struct FileMakerAdminAPIFileConfig: Decodable {
 struct SMTPFileConfig: Decodable {
     var relays: [String: SMTPRelayFileConfig]
     var defaultRelay: String?
+    var allowEmailSMTP: Bool?
 
-    init(relays: [String: SMTPRelayFileConfig] = [:], defaultRelay: String? = nil) {
+    init(relays: [String: SMTPRelayFileConfig] = [:], defaultRelay: String? = nil, allowEmailSMTP: Bool? = nil) {
         self.relays = relays
         self.defaultRelay = defaultRelay
+        self.allowEmailSMTP = allowEmailSMTP
     }
 
     init(from decoder: Decoder) throws {
         let container = try decoder.container(keyedBy: CodingKeys.self)
         relays = try container.decodeIfPresent([String: SMTPRelayFileConfig].self, forKey: .relays) ?? [:]
         defaultRelay = try container.decodeIfPresent(String.self, forKey: .defaultRelay)
+        allowEmailSMTP = try container.decodeIfPresent(Bool.self, forKey: .allowEmailSMTP)
     }
 
-    private enum CodingKeys: String, CodingKey { case relays, defaultRelay }
+    private enum CodingKeys: String, CodingKey { case relays, defaultRelay, allowEmailSMTP }
 }
 
 /// One named relay's connection settings. `host` is optional here (not
@@ -853,14 +881,19 @@ struct LassoSiteServer: Sendable {
     /// `LassoSMTPConnectionRegistry`'s own doc comment for why): the actor
     /// just exposes `sweepIdleConnections(idleTimeout:)`, and this Task is
     /// the periodic caller. `LassoSiteServer` is a `struct` (no `deinit`
-    /// available, matching the CWP janitor's own identical lifecycle —
-    /// `cwpJanitorTask` below has no formal shutdown hook either) and is
+    /// available, matching the CWP janitor's own identical lifecycle) and is
     /// constructed exactly once for the life of the process
-    /// (`main.swift`'s top-level `let siteServer = try LassoSiteServer(...)`),
-    /// so this Task's lifetime is, in practice, the process's — reaped only
-    /// by process exit, not by any explicit cancellation path. Exposed here
-    /// (rather than only captured in a local closure) so a future graceful-
-    /// shutdown path has something to `.cancel()`.
+    /// (`main.swift`'s top-level `let siteServer = try LassoSiteServer(...)`).
+    /// Milestone review correction (BLOCKING #3): an earlier revision of
+    /// this comment claimed `cwpJanitorTask` "below has no formal shutdown
+    /// hook either" — false even then (`AdminConsoleIntegration.swift:325`
+    /// already cancels it on a "Restart Server" admin action), and this
+    /// comment's own claim that this Task's lifetime is "reaped only by
+    /// process exit" was the actual gap: `main.swift` passes this Task to
+    /// `LassoAdminDelegate` exactly like `cwpJanitorTask`, and the restart
+    /// action now cancels it alongside `cwpJanitorTask`/`siteServerTask` —
+    /// it IS genuinely cancelled on restart, not merely exposed for some
+    /// hypothetical future path.
     let smtpConnectionReaperTask: Task<Void, Never>?
 
     init(
@@ -1113,7 +1146,8 @@ struct LassoSiteServer: Sendable {
                 mxResolver: mxResolver,
                 mxLookupCache: LassoMXLookupCache(),
                 connectionRegistry: connectionRegistry,
-                group: MultiThreadedEventLoopGroup.singleton
+                group: MultiThreadedEventLoopGroup.singleton,
+                allowEmailSMTP: config.smtpAllowEmailSMTP
             )
             // Idle-timeout reaper: a page that errors out mid `->open`/
             // `->command`/`->send` sequence, or simply forgets `->close`,
@@ -2230,7 +2264,8 @@ if config.adminConsoleEnabled {
         datasourceFailureTracker: siteServer.datasourceFailureTracker,
         janitorTracker: janitorTracker,
         cwpAdminAPIClient: cwpAdminAPIClient,
-        cwpJanitorTask: cwpJanitorTask
+        cwpJanitorTask: cwpJanitorTask,
+        smtpConnectionReaperTask: siteServer.smtpConnectionReaperTask
     )
     let admin = try AdminConsole(
         port: config.adminConsolePort,
