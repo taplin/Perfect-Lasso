@@ -9290,3 +9290,92 @@ struct IncludeURLTests {
     #expect(output.trimmingCharacters(in: .whitespacesAndNewlines) == "Ada!")
 }
 
+@Test func blockTagPastTheFirstStatementInASquareBracketSpanStillBecomesARealBlock() async throws {
+    // Real corpus: includes/mini_cart.lasso's `[var(What_Action::string =
+    // $function) if(var_defined('cart_id') && $cart_id != '') ...
+    // records ... /if]` — an ordinary `var(...)` assignment precedes the
+    // real `if`, and both the `if` and the nested `records` loop opened
+    // here don't close until much later, in their own separate
+    // single-tag bracket spans (`[/records]`, `[/if]`) after intervening
+    // literal HTML. `emitCode`'s square-bracket dispatch only checked
+    // whether the span's FIRST statement was itself a block-tag call
+    // (the already-handled `[if(...) ... else ... /if]` shape) — a block
+    // tag appearing anywhere past the first position fell through to the
+    // flat `ExpressionParser` + `.code(...)` path, which has no concept
+    // of blocks: "if"/"records" parsed as ordinary calls, never became
+    // `.tag(...)` nodes `BlockBuilder` could pair with their real
+    // closers, and evaluation crashed trying to call them as functions
+    // (`unknownFunction("if")`).
+    var context = LassoContext()
+    let output = try await LassoRenderer().render(
+        """
+        [
+          var(marker::string = 'seen')
+          if(true)
+            'body-before-close'
+        ]
+        <div>middle html</div>
+        [
+          if(true)
+            'nested-yes'
+          else
+            'nested-no'
+          /if
+        ]
+        tail
+        [
+        /if
+        ]
+        """,
+        context: &context
+    )
+    #expect(output.contains("body-before-close"))
+    #expect(output.contains("nested-yes"))
+    #expect(!output.contains("nested-no"))
+    #expect(output.contains("middle html"))
+    #expect(output.contains("tail"))
+}
+
+@Test func recordsLoopPastTheFirstStatementInASquareBracketSpanStillClosesAcrossLaterSpans() async throws {
+    // Companion case to the above, using `records`/`/records` (a bare
+    // `.bareIdentifier`-form block, unlike `if`'s `.bareCondition` form)
+    // instead of `if` — matching mini_cart.lasso's actual inner loop,
+    // which is the specific construct BlockBuilder reported as an
+    // "Unexpected closing tag records" diagnostic before this fix (the
+    // bare-opened `records` never became a `.tag(...)` node, so its
+    // later, separate `[/records]` span had no open to match). The
+    // ordinary `var(...)` statement preceding the bare `records` here
+    // (matching mini_cart.lasso's own `var(marker...) records` shape) is
+    // what makes `records` NOT the span's first statement.
+    let executor = PerfectCRUDLassoExecutor { _, _ in
+        DynamicResult(
+            rows: [
+                DynamicRow(["mfr_style_no": .string("A")]),
+                DynamicRow(["mfr_style_no": .string("B")]),
+            ],
+            statement: "SELECT ..."
+        )
+    }
+    var context = LassoContext(inlineProvider: LassoDynamicInlineProvider(
+        executor: executor,
+        datasourceAliases: ["catalog_mysql": "catalog"]
+    ))
+    let output = try await LassoRenderer().render(
+        """
+        [inline(-database='catalog_mysql', -table='skus', -findall)]
+        [
+          var(marker::string = 'seen')
+          records
+        ]
+        [field('mfr_style_no')]|
+        [
+          /records
+        ]
+        [/inline]
+        """,
+        context: &context
+    )
+    let compact = output.components(separatedBy: .whitespacesAndNewlines).joined()
+    #expect(compact == "A|B|")
+}
+
