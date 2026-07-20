@@ -72,26 +72,62 @@
 //  *how* the connection to an already-safe, already-configured relay is
 //  made, which the relay's own config now governs unconditionally.
 //
-//  **`-tokens`/`-merge` (mail-merge templating) and
-//  `-contentType`/`-transferEncoding`/`-characterSet` throw
-//  `LassoSMTPFailureKind.notYetSupported`, not silently ignored.** Unlike
-//  the connection-only params above, these change what content is
+//  **`-tokens`/`-merge` (mail-merge templating) and `-characterSet` still
+//  throw `LassoSMTPFailureKind.notYetSupported`, not silently ignored.**
+//  Unlike the connection-only params above, these change what content is
 //  actually sent: silently ignoring `-tokens`/`-merge` would mail
 //  unsubstituted `{{token}}`-style placeholder text straight to real
-//  recipients, and `-contentType`/`-transferEncoding` don't even have a
-//  landing spot in `EmailMessage` today (§4.3: `MIMEComposer.forbiddenExtraHeaderNames`
-//  explicitly denies both as `extraHeaders`) — this plan's own §4.3 table
-//  recommends the explicit-error posture for the initial release. A
-//  caller passing any of these five gets a clear, catchable
-//  `[protect]`-able error instead of a message that silently doesn't do
-//  what was asked.
+//  recipients. Still deferred past Phase B — not in this phase's scope.
 //
-//  **`-attachments`/`-htmlImages` also throw `notYetSupported`, for the
-//  same reason and arguably more urgently** — path-or-inline attachment
-//  resolution is scoped to Phase B (§4.5/§6), not yet implemented in this
-//  builder at all, and a dropped attachment is a correctness failure a
-//  recipient has no way to detect (unlike an unsupported header param,
-//  which at worst fails to change behavior the recipient can observe).
+//  **Phase B: `-contentType`/`-transferEncoding` now implemented** —
+//  Perfect-SMTP's `EmailMessage.bodyContentTypeOverride`/
+//  `.bodyTransferEncodingOverride` (merged to Perfect-SMTP `main` at
+//  `33ac532`, §4.3/§7 item 5) give these two params a real landing spot.
+//  `-contentType` is passed through to `bodyContentTypeOverride` verbatim
+//  (unvalidated here — `MIMEComposer` is the single enforcement point for
+//  CRLF-injection/charset checks, matching this file's existing
+//  `-extraMIMEHeaders` precedent: one enforcement point, not two).
+//  `-transferEncoding`'s accepted token values are not spelled out with a
+//  literal list anywhere in lassoguide.com's "Sending Email" page
+//  (`https://lassoguide.com/operations/sending-email.html`, fetched
+//  2026-07-19 — "The value for the Transfer-Encoding header of the
+//  message") or the local Lasso 8.5 Language Guide (`References/Lasso/
+//  Lasso 8.5 Language Guide.pdf`, Table 7, Ch. 47 "Sending Email" —
+//  identical wording); both simply describe it as the literal header
+//  value, implying it's passed through close to verbatim. Rather than
+//  invent a Lasso-specific token set, `transferEncodingOverride(from:)`
+//  below maps the standard RFC 2045 §6.1 Content-Transfer-Encoding
+//  mechanism-name tokens `7bit`/`quoted-printable`/`base64`
+//  (case-insensitive) onto the three cases `ContentTransferEncodingOverride`
+//  actually offers — real MTAs/mail clients already expect exactly these
+//  values in that header regardless of which language generated it.
+//  `8bit`/`binary` are real RFC 2045 tokens too but are deliberately NOT
+//  offered by `ContentTransferEncodingOverride` at all (see its own doc
+//  comment for why) — passed here, they throw the same clear, catchable
+//  `.invalidParameter` error as any other unrecognized token, never a
+//  silent default to one of the three supported cases.
+//
+//  **Phase B: `-attachments`/`-htmlImages` now implemented, in two
+//  stages.** This file (`LassoSMTPMessageBuilder.build`, no I/O) parses
+//  each dash-param's entries into `LassoSMTPPendingAttachment`/
+//  `LassoSMTPPendingInlineImage` — a not-yet-resolved intermediate
+//  representation, carried on `BuildResult`. Path-based entries need real
+//  file I/O to resolve (reading the file, containment-checking it against
+//  `siteRoot`) — that happens in `LassoSMTPAttachmentLoader`, called from
+//  `LassoEmailProviderImpl.send` *after* this function returns, never from
+//  here (see `LassoSMTPAttachmentLoader.swift`'s own doc comment for the
+//  full design and lassoguide.com/Lasso-8.5-Language-Guide citations for
+//  the exact accepted shape: an array of file-path strings, OR an array of
+//  `name = data` pairs — confirmed directly against both sources, not
+//  guessed; no `type=`/`name=`/`path=` map-keyed shape exists for
+//  `email_send`'s `-attachments`/`-htmlImages` themselves, unlike the
+//  unrelated `email_compose->addAttachment(-data=?, -name=?, -path=?,
+//  -type=?)` companion method. A THIRD shape does exist per lassoguide.com
+//  (an `email_compose` MIME-part object fed into `-attachments`/
+//  `-htmlImages`), but no `LassoValue` can represent it until Phase C
+//  implements `email_compose` — `pendingAttachment(from:)`/
+//  `pendingInlineImage(from:)`'s `default:` case will need a third arm
+//  added at that point, not before).
 //
 
 import Foundation
@@ -111,17 +147,26 @@ public enum LassoSMTPMessageBuilder {
         /// against the configured `smtp.relays` map, never a literal host.
         /// `nil` means "use the configured default relay."
         public let relayName: String?
+        /// `-attachments`, parsed but not yet resolved (no I/O has
+        /// happened) — `LassoSMTPAttachmentLoader.resolve(attachments:inlineImages:)`
+        /// turns these into real `Attachment`s. See §4.5/this file's doc
+        /// comment.
+        public let pendingAttachments: [LassoSMTPPendingAttachment]
+        /// `-htmlImages`, parsed but not yet resolved — same deal as
+        /// `pendingAttachments`.
+        public let pendingInlineImages: [LassoSMTPPendingInlineImage]
     }
 
-    /// Dash-params this Phase A builder deliberately does not implement at
-    /// all — throws `LassoSMTPFailureKind.notYetSupported` if any is
-    /// present, regardless of its value. See the file doc comment for why
-    /// each is in this list (as opposed to the silently-ignored
-    /// connection-only params, `-port`/`-username`/`-password`/`-ssl`/
-    /// `-timeout`, handled separately below).
+    /// Dash-params this builder deliberately does not implement at all —
+    /// throws `LassoSMTPFailureKind.notYetSupported` if any is present,
+    /// regardless of its value. See the file doc comment for why each is
+    /// in this list (as opposed to the silently-ignored connection-only
+    /// params, `-port`/`-username`/`-password`/`-ssl`/`-timeout`, handled
+    /// separately below). `-contentType`/`-transferEncoding`/
+    /// `-attachments`/`-htmlImages` moved OFF this list in Phase B — see
+    /// the file doc comment for their real handling.
     private static let unsupportedParameterNames: [String] = [
-        "date", "tokens", "merge", "contentType", "transferEncoding", "characterSet",
-        "attachments", "htmlImages",
+        "date", "tokens", "merge", "characterSet",
     ]
 
     public static func build(_ arguments: [EvaluatedArgument]) throws -> BuildResult {
@@ -187,6 +232,12 @@ public enum LassoSMTPMessageBuilder {
             message.defaultDisposition = try contentDisposition(dispositionRaw)
         }
         message.extraHeaders = extraMIMEHeaders(arguments)
+        // -contentType: passed through verbatim, unvalidated here --
+        // MIMEComposer is the single enforcement point (CRLF-injection,
+        // charset=utf-8-only), matching the file doc comment's
+        // "-extraMIMEHeaders" precedent.
+        message.bodyContentTypeOverride = arguments.lastString(named: "contentType")
+        message.bodyTransferEncodingOverride = try transferEncodingOverride(from: arguments.lastString(named: "transferEncoding"))
 
         let relayName: String? = {
             guard let raw = arguments.lastString(named: "host")?.trimmingCharacters(in: .whitespacesAndNewlines),
@@ -194,11 +245,16 @@ public enum LassoSMTPMessageBuilder {
             return raw
         }()
 
+        let pendingAttachments = try collectEntries(arguments, name: "attachments").map(pendingAttachment(from:))
+        let pendingInlineImages = try collectEntries(arguments, name: "htmlImages").map(pendingInlineImage(from:))
+
         return BuildResult(
             message: message,
             bcc: bcc,
             envelopeFrom: .address(from.address),
-            relayName: relayName
+            relayName: relayName,
+            pendingAttachments: pendingAttachments,
+            pendingInlineImages: pendingInlineImages
         )
     }
 
@@ -280,5 +336,144 @@ public enum LassoSMTPMessageBuilder {
             }
         }
         return headers
+    }
+
+    /// See the file doc comment's "Phase B" section for the citations
+    /// backing the accepted token set. Case-insensitive; `nil`/empty input
+    /// (no `-transferEncoding` given) yields `nil` (no override, matching
+    /// `bodyContentTypeOverride`'s own "absent means don't override"
+    /// contract).
+    private static func transferEncodingOverride(from raw: String?) throws -> ContentTransferEncodingOverride? {
+        guard let raw, raw.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty == false else { return nil }
+        switch raw.lowercased() {
+        case "7bit": return .sevenBit
+        case "quoted-printable", "quotedprintable", "quoted_printable": return .quotedPrintable
+        case "base64": return .base64
+        default:
+            throw LassoSMTPError(
+                kind: .invalidParameter,
+                message: "-transferEncoding must be one of '7bit'/'quoted-printable'/'base64' (RFC 2045 §6.1), got '\(raw)'."
+            )
+        }
+    }
+
+    /// Collects every element across all occurrences of a dash-param whose
+    /// value is meant to be an array (`-attachments`/`-htmlImages`) —
+    /// lassoguide.com's own wording ("This parameter can be specified with
+    /// either a single file name or an array of file names") confirms a
+    /// bare, non-array value is also legal, so a non-`.array` value is
+    /// treated as a single one-element list rather than rejected. Multiple
+    /// occurrences of the same dash-param (unconfirmed against real corpus
+    /// usage, same judgment call as `joinedAddressList`) are concatenated
+    /// rather than "last wins," for the same "at least as reasonable to
+    /// merge as to silently drop content" reasoning.
+    private static func collectEntries(_ arguments: [EvaluatedArgument], name: String) -> [LassoValue] {
+        var entries: [LassoValue] = []
+        for argument in arguments where argument.label?.caseInsensitiveCompare(name) == .orderedSame {
+            switch argument.value {
+            case .array(let items): entries.append(contentsOf: items)
+            default: entries.append(argument.value)
+            }
+        }
+        return entries
+    }
+
+    /// One `-attachments` array element -> `LassoSMTPPendingAttachment`.
+    /// Confirmed shape (lassoguide.com "Sending Email", fetched 2026-07-19,
+    /// and the local Lasso 8.5 Language Guide Table 4/Ch. 47, byte-for-byte
+    /// consistent): a bare file-path string (`'MyAttachment.txt'`), or a
+    /// `name = data` pair (`'MyPDF.pdf' = string(#my_file)`) where `data`
+    /// is already-evaluated content, not a third path/type-keyed shape.
+    private static func pendingAttachment(from value: LassoValue) throws -> LassoSMTPPendingAttachment {
+        switch value {
+        case .string(let path):
+            return .path(relativePath: path)
+        case .pair(let key, let dataValue):
+            let filename = key.outputString
+            guard filename.isEmpty == false else {
+                throw LassoSMTPError(kind: .invalidParameter, message: "-attachments pair entry has an empty filename.")
+            }
+            return .data(filename: filename, data: dataBytes(from: dataValue))
+        default:
+            throw LassoSMTPError(
+                kind: .invalidParameter,
+                message: "-attachments entries must be a file path or a name=data pair, got a \(describeShape(value))."
+            )
+        }
+    }
+
+    /// One `-htmlImages` array element -> `LassoSMTPPendingInlineImage`.
+    /// Same two-shape contract as `pendingAttachment(from:)` (identical
+    /// citations), plus the documented `Content-ID` derivation: "Lasso
+    /// automatically uses the image file name as the Content-ID without
+    /// any path information" for the path variant (so `cid` is the raw
+    /// path's basename, computed here — pure string logic, no I/O); for
+    /// the pair variant, "the name that is specified in the first part of
+    /// the pair should be used within the HTML body," i.e. the pair's own
+    /// name IS the Content-ID, verbatim, not basenamed further.
+    private static func pendingInlineImage(from value: LassoValue) throws -> LassoSMTPPendingInlineImage {
+        switch value {
+        case .string(let path):
+            return .path(contentID: LassoSMTPAttachmentLoader.basename(path), relativePath: path)
+        case .pair(let key, let dataValue):
+            let contentID = key.outputString
+            guard contentID.isEmpty == false else {
+                throw LassoSMTPError(kind: .invalidParameter, message: "-htmlImages pair entry has an empty name.")
+            }
+            return .data(contentID: contentID, data: dataBytes(from: dataValue))
+        default:
+            throw LassoSMTPError(
+                kind: .invalidParameter,
+                message: "-htmlImages entries must be a file path or a name=data pair, got a \(describeShape(value))."
+            )
+        }
+    }
+
+    /// Extracts raw bytes from an already-evaluated `-attachments`/
+    /// `-htmlImages` pair's data half. Mirrors `sendfile`'s existing
+    /// `-data` handling (`NativeTypes.swift`) for the plain-string case —
+    /// this interpreter's real corpus usage overwhelmingly produces
+    /// binary-ish content as a lossy-UTF8-decoded `.string` (e.g.
+    /// `include_raw`/`string(...)`), so `Data(string.utf8)` is the
+    /// correct, precedented re-encoding, not a guess. A `bytes` native
+    /// object (`.object` with `typeName == "bytes"`) is decoded from its
+    /// lossless `_base64` field instead, when the caller happens to
+    /// construct one directly — the exact-bytes path when it's available,
+    /// falling back to the lossy string path otherwise. Any other
+    /// `LassoValue` case (e.g. `.integer`) falls back to its
+    /// `outputString`'s UTF-8 bytes, matching `LassoValue.outputString`'s
+    /// own general auto-stringification contract.
+    private static func dataBytes(from value: LassoValue) -> Data {
+        switch value {
+        case .string(let string):
+            return Data(string.utf8)
+        case .object(let instance) where instance.typeName == "bytes":
+            guard case let .string(base64) = instance.value(for: "_base64"), let decoded = Data(base64Encoded: base64) else {
+                return Data()
+            }
+            return decoded
+        default:
+            return Data(value.outputString.utf8)
+        }
+    }
+
+    /// A short, human-readable shape description for error messages —
+    /// `LassoValue.typeName` itself is `internal` to `LassoParser`, not
+    /// reachable from this target, so this is a small, deliberately
+    /// approximate stand-in (exact wording doesn't matter; it only ever
+    /// appears inside a caught, catchable error message).
+    private static func describeShape(_ value: LassoValue) -> String {
+        switch value {
+        case .void: "void"
+        case .null: "null"
+        case .boolean: "boolean"
+        case .integer: "integer"
+        case .decimal: "decimal"
+        case .string: "string"
+        case .array: "array"
+        case .map: "map"
+        case .object: "object"
+        case .pair: "pair"
+        }
     }
 }

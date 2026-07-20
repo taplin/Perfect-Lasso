@@ -1064,7 +1064,7 @@ struct LassoSiteServer: Sendable {
                 defaultRelay: defaultRelay,
                 group: MultiThreadedEventLoopGroup.singleton
             )
-            emailProvider = LassoEmailProviderImpl(registry: registry)
+            emailProvider = LassoEmailProviderImpl(registry: registry, siteRoot: config.siteRoot)
         } else {
             emailProvider = nil
         }

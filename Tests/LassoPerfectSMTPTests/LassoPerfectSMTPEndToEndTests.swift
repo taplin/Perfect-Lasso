@@ -16,8 +16,14 @@
 //    error, also `[protect]`-catchable;
 //  - `-host` naming an unconfigured relay throws a clear error;
 //  - `-host` naming a configured relay actually routes to that relay
-//    (verified by which fake transport recorded the call).
+//    (verified by which fake transport recorded the call);
+//  - Phase B: a real `-attachments` path entry round-trips end to end
+//    (dash-params -> resolved file bytes -> the fake transport's recorded
+//    `SignedMessage`), and a path escaping `siteRoot` is a
+//    `[protect]`-catchable failure, not a crash.
 //
+
+import Foundation
 
 import Testing
 @testable import LassoParser
@@ -27,9 +33,11 @@ import PerfectSMTP
 private final class SendRecorder: @unchecked Sendable {
     private(set) var sendCount = 0
     private(set) var lastEnvelope: SMTPEnvelope?
-    func record(_ envelope: SMTPEnvelope) {
+    private(set) var lastMessage: SignedMessage?
+    func record(_ envelope: SMTPEnvelope, _ message: SignedMessage) {
         sendCount += 1
         lastEnvelope = envelope
+        lastMessage = message
     }
 }
 
@@ -45,7 +53,7 @@ private struct FakeSMTPTransport: SMTPTransport {
     let recorder: SendRecorder
 
     func send(_ envelope: SMTPEnvelope, _ message: SignedMessage) async throws -> [DeliveryResult] {
-        recorder.record(envelope)
+        recorder.record(envelope, message)
         switch behavior {
         case .succeed:
             return envelope.recipients.map {
@@ -65,7 +73,8 @@ struct LassoPerfectSMTPEndToEndTests {
     private static func makeContext(
         primaryBehavior: FakeSMTPTransport.Behavior = .succeed,
         primaryRecorder: SendRecorder = SendRecorder(),
-        marketingRecorder: SendRecorder = SendRecorder()
+        marketingRecorder: SendRecorder = SendRecorder(),
+        siteRoot: URL = FileManager.default.temporaryDirectory
     ) throws -> LassoContext {
         let primaryMailer = SMTPMailer(transport: FakeSMTPTransport(behavior: primaryBehavior, recorder: primaryRecorder))
         let marketingMailer = SMTPMailer(transport: FakeSMTPTransport(behavior: .succeed, recorder: marketingRecorder))
@@ -73,7 +82,17 @@ struct LassoPerfectSMTPEndToEndTests {
             mailers: ["primary": primaryMailer, "marketing": marketingMailer],
             defaultRelay: "primary"
         )
-        return LassoContext(emailProvider: LassoEmailProviderImpl(registry: registry))
+        return LassoContext(emailProvider: LassoEmailProviderImpl(registry: registry, siteRoot: siteRoot))
+    }
+
+    /// Fresh, real, uniquely-named temp directory standing in for
+    /// `siteRoot` — Phase B's attachment tests need a real filesystem, not
+    /// a fake, since `LassoSMTPAttachmentLoader` does real containment
+    /// checks/`open`/`fstat`/`read` against it.
+    private static func makeSiteRoot() throws -> URL {
+        let root = FileManager.default.temporaryDirectory.appendingPathComponent("lasso-smtp-e2e-\(UUID().uuidString)")
+        try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
+        return root
     }
 
     @Test func successfulSendEvaluatesToVoidAndRoutesThroughTheDefaultRelay() async throws {
@@ -168,5 +187,37 @@ struct LassoPerfectSMTPEndToEndTests {
         #expect(output == "")
         #expect(marketingRecorder.sendCount == 1)
         #expect(primaryRecorder.sendCount == 0)
+    }
+
+    // MARK: - Phase B: -attachments end to end (§4.5)
+
+    @Test func attachmentsPathEntryRoundTripsEndToEndIntoTheComposedMessage() async throws {
+        let siteRoot = try Self.makeSiteRoot()
+        try Data("hello attachment".utf8).write(to: siteRoot.appendingPathComponent("report.txt"))
+
+        let primaryRecorder = SendRecorder()
+        var context = try Self.makeContext(primaryRecorder: primaryRecorder, siteRoot: siteRoot)
+
+        let output = try await LassoRenderer().render(
+            "[email_send: -to='a@example.com', -from='b@example.com', -subject='s', -body='hi', -attachments=array('report.txt')]",
+            context: &context
+        )
+
+        #expect(output == "")
+        #expect(primaryRecorder.sendCount == 1)
+        let rfc5322 = String(decoding: primaryRecorder.lastMessage?.rfc5322 ?? [], as: UTF8.self)
+        #expect(rfc5322.contains("report.txt"))
+        #expect(rfc5322.contains(Data("hello attachment".utf8).base64EncodedString()))
+    }
+
+    @Test func attachmentPathEscapingSiteRootIsACatchableFailureNotACrash() async throws {
+        let siteRoot = try Self.makeSiteRoot()
+        var context = try Self.makeContext(siteRoot: siteRoot)
+
+        let output = try await LassoRenderer().render(
+            "[protect][email_send: -to='a@example.com', -from='b@example.com', -subject='s', -body='hi', -attachments=array('../../../../../../etc/passwd')][/protect]after",
+            context: &context
+        )
+        #expect(output == "after")
     }
 }

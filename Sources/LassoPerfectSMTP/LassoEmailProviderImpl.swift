@@ -31,6 +31,9 @@
 //  whether the message actually sent):
 //  - `LassoSMTPMessageBuilder.build` validation failures (malformed
 //    dash-params, an unsupported param, `-immediate=false`/`-date`).
+//  - `LassoSMTPAttachmentLoader.resolve(attachments:inlineImages:siteRoot:)`
+//    failures (§4.5) — a path escaping `siteRoot`, a non-regular file, a
+//    missing file, or the combined byte/count ceiling exceeded.
 //  - `LassoSMTPMailerRegistry.mailer(named:)` throwing
 //    `LassoSMTPRelayError.unknownRelay` (`-host` named a relay that isn't
 //    configured).
@@ -53,15 +56,33 @@ import PerfectSMTP
 
 public struct LassoEmailProviderImpl: LassoEmailProvider {
     private let registry: LassoSMTPMailerRegistry
+    /// Passed straight through to `LassoSMTPAttachmentLoader.resolve` — the
+    /// same value `main.swift` passes to `LassoFileSystemIncludeLoader`/
+    /// `LassoFileSystemUploadProcessor` (`config.siteRoot`).
+    private let siteRoot: URL
 
-    public init(registry: LassoSMTPMailerRegistry) {
+    public init(registry: LassoSMTPMailerRegistry, siteRoot: URL) {
         self.registry = registry
+        self.siteRoot = siteRoot
     }
 
     public func send(_ arguments: [EvaluatedArgument], context: LassoContext) async throws -> LassoValue {
         let built: LassoSMTPMessageBuilder.BuildResult
         do {
             built = try LassoSMTPMessageBuilder.build(arguments)
+        } catch let error as LassoSMTPError {
+            throw LassoRecoverableError(error.state)
+        }
+
+        var message = built.message
+        do {
+            let files = try LassoSMTPAttachmentLoader.resolve(
+                attachments: built.pendingAttachments,
+                inlineImages: built.pendingInlineImages,
+                siteRoot: siteRoot
+            )
+            message.attachments = files.attachments
+            message.inlineImages = files.inlineImages
         } catch let error as LassoSMTPError {
             throw LassoRecoverableError(error.state)
         }
@@ -75,7 +96,7 @@ public struct LassoEmailProviderImpl: LassoEmailProvider {
 
         let results: [DeliveryResult]
         do {
-            results = try await resolved.mailer.send(built.message, bcc: built.bcc, envelopeFrom: built.envelopeFrom)
+            results = try await resolved.mailer.send(message, bcc: built.bcc, envelopeFrom: built.envelopeFrom)
         } catch let error as MIMEComposer.ComposerError {
             throw LassoRecoverableError(LassoSMTPError(
                 kind: .composeFailed,

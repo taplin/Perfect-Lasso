@@ -60,6 +60,14 @@ public enum LassoSMTPFailureKind: String, Sendable {
     /// `MAIL FROM` rejection, a connection failure) or a per-recipient
     /// `DeliveryResult.Outcome` that isn't `.delivered`/`.queuedForRetry`.
     case deliveryFailed
+    /// `-attachments`/`-htmlImages` resolution failed (`LassoSMTPAttachmentLoader`,
+    /// §4.5) — a path escaped `siteRoot`, wasn't a regular file, was
+    /// missing/unreadable, or the combined byte/count ceiling was
+    /// exceeded. Distinct from `.invalidParameter` because these are
+    /// resolve-time (after `LassoSMTPMessageBuilder.build` already
+    /// validated dash-param shape) file/security failures, not dash-param
+    /// parsing failures.
+    case attachmentFailed
 
     var code: Int {
         switch self {
@@ -68,6 +76,7 @@ public enum LassoSMTPFailureKind: String, Sendable {
         case .notYetSupported: 3003
         case .composeFailed: 3004
         case .deliveryFailed: 3005
+        case .attachmentFailed: 3006
         }
     }
 }

@@ -8,6 +8,7 @@
 //  takes `[EvaluatedArgument]` directly.
 //
 
+import Foundation
 import Testing
 @testable import LassoParser
 @testable import LassoPerfectSMTP
@@ -212,34 +213,119 @@ struct LassoSMTPMessageBuilderTests {
         }
     }
 
-    @Test func contentTypeThrows() throws {
-        #expect(throws: LassoSMTPError.self) {
-            try LassoSMTPMessageBuilder.build(validBaseArguments + [arg("contentType", "text/plain")])
-        }
-    }
-
-    @Test func transferEncodingThrows() throws {
-        #expect(throws: LassoSMTPError.self) {
-            try LassoSMTPMessageBuilder.build(validBaseArguments + [arg("transferEncoding", "base64")])
-        }
-    }
-
     @Test func characterSetThrows() throws {
         #expect(throws: LassoSMTPError.self) {
             try LassoSMTPMessageBuilder.build(validBaseArguments + [arg("characterSet", "iso-8859-1")])
         }
     }
 
-    @Test func attachmentsThrows() throws {
+    // MARK: - Phase B: -contentType/-transferEncoding (§4.3, now implemented)
+
+    @Test func contentTypeMapsVerbatimOntoBodyContentTypeOverride() throws {
+        let result = try LassoSMTPMessageBuilder.build(validBaseArguments + [arg("contentType", "text/plain; charset=utf-8")])
+        #expect(result.message.bodyContentTypeOverride == "text/plain; charset=utf-8")
+    }
+
+    @Test func contentTypeAbsentLeavesOverrideNil() throws {
+        let result = try LassoSMTPMessageBuilder.build(validBaseArguments)
+        #expect(result.message.bodyContentTypeOverride == nil)
+    }
+
+    @Test func transferEncoding7bitMapsToSevenBit() throws {
+        let result = try LassoSMTPMessageBuilder.build(validBaseArguments + [arg("transferEncoding", "7bit")])
+        #expect(result.message.bodyTransferEncodingOverride == .sevenBit)
+    }
+
+    @Test func transferEncodingQuotedPrintableMapsToQuotedPrintable() throws {
+        let result = try LassoSMTPMessageBuilder.build(validBaseArguments + [arg("transferEncoding", "quoted-printable")])
+        #expect(result.message.bodyTransferEncodingOverride == .quotedPrintable)
+    }
+
+    @Test func transferEncodingBase64MapsToBase64() throws {
+        let result = try LassoSMTPMessageBuilder.build(validBaseArguments + [arg("transferEncoding", "BASE64")])
+        #expect(result.message.bodyTransferEncodingOverride == .base64)
+    }
+
+    @Test func transferEncodingAbsentLeavesOverrideNil() throws {
+        let result = try LassoSMTPMessageBuilder.build(validBaseArguments)
+        #expect(result.message.bodyTransferEncodingOverride == nil)
+    }
+
+    @Test func unrecognizedTransferEncodingTokenThrows() throws {
         #expect(throws: LassoSMTPError.self) {
-            try LassoSMTPMessageBuilder.build(validBaseArguments + [arg("attachments", "report.pdf")])
+            try LassoSMTPMessageBuilder.build(validBaseArguments + [arg("transferEncoding", "8bit")])
         }
     }
 
-    @Test func htmlImagesThrows() throws {
+    // MARK: - Phase B: -attachments/-htmlImages (§4.5, now implemented --
+    // parsed into PendingAttachment/PendingInlineImage, never throw
+    // notYetSupported anymore).
+
+    @Test func attachmentsAbsentYieldsNoPendingAttachments() throws {
+        let result = try LassoSMTPMessageBuilder.build(validBaseArguments)
+        #expect(result.pendingAttachments.isEmpty)
+    }
+
+    @Test func bareStringAttachmentIsAPathVariant() throws {
+        let result = try LassoSMTPMessageBuilder.build(validBaseArguments + [arg("attachments", "report.pdf")])
+        #expect(result.pendingAttachments == [.path(relativePath: "report.pdf")])
+    }
+
+    @Test func arrayOfPathsProducesOnePendingAttachmentEach() throws {
+        let arguments = validBaseArguments + [
+            EvaluatedArgument(label: "attachments", value: .array([.string("a.txt"), .string("b.txt")])),
+        ]
+        let result = try LassoSMTPMessageBuilder.build(arguments)
+        #expect(result.pendingAttachments == [.path(relativePath: "a.txt"), .path(relativePath: "b.txt")])
+    }
+
+    @Test func pairAttachmentIsADataVariant() throws {
+        let arguments = validBaseArguments + [
+            EvaluatedArgument(label: "attachments", value: .array([.pair(.string("MyPDF.pdf"), .string("file contents"))])),
+        ]
+        let result = try LassoSMTPMessageBuilder.build(arguments)
+        #expect(result.pendingAttachments == [.data(filename: "MyPDF.pdf", data: Data("file contents".utf8))])
+    }
+
+    @Test func mixedPathsAndPairsInOneArrayAllParse() throws {
+        let arguments = validBaseArguments + [
+            EvaluatedArgument(label: "attachments", value: .array([
+                .string("MyAttachment.txt"),
+                .pair(.string("MyPDF.pdf"), .string("contents")),
+            ])),
+        ]
+        let result = try LassoSMTPMessageBuilder.build(arguments)
+        #expect(result.pendingAttachments == [
+            .path(relativePath: "MyAttachment.txt"),
+            .data(filename: "MyPDF.pdf", data: Data("contents".utf8)),
+        ])
+    }
+
+    @Test func malformedAttachmentEntryThrows() throws {
+        let arguments = validBaseArguments + [
+            EvaluatedArgument(label: "attachments", value: .array([.integer(42)])),
+        ]
         #expect(throws: LassoSMTPError.self) {
-            try LassoSMTPMessageBuilder.build(validBaseArguments + [arg("htmlImages", "logo.png")])
+            try LassoSMTPMessageBuilder.build(arguments)
         }
+    }
+
+    @Test func htmlImagesAbsentYieldsNoPendingInlineImages() throws {
+        let result = try LassoSMTPMessageBuilder.build(validBaseArguments)
+        #expect(result.pendingInlineImages.isEmpty)
+    }
+
+    @Test func bareStringHTMLImageIsAPathVariantWithBasenameAsContentID() throws {
+        let result = try LassoSMTPMessageBuilder.build(validBaseArguments + [arg("htmlImages", "/images/apache_pb.gif")])
+        #expect(result.pendingInlineImages == [.path(contentID: "apache_pb.gif", relativePath: "/images/apache_pb.gif")])
+    }
+
+    @Test func pairHTMLImageUsesThePairNameAsContentIDVerbatim() throws {
+        let arguments = validBaseArguments + [
+            EvaluatedArgument(label: "htmlImages", value: .array([.pair(.string("myimage.jpg"), .string("binarydata"))])),
+        ]
+        let result = try LassoSMTPMessageBuilder.build(arguments)
+        #expect(result.pendingInlineImages == [.data(contentID: "myimage.jpg", data: Data("binarydata".utf8))])
     }
 
     // MARK: - Silently-ignored connection-only params (§4.3/§5): recognized,
