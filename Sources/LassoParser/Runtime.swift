@@ -46,7 +46,24 @@ public indirect enum LassoValue: Equatable, Sendable {
         case .void, .null: ""
         case let .boolean(value): value ? "true" : "false"
         case let .integer(value): String(value)
-        case let .decimal(value): String(value)
+        // Real Lasso's documented default: "The precision of a decimal
+        // value when converted to a string is always displayed as six
+        // decimal places" (lassoguide.com Math chapter, "Creating
+        // Decimal Objects") -- this governs `string()`, bracket output,
+        // and `+` string concatenation, all of which route through this
+        // property. Swift's raw `String(Double)` instead prints the
+        // shortest round-trippable representation, leaking IEEE-754
+        // binary-fraction noise straight through for any value not
+        // exactly representable in binary -- almost every two-decimal
+        // money amount (`string(0.1 + 0.2)` produced
+        // `"0.30000000000000004"`, not the six-place `"0.300000"` real
+        // Lasso guarantees). Found live: FileMaker's own CR_web
+        // order_grandtotal field, after round-tripping through ordinary
+        // Lasso arithmetic (subtotal + tax + shipping - discount),
+        // carried exactly this kind of raw-noise value, which then
+        // leaked through this exact case into a payment gateway's
+        // amount field.
+        case let .decimal(value): String(format: "%.6f", value)
         case let .string(value): value
         case let .array(value): value.map(\.outputString).joined()
         case let .map(value): String(describing: value)

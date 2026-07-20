@@ -676,7 +676,7 @@ import PerfectSessionCore
         "[$roundTripped->find('g')]/[$roundTripped->find('g')->type]",
         context: &context
     )
-    #expect(output == "1/Integer|two|1,2,3|true/Boolean|true|0/Integer|1.5/Decimal")
+    #expect(output == "1/Integer|two|1,2,3|true/Boolean|true|0/Integer|1.500000/Decimal")
 }
 
 @Test func lassoValueFromJsonDirectlyDistinguishesBooleansFromZeroAndOneValuedNumbers() async throws {
@@ -1301,7 +1301,7 @@ import PerfectSessionCore
     )
     let parts = output.components(separatedBy: "|")
     #expect(parts[0] == "15")
-    #expect(parts[1] == "101.0")
+    #expect(parts[1] == "101.000000")
     #expect(parts[2] == "5")
     #expect(parts[3] == "200")
     #expect(parts[4] == "100")
@@ -1330,7 +1330,7 @@ import PerfectSessionCore
     )
     let parts = output.components(separatedBy: "|")
     #expect(parts[0] == "0")
-    #expect(parts[1] == "0.125")
+    #expect(parts[1] == "0.125000")
 }
 
 @Test func mathCeilFloorRIntAlwaysReturnIntegersRegardlessOfInputType() async throws {
@@ -1361,10 +1361,10 @@ import PerfectSessionCore
         context: &context
     )
     let parts = output.components(separatedBy: "|")
-    #expect(parts[0] == "3.1416")
-    #expect(parts[1] == "3.142")
-    #expect(parts[2] == "3.14")
-    #expect(parts[3] == "3.1")
+    #expect(parts[0] == "3.141600")
+    #expect(parts[1] == "3.142000")
+    #expect(parts[2] == "3.140000")
+    #expect(parts[3] == "3.100000")
     #expect(parts[4] == "1000")
     #expect(parts[5] == "1500")
     #expect(parts[6] == "1460")
@@ -1417,7 +1417,7 @@ import PerfectSessionCore
         "[Math_Pow(3, 3)]|[Math_Sqrt(100.0)]",
         context: &context
     )
-    #expect(output == "27|10.0")
+    #expect(output == "27|10.000000")
 }
 
 @Test func mathAbsPreservesTheInvocantsIntegerOrDecimalType() async throws {
@@ -1426,7 +1426,7 @@ import PerfectSessionCore
         "[Math_Abs(-5)]|[Math_Abs(-5.5)]",
         context: &context
     )
-    #expect(output == "5|5.5")
+    #expect(output == "5|5.500000")
 }
 
 @Test func unaryMinusOnAWholeNumberPreservesIntegerTypeNotAlwaysDecimal() async throws {
@@ -1446,7 +1446,7 @@ import PerfectSessionCore
         "[Math_Add(-5, 3)]|[-5]|[-5.5]|[+5]",
         context: &context
     )
-    #expect(output == "-2|-5|-5.5|5")
+    #expect(output == "-2|-5|-5.500000|5")
 }
 
 // lassoguide.com "Byte Streams" — `bytes(...)->decodeBase64`/
@@ -7343,7 +7343,7 @@ struct IncludeURLTests {
         "[$html += 'b'][$html]|[local(n = 10)][#n -= 3][#n]|[local(m = 4)][#m *= 2][#m]|[local(d = 10)][#d /= 4][#d]",
         context: &context
     )
-    #expect(output == "ab|7|8|2.5")
+    #expect(output == "ab|7|8|2.500000")
 }
 
 @Test func stringLiteralInterpretsBackslashNTAndRAsRealControlCharacters() async throws {
@@ -9856,7 +9856,7 @@ struct IncludeURLTests {
         "[math_round(14.018374999999999, .01)]|[.5]|[-.25]",
         context: &context
     )
-    #expect(output == "14.02|0.5|-0.25")
+    #expect(output == "14.020000|0.500000|-0.250000")
 }
 
 @Test func selfShorthandMemberAccessStillWorksAlongsideTheLeadingDotDecimalFix() async throws {
@@ -9973,5 +9973,43 @@ struct IncludeURLTests {
     )
     let compact = output.components(separatedBy: .whitespacesAndNewlines).joined()
     #expect(compact == "A|B|")
+}
+
+@Test func decimalToStringDefaultsToSixDecimalPlacesMatchingTheLanguageGuidesOwnDocumentedRule() async throws {
+    // lassoguide.com Math chapter, "Creating Decimal Objects": "The
+    // precision of a decimal value when converted to a string is always
+    // displayed as six decimal places even though the actual precision
+    // of the number may vary based on the size of the number and its
+    // internal representation." This governs `string()`, bare bracket
+    // output, and `+` string concatenation (all of which route through
+    // `LassoValue.outputString`), and `decimal->asString` with no
+    // `-precision` argument (`formattedNumber`'s default). Both
+    // previously fell back to Swift's raw `String(Double)`, which prints
+    // the shortest round-trippable representation instead -- leaking
+    // IEEE-754 binary-fraction noise straight through for any value not
+    // exactly representable in binary (almost every two-decimal money
+    // amount). Found live: a real order's `order_grandtotal`
+    // (`14.018374999999999`, after round-tripping through ordinary Lasso
+    // arithmetic) leaked this exact noise into a payment gateway's
+    // amount field via a bare `$order_grandtotal` reference.
+    var context = LassoContext()
+    let output = try await LassoRenderer().render(
+        "[string(14.018374999999999)]|[string(0.1 + 0.2)]|[14.02->asString]|[(59.99 * 0.89)->asString]",
+        context: &context
+    )
+    #expect(output == "14.018375|0.300000|14.020000|53.391100")
+}
+
+@Test func integerAsStringWithNoPrecisionPrintsABareIntegerNotADoubleWithATrailingDotZero() async throws {
+    // Companion regression to the decimal default above -- `formattedNumber`
+    // is shared by both `integer->asString` and `decimal->asString`, and
+    // integers have no six-decimal-place rule at all (real Lasso just
+    // prints the bare whole number). Previously the shared fallback
+    // (`String(value)` on the `Double` both branches flatten to) applied
+    // uniformly regardless of invocant type, so `123->asString` produced
+    // `"123.0"`, not `"123"`.
+    var context = LassoContext()
+    let output = try await LassoRenderer().render("[123->asString]", context: &context)
+    #expect(output == "123")
 }
 
