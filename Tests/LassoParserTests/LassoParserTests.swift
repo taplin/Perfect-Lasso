@@ -9166,3 +9166,127 @@ struct IncludeURLTests {
     #expect(output == "1|One|0")
 }
 
+@Test func elseLessArrowIfNestedInALargerIfElseChainDoesNotSwallowTheOuterElse() async throws {
+    // Real corpus: includes/efs_process.lasso's PayPal branch is a
+    // self-contained, else-less `if(...) => { ... }` nested inside a
+    // larger if(gift)/else(if(invoice)/else(paypal)/else(creditcard)/if)
+    // chain. ScriptBodyParser's peekIsElseKeyword() used to defer the
+    // inner arrow-if's closing brace whenever ANY `else` followed it,
+    // even one that belonged to the outer chain -- permanently leaving
+    // the inner if unpopped, so BlockBuilder's later re-nesting pass
+    // attached the outer's real else (and everything after it) to the
+    // wrong, inner if instead. This silently truncated the outer
+    // chain, dropping the whole "creditcard" branch below.
+    var context = LassoContext()
+    let output = try await LassoRenderer().render(
+        """
+        <?lasso
+        if($mode == 'gift')
+          'gift'
+        else($mode == 'paypal')
+          if($paypal_ready) => {
+            'entering paypal'
+          }
+          'after paypal block'
+        else
+          'entering creditcard'
+        /if
+        ?>
+        """,
+        context: &context
+    )
+    #expect(output.contains("entering creditcard"))
+}
+
+@Test func selfContainedArrowIfElseNestedInALargerChainStillWorksBothWays() async throws {
+    // Companion case to the above -- an arrow-if that DOES have its own
+    // arrow-style else must still correctly attach that else to ITSELF,
+    // not to the outer chain, in both the entered and not-entered state.
+    var context = LassoContext()
+    let entered = try await LassoRenderer().render(
+        """
+        <?lasso
+        if('x' == 'x')
+          if(true) => {
+            'inner-true'
+          } else => {
+            'inner-false'
+          }
+          'after-inner'
+        else
+          'outer-false-branch'
+        /if
+        ?>
+        """,
+        context: &context
+    )
+    #expect(entered.contains("inner-true"))
+    #expect(!entered.contains("inner-false"))
+    #expect(entered.contains("after-inner"))
+
+    var context2 = LassoContext()
+    let notEntered = try await LassoRenderer().render(
+        """
+        <?lasso
+        if('x' == 'x')
+          if(false) => {
+            'inner-true'
+          } else => {
+            'inner-false'
+          }
+          'after-inner'
+        else
+          'outer-false-branch'
+        /if
+        ?>
+        """,
+        context: &context2
+    )
+    #expect(notEntered.contains("inner-false"))
+    #expect(!notEntered.contains("inner-true"))
+    #expect(notEntered.contains("after-inner"))
+}
+
+@Test func leadingDotDecimalLiteralsParseAsNumbersNotSelfShorthandMemberAccess() async throws {
+    // Real corpus: includes/efs_process.lasso calls
+    // `math_round(field('order_grandtotal'), .01)` -- the bare `.01`
+    // argument. The lexer only recognized numbers starting with a
+    // digit, so `.01` fell through to `.symbol(".")`, which
+    // parsePrimary's self-shorthand member-access case
+    // (`.methodName` -> `self->methodName`) happily accepted, producing
+    // a nonsense `.member(self, "<unknown>")` node instead of a number.
+    var context = LassoContext()
+    let output = try await LassoRenderer().render(
+        "[math_round(14.018374999999999, .01)]|[.5]|[-.25]",
+        context: &context
+    )
+    #expect(output == "14.02|0.5|-0.25")
+}
+
+@Test func selfShorthandMemberAccessStillWorksAlongsideTheLeadingDotDecimalFix() async throws {
+    // Guards against the leading-dot-decimal fix regressing the actual
+    // legitimate construct it could be confused with: `.methodName`
+    // inside a custom type's method body, shorthand for
+    // `self->methodName`.
+    var context = LassoContext()
+    let output = try await LassoRenderer().render(
+        """
+        <?lassoscript
+        define Widget => type {
+            data public name::string
+            public onCreate(name::string) => {
+                self->name = #name
+            }
+            public shout() => {
+                return .name + '!'
+            }
+        }
+        local(widget::Widget = Widget('Ada'))
+        ?>
+        [#widget->shout()]
+        """,
+        context: &context
+    )
+    #expect(output.trimmingCharacters(in: .whitespacesAndNewlines) == "Ada!")
+}
+

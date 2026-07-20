@@ -971,16 +971,43 @@ struct ScriptBodyParser {
         return String(characters[start..<index])
     }
 
-    /// Non-mutating lookahead: does an `else` keyword appear next, once
-    /// trivia is skipped? Used by `parseIgnoredBrace` to decide whether a
-    /// brace-style if's closing `}` should close it immediately or wait
-    /// for a following else branch's own closing brace.
+    /// Non-mutating lookahead: does an `else` keyword appear next, AND
+    /// does that else clause itself continue as an arrow/brace body
+    /// (`else`, optionally `(condition)`, then `=>{` or bare `{`)? Used by
+    /// `parseIgnoredBrace` to decide whether a brace-style if's closing
+    /// `}` should close it immediately or wait for a following else
+    /// branch's own closing brace to finally pop it.
+    ///
+    /// Checking only for a bare `else` keyword (as this used to) isn't
+    /// enough: a plain, slash-closed else belonging to an OUTER,
+    /// differently-nested if looks identical from here (e.g. `if(cond)
+    /// ... else if(x)=>{...} else 'plain' /if`, where the inner arrow-if
+    /// has no else of its own). Deferring the inner if's close in that
+    /// case leaves it permanently unpopped — `BlockBuilder`'s later flat
+    /// re-nesting pass then greedily attaches the OUTER if's real else
+    /// (and its own closing `/if`) to this inner if instead, silently
+    /// truncating the outer if's body and losing everything meant to
+    /// follow it. Requiring the else clause to ALSO open with
+    /// `=>{`/bare `{` here is what disambiguates "this else really is
+    /// this arrow-if's own" from "this else belongs to some enclosing,
+    /// differently-styled if that just happens to sit right after my
+    /// closing brace." Real corpus:
+    /// includes/efs_process.lasso's PayPal branch — a self-contained,
+    /// else-less `if(...)=>{ ... }` nested inside a larger
+    /// if(gift)/else(if(invoice)/else(paypal)/else(creditcard)/if)
+    /// chain — silently dropped the entire Credit Card branch (and
+    /// everything in the file after it) before this fix.
     private mutating func peekIsElseKeyword() -> Bool {
         let saved = index
+        defer { index = saved }
         skipTrivia()
-        let isElse = readKeyword("else")
-        index = saved
-        return isElse
+        guard readKeyword("else") else { return false }
+        skipHorizontalWhitespace()
+        if index < characters.count, characters[index] == "(" {
+            _ = readBalanced(open: "(", close: ")")
+            skipHorizontalWhitespace()
+        }
+        return consumeArrowBlockStartIfPresent()
     }
 
     private mutating func readKeyword(_ keyword: String) -> Bool {

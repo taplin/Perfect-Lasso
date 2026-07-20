@@ -31,6 +31,18 @@ private struct ExpressionLexer {
 
         if character == "'" || character == "\"" { return .string(readString(character)) }
         if character.isNumber { return readNumber() }
+        // A leading-dot decimal literal (`.01`, `.5`) -- real Lasso allows
+        // omitting the integer part before the point. Without this, a bare
+        // `.` here is indistinguishable from Lasso's `.methodName`
+        // self-shorthand member access (parsePrimary's `.symbol(".")`
+        // case, `.member(base: self, name: ...)`), which happily accepts
+        // ANY next token as the "member name" including a stray number,
+        // producing a nonsense `.member(self, "<unknown>")` node. Member
+        // names never start with a digit, so peeking one character ahead
+        // cleanly disambiguates the two: real corpus
+        // includes/efs_process.lasso's `math_round(field('order_grandtotal'),
+        // .01)` was hitting exactly this collision.
+        if character == ".", index + 1 < characters.count, characters[index + 1].isNumber { return readNumber() }
         if character == "$" || character == "#" {
             index += 1
             return .variable(readIdentifier(), character == "$" ? .global : .local)
