@@ -166,21 +166,86 @@ struct ExpressionParser {
     private let tokens: [Token]
     private var index = 0
 
-    /// True while parsing the value of a bare colon-call argument (`closing
-    /// == nil` in `parseArguments`) — real Lasso's colon syntax has no
-    /// closing delimiter of its own, so per the Lasso 8.5 Language Guide's
-    /// "Colon Syntax" section, an unparenthesized nested/trailing construct
-    /// binds to the *outermost* call, not to the argument being parsed.
-    /// Concretely: `$arr->get:2->first` must parse as `($arr->get:2)->first`
-    /// (`->first` targets the call's result), not `$arr->get:(2->first)`
-    /// (which crashes — `2` has no `first` member). Suppressing `->` here
-    /// stops `parsePostfix` from greedily absorbing that trailing member
-    /// access into the argument value; it's lifted again the moment we
-    /// enter any parenthesized (unambiguously bounded) sub-expression. Real
-    /// corpus (`->get:1`-style calls, 70+ sites) never puts a `->` inside a
-    /// bare colon-call's own argument, so this never suppresses anything
-    /// real code relies on.
-    private var suppressArrowPostfix = false
+    /// How many `parseArguments` calls — BARE (`closing == nil`) *or*
+    /// WRAPPED (`Foo(...)`, `closing == ")"`) — are currently active, one
+    /// inside another. Used by `parseArguments` to know whether an
+    /// upcoming `)` genuinely, safely terminates THIS SPECIFIC bare call
+    /// (only true when NO call frame of either kind currently encloses
+    /// it) or merely terminates some ANCESTOR call's own wrap (depth > 0
+    /// on entry) — see `parseArguments`'s own doc comment for why this
+    /// distinction is load-bearing. Both kinds of frame must count: a
+    /// bare colon-call nested directly inside an ordinary WRAPPED call's
+    /// argument — e.g. `Identity($arr->get:1->first)` — sees `get:`'s own
+    /// upcoming `)` as belonging to `Identity`'s wrap, not to `get`
+    /// itself, and only a depth count that also tracks wrapped frames
+    /// can tell the two apart. Found by architect re-verification via a
+    /// real failing trace: counting bare frames only let `get:` in that
+    /// example wrongly believe itself outermost, since `Identity(...)`'s
+    /// own wrapped `parseArguments` call never touched the counter.
+    /// Incremented/decremented with `defer` around EVERY `parseArguments`
+    /// call regardless of `closing`, the same safe save/restore
+    /// discipline the original, now-removed `suppressArrowPostfix` field
+    /// always used correctly (that field's own problem was being too
+    /// BROAD in scope, never a staleness/restore bug) — unlike the
+    /// UNSCOPED `giveback` value itself, which is threaded through return
+    /// values specifically BECAUSE an earlier draft's attempt to track it
+    /// via a similar always-restored instance field still leaked (see
+    /// `ArrowGiveback`'s own doc comment). A plain depth counter has no
+    /// such risk: it carries no parse-result payload to go stale, only a
+    /// nesting count that's always correctly restored on every exit path.
+    private var enclosingCallArgumentListDepth = 0
+
+    /// A bare colon-call (`closing == nil` in `parseArguments`) has no
+    /// closing delimiter of its own — per the Lasso 8.5 Language Guide's
+    /// "Colon Syntax" section (Ch. 4, Table 1's own worked example:
+    /// `Tag_Name: Parameter_1, Sub_Tag: Parameter_2, Parameter_3` resolves
+    /// as `Tag_Name: Parameter_1, (Sub_Tag: Parameter_2), Parameter_3` —
+    /// "the outermost tag is greedy"), a `->`-chain trailing an argument's
+    /// value can be genuinely ambiguous between "part of this argument" and
+    /// "part of the whole call's result": `$arr->get:2->first` must parse
+    /// as `($arr->get:2)->first`, not `$arr->get:(2->first)` (which
+    /// crashes — `2` has no `first` member).
+    ///
+    /// Resolved by parsing GREEDILY (every argument's `->` chain is always
+    /// consumed normally, no suppression) and then, in `parseArguments`,
+    /// GIVING BACK the trailing chain if it turns out ambiguous — i.e. only
+    /// when: the argument list is genuinely bare (`closing == nil`), the
+    /// chain was applied directly onto a non-parenthesized base (a
+    /// parenthesized base like `('abe')->SubString(1,1)` is never
+    /// ambiguous — the parens themselves already scope it), AND neither a
+    /// comma (proving more arguments follow, so the chain unambiguously
+    /// belongs to what's already been parsed — matches the Guide's own
+    /// "up to the next comma" reading) nor a `)` (an enclosing wrap's own
+    /// boundary, which the chain can never reach past) follows. Only in
+    /// that specific, genuinely-ambiguous circumstance is the chain's
+    /// starting position rewound and handed back to the ENCLOSING postfix
+    /// parse. This generalizes the fix beyond the original bare-integer-
+    /// literal case above to any non-parenthesized base (a variable, a
+    /// call result, etc.) — e.g. `(Compare_LessThan: $x->SubString(1,1),
+    /// 'bob')` now correctly binds `->SubString(1,1)` to `$x` (a comma
+    /// follows, unambiguous), while `$arr->get:2->first` still correctly
+    /// binds `->first` to the call's result (nothing safe follows the bare
+    /// `2->first`, ambiguous).
+    ///
+    /// **Threaded through return values, deliberately NOT a shared mutable
+    /// instance field**: an earlier version of this fix used exactly such
+    /// a field (`lastArrowStepGiveback: ArrowGiveback?`, set by
+    /// `parsePostfix`, read by `parseArguments`) and shipped a real
+    /// regression — `TypeBodyParser`'s recursive descent through nested
+    /// tag bodies (e.g. `(self->'ticks') = (self->'ticks') + 1` inside a
+    /// `Define_Tag` body, itself inside a `Define_Type` body) left STALE
+    /// giveback state from one nested parse bleeding into an unrelated
+    /// LATER `parseArguments` call's own check, since nothing scoped the
+    /// field correctly across recursive `parseArguments`/`parseExpression`
+    /// calls (mirroring exactly the save/restore discipline the ORIGINAL,
+    /// now-removed `suppressArrowPostfix` field needed for the same
+    /// reason). Threading `ArrowGiveback?` through `parsePrefix`/
+    /// `parsePostfix`/`parseExpression`/`parseJuxtaposedValue`'s own
+    /// TRACKING variants instead makes this a non-issue by construction —
+    /// there's no shared state left to go stale. Real corpus (`->get:1`-
+    /// style calls, 70+ sites) never puts a `->` inside a bare colon-call's
+    /// own argument, so none of this changes behavior real code relies on.
+    private typealias ArrowGiveback = (indexBeforeArrow: Int, expressionBeforeArrow: LassoExpression)
 
     init(_ source: String) {
         var lexer = ExpressionLexer(source)
@@ -199,9 +264,24 @@ struct ExpressionParser {
     }
 
     mutating func parseExpression(minimumPrecedence: Int = 0) -> LassoExpression {
-        var left = parsePrefix()
+        parseExpressionTrackingGiveback(minimumPrecedence: minimumPrecedence).expression
+    }
+
+    /// See `ArrowGiveback`'s own doc comment. `giveback` only survives
+    /// this function's own binary/`::`/ternary logic untouched (reset to
+    /// `nil` the instant any of it fires) — it's ONLY non-`nil` when this
+    /// call's entire result is exactly, unmodified, whatever the initial
+    /// `parsePrefixTrackingGiveback()` call produced, which is the only
+    /// circumstance `parseArguments` can safely act on it (see
+    /// `isPostfixChainShape`'s own doc comment for why that's checked
+    /// again there too, as a second, independent guard).
+    mutating private func parseExpressionTrackingGiveback(
+        minimumPrecedence: Int = 0
+    ) -> (expression: LassoExpression, giveback: ArrowGiveback?) {
+        var (left, giveback) = parsePrefixTrackingGiveback()
         while consume("::") {
             left = .binary(left: left, operator: "::", right: parseTypeConstraint())
+            giveback = nil
         }
         while case let .symbol(op) = peek,
               let precedence = Self.precedence[op],
@@ -216,6 +296,7 @@ struct ExpressionParser {
             } else {
                 left = .binary(left: left, operator: op, right: right)
             }
+            giveback = nil
         }
         // Lasso 8's `condition ? whenTrue | whenFalse` conditional-expression
         // operator — not a binary operator (not in `precedence`, and its
@@ -245,12 +326,23 @@ struct ExpressionParser {
                 // matches that; there's no real "else" value in this form.
                 left = .ternary(condition: left, whenTrue: whenTrue, whenFalse: .void)
             }
+            giveback = nil
         }
-        return left
+        return (left, giveback)
     }
 
     mutating private func parsePrefix() -> LassoExpression {
+        parsePrefixTrackingGiveback().expression
+    }
+
+    /// See `ArrowGiveback`'s own doc comment for the overall mechanism.
+    /// Every case here is giveback-ELIGIBLE (a bare, non-parenthesized
+    /// base) except `.symbol("(")`, which produces an already self-
+    /// contained, unambiguous group that never needs its own trailing
+    /// chain given back.
+    mutating private func parsePrefixTrackingGiveback() -> (expression: LassoExpression, giveback: ArrowGiveback?) {
         var expression: LassoExpression
+        var eligibleForGiveback = true
         switch advance() {
         case let .string(value): expression = .string(value)
         case let .integer(value): expression = .integer(value)
@@ -280,69 +372,60 @@ struct ExpressionParser {
         case .symbol("."):
             expression = .member(base: .identifier("self"), name: readMemberName(), arguments: nil)
         case .symbol("("):
-            let previousSuppression = suppressArrowPostfix
-            suppressArrowPostfix = false
             expression = parseExpression()
             _ = consume(")")
-            // Parse this parenthesized expression's OWN postfix chain
-            // (`->member`, `(...)`, `:...`) while suppression is still
-            // off, THEN restore — not the other way around. A `(...)`
-            // group is an unambiguous, self-contained unit; any `->`
-            // immediately following its closing paren can only belong
-            // to IT, never to some enclosing bare colon-call's own
-            // trailing-member ambiguity (`suppressArrowPostfix`'s real
-            // purpose, see `bareColonCallArgumentDoesNotAbsorbATrailing
-            // ArrowMemberAccess`'s own doc comment — that ambiguity is
-            // specifically about an UNPARENTHESIZED argument value like
-            // bare `1` in `$var->get:1->first`, which parens can't even
-            // arise for). Found via a real failure: `(Compare_LessThan:
-            // ('abe')->SubString(1,1), 'bob')` — a colon-call argument
-            // that is itself a parenthesized base with a chained member
-            // call — threw `unsupportedExpression(")")`, because the OLD
-            // ordering restored suppression BEFORE this expression's own
-            // `->SubString(1,1)` postfix chain got a chance to parse,
-            // silently dropping it and leaving the parser to choke on
-            // the leftover `->SubString(1,1)` tokens it never consumed.
-            // The final `return parsePostfix(expression)` below still
-            // runs afterward (with suppression restored) but is a
-            // harmless no-op here — every postfix token this expression
-            // could legitimately absorb was already consumed above.
-            //
-            // **Known, narrower, still-open limitations** (not fixed
-            // here, both predate and are unchanged by this fix): a BARE
-            // (unparenthesized) variable/identifier with a chained
-            // member call as a NON-LAST bare-colon-call argument — e.g.
-            // `(Tag: $x->Member(), 'y')` — still throws
-            // `unsupportedExpression(")")`. The sibling shape, a bare
-            // chained-member-call as the LAST (or only) bare-colon-call
-            // argument — e.g. `(Tag: $x->Member())` — does NOT throw,
-            // but silently MIS-parses as `(Tag: $x)->Member()` instead
-            // of the presumably-intended `Tag($x->Member())` (this
-            // happens entirely inside `parsePostfix`'s own shared
-            // while-loop, after `parseArguments` restores suppression —
-            // code this fix never touches, confirmed unaffected either
-            // way). Only the parenthesized-base case above is fixed; a
-            // bare value has no syntactic boundary of its own to hang
-            // this same "give it back its suppression-free postfix
-            // parse" fix on without risking exactly the regression this
-            // whole mechanism was built to prevent (`$var->get:1->first`).
-            expression = parsePostfix(expression)
-            suppressArrowPostfix = previousSuppression
+            // Already a self-contained, unambiguous unit — see
+            // `eligibleForGiveback`'s own doc comment above.
+            eligibleForGiveback = false
         case let .named(name): expression = .unknown("-\(name)")
         case let .symbol(value): expression = .unknown(value)
-        case .eof: return .unknown("")
+        case .eof: return (.unknown(""), nil)
         }
-        return parsePostfix(expression)
+        return parsePostfixTrackingGiveback(expression, eligibleForGiveback: eligibleForGiveback)
     }
 
-    mutating private func parsePostfix(_ initial: LassoExpression) -> LassoExpression {
+    /// Parses `initial`'s own postfix chain (`(...)`/`:...`/`->member`),
+    /// greedily — no suppression. When `eligibleForGiveback` (only true for
+    /// a bare, non-parenthesized `initial`), the FIRST `->`-triggered step
+    /// applied records its own pre-state as the returned `giveback` (only
+    /// the first: once any step has been applied, eligibility is cleared,
+    /// so a `1->first->second` chain's giveback point — if it turns out
+    /// ambiguous — rewinds all the way back to `1`, handing the WHOLE
+    /// trailing chain to the enclosing postfix parse, not just its last
+    /// segment). See `ArrowGiveback`'s own doc comment for why, and
+    /// `parseArguments` for where the giveback actually gets applied.
+    mutating private func parsePostfixTrackingGiveback(
+        _ initial: LassoExpression, eligibleForGiveback: Bool
+    ) -> (expression: LassoExpression, giveback: ArrowGiveback?) {
         var expression = initial
+        var eligible = eligibleForGiveback
+        var giveback: ArrowGiveback?
         while true {
             if consume("(") {
                 expression = .call(callee: expression, arguments: parseArguments(closing: ")"))
+                eligible = false
+                // A call step (unlike a further `->member` step) already
+                // resolves its OWN internal argument-boundary ambiguity,
+                // if any — the result is a new, self-contained value, not
+                // simply "a bare base with a naive trailing chain"
+                // anymore. Any `giveback` captured from an EARLIER `->`
+                // step in this same chain is now stale relative to the
+                // NEW `expression` (it would rewind too far back, past
+                // this call, corrupting an unrelated OUTER bare-call's
+                // own argument — found by code review via a real
+                // failing trace: `$arr->get:1->first` nested as another
+                // bare call's sole trailing argument).
+                giveback = nil
             } else if consume(":") {
                 expression = .call(callee: expression, arguments: parseArguments(closing: nil))
-            } else if !suppressArrowPostfix, consume("->") {
+                eligible = false
+                giveback = nil // see the `consume("(")` branch's own comment just above.
+            } else if peek == .symbol("->") {
+                if eligible {
+                    giveback = (index, expression)
+                }
+                eligible = false
+                index += 1 // consume "->"
                 let wrapped = consume("(")
                 let name = readMemberName()
                 let arguments: [LassoArgument]?
@@ -382,7 +465,7 @@ struct ExpressionParser {
                 }
                 expression = .member(base: expression, name: name, arguments: arguments)
             } else {
-                return expression
+                return (expression, giveback)
             }
         }
     }
@@ -398,9 +481,24 @@ struct ExpressionParser {
 
     mutating private func parseArguments(closing: String?) -> [LassoArgument] {
         var arguments: [LassoArgument] = []
-        let previousSuppression = suppressArrowPostfix
-        suppressArrowPostfix = (closing == nil)
-        defer { suppressArrowPostfix = previousSuppression }
+        // See `enclosingCallArgumentListDepth`'s own doc comment. Computed
+        // BEFORE incrementing: depth is still whatever it was set to by
+        // any ENCLOSING call frame (bare or wrapped), so `== 0` here
+        // genuinely means "no other call frame is currently active above
+        // me" — I'm the outermost, and an upcoming `)` can only belong to
+        // MY OWN immediate wrap (or none at all). A NESTED bare call
+        // (e.g. `get:` triggered while parsing `Outer:`'s own still-open
+        // argument, OR while parsing an ordinary WRAPPED call's argument
+        // like `Identity(...)`) sees a non-zero depth here instead,
+        // correctly disqualifying `)` from being treated as a safe
+        // terminator for ITS OWN giveback check — that `)` might belong
+        // to the enclosing call's wrap, arbitrarily far up, not to `get`
+        // itself. Found by architect review via real failing traces:
+        // `(Outer: $arr->get:2->first)` and `Identity($arr->get:1->first)`.
+        let isOutermostBareArgumentList = closing == nil && enclosingCallArgumentListDepth == 0
+        let previousDepth = enclosingCallArgumentListDepth
+        enclosingCallArgumentListDepth += 1
+        defer { enclosingCallArgumentListDepth = previousDepth }
         while peek != .eof {
             if let closing, consume(closing) { break }
             // A bare-colon-call's argument list (`closing == nil` — no
@@ -432,13 +530,50 @@ struct ExpressionParser {
                     continue
                 }
             }
-            arguments.append(LassoArgument(label: label, value: parseJuxtaposedValue()))
+            var (value, giveback) = parseJuxtaposedValueTrackingGiveback()
+            // Give back an ambiguous trailing `->` chain — see
+            // `ArrowGiveback`'s own doc comment for the full reasoning.
+            // Only applies when: this is a genuinely bare (`closing ==
+            // nil`) argument list; the just-parsed value's OWN outermost
+            // shape is exactly what a `->`-chain step would produce
+            // (`.member`/`.call`) — a second, independent guard beyond
+            // `giveback` already being `nil` whenever a compound
+            // expression (`.binary`/`.ternary`/etc.) wraps it (see
+            // `parseExpressionTrackingGiveback`/`parseJuxtaposedValueTrack
+            // ingGiveback`'s own reset-on-any-wrapping logic) — belt and
+            // suspenders against ever discarding part of a compound
+            // value; and neither a comma (proving more arguments follow —
+            // the chain unambiguously belongs to what's already been
+            // parsed) nor a `)` THIS SPECIFIC bare call's own immediate
+            // wrap will consume follows. That last check is `peek ==
+            // .symbol(")")` ONLY when `isOutermostBareArgumentList` — a
+            // NESTED bare call (some ancestor bare call is still open
+            // above this one) can never trust an upcoming `)` to be ITS
+            // OWN boundary, since it might belong to that ancestor's wrap
+            // arbitrarily far up (see `enclosingCallArgumentListDepth`'s
+            // own doc comment).
+            let upcomingCloseParenIsSafe = isOutermostBareArgumentList && peek == .symbol(")")
+            if closing == nil,
+               let giveback,
+               isPostfixChainShape(value),
+               peek != .symbol(","), !upcomingCloseParenIsSafe {
+                index = giveback.indexBeforeArrow
+                value = giveback.expressionBeforeArrow
+            }
+            arguments.append(LassoArgument(label: label, value: value))
             if !consume(",") {
                 if let closing { _ = consume(closing) }
                 break
             }
         }
         return arguments
+    }
+
+    private func isPostfixChainShape(_ expression: LassoExpression) -> Bool {
+        switch expression {
+        case .member, .call: true
+        default: false
+        }
     }
 
     /// Lasso 8's documented operator-less string concatenation (Language
@@ -472,11 +607,16 @@ struct ExpressionParser {
     /// continuation would risk swallowing what's actually the *next*
     /// statement into this argument's value.
     mutating private func parseJuxtaposedValue() -> LassoExpression {
-        var value = parseExpression()
+        parseJuxtaposedValueTrackingGiveback().value
+    }
+
+    mutating private func parseJuxtaposedValueTrackingGiveback() -> (value: LassoExpression, giveback: ArrowGiveback?) {
+        var (value, giveback) = parseExpressionTrackingGiveback()
         while startsJuxtaposedContinuation() {
             value = .binary(left: value, operator: "+", right: parseExpression())
+            giveback = nil
         }
-        return value
+        return (value, giveback)
     }
 
     private func startsJuxtaposedContinuation() -> Bool {

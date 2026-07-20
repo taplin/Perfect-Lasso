@@ -6877,22 +6877,228 @@ struct IncludeURLTests {
     // `('abe')->SubString(1,1)` — threw `unsupportedExpression(")")`
     // whether it was a non-last argument (followed by a comma and
     // another argument) or the last argument inside an explicit
-    // `(Tag: ...)` wrap. Root cause: `parsePrefix`'s `.symbol("(")` case
-    // restored `suppressArrowPostfix` to the enclosing bare-colon-call's
-    // suppressed state BEFORE this parenthesized expression's own
-    // `->SubString(1,1)` postfix chain got a chance to parse, silently
-    // dropping it. Fixed by parsing the parenthesized expression's own
-    // postfix chain while suppression is still off, then restoring —
-    // see `ExpressionParser.swift`'s own doc comment on this case for
-    // the full reasoning, including the narrower, still-open case (a
-    // BARE, unparenthesized variable with a chained call as a non-last
-    // argument) this fix does not cover.
+    // `(Tag: ...)` wrap. Fixed as part of the broader `ArrowGiveback`
+    // redesign (`ExpressionParser.swift`) — see its own doc comment,
+    // and `colonCallArgumentWithABareChainedMemberCallParsesCorrectly`
+    // below for the sibling case (a BARE, unparenthesized base) this
+    // fix was initially narrower than, now also fixed.
     var context = LassoContext()
     let output = try await LassoRenderer().render(
         "[(Compare_LessThan: ('abe')->SubString(1,1), 'bob')]|[(Compare_LessThan: 'bob', ('abe')->SubString(1,1))]",
         context: &context
     )
     #expect(output == "0|-1")
+}
+
+@Test func colonCallArgumentWithABareChainedMemberCallParsesCorrectly() async throws {
+    // Sibling to the parenthesized-base test above, for a BARE
+    // (unparenthesized) base — `$x->SubString(1,1)` as a colon-call
+    // argument. Previously: as a non-last argument (followed by a
+    // comma and another argument), this threw
+    // `unsupportedExpression(")")`; as the sole/last argument, it
+    // silently MIS-parsed as `(Compare_LessThan: $x)->SubString(1,1)`
+    // instead of the intended `Compare_LessThan($x->SubString(1,1))`.
+    // Fixed by the `ArrowGiveback` redesign: every argument's `->`
+    // chain is now parsed greedily (no suppression), then GIVEN BACK
+    // to the enclosing call only when genuinely ambiguous — neither a
+    // comma nor a `)` follows (see `ExpressionParser.swift`'s own doc
+    // comment on `ArrowGiveback` for the full reasoning). A comma or a
+    // `)` following the chain proves it unambiguously belongs to the
+    // argument, exactly as it does for the already-fixed parenthesized
+    // case.
+    //
+    // `$x`/`'zap'` are chosen deliberately (found by architect review
+    // to matter): the FULL string and the SUBSTRING must compare
+    // DIFFERENTLY against the other operand, or a version of this test
+    // that silently used `$x` instead of `$x->SubString(1,1)` would
+    // pass "by luck" — `'zoo' < 'zap'` is FALSE (`'o' > 'a'` at the
+    // second character) while `'z' < 'zap'` is TRUE (`'z'` is a strict
+    // prefix of `'zap'`), so the two forms are only both correct if the
+    // substring genuinely got applied.
+    var context = LassoContext()
+    let output = try await LassoRenderer().render(
+        """
+        [var('x' = 'zoo')]
+        [(Compare_LessThan: $x->SubString(1,1), 'zap')]|\
+        [(Compare_LessThan: 'zap', $x->SubString(1,1))]
+        """,
+        context: &context
+    ).trimmingCharacters(in: .whitespacesAndNewlines)
+    #expect(output == "0|-1")
+}
+
+@Test func bareColonCallStillCorrectlyBindsATrailingArrowToTheCallResultWhenGenuinelyAmbiguous() async throws {
+    // Companion to `bareColonCallArgumentDoesNotAbsorbATrailingArrowMember
+    // Access` above (the original motivating case for this whole
+    // mechanism) — confirms the `ArrowGiveback` redesign didn't regress
+    // it, using the exact same proof technique: with NOTHING safe (no
+    // comma, no `)`) following a bare argument's own trailing `->`
+    // chain, that chain must still bind to the CALL's result, not the
+    // argument. `MakeArray` wraps its argument in a 1-element array —
+    // if `->first` incorrectly bound to the bare `5` argument itself
+    // (`MakeArray(5->first)`), it would throw
+    // `unsupportedExpression("Member first")` (integers have no
+    // `first` member, same crash the original motivating test's own
+    // bug produced); binding correctly to the call's result
+    // (`MakeArray(5)->first`, i.e. `array(5)->first`) evaluates cleanly
+    // to `5`.
+    var context = LassoContext()
+    let output = try await LassoRenderer().render(
+        """
+        [
+        Define_Tag('MakeArray', -Required='Value');
+            Return(Array((Local: 'Value')));
+        /Define_Tag;
+        ]\
+        [MakeArray:5->first]
+        """,
+        context: &context
+    ).trimmingCharacters(in: .whitespacesAndNewlines)
+    #expect(output == "5")
+}
+
+@Test func bareColonCallArgumentWithATrailingChainInACompoundExpressionIsNotCorrupted() async throws {
+    // Safety-guard test: `ArrowGiveback` must NEVER apply when the
+    // argument's own top-level shape is a compound expression
+    // (`.binary`/`.ternary`/etc.) wrapping a trailing chain, since
+    // giving back just the chain would silently discard the rest of
+    // the expression. `1 + $arr->first` as a bare colon-call's sole
+    // argument must keep its `+` intact regardless of what
+    // (non-)ambiguity the trailing `->first` might otherwise have.
+    var context = LassoContext()
+    let output = try await LassoRenderer().render(
+        """
+        [
+        Define_Tag('Describe', -Required='Value');
+            Return('got:' + (Local: 'Value'));
+        /Define_Tag;
+        var('arr' = array('first-element', 'unused'));
+        ]\
+        [Describe:1 + $arr->first]
+        """,
+        context: &context
+    ).trimmingCharacters(in: .whitespacesAndNewlines)
+    #expect(output == "got:1first-element")
+}
+
+@Test func nestedBareColonCallUnderAnExplicitParenWrapStillResolvesItsOwnAmbiguityCorrectly() async throws {
+    // Regression test for a real bug found by architect review during
+    // the `ArrowGiveback` redesign: `(Outer: $arr->get:2->first)` — a
+    // BARE colon-call (`get:2`) nested, with no wrap of its own, inside
+    // ANOTHER bare colon-call (`Outer:`) that IS explicitly wrapped in
+    // parens. `get`'s own giveback check must NOT treat the upcoming
+    // `)` as a safe terminator for ITS OWN ambiguity — that `)` belongs
+    // to `Outer`'s wrap, two levels up, not to `get`'s own (nonexistent)
+    // wrap. Before the fix, `get`'s own check saw ANY upcoming `)` as
+    // universally safe, incorrectly leaving `2->first` bound together as
+    // `get`'s own argument (`get(2->first)`) — which crashes at
+    // evaluation (integers have no `first` member) instead of correctly
+    // resolving to `($arr->get:2)->first`, embedded as `Outer`'s single
+    // argument. Fixed via `enclosingCallArgumentListDepth` — an upcoming
+    // `)` is only trusted when THIS bare call is the outermost one
+    // currently active, not nested inside another still-open call frame.
+    var context = LassoContext()
+    let output = try await LassoRenderer().render(
+        """
+        [
+        Define_Tag('Identity', -Required='Value');
+            Return((Local: 'Value'));
+        /Define_Tag;
+        var(items::array = array);
+        $items->insert('a' = array(1, 2, 3));
+        $items->insert('b' = array(4, 5, 6));
+        ]\
+        [(Identity: $items->get:1->first)]
+        """,
+        context: &context
+    ).trimmingCharacters(in: .whitespacesAndNewlines)
+    #expect(output == "a")
+}
+
+@Test func giveBackDoesNotLeakPastAnEmbeddedCallWithinTheSameChain() async throws {
+    // Regression test for a real bug found by code review during the
+    // `ArrowGiveback` redesign: a chain containing an embedded bare
+    // colon-call (`->get:1`) followed by FURTHER `->` chaining
+    // (`->first`) — e.g. `$items->get:1->first`, the exact shape the
+    // ORIGINAL motivating fix targeted — used as ANOTHER bare colon-
+    // call's sole/trailing argument. The `giveback` captured at the
+    // FIRST eligible `->` step (before `->get`) must NOT survive past
+    // the embedded `:`-triggered call that follows it — that call
+    // already resolved its OWN internal ambiguity independently,
+    // producing a new, self-contained value; the earlier, now-stale
+    // giveback point would otherwise cause the OUTER call to rewind too
+    // far back, discarding `->get:1->first` entirely and re-attaching
+    // it to the OUTER call's own result instead.
+    //
+    // **`MakeArray` must be a genuinely TRANSFORMING tag, not a
+    // passthrough.** Two earlier versions of this test were found
+    // non-decisive on review: (1) wrapping `MakeArray:...` directly in
+    // parens (`(MakeArray:...)->join(',')`) made `MakeArray:`'s own
+    // giveback check see itself as the OUTERMOST bare call, independently
+    // masking the bug via the depth-tracking fix's own guard; (2) nesting
+    // it unwrapped under another bare call (`Outer: Inner:...`) fixed
+    // that, but using a no-op passthrough `Inner` meant the corrupted and
+    // correct parse trees evaluate to the SAME final value regardless of
+    // which one runs — a stale giveback causes `Inner`'s whole
+    // `->get:1->first` chain to get re-parsed OUTSIDE `Inner`'s call
+    // instead of resolved inside it (`Inner($items)->get:1->first` vs.
+    // `Inner($items->get:1->first)`), and since `Inner(x) == x`, member
+    // access commutes straight through either way, producing `10` either
+    // way — found by architect re-verification: this version would have
+    // passed even with the fix fully reverted. `MakeArray` genuinely
+    // transforms (wraps its argument in a 1-element array), so the two
+    // parse trees evaluate to visibly different results (`"10,20,30"` if
+    // broken vs. `"10"` if correct) — architect-verified decisive by
+    // reverting the fix and confirming the output actually changes.
+    var context = LassoContext()
+    let output = try await LassoRenderer().render(
+        """
+        [
+        Define_Tag('Outer', -Required='Value');
+            Return((Local: 'Value'));
+        /Define_Tag;
+        Define_Tag('MakeArray', -Required='Value');
+            Return(Array((Local: 'Value')));
+        /Define_Tag;
+        var('items' = array(array(10, 20, 30)));
+        ]\
+        [(Outer: MakeArray:$items->get:1->first)->join(',')]
+        """,
+        context: &context
+    ).trimmingCharacters(in: .whitespacesAndNewlines)
+    #expect(output == "10")
+}
+
+@Test func bareColonCallNestedInsideAWrappedCallArgumentStillResolvesItsOwnAmbiguityCorrectly() async throws {
+    // Regression test for a real bug found by architect re-verification:
+    // the depth counter guarding the giveback boundary check originally
+    // only tracked BARE (`closing == nil`) `parseArguments` calls, so a
+    // bare colon-call nested directly inside an ordinary WRAPPED call's
+    // argument — `Identity($items->get:1->first)`, where `Identity(...)`
+    // uses regular parens as ITS OWN call syntax, not a bare colon-call —
+    // never had that wrap counted. `get:`'s own frame incorrectly saw
+    // itself as depth 0 (outermost) and wrongly trusted `Identity`'s own
+    // closing `)` as a safe terminator for its own ambiguity, leaving
+    // `1->first` bound together as `get`'s own argument (`get(1->first)`)
+    // — which crashes at evaluation (integers have no `first` member) —
+    // instead of correctly resolving to `($items->get:1)->first` as
+    // `Identity`'s single argument. Fixed by having
+    // `enclosingCallArgumentListDepth` count EVERY `parseArguments` call,
+    // wrapped or bare, not just bare ones.
+    var context = LassoContext()
+    let output = try await LassoRenderer().render(
+        """
+        [
+        Define_Tag('Identity', -Required='Value');
+            Return((Local: 'Value'));
+        /Define_Tag;
+        var('items' = array(array(10, 20, 30)));
+        ]\
+        [Identity($items->get:1->first)]
+        """,
+        context: &context
+    ).trimmingCharacters(in: .whitespacesAndNewlines)
+    #expect(output == "10")
 }
 
 @Test func mapInsertAddsAKeyedEntryMutatingTheInvocantInPlace() async throws {
