@@ -616,6 +616,42 @@ struct Evaluator {
                 }
                 return
             }
+            // `Map->Get(n) = value` — the Lasso 9 divergence this
+            // subsystem's own Stage 2 originally scoped and then never
+            // followed through on (see `collections-subsystem-plan.md`'s
+            // own status note). Cross-checked directly against
+            // lassoguide.com/operations/collections.html (not assumed):
+            // Lasso 9's REAL `map->get`/`->get=` contract turns out to
+            // be a much bigger redesign than "add a setter" — it's
+            // KEY-based (`map->get(key)`), returns the bare VALUE (not
+            // a `.pair`), and "will FAIL" (throw) on a missing key,
+            // wholesale replacing 8.5's position-based, Pair-returning,
+            // never-fails `->Get(n)` (Table 7, already implemented and
+            // tested above in the read-dispatch switch). Adopting that
+            // full redesign would silently break the already-shipped,
+            // worked-example-verified 8.5 behavior with no user sign-off
+            // on such a disruptive change. Implemented here as the
+            // NARROWER, disclosed reading instead: `->Get(n) = value`
+            // reassigns the VALUE half of the pair at that same 1-based
+            // sorted-by-key position — the same "just add assignment-
+            // target support to the existing read contract" shape
+            // already used for `Set->Get(n)=` right above, not a
+            // wholesale Lasso 9 semantic swap. `.map` is a VALUE-type
+            // `LassoValue` case (a Swift Dictionary, not `.object`-
+            // wrapped) — same as `Pair` above, there's no instance to
+            // mutate, so the whole map is rebuilt and recursively
+            // re-assigned to whatever expression `base` was.
+            if normalizedName == "get", case let .map(mapValues) = baseValue {
+                let getArguments = memberArguments ?? []
+                let position = getArguments.first != nil ? Int(try await evaluate(getArguments[0].value).number ?? 0) : 0
+                let sortedKeys = mapValues.keys.sorted()
+                let index = position - 1
+                guard sortedKeys.indices.contains(index) else { return }
+                var updated = mapValues
+                updated[sortedKeys[index]] = value
+                try await assign(.map(updated), to: base, defaultScope: defaultScope)
+                return
+            }
             guard case let .object(object) = baseValue else {
                 throw LassoRuntimeError.invalidAssignment
             }

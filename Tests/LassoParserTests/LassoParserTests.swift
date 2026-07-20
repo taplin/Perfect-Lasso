@@ -9079,3 +9079,56 @@ struct IncludeURLTests {
     #expect(output == "true|true|true|true|false")
 }
 
+@Test func mapGetCanBeUsedAsAnAssignmentTargetToOverwriteAValueAtAPosition() async throws {
+    // Cross-checked directly against lassoguide.com's Lasso 9
+    // documentation for `map->get`/`->get=` — that real contract turns
+    // out to be a much bigger redesign than "add a setter" (key-based,
+    // returns a bare value not a pair, fails on a missing key), which
+    // would break the already-shipped, worked-example-verified 8.5
+    // `->Get(n)` behavior (position-based, pair-returning) with no
+    // user sign-off on such a disruptive change. Implemented instead as
+    // the narrower reading: `->Get(n) = value` reassigns the VALUE half
+    // of the pair at that position, same shape as `Set->Get(n)=`. `.map`
+    // is a value type, so this only works via the same recursive
+    // rebuild-and-reassign path `Pair->First=` already established.
+    var context = LassoContext()
+    let output = try await LassoRenderer().render(
+        """
+        [var('m' = map(1='One', 2='Two', 3='Three'))]\
+        [$m->Get(2) = 'Replaced']\
+        [$m->Get(1)->Second]|[$m->Get(2)->Second]|[$m->Get(3)->Second]
+        """,
+        context: &context
+    )
+    #expect(output == "One|Replaced|Three")
+}
+
+@Test func mapGetAssignmentOutOfRangePositionIsANoOp() async throws {
+    var context = LassoContext()
+    let output = try await LassoRenderer().render(
+        """
+        [var('m' = map(1='One'))][$m->Get(99) = 'X'][$m->Get(0) = 'Y']\
+        [$m->Size]|[$m->Get(1)->Second]
+        """,
+        context: &context
+    )
+    #expect(output == "1|One")
+}
+
+@Test func mapGetAssignmentOnANegativePositionOrAnEmptyMapIsAlsoANoOp() async throws {
+    // Widens the out-of-range coverage above per code review's own
+    // nit — a negative position (not just 0/beyond-count) and an
+    // entirely empty map (where `sortedKeys` itself is empty) are
+    // both distinct edge cases worth exercising explicitly rather than
+    // trusting they're covered by inspection alone.
+    var context = LassoContext()
+    let output = try await LassoRenderer().render(
+        """
+        [var('m' = map(1='One'))][$m->Get(-1) = 'X'][$m->Size]|[$m->Get(1)->Second]|\
+        [var('empty' = map)][$empty->Get(1) = 'Y'][$empty->Size]
+        """,
+        context: &context
+    )
+    #expect(output == "1|One|0")
+}
+
