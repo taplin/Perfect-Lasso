@@ -73,6 +73,32 @@ struct Evaluator {
             if let scope = Self.declarationScope(for: name) {
                 return try await declare(arguments, scope: scope)
             }
+            if name.caseInsensitiveCompare("treemap") == .orderedSame {
+                // Special-cased HERE, ahead of the generic
+                // `context.natives.function(named:)` dispatch just
+                // below — for the EXACT same reason
+                // `TreeMap->Insert`/`->Find`/`->Remove`/`->RemoveAll`
+                // are special-cased in `member(_:_:_:)` (see those
+                // cases' own doc comment): the generic path's argument
+                // pre-evaluation (`evaluate(_ arguments:)` below)
+                // collapses a `key = value` argument's key down to a
+                // bare `String` label before any closure sees it,
+                // which would silently defeat TreeMap's documented
+                // "any Lasso data type" key requirement (Ch. 30
+                // p.416). Found missing here by architect review: an
+                // earlier version of this fix covered the mutating
+                // METHOD path but left the CONSTRUCTOR form
+                // (`treemap(1='Sunday', ...)`, Table 19's own
+                // documented form) going through the same lossy path
+                // it was supposed to avoid. The `register("treemap")`
+                // free function in `Runtime.swift` still exists and is
+                // intentionally left in place — it's still reachable
+                // via `context.natives.contains(name)` (used by
+                // introspection/`HasMethod`-style checks), just no
+                // longer via actual invocation, which this case now
+                // handles instead.
+                return try await evaluateTreeMapConstructorCall(arguments)
+            }
             if let function = context.natives.function(named: name) {
                 return try await function(try await evaluate(arguments), &context)
             }
@@ -144,6 +170,41 @@ struct Evaluator {
             results.append(EvaluatedArgument(label: argument.label, value: try await evaluate(argument.value)))
         }
         return results
+    }
+
+    /// `treemap(...)` construction with real (non-string-coerced) key
+    /// types preserved — see the `.call` case's own doc comment above
+    /// for why this can't just reuse `evaluate(_ arguments:)`. Mirrors
+    /// `Runtime.swift`'s `register("treemap")` free function's own
+    /// leading-optional-comparator-then-name/value-pairs shape, but
+    /// works from the RAW, unevaluated `[LassoArgument]` list so each
+    /// key keeps whatever real type its literal had.
+    private mutating func evaluateTreeMapConstructorCall(_ arguments: [LassoArgument]) async throws -> LassoValue {
+        var kind = "lessthan"
+        var remaining = arguments
+        if let first = arguments.first, first.label == nil {
+            if case .assignment = first.value {
+                // A `key = value` first argument is a real entry, not
+                // a leading comparator — leave `remaining` as-is.
+            } else {
+                let evaluatedFirst = try await evaluate(first.value)
+                if let comparatorKind = LassoComparatorValue.kind(of: evaluatedFirst) {
+                    kind = comparatorKind
+                    remaining = Array(arguments.dropFirst())
+                }
+            }
+        }
+        var entries: [LassoValue] = []
+        for argument in remaining {
+            if argument.label == nil, case let .assignment(target, value) = argument.value {
+                let key = try await evaluate(target)
+                let entryValue = try await evaluate(value)
+                entries.append(.pair(key, entryValue))
+            } else if let label = argument.label {
+                entries.append(.pair(.string(label), try await evaluate(argument.value)))
+            }
+        }
+        return .object(LassoTreeMapValue.makeObject(kind: kind, entries: entries))
     }
 
     mutating func evaluateArguments(_ arguments: [LassoArgument]) async throws -> [EvaluatedArgument] {
@@ -358,7 +419,7 @@ struct Evaluator {
         ],
         "integer": ["asstring", "ceil"],
         "decimal": ["asstring", "ceil"],
-        "pair": ["first", "second"],
+        "pair": ["first", "second", "size", "get"],
         "array": [
             "size", "first", "insert", "get", "last", "second", "reverse", "sort",
             "join", "contains", "find", "findposition", "remove", "removeall",
@@ -472,7 +533,8 @@ struct Evaluator {
             context.set(value, for: name, scope: defaultScope)
         case let .string(name):
             context.set(value, for: name, scope: defaultScope)
-        case let .member(base, name, _):
+        case let .member(base, name, memberArguments):
+            let normalizedName = name.lowercased()
             let baseValue: LassoValue
             if case let .identifier(baseName) = base,
                baseName.caseInsensitiveCompare("self") == .orderedSame,
@@ -480,6 +542,115 @@ struct Evaluator {
                 baseValue = .object(object)
             } else {
                 baseValue = try await evaluate(base)
+            }
+            // `Pair->First=`/`->Second=` (Ch. 30 Table 9, p.404: "Can be
+            // used as the left parameter of an assignment operator to
+            // change the first/second element") and `Queue->First=`/
+            // `Stack->First=` (Tables 13/18: "[Queue->First] returns
+            // the first element of the queue BY REFERENCE so the value
+            // of the element can be changed") — genuinely new
+            // architectural work (§3.6 of the collections plan), not a
+            // generic `object.set(value, for: name)` data-field write.
+            // `Pair` is a VALUE-type `LassoValue` case, not `.object`-
+            // wrapped at all — there is no instance to mutate, so the
+            // only way to make `$myPair->First = X` visible is to
+            // rebuild the WHOLE pair and recursively re-assign it to
+            // whatever expression `base` itself was (mirroring exactly
+            // how `Var(name::type) = value` above recurses into `assign`
+            // again for its own unwrapped target). `Queue`/`Stack` ARE
+            // `.object`-wrapped (reference types) — their `_elements`
+            // array can be mutated in place through the existing
+            // `LassoObjectInstance`, no recursive reassignment needed,
+            // same pattern `Iterator`'s own mutating methods already
+            // use. `Set->Get(n)=` (Table 16: "This tag can be used as
+            // the left parameter of an assignment operator to set an
+            // element of the set") is the third case — position-based,
+            // matching `->Get`'s own read semantics; a direct positional
+            // overwrite, not a re-insert-and-resort (no worked example
+            // exists to check that choice against — Set's sortedness
+            // invariant is not addressed by Table 16's terse wording).
+            if normalizedName == "first" || normalizedName == "second" {
+                if case let .pair(first, second) = baseValue {
+                    let newPair: LassoValue = normalizedName == "first" ? .pair(value, second) : .pair(first, value)
+                    try await assign(newPair, to: base, defaultScope: defaultScope)
+                    return
+                }
+                // Atomic read-modify-write under a single lock hold —
+                // composing separate `LassoCollectionValue.elements(from:)`
+                // (a locked read) and `object.set(_:for:)` (a separate
+                // locked write) reintroduces the exact lost-update race
+                // already found and fixed for `Queue`/`Stack`/
+                // `PriorityQueue->Get` and Iterator's own mutating
+                // methods (see their own comments) — flagged again here
+                // by swift-concurrency-pro/code-reviewer review.
+                if normalizedName == "first", case let .object(object) = baseValue, object.typeName == "queue" {
+                    object.withLock("_elements") { stored in
+                        guard case var .array(elements) = stored, !elements.isEmpty else { return }
+                        elements[0] = value
+                        stored = .array(elements)
+                    }
+                    return
+                }
+                if normalizedName == "first", case let .object(object) = baseValue, object.typeName == "stack" {
+                    object.withLock("_elements") { stored in
+                        guard case var .array(elements) = stored, !elements.isEmpty else { return }
+                        elements[elements.count - 1] = value
+                        stored = .array(elements)
+                    }
+                    return
+                }
+            }
+            if normalizedName == "get", case let .object(object) = baseValue, object.typeName == "set" {
+                // The position argument is evaluated BEFORE acquiring
+                // the lock — it may itself suspend (`await`), and
+                // holding a lock across a suspension point is exactly
+                // the kind of hazard `withLock`'s own synchronous-only
+                // closure shape exists to prevent.
+                let getArguments = memberArguments ?? []
+                let position = getArguments.first != nil ? Int(try await evaluate(getArguments[0].value).number ?? 0) : 0
+                let index = position - 1
+                object.withLock("_elements") { stored in
+                    guard case var .array(elements) = stored, elements.indices.contains(index) else { return }
+                    elements[index] = value
+                    stored = .array(elements)
+                }
+                return
+            }
+            // `Map->Get(n) = value` — the Lasso 9 divergence this
+            // subsystem's own Stage 2 originally scoped and then never
+            // followed through on (see `collections-subsystem-plan.md`'s
+            // own status note). Cross-checked directly against
+            // lassoguide.com/operations/collections.html (not assumed):
+            // Lasso 9's REAL `map->get`/`->get=` contract turns out to
+            // be a much bigger redesign than "add a setter" — it's
+            // KEY-based (`map->get(key)`), returns the bare VALUE (not
+            // a `.pair`), and "will FAIL" (throw) on a missing key,
+            // wholesale replacing 8.5's position-based, Pair-returning,
+            // never-fails `->Get(n)` (Table 7, already implemented and
+            // tested above in the read-dispatch switch). Adopting that
+            // full redesign would silently break the already-shipped,
+            // worked-example-verified 8.5 behavior with no user sign-off
+            // on such a disruptive change. Implemented here as the
+            // NARROWER, disclosed reading instead: `->Get(n) = value`
+            // reassigns the VALUE half of the pair at that same 1-based
+            // sorted-by-key position — the same "just add assignment-
+            // target support to the existing read contract" shape
+            // already used for `Set->Get(n)=` right above, not a
+            // wholesale Lasso 9 semantic swap. `.map` is a VALUE-type
+            // `LassoValue` case (a Swift Dictionary, not `.object`-
+            // wrapped) — same as `Pair` above, there's no instance to
+            // mutate, so the whole map is rebuilt and recursively
+            // re-assigned to whatever expression `base` was.
+            if normalizedName == "get", case let .map(mapValues) = baseValue {
+                let getArguments = memberArguments ?? []
+                let position = getArguments.first != nil ? Int(try await evaluate(getArguments[0].value).number ?? 0) : 0
+                let sortedKeys = mapValues.keys.sorted()
+                let index = position - 1
+                guard sortedKeys.indices.contains(index) else { return }
+                var updated = mapValues
+                updated[sortedKeys[index]] = value
+                try await assign(.map(updated), to: base, defaultScope: defaultScope)
+                return
             }
             guard case let .object(object) = baseValue else {
                 throw LassoRuntimeError.invalidAssignment
@@ -526,7 +697,12 @@ struct Evaluator {
         }
     }
 
-    private func binary(_ left: LassoValue, _ op: String, _ right: LassoValue) throws -> LassoValue {
+    // `internal` (not `private`) since `Collections.swift`'s Set/List
+    // implementation reuses this directly for element equality/ordering —
+    // see `lassoEquals`'s own doc comment below. Purely functional on the
+    // two passed-in values, no `self`/`context` state touched anywhere in
+    // its body, so widening this doesn't change what it can observe.
+    func binary(_ left: LassoValue, _ op: String, _ right: LassoValue) throws -> LassoValue {
         switch op {
         case "+":
             if case .string = left { return .string(left.outputString + right.outputString) }
@@ -876,6 +1052,19 @@ struct Evaluator {
         case let (.integer(value), "ceil"): return .integer(value)
         case let (.pair(key, _), "first"): return key
         case let (.pair(_, value), "second"): return value
+        case (.pair, "size"):
+            // Ch. 30 p.404 Note: "For compatibility with maps and
+            // arrays the [Pair->Size] tag always returns 2".
+            return .integer(2)
+        case let (.pair(key, value), "get"):
+            // Same Note: "[Pair->(Get:1)] and [Pair->(Get:2)] work to
+            // extract the first and second elements from a pair."
+            let position = arguments.first != nil ? Int(try await evaluate(arguments[0].value).number ?? 0) : 0
+            switch position {
+            case 1: return key
+            case 2: return value
+            default: return .null
+            }
         case let (.array(values), "size"): return .integer(values.count)
         case let (.array(values), "first"): return values.first ?? .null
         case let (.array(values), "insert"):
@@ -934,6 +1123,44 @@ struct Evaluator {
             // extension (clear the whole map), kept unconditional for the
             // same corruption-avoidance reason as `->remove` above.
             return .map([:])
+        // `TreeMap->Insert`/`->Find`/`->Remove`/`->RemoveAll` — special-
+        // cased here, ahead of the generic `.object` native-type
+        // dispatch further below, for the EXACT same reason `.map`'s
+        // own `->insert`/`->remove` are special-cased right above:
+        // the generic path pre-evaluates every argument (collapsing a
+        // `key = value` argument's key down to a bare `String` label)
+        // before a native-type closure ever sees it, which would
+        // silently defeat TreeMap's "any Lasso data type" key
+        // requirement (Ch. 30 p.416) — see `Collections.swift`'s
+        // `makeTreeMapType()` doc comment for the full reasoning.
+        // `->Get`/`->Keys`/`->Values`/`->Size` need no typed-key
+        // argument and stay registered normally in `makeTreeMapType()`.
+        case let (.object(object), "insert") where object.typeName == LassoTreeMapValue.typeName:
+            guard let argument = arguments.first, case let .assignment(target, value) = argument.value else {
+                return .object(object)
+            }
+            let key = try await evaluate(target)
+            let entryValue = try await evaluate(value)
+            let updated = LassoTreeMapValue.inserting(key: key, value: entryValue, into: object, context: context)
+            return .object(LassoTreeMapValue.makeObject(kind: LassoTreeMapValue.kind(of: object), entries: updated))
+        case let (.object(object), "find") where object.typeName == LassoTreeMapValue.typeName:
+            guard let argument = arguments.first else { return .null }
+            let key = try await evaluate(argument.value)
+            return LassoTreeMapValue.find(key: key, in: object, context: context)
+        case let (.object(object), "remove") where object.typeName == LassoTreeMapValue.typeName:
+            guard let argument = arguments.first else { return .object(object) }
+            let key = try await evaluate(argument.value)
+            let updated = LassoTreeMapValue.removingByKey(key, from: object, context: context)
+            return .object(LassoTreeMapValue.makeObject(kind: LassoTreeMapValue.kind(of: object), entries: updated))
+        case let (.object(object), "removeall") where object.typeName == LassoTreeMapValue.typeName:
+            // Same underlying key-based filter as `->Remove` this stage
+            // — see `LassoTreeMapValue.removingByKey`'s own doc comment
+            // for why these two are documented distinctly (Matcher-vs-
+            // exact-key) but implemented identically until Stage 5.
+            guard let argument = arguments.first else { return .object(object) }
+            let key = try await evaluate(argument.value)
+            let updated = LassoTreeMapValue.removingByKey(key, from: object, context: context)
+            return .object(LassoTreeMapValue.makeObject(kind: LassoTreeMapValue.kind(of: object), entries: updated))
         case let (.array(values), "get"):
             let requested: Double?
             if let argument = arguments.first {
@@ -957,6 +1184,29 @@ struct Evaluator {
             let ascending = arguments.first != nil ? try await evaluate(arguments[0].value).isTruthy : true
             let sorted = values.sorted(by: Self.lassoLessThan)
             return .array(ascending ? sorted : sorted.reversed())
+        case let (.array(values), "sortwith"):
+            // Table 21: "Comparators can also be used with the
+            // [Array->SortWith] and [List->SortWith] tags to explicitly
+            // order the elements" — verified against the worked example
+            // (p.419-420): sorting `('aaa','bbb','ccc','aa','a','b','c',
+            // 'bb','cc')` with `\Compare_LessThan` → ascending
+            // (`a,aa,aaa,b,bb,bbb,c,cc,ccc`); with `\Compare_GreaterThan`
+            // → descending. Unlike `->Sort` above, there's no separate
+            // ascending/descending boolean — the comparator alone
+            // determines direction (`LassoComparatorValue
+            // .isOrderedBefore` already encodes GreaterThan's reversal).
+            let comparatorArgument: LassoValue = arguments.first != nil ? try await evaluate(arguments[0].value) : .null
+            guard let kind = LassoComparatorValue.kind(of: comparatorArgument) else {
+                return .array(values)
+            }
+            return .array(values.sorted { LassoComparatorValue.isOrderedBefore(kind: kind, $0, $1) })
+        case let (.array(values), "iterator"):
+            // Table 23: array is one of the explicitly-named built-in
+            // `->Iterator`-supporting types — verified against the
+            // p.423 worked example's own `Array->Iterator` call.
+            return LassoIteratorValue.build(from: .array(values), reverse: false) ?? .null
+        case let (.array(values), "reverseiterator"):
+            return LassoIteratorValue.build(from: .array(values), reverse: true) ?? .null
         case let (.array(values), "join"):
             // `array->join(separator)` — real corpus need: comma/CSV-list
             // and breadcrumb-trail building, previously requiring a manual
@@ -1068,6 +1318,33 @@ struct Evaluator {
         // p.400: "the order of elements in a map is not defined").
         case let (.map(values), "keys"): return .array(values.keys.sorted().map(LassoValue.string))
         case let (.map(values), "values"): return .array(values.keys.sorted().map { values[$0] ?? .null })
+        case let (.map(values), "get"):
+            // Ch. 30 p.402: "[Map->Get] Returns a PAIR from the map by
+            // integer position" (1-based) — using the exact same
+            // sorted-by-key order as `->Keys`/`->Values` right above, so
+            // `Get(n)` genuinely corresponds to `Keys[n]`/`Values[n]`.
+            // Confirmed via the worked example's own `[Loop:
+            // ($DaysOfWeek->Size)] ... ($DaysOfWeek->(Get: (Loop_Count)))`
+            // pattern producing keys 1..7 in order — that example's keys
+            // happen to already be pre-sorted integers, so it can't by
+            // itself distinguish sorted-order from insertion-order, but
+            // matches this codebase's own established "order is
+            // undefined, so pick sorted-by-key for determinism"
+            // position on `->Keys`/`->Values` two lines up.
+            let sortedKeys = values.keys.sorted()
+            let position = (arguments.first != nil ? try await evaluate(arguments[0].value).number : nil).map(Int.init) ?? 0
+            let index = position - 1
+            guard sortedKeys.indices.contains(index) else { return .null }
+            let key = sortedKeys[index]
+            return .pair(.string(key), values[key] ?? .null)
+        case let (.map(values), "iterator"):
+            // Table 23: map is one of the explicitly-named built-in
+            // `->Iterator`-supporting types — verified against the
+            // p.424 worked example's own key+value `While` loop
+            // (`$myIterator->Key + ' = ' + $myIterator->Value`).
+            return LassoIteratorValue.build(from: .map(values), reverse: false) ?? .null
+        case let (.map(values), "reverseiterator"):
+            return LassoIteratorValue.build(from: .map(values), reverse: true) ?? .null
         case let (.map(values), "contains"):
             let key = arguments.first != nil ? try await evaluate(arguments[0].value).outputString : ""
             return .boolean(values[key] != nil)
@@ -1220,6 +1497,28 @@ struct Evaluator {
         // `.string` member case uses either name, so this has no effect
         // on those.
         "add", "subtract",
+        // List/Queue/Stack/Set (Ch. 30 Tables 5/13/16/18) — each
+        // documented "Returns no value" except `Queue->Get`/`Stack->Get`
+        // (deliberately excluded here — see `Collections.swift`'s own
+        // top-level doc comment for why those two need a different,
+        // narrower mechanism instead). `Difference`/`Intersection`/
+        // `Union` "return a new [list/set]" per their own Table
+        // wording, but the Guide's own worked example
+        // (`[$ResultSet->(Difference: $SecondSet)] [$ResultSet]`, Ch.
+        // 30 p.412) calls one bare and shows the CALLING variable
+        // reflecting the result afterward with no reassignment — the
+        // exact same self-mutating write-back shape as everything else
+        // in this set.
+        "insertfirst", "insertlast", "removefirst", "removelast",
+        "difference", "intersection", "union",
+        // `Array->SortWith`/`List->SortWith` (Ch. 30 Table 21's own
+        // text: "Comparators can also be used with the [Array->SortWith]
+        // and [List->SortWith] tags") — documented "Modifies the list in
+        // place and returns no value" for List (Table 5); Array's own
+        // `->Sort` above already established the same bare-statement
+        // mutation shape, so `->SortWith` follows it too now that
+        // Comparator values exist (Stage 2, `Comparators.swift`).
+        "sortwith",
     ]
 
     /// Best-effort ordering for `Array->Sort` — every numeric-parseable
@@ -1237,7 +1536,8 @@ struct Evaluator {
     /// "5apple"` is FALSE (`'9' > '5'`) — `9 < 10 < "5apple"` yet NOT
     /// `9 < "5apple"`, a transitivity violation Swift's `sorted(by:)`
     /// doesn't validate and would silently mis-sort on.
-    private static func lassoSortKey(_ value: LassoValue) -> (Int, Double, String) {
+    // `internal`, same reason as `binary` above.
+    static func lassoSortKey(_ value: LassoValue) -> (Int, Double, String) {
         // `.isFinite` guards against Swift's `Double(String)` parsing
         // tokens like `"nan"`/`"inf"`/`"infinity"` (matching C's `strtod`)
         // into real IEEE 754 NaN/infinity rather than returning `nil` —
@@ -1251,7 +1551,8 @@ struct Evaluator {
         return (1, 0, value.outputString)
     }
 
-    private static func lassoLessThan(_ lhs: LassoValue, _ rhs: LassoValue) -> Bool {
+    // `internal`, same reason as `binary` above.
+    static func lassoLessThan(_ lhs: LassoValue, _ rhs: LassoValue) -> Bool {
         lassoSortKey(lhs) < lassoSortKey(rhs)
     }
 
@@ -1265,7 +1566,11 @@ struct Evaluator {
     /// real production incident for (`thumbs2.page.lasso`'s ribbon check
     /// silently breaking on `'Yes'` vs `'yes'`) — flagged in architect
     /// review before it shipped.
-    private func lassoEquals(_ lhs: LassoValue, _ rhs: LassoValue) -> Bool {
+    // `internal`, same reason as `binary` above — `Collections.swift`
+    // constructs a throwaway `Evaluator(context:)` (a cheap value-type
+    // copy, not aliasing) purely to call this and `binary`, neither of
+    // which read or mutate `self.context`.
+    func lassoEquals(_ lhs: LassoValue, _ rhs: LassoValue) -> Bool {
         (try? binary(lhs, "==", rhs))?.isTruthy ?? false
     }
 
