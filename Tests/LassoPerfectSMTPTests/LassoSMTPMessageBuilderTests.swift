@@ -209,22 +209,89 @@ struct LassoSMTPMessageBuilderTests {
         #expect(explicitTrue.immediateExplicitlyFalse == false)
     }
 
-    @Test func tokensThrows() throws {
+    // MARK: - `-tokens`/`-merge`/`-characterSet` (Phase F, §4.9c) -- real
+    // landing spots now, not `notYetSupported` -- this file only parses the
+    // two maps (`BuildResult.tokens`/`.merge`); the actual per-recipient
+    // substitution/batch-send happens in `LassoEmailProviderImpl.send`
+    // (covered by `LassoPerfectSMTPEndToEndTests`).
+
+    @Test func tokensMapParsesIntoAStringKeyedDictionaryWithOutputStringCoercedValues() throws {
+        let result = try LassoSMTPMessageBuilder.build(validBaseArguments + [
+            EvaluatedArgument(label: "tokens", value: .map(["FirstName": .string("Lasso User"), "Age": .integer(42)])),
+        ])
+        #expect(result.tokens == ["FirstName": "Lasso User", "Age": "42"])
+        #expect(result.merge == nil)
+    }
+
+    @Test func tokensAbsentLeavesTokensNil() throws {
+        let result = try LassoSMTPMessageBuilder.build(validBaseArguments)
+        #expect(result.tokens == nil)
+    }
+
+    @Test func tokensNotAMapThrowsInvalidParameter() throws {
         #expect(throws: LassoSMTPError.self) {
             try LassoSMTPMessageBuilder.build(validBaseArguments + [arg("tokens", "a=1")])
         }
     }
 
-    @Test func mergeThrows() throws {
+    @Test func mergeMapParsesIntoAddressKeyedNestedDictionaries() throws {
+        let result = try LassoSMTPMessageBuilder.build(validBaseArguments + [
+            EvaluatedArgument(label: "merge", value: .map([
+                "john@example.com": .map(["FirstName": .string("John")]),
+                "jane@example.com": .map(["FirstName": .string("Jane")]),
+            ])),
+        ])
+        #expect(result.merge == [
+            "john@example.com": ["FirstName": "John"],
+            "jane@example.com": ["FirstName": "Jane"],
+        ])
+    }
+
+    @Test func mergeAbsentLeavesMergeNil() throws {
+        let result = try LassoSMTPMessageBuilder.build(validBaseArguments)
+        #expect(result.merge == nil)
+    }
+
+    @Test func mergeNotAMapThrowsInvalidParameter() throws {
         #expect(throws: LassoSMTPError.self) {
             try LassoSMTPMessageBuilder.build(validBaseArguments + [arg("merge", "true")])
         }
     }
 
-    @Test func characterSetThrows() throws {
+    @Test func mergeEntryNotItselfAMapThrowsInvalidParameter() throws {
         #expect(throws: LassoSMTPError.self) {
-            try LassoSMTPMessageBuilder.build(validBaseArguments + [arg("characterSet", "iso-8859-1")])
+            try LassoSMTPMessageBuilder.build(validBaseArguments + [
+                EvaluatedArgument(label: "merge", value: .map(["john@example.com": .string("not a map")])),
+            ])
         }
+    }
+
+    @Test func ccTogetherWithTokensThrowsTheExplicitMutualExclusionError() throws {
+        #expect(throws: LassoSMTPError.self) {
+            try LassoSMTPMessageBuilder.build(validBaseArguments + [
+                arg("cc", "c@example.com"),
+                EvaluatedArgument(label: "tokens", value: .map(["FirstName": .string("X")])),
+            ])
+        }
+    }
+
+    @Test func bccTogetherWithMergeThrowsTheExplicitMutualExclusionError() throws {
+        #expect(throws: LassoSMTPError.self) {
+            try LassoSMTPMessageBuilder.build(validBaseArguments + [
+                arg("bcc", "d@example.com"),
+                EvaluatedArgument(label: "merge", value: .map(["recipient@example.com": .map(["FirstName": .string("X")])])),
+            ])
+        }
+    }
+
+    @Test func characterSetWiresDirectlyOntoEmailMessageCharset() throws {
+        let result = try LassoSMTPMessageBuilder.build(validBaseArguments + [arg("characterSet", "iso-8859-1")])
+        #expect(result.message.charset == "iso-8859-1")
+    }
+
+    @Test func characterSetAbsentLeavesEmailMessagesDefaultUTF8Charset() throws {
+        let result = try LassoSMTPMessageBuilder.build(validBaseArguments)
+        #expect(result.message.charset == "utf-8")
     }
 
     // Phase C milestone review BLOCKING FIX #3/#4: `-attachment`

@@ -299,6 +299,19 @@ public struct LassoEmailProviderImpl: LassoEmailProvider {
         // as possible, but don't block the request" (§4.7b).
         let deferred = dueDate != nil || built.immediateExplicitlyFalse
 
+        // Phase F (§4.9c): `-tokens`/`-merge` branch into a per-recipient
+        // personalized BATCH send instead of the single-message path --
+        // real Lasso's own documented "Email Merge" semantics (confirmed
+        // against lassoguide.com), not a single-message content edit. This
+        // composes with BOTH the synchronous and deferred branches below
+        // unchanged: whichever branch would have called
+        // `mailer.send(message, bcc:, envelopeFrom:)` calls
+        // `mailer.send(personalizedMessages, envelopeFrom:)` instead when
+        // `mergeMode` is true. The non-merge path (`built.tokens == nil &&
+        // built.merge == nil`) is completely unaffected -- this is a
+        // strictly additive branch.
+        let mergeMode = built.tokens != nil || built.merge != nil
+
         // Everything above this line can fail with NO job ever recorded.
         // From here on, build/attachment-resolution/relay-resolution have
         // ALL succeeded -- a real send is genuinely about to be attempted
@@ -352,10 +365,13 @@ public struct LassoEmailProviderImpl: LassoEmailProvider {
             let envelopeFrom = built.envelopeFrom
             let tracker = jobTracker
             let capturedMessage = message
+            let tokens = built.tokens
+            let merge = built.merge
             // `self` (this conformer) is a plain `Sendable` struct (the
             // protocol itself requires `Sendable`) -- capturing it directly
-            // to reuse `isFailureOutcome`/`describeOutcome` is exactly as
-            // safe as capturing any other `Sendable` value here.
+            // to reuse `isFailureOutcome`/`describeOutcome`/
+            // `personalizedMessages` is exactly as safe as capturing any
+            // other `Sendable` value here.
             let provider = self
             Task {
                 if let dueDate {
@@ -365,8 +381,13 @@ public struct LassoEmailProviderImpl: LassoEmailProvider {
                         try? await Task.sleep(for: .milliseconds(millis))
                     }
                 }
-                do {
-                    let results = try await mailer.send(capturedMessage, bcc: bcc, envelopeFrom: envelopeFrom)
+                if mergeMode {
+                    // `SMTPMailer.send(_ messages:envelopeFrom:)` never
+                    // throws (every per-message failure already becomes a
+                    // `.failed(error)` `DeliveryResult`) -- no `do`/`catch`
+                    // needed here, unlike the single-message overload below.
+                    let messages = provider.personalizedMessages(from: capturedMessage, tokens: tokens, merge: merge)
+                    let results = await mailer.send(messages, envelopeFrom: envelopeFrom)
                     if let failure = results.first(where: { provider.isFailureOutcome($0.outcome) }) {
                         await tracker.update(jobID, to: .error(
                             "delivery failed for \(failure.recipient) via relay '\(relayName)' (\(provider.describeOutcome(failure.outcome)))."
@@ -374,10 +395,21 @@ public struct LassoEmailProviderImpl: LassoEmailProvider {
                     } else {
                         await tracker.update(jobID, to: .sent)
                     }
-                } catch {
-                    await tracker.update(jobID, to: .error(
-                        "sending through relay '\(relayName)' failed (\(error))."
-                    ))
+                } else {
+                    do {
+                        let results = try await mailer.send(capturedMessage, bcc: bcc, envelopeFrom: envelopeFrom)
+                        if let failure = results.first(where: { provider.isFailureOutcome($0.outcome) }) {
+                            await tracker.update(jobID, to: .error(
+                                "delivery failed for \(failure.recipient) via relay '\(relayName)' (\(provider.describeOutcome(failure.outcome)))."
+                            ))
+                        } else {
+                            await tracker.update(jobID, to: .sent)
+                        }
+                    } catch {
+                        await tracker.update(jobID, to: .error(
+                            "sending through relay '\(relayName)' failed (\(error))."
+                        ))
+                    }
                 }
             }
             return LassoEmailSendResult(value: .void, jobID: jobID)
@@ -394,32 +426,45 @@ public struct LassoEmailProviderImpl: LassoEmailProvider {
         // to stash the job ID into `context.lastEmailJobID` before
         // re-throwing the underlying, `[protect]`-catchable error.
         let results: [DeliveryResult]
-        do {
-            results = try await resolved.mailer.send(message, bcc: built.bcc, envelopeFrom: built.envelopeFrom)
-        } catch let error as MIMEComposer.ComposerError {
-            let state = LassoSMTPError(
-                kind: .composeFailed,
-                message: "email_send: message composition failed (\(error)).",
-                detail: String(describing: error)
-            ).state
-            await jobTracker.update(jobID, to: .error(state.message))
-            throw LassoEmailSendFailure(jobID: jobID, underlying: LassoRecoverableError(state))
-        } catch let error as HeaderEncoder.HeaderInjectionError {
-            let state = LassoSMTPError(
-                kind: .composeFailed,
-                message: "email_send: rejected header/address content (\(error)).",
-                detail: String(describing: error)
-            ).state
-            await jobTracker.update(jobID, to: .error(state.message))
-            throw LassoEmailSendFailure(jobID: jobID, underlying: LassoRecoverableError(state))
-        } catch {
-            let state = LassoSMTPError(
-                kind: .deliveryFailed,
-                message: "email_send: sending through relay '\(resolved.name)' failed (\(error)).",
-                detail: String(describing: error)
-            ).state
-            await jobTracker.update(jobID, to: .error(state.message))
-            throw LassoEmailSendFailure(jobID: jobID, underlying: LassoRecoverableError(state))
+        if mergeMode {
+            // Phase F (§4.9c): one batch call across every personalized
+            // clone, never N sequential single-message `send` calls --
+            // preserves the connection-pooling benefit
+            // `SMTPMailer.send(_:envelopeFrom:)`'s batch overload exists
+            // for. Never throws (every per-message failure already
+            // becomes a `.failed(error)` `DeliveryResult`), so no
+            // `do`/`catch` is needed here, unlike the non-merge path
+            // below.
+            let messages = personalizedMessages(from: message, tokens: built.tokens, merge: built.merge)
+            results = await resolved.mailer.send(messages, envelopeFrom: built.envelopeFrom)
+        } else {
+            do {
+                results = try await resolved.mailer.send(message, bcc: built.bcc, envelopeFrom: built.envelopeFrom)
+            } catch let error as MIMEComposer.ComposerError {
+                let state = LassoSMTPError(
+                    kind: .composeFailed,
+                    message: "email_send: message composition failed (\(error)).",
+                    detail: String(describing: error)
+                ).state
+                await jobTracker.update(jobID, to: .error(state.message))
+                throw LassoEmailSendFailure(jobID: jobID, underlying: LassoRecoverableError(state))
+            } catch let error as HeaderEncoder.HeaderInjectionError {
+                let state = LassoSMTPError(
+                    kind: .composeFailed,
+                    message: "email_send: rejected header/address content (\(error)).",
+                    detail: String(describing: error)
+                ).state
+                await jobTracker.update(jobID, to: .error(state.message))
+                throw LassoEmailSendFailure(jobID: jobID, underlying: LassoRecoverableError(state))
+            } catch {
+                let state = LassoSMTPError(
+                    kind: .deliveryFailed,
+                    message: "email_send: sending through relay '\(resolved.name)' failed (\(error)).",
+                    detail: String(describing: error)
+                ).state
+                await jobTracker.update(jobID, to: .error(state.message))
+                throw LassoEmailSendFailure(jobID: jobID, underlying: LassoRecoverableError(state))
+            }
         }
 
         if let failure = results.first(where: { isFailureOutcome($0.outcome) }) {
@@ -727,7 +772,107 @@ public struct LassoEmailProviderImpl: LassoEmailProvider {
                 message: "email_send: no default SMTP relay is configured (looked for '\(name)').",
                 detail: name
             ).state
+        case .reservedRelayNameCollision(let name):
+            // Unreachable via `email_send`'s own runtime path -- this
+            // registry-construction-time invariant is enforced at server
+            // startup (`ServerConfigError.smtpReservedRelayName`), long
+            // before any request could ever call `mailer(named:)` -- kept
+            // exhaustive here only because `LassoSMTPRelayError` is a
+            // single enum shared by both failure classes.
+            LassoSMTPError(
+                kind: .unknownRelay,
+                message: "email_send: internal configuration error -- relay name '\(name)' is reserved.",
+                detail: name
+            ).state
         }
+    }
+
+    /// Phase F (§4.9c): builds one personalized `EmailMessage` clone per
+    /// address in `base.to` — the per-recipient fan-out `-tokens`/`-merge`
+    /// requires. Each clone's `.to` is narrowed to that ONE recipient
+    /// (never the full original recipient list — `SMTPMailer.send(_
+    /// messages:envelopeFrom:)`'s own doc comment describes each array
+    /// element as "already fully composed as its own `EmailMessage`" for
+    /// "many independent recipients," which only makes sense if each
+    /// element addresses exactly one of them); `-cc`/`-bcc` are already
+    /// guaranteed absent by `LassoSMTPMessageBuilder.build`'s mutual-
+    /// exclusion check whenever `tokens`/`merge` is non-nil, so `base.cc`
+    /// is empty here regardless. Every other field (attachments, extra
+    /// headers, etc.) is copied from `base` unchanged.
+    ///
+    /// Token resolution per recipient: `tokens` (the `-tokens` default map)
+    /// overlaid by that recipient's own `merge[address]` entry, if any —
+    /// `merge` values win on key collision, matching real Lasso's
+    /// documented "Email Merge" override rule (lassoguide.com, fetched
+    /// 2026-07-20).
+    func personalizedMessages(
+        from base: EmailMessage,
+        tokens: [String: String]?,
+        merge: [String: [String: String]]?
+    ) -> [EmailMessage] {
+        let baseTokens = tokens ?? [:]
+        return base.to.map { recipient in
+            var resolved = baseTokens
+            // `.lowercased()` here for the same root-cause reason
+            // `substitute(_:tokens:)`'s own doc comment explains for token
+            // NAMES: `-merge`'s outer map (address -> token map) is also
+            // built via Lasso `map(...)`, whose `register("map")`
+            // registration lowercases every key it stores — so `merge`'s
+            // keys are always already lowercase, regardless of the case a
+            // caller wrote in `-merge=map('SomeAddress@Example.com'=...)`.
+            // Matching that against `recipient.address` (which preserves
+            // whatever case `-to` was written in) needs the same
+            // normalization on this side of the lookup.
+            if let overrides = merge?[recipient.address.lowercased()] {
+                for (name, value) in overrides {
+                    resolved[name] = value
+                }
+            }
+            var clone = base
+            clone.to = [recipient]
+            clone.subject = substitute(base.subject, tokens: resolved)
+            clone.textBody = base.textBody.map { substitute($0, tokens: resolved) }
+            clone.htmlBody = base.htmlBody.map { substitute($0, tokens: resolved) }
+            return clone
+        }
+    }
+
+    /// Literal substring replacement of every `"#\(name)#"` marker
+    /// occurrence — NOT a regex pass (§4.9c: real Lasso's own
+    /// `email_token`/`#TOKEN#` marker convention is a plain literal
+    /// string, and this codebase's `email_token` registration
+    /// (`Runtime.swift`) emits exactly that literal shape). A marker with
+    /// no resolved value in `tokens` is left verbatim, unsubstituted — a
+    /// deliberate, conservative judgment call (§4.9c: neither doc source
+    /// describes missing-token behavior; leaving it as literal text is the
+    /// least surprising of the unconfirmed options and easy to spot in a
+    /// rendered message if it happens).
+    ///
+    /// **Case-insensitive marker matching — a correction discovered during
+    /// implementation, not in the original plan text.** `tokens`'/`merge`'s
+    /// values originate from Lasso `map(...)` literals (`-tokens=map(
+    /// 'FirstName'='...')`), and `Runtime.swift`'s `register("map")`
+    /// lowercases every key it stores (`values[label.lowercased()] =
+    /// argument.value`) — a real, pre-existing, generic `map()` behavior,
+    /// not something specific to this feature. That means the resolved
+    /// token dictionary this method receives always has lowercase keys
+    /// (e.g. `"firstname"`), while `#TokenName#` marker text in a rendered
+    /// `-subject`/`-body`/`-html` value keeps whatever case the caller
+    /// actually wrote (`email_token('FirstName')` emits `"#FirstName#"`
+    /// verbatim, case preserved — it does not lowercase its argument).
+    /// Without case-insensitive matching here, every mixed-case token name
+    /// in the plan's own worked example (`'FirstName'`) would silently
+    /// fail to substitute. `.caseInsensitive` keeps this a literal
+    /// substring match (Foundation's case-insensitive string search, not a
+    /// regex engine) — still satisfying "simple literal substring replace,
+    /// not regex."
+    private func substitute(_ text: String, tokens: [String: String]) -> String {
+        guard tokens.isEmpty == false else { return text }
+        var result = text
+        for (name, value) in tokens {
+            result = result.replacingOccurrences(of: "#\(name)#", with: value, options: [.caseInsensitive])
+        }
+        return result
     }
 
     /// `.delivered`/`.queuedForRetry` are both "accepted" outcomes for

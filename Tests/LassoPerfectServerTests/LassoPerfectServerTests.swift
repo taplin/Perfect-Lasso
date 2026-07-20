@@ -245,6 +245,166 @@ private func sampleRequestInfo() -> HTTPRequestInfo {
     #expect(config.filemaker?.host == "192.0.2.1")
 }
 
+// MARK: - SMTP DKIM / direct-MX config resolution (Phase F, §4.9a/§4.9b)
+//
+// `ServerConfig.resolveSMTPDKIM(_:)`/`.validateDirectMXConfig(...)` are
+// deliberately pure, directly-callable static functions (separated from
+// `ServerConfig.load()`'s env-var/file plumbing specifically so they can be
+// tested this way) — this codebase has no existing precedent for testing
+// `ServerConfig.load()` end to end via live env vars, so these tests follow
+// this file's own established style of exercising a `Decodable` conformance
+// or a small pure resolver function directly instead.
+
+private func makeTempDKIMKeyFile(contents: String, posixPermissions: Int) throws -> URL {
+    let url = FileManager.default.temporaryDirectory.appendingPathComponent("dkim-test-\(UUID().uuidString).pem")
+    try Data(contents.utf8).write(to: url)
+    try FileManager.default.setAttributes([.posixPermissions: posixPermissions], ofItemAtPath: url.path)
+    return url
+}
+
+@Test func resolveSMTPDKIMReturnsNilWhenTheDKIMBlockIsAbsentEntirely() throws {
+    #expect(try ServerConfig.resolveSMTPDKIM(nil) == nil)
+}
+
+@Test func resolveSMTPDKIMReturnsNilWhenAllThreeRequiredFieldsAreAbsent() throws {
+    let dkim = SMTPDKIMFileConfig(domain: nil, selector: nil, keyPath: nil, keyType: nil)
+    #expect(try ServerConfig.resolveSMTPDKIM(dkim) == nil)
+}
+
+@Test func resolveSMTPDKIMThrowsIncompleteConfigWhenOnlyOneOfThreeFieldsIsSet() throws {
+    let dkim = SMTPDKIMFileConfig(domain: "example.com", selector: nil, keyPath: nil, keyType: nil)
+    #expect(throws: ServerConfigError.smtpIncompleteDKIMConfig) {
+        _ = try ServerConfig.resolveSMTPDKIM(dkim)
+    }
+}
+
+@Test func resolveSMTPDKIMThrowsIncompleteConfigWhenExactlyTwoOfThreeFieldsAreSet() throws {
+    let dkim = SMTPDKIMFileConfig(domain: "example.com", selector: "s1", keyPath: nil, keyType: nil)
+    #expect(throws: ServerConfigError.smtpIncompleteDKIMConfig) {
+        _ = try ServerConfig.resolveSMTPDKIM(dkim)
+    }
+}
+
+@Test func resolveSMTPDKIMThrowsOnAnUnrecognizedKeyType() throws {
+    let keyURL = try makeTempDKIMKeyFile(contents: "irrelevant", posixPermissions: 0o600)
+    defer { try? FileManager.default.removeItem(at: keyURL) }
+    let dkim = SMTPDKIMFileConfig(domain: "example.com", selector: "s1", keyPath: keyURL.path, keyType: "dsa")
+    #expect(throws: ServerConfigError.smtpInvalidDKIMKeyType("dsa")) {
+        _ = try ServerConfig.resolveSMTPDKIM(dkim)
+    }
+}
+
+@Test func resolveSMTPDKIMThrowsWhenTheKeyFileIsGroupOrWorldReadable() throws {
+    let keyURL = try makeTempDKIMKeyFile(contents: "irrelevant", posixPermissions: 0o644)
+    defer { try? FileManager.default.removeItem(at: keyURL) }
+    let dkim = SMTPDKIMFileConfig(domain: "example.com", selector: "s1", keyPath: keyURL.path, keyType: "rsa")
+    #expect(throws: ServerConfigError.dkimKeyFilePermissionsTooPermissive(path: keyURL.path)) {
+        _ = try ServerConfig.resolveSMTPDKIM(dkim)
+    }
+}
+
+@Test func resolveSMTPDKIMSucceedsAndReadsFileContentsWhenPermissionsAreOwnerOnly() throws {
+    let keyURL = try makeTempDKIMKeyFile(contents: "-----BEGIN FAKE KEY-----\ncontents\n-----END FAKE KEY-----", posixPermissions: 0o600)
+    defer { try? FileManager.default.removeItem(at: keyURL) }
+    let dkim = SMTPDKIMFileConfig(domain: "example.com", selector: "s1", keyPath: keyURL.path, keyType: nil)
+    let settings = try #require(try ServerConfig.resolveSMTPDKIM(dkim))
+    #expect(settings.domain == "example.com")
+    #expect(settings.selector == "s1")
+    // `keyType` absent -> defaults "rsa" (§4.9a).
+    #expect(settings.keyType == "rsa")
+    #expect(String(decoding: settings.keyMaterial, as: UTF8.self).contains("FAKE KEY"))
+}
+
+@Test func resolveSMTPDKIMKeyTypeIsCaseInsensitiveAndAcceptsEd25519() throws {
+    let keyURL = try makeTempDKIMKeyFile(contents: "irrelevant", posixPermissions: 0o600)
+    defer { try? FileManager.default.removeItem(at: keyURL) }
+    let dkim = SMTPDKIMFileConfig(domain: "example.com", selector: "s1", keyPath: keyURL.path, keyType: "Ed25519")
+    let settings = try #require(try ServerConfig.resolveSMTPDKIM(dkim))
+    #expect(settings.keyType == "ed25519")
+}
+
+@Test func validateDirectMXConfigThrowsWhenMTASTSEnforceIsTrueWithoutAllowDirectMX() throws {
+    #expect(throws: ServerConfigError.mtaSTSEnforceRequiresDirectMX) {
+        try ServerConfig.validateDirectMXConfig(allowDirectMX: false, mtaSTSEnforce: true, relayNames: [])
+    }
+}
+
+@Test func validateDirectMXConfigSucceedsWhenMTASTSEnforceAndAllowDirectMXAreBothTrue() throws {
+    try ServerConfig.validateDirectMXConfig(allowDirectMX: true, mtaSTSEnforce: true, relayNames: [])
+}
+
+@Test func validateDirectMXConfigThrowsOnAReservedRelayNameCollisionWhenDirectMXIsAllowed() throws {
+    #expect(throws: ServerConfigError.smtpReservedRelayName("direct-mx")) {
+        try ServerConfig.validateDirectMXConfig(allowDirectMX: true, mtaSTSEnforce: false, relayNames: ["primary", "direct-mx"])
+    }
+}
+
+@Test func validateDirectMXConfigAllowsAReservedNameCollisionWhenDirectMXIsNotEnabled() throws {
+    // The reserved name is only actually reserved once `allowDirectMX` is
+    // true -- an operator who happens to have a relay literally named
+    // "direct-mx" but never opts into direct-MX delivery isn't affected.
+    try ServerConfig.validateDirectMXConfig(allowDirectMX: false, mtaSTSEnforce: false, relayNames: ["direct-mx"])
+}
+
+// MARK: - `LassoSiteServer.makeDKIMSigner(_:)` (Phase F, §4.9a) — rsa/ed25519
+// key-loading paths
+
+@Test func makeDKIMSignerLoadsARealRSAKeySuccessfully() throws {
+    let settings = SMTPDKIMSettings(domain: "example.com", selector: "s1", keyType: "rsa", keyMaterial: Data(sampleRSA2048PEM.utf8))
+    _ = try LassoSiteServer.makeDKIMSigner(settings)
+}
+
+@Test func makeDKIMSignerLoadsARealEd25519KeySuccessfully() throws {
+    let settings = SMTPDKIMSettings(
+        domain: "example.com", selector: "s1", keyType: "ed25519",
+        keyMaterial: Data("nWGxne/9WmC6hEr0kuwsxERJxWl7MmkZcDusAxyuf2A=".utf8)
+    )
+    _ = try LassoSiteServer.makeDKIMSigner(settings)
+}
+
+@Test func makeDKIMSignerThrowsAClearErrorWhenEd25519KeyMaterialIsNotValidBase64() throws {
+    let settings = SMTPDKIMSettings(domain: "example.com", selector: "s1", keyType: "ed25519", keyMaterial: Data("not valid base64!!!".utf8))
+    #expect(throws: SMTPDKIMKeyMaterialError.self) {
+        _ = try LassoSiteServer.makeDKIMSigner(settings)
+    }
+}
+
+/// A real 2048-bit RSA private key, reused verbatim from Perfect-SMTP's own
+/// `SMTPMailerDKIMIntegrationTests.swift` (`rsa2048PEM`) — the same
+/// already-reviewed test vector `LassoPerfectSMTPEndToEndTests.swift` uses,
+/// so `SigningKey.rsa(pem:)`'s `>=2048-bit` validation genuinely passes
+/// rather than needing a freshly-generated key for every test file that
+/// needs one.
+private let sampleRSA2048PEM = """
+-----BEGIN RSA PRIVATE KEY-----
+MIIEpAIBAAKCAQEAwYYqnvIW69nFbGXs/1MlUxvZ6omQwRUQG4vXQvOsScGMPXXR
+ZiYhxblhM3IB+qJ1/x21yT0h0NaFSWMPE2uKxlG8+PPlYEdo7J0RdzX6zPP9AEz9
+eJGl0qEo2hIdHI/rXe5ROXFeG4c/cl4i3I1nDWlcS/g+A6dGtWbtCONlYnGXE5wS
+B6oVuJxOvKMlC0x1HuxQxeJ1K8gHfLg4LT4At4eNI8tuNMDPCLUbqmKvrmOO0SDO
+FD26mxiVoRHQxVX+Fm8xi4f2j2x1H2/rY+dpr8chepCCXGnqHA1GqYuq5zhgfx+o
+SGQgk1UJibN+ffvFxfXeVJIcrLaWYUe81XJg6wIDAQABAoIBAHKB6pIl+L4RGynq
+nXLuRbWJU0XdpBM7XU6PTg3FlPoHVe2/2ukwQud1qzf/i4A7xMnxUHEEhQ/G/xLP
+VEpPZcu27bP4zI5Ncp4eygjZnc7Lx7X32DsRIycgSMXP1f3igogPzWvJ0r9DJZ2M
+aeBKouFiqEQjXL5YqhQIFNUfiAvY1vvzz/xxV7bUQo1S7gmLKI6LGqbNiFTHo/sK
+RiRjO2G6/8G6R4pzOkE2rf1/gqckI/wVBCdaSeTym/tTw3/oFEgdA2qhwPisPhPv
+0BI30eJDtAhBuhUgXhVr5RZVYF84DcZPGQZq/l6mEvclDGJR6WisaAFqnq7fu0P0
+Pq2lB8ECgYEA4Gh+XDXngVVspP3LKg6p0udqW6C5IbjN0RUIHfhQhH6Lu3zrTFpX
+VZqd+aYciKD9HPxov+7YSMUjCFaDsJjqg75TRZuHbLVJkONhdiaOO0PU7588wNHm
+pwh/vneV5w6bqtiJCxOfH3FzH2CC5G5RQ2FBLBixZqoc5hQQLMKkqBsCgYEA3MSi
+BYNgSvL/VGN0EyVYuHdqBnSUFLRmdj0hvGR6JGaShoh7K8Oaz4a4v06jf9PUCdA5
+JJpBnZ+IFwQTyoMkbesleIQcFVRg0tTVU7PxEng2+Beg5qnNPuRuIYz7HvVn5xuu
+5kN2+wWEyz5oVhguJg7zg2p7RNWS+v7AsFEZV3ECgYEAofgJq/hkHZ9QiU19A+AN
+huHsjDHXLZW7R7uMXkVJqDfGFw60rilOe8TbXMMeOScpSXCNEmsLxIo1HOGEr0PP
+kEMgy07UUgwPCvpy79ooMnJlEIa4TNuzRMAHo6ugkGKkzIz5bPs+kG1MEEuSbdmJ
+4b4iUfeIo3cI4K9+dTAPtB0CgYBQeBvWhpyCtS/8QoP8tpAwLNaoo7WWFmuCjaXO
+VZFv0zN1dinvOc0j96c/lBpkbYHMUemCPffMzGl+ei38kvCkYCG4W+8glzDzqEBZ
+0iz83nSq2XH8ocf+NKUv9YNTNYA57Q1DQTQNK2XL72N4fjfUB38bV6S24mJAurrh
+ia4DAQKBgQDOmIn9iyXgGFMbldehPMU9RGKyJCMG47lBIaG9lg63SNLByJTdcn96
+6kNXD9cRbEEz86ebdtmC/4knKOSyN6ymPv7z5UPVvN8ezpNQiQ0ixS5AkTL3yYKv
+Qjb87l8lMbWyR5WKYbWVpsTPiEmw7iU4GptR5DXAbhzOBWY5VEo0WQ==
+-----END RSA PRIVATE KEY-----
+"""
+
 // MARK: - LassoMultiBackendInlineProvider routing
 
 private final class InlineProviderCallRecorder: @unchecked Sendable {
@@ -345,7 +505,10 @@ private func sampleServerConfig(
     cwpJanitorMaxSessions: Int? = nil,
     cwpJanitorMinFloor: Int = 5,
     cwpJanitorMaxDisconnectsPerSweep: Int? = nil,
-    smtpAllowEmailSMTP: Bool = false
+    smtpAllowEmailSMTP: Bool = false,
+    smtpDKIM: SMTPDKIMSettings? = nil,
+    smtpAllowDirectMX: Bool = false,
+    smtpMTASTSEnforce: Bool = false
 ) -> ServerConfig {
     ServerConfig(
         siteRoot: URL(fileURLWithPath: "/tmp/sample-site"),
@@ -400,7 +563,10 @@ private func sampleServerConfig(
         fmAdminAPITrustSelfSignedTLS: false,
         smtpRelays: [:],
         smtpDefaultRelay: nil,
-        smtpAllowEmailSMTP: smtpAllowEmailSMTP
+        smtpAllowEmailSMTP: smtpAllowEmailSMTP,
+        smtpDKIM: smtpDKIM,
+        smtpAllowDirectMX: smtpAllowDirectMX,
+        smtpMTASTSEnforce: smtpMTASTSEnforce
     )
 }
 

@@ -1505,6 +1505,28 @@ public struct LassoNativeRegistry: Sendable {
             }
             return .object(LassoObjectInstance(typeName: "email_smtp", data: data))
         }
+        // `email_token(name::string)` (Phase F, §4.9c) -- real Lasso's
+        // mail-merge marker-emitting method ("Can be used within the body
+        // of an email to insert Lasso email merge tokens"): emits the
+        // literal `#TokenName#` marker text into wherever it's called from
+        // inside a rendered `-subject`/`-body`/`-html` value.
+        // `LassoSMTPMessageBuilder`'s `-tokens`/`-merge` per-recipient
+        // substitution pass (`LassoPerfectSMTP`) later replaces every
+        // `#TokenName#` occurrence with that recipient's resolved token
+        // value -- by the time `LassoSMTPMessageBuilder.build` ever sees
+        // the rendered string, this function has already run and returned
+        // its marker text, exactly like any other native function call.
+        // Pure, synchronous, zero I/O -- the same `date`/`bytes` native-
+        // function shape, matching a single-positional-string-argument
+        // idiom already used by `email_mxlookup`'s own `domain` argument
+        // access (positional first, falling back to a same-named keyword
+        // argument). Does NOT dispatch through `LassoEmailProvider` at all
+        // -- no provider/relay/network involvement is needed to emit a
+        // literal string.
+        register("email_token") { arguments, _ in
+            let name = arguments.positionalValue(at: 0)?.outputString ?? arguments.firstValue(named: "name")?.outputString ?? ""
+            return .string("#\(name)#")
+        }
         register("redirect_url") { arguments, context in
             let url = arguments.firstValue(named: "url")?.outputString ??
                 arguments.first?.value.outputString ?? ""

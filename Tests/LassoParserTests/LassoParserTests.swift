@@ -7005,6 +7005,25 @@ struct IncludeURLTests {
     }
 }
 
+@Test func emailTokenRendersLiterallyAsTheHashWrappedMarker() async throws {
+    // Phase F (§4.9c): `email_token(name)` is a pure, synchronous,
+    // zero-I/O free function -- no `LassoEmailProvider` needed at all
+    // (unlike `email_send`/`email_compose`/`email_mxlookup`, which all
+    // throw `LassoRuntimeError.emailNotConfigured` with no provider
+    // wired) -- confirmed here by rendering with a bare, provider-less
+    // `LassoContext`. `LassoSMTPMessageBuilder`'s own `-tokens`/`-merge`
+    // substitution pass is what later replaces this literal marker text
+    // per recipient; this test only proves the marker itself renders
+    // correctly, matching real Lasso's documented "the #TOKEN# marker can
+    // be used instead" plain-text convention.
+    var context = LassoContext()
+    let output = try await LassoRenderer().render(
+        "[email_token('FirstName')]",
+        context: &context
+    )
+    #expect(output == "#FirstName#")
+}
+
 @Test func decimalConstructorAndAsStringWithPrecisionFormatFixedDecimalPlaces() async throws {
     // `decimal(...)` (a native type constructor, like the already-supported
     // `integer(...)`/`string(...)`) plus `->asString(-precision=N)` — real

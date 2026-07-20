@@ -72,12 +72,24 @@
 //  *how* the connection to an already-safe, already-configured relay is
 //  made, which the relay's own config now governs unconditionally.
 //
-//  **`-tokens`/`-merge` (mail-merge templating) and `-characterSet` still
-//  throw `LassoSMTPFailureKind.notYetSupported`, not silently ignored.**
-//  Unlike the connection-only params above, these change what content is
-//  actually sent: silently ignoring `-tokens`/`-merge` would mail
-//  unsubstituted `{{token}}`-style placeholder text straight to real
-//  recipients. Still deferred past Phase B — not in this phase's scope.
+//  **Phase F: `-tokens`/`-merge`/`-characterSet` now implemented** (plan
+//  §4.9c). `-characterSet` is trivial — `EmailMessage.charset` verbatim,
+//  same one-line mapping §4.3's table always specified. `-tokens`/`-merge`
+//  turned out to be a genuinely different mechanism than a simple string-
+//  substitution pass on one message: confirmed against lassoguide.com's
+//  "Email Merge" section to be a per-recipient personalized BATCH send —
+//  one composed message per address named in `-merge`, each with that
+//  recipient's own token values substituted into the shared `-subject`/
+//  `-body`/`-html` templates (`-tokens` supplies the default token map;
+//  `-merge`'s per-address map overrides it for that recipient only). This
+//  file only PARSES the two maps (`tokens`/`merge` on `BuildResult`) — the
+//  actual per-recipient cloning/substitution/batch-send happens in
+//  `LassoEmailProviderImpl.send`, which is what has access to
+//  `SMTPMailer.send(_ messages:envelopeFrom:)`'s batch overload. `-cc`/
+//  `-bcc` given together with `-tokens`/`-merge` is explicitly rejected
+//  here (a pre-send validation error) rather than guessed at — neither
+//  lassoguide.com nor the local Language Guide PDF documents what a static
+//  cc/bcc list would mean against a per-recipient personalized batch.
 //
 //  **Phase B: `-contentType`/`-transferEncoding` now implemented** —
 //  Perfect-SMTP's `EmailMessage.bodyContentTypeOverride`/
@@ -174,6 +186,21 @@ public enum LassoSMTPMessageBuilder {
         /// what combines the two into the actual sync-vs-deferred decision,
         /// not this builder.
         public let immediateExplicitlyFalse: Bool
+        /// `-tokens` (Phase F, §4.9c) -- a map of token name -> default
+        /// value, applied to every recipient unless overridden by that
+        /// recipient's own `-merge` entry. `nil` when `-tokens` wasn't
+        /// given at all (as opposed to an empty map, which is `Optional(
+        /// [:])`) -- `LassoEmailProviderImpl.send` treats either `tokens`
+        /// or `merge` being non-nil as "enter per-recipient batch-send
+        /// mode" (see that method's own doc comment).
+        public let tokens: [String: String]?
+        /// `-merge` (Phase F, §4.9c) -- a map of recipient address ->
+        /// (token name -> value), one entry per personalized recipient.
+        /// Values here override `tokens`' defaults for that specific
+        /// recipient only (real Lasso's own documented "Email Merge"
+        /// semantics — lassoguide.com, fetched 2026-07-20). `nil` when
+        /// `-merge` wasn't given at all.
+        public let merge: [String: [String: String]]?
     }
 
     /// Dash-params this builder deliberately does not implement at all —
@@ -204,8 +231,11 @@ public enum LassoSMTPMessageBuilder {
     /// real landing spot (`BuildResult.dateValue`) now that
     /// `LassoEmailJobTracker` exists to back real deferred sending. See the
     /// file doc comment's Phase E section.
+    /// `-tokens`/`-merge`/`-characterSet` moved OFF this list in Phase F
+    /// (§4.9c) — see the file doc comment's Phase F section below for
+    /// their real handling.
     private static let unsupportedParameterNames: [String] = [
-        "tokens", "merge", "characterSet", "attachment", "parts", "headerType",
+        "attachment", "parts", "headerType",
     ]
 
     /// - Parameter functionName: Interpolated into the three
@@ -254,6 +284,19 @@ public enum LassoSMTPMessageBuilder {
             throw LassoSMTPError(kind: .invalidParameter, message: "\(functionName) requires at least one of -to/-cc/-bcc.")
         }
 
+        // -tokens/-merge (Phase F, §4.9c) -- parsed here (pure mapping,
+        // no I/O), applied by `LassoEmailProviderImpl.send` as a
+        // per-recipient personalized batch send. See this file's doc
+        // comment for the real, confirmed semantics.
+        let tokens = try tokensMap(arguments)
+        let merge = try mergeMap(arguments)
+        if (tokens != nil || merge != nil), isPresent("cc", in: arguments) || isPresent("bcc", in: arguments) {
+            throw LassoSMTPError(
+                kind: .invalidParameter,
+                message: "-cc/-bcc are not supported together with -tokens/-merge in this phase."
+            )
+        }
+
         var message = EmailMessage(from: from)
         message.to = to
         message.cc = cc
@@ -287,6 +330,14 @@ public enum LassoSMTPMessageBuilder {
         // "-extraMIMEHeaders" precedent.
         message.bodyContentTypeOverride = arguments.lastString(named: "contentType")
         message.bodyTransferEncodingOverride = try transferEncodingOverride(from: arguments.lastString(named: "transferEncoding"))
+        // -characterSet (Phase F, §4.9c/§4.3 table, §7 item 6): trivial,
+        // zero-ambiguity mapping onto `EmailMessage.charset` -- was simply
+        // never wired through when -contentType/-transferEncoding landed
+        // in Phase B. Absent -characterSet leaves `EmailMessage`'s own
+        // "utf-8" default untouched.
+        if let characterSet = arguments.lastString(named: "characterSet") {
+            message.charset = characterSet
+        }
 
         let relayName: String? = {
             guard let raw = arguments.lastString(named: "host")?.trimmingCharacters(in: .whitespacesAndNewlines),
@@ -309,7 +360,9 @@ public enum LassoSMTPMessageBuilder {
             pendingAttachments: pendingAttachments,
             pendingInlineImages: pendingInlineImages,
             dateValue: dateValue,
-            immediateExplicitlyFalse: immediateExplicitlyFalse
+            immediateExplicitlyFalse: immediateExplicitlyFalse,
+            tokens: tokens,
+            merge: merge
         )
     }
 
@@ -510,6 +563,60 @@ public enum LassoSMTPMessageBuilder {
         default:
             return Data(value.outputString.utf8)
         }
+    }
+
+    /// `-tokens` (Phase F, §4.9c) -- a Lasso map of token name -> default
+    /// value, applied to every recipient. `nil` when `-tokens` wasn't
+    /// given at all. Every value is coerced via `outputString`, matching
+    /// this file's own established string-coercion convention elsewhere
+    /// (e.g. `dataBytes(from:)`'s fallback case, `extraMIMEHeaders`'s
+    /// value handling) rather than requiring every value already be a
+    /// `.string`.
+    private static func tokensMap(_ arguments: [EvaluatedArgument]) throws -> [String: String]? {
+        guard let value = arguments.lastValue(named: "tokens") else { return nil }
+        guard case let .map(raw) = value else {
+            throw LassoSMTPError(
+                kind: .invalidParameter,
+                message: "-tokens must be a map of token name to value, got a \(describeShape(value))."
+            )
+        }
+        var result: [String: String] = [:]
+        for (name, tokenValue) in raw {
+            result[name] = tokenValue.outputString
+        }
+        return result
+    }
+
+    /// `-merge` (Phase F, §4.9c) -- a Lasso map of recipient address ->
+    /// (token name -> value), one entry per personalized recipient — real
+    /// Lasso's own documented "Email Merge" shape (lassoguide.com, fetched
+    /// 2026-07-20): `-merge=map('a@example.com'=map('FirstName'='...'),
+    /// ...)`. `nil` when `-merge` wasn't given at all. Same
+    /// `outputString`-based value coercion as `tokensMap(_:)` for each
+    /// inner map's values.
+    private static func mergeMap(_ arguments: [EvaluatedArgument]) throws -> [String: [String: String]]? {
+        guard let value = arguments.lastValue(named: "merge") else { return nil }
+        guard case let .map(raw) = value else {
+            throw LassoSMTPError(
+                kind: .invalidParameter,
+                message: "-merge must be a map of recipient address to a map of token name to value, got a \(describeShape(value))."
+            )
+        }
+        var result: [String: [String: String]] = [:]
+        for (address, perRecipientValue) in raw {
+            guard case let .map(innerRaw) = perRecipientValue else {
+                throw LassoSMTPError(
+                    kind: .invalidParameter,
+                    message: "-merge entries must each be a map of token name to value, got a \(describeShape(perRecipientValue)) for '\(address)'."
+                )
+            }
+            var inner: [String: String] = [:]
+            for (name, tokenValue) in innerRaw {
+                inner[name] = tokenValue.outputString
+            }
+            result[address] = inner
+        }
+        return result
     }
 
     /// A short, human-readable shape description for error messages —

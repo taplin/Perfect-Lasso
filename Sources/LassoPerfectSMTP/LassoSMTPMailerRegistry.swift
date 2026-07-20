@@ -67,6 +67,16 @@ public enum LassoSMTPRelayError: Error, Equatable, Sendable {
     /// case exists so a future caller building a registry by hand, e.g. in
     /// a test, gets a clear failure instead of a silent `nil` default).
     case unknownDefaultRelay(String)
+    /// Defense-in-depth (Phase F, §4.9b) — `directMX` was supplied AND
+    /// `relays` already contains a key literally equal to `"direct-mx"`.
+    /// `ServerConfig.load()` already validates this can't happen for a
+    /// real, config-file-driven server (`ServerConfigError
+    /// .smtpReservedRelayName`), so this is unreachable in the real
+    /// startup path — this case exists purely so a future caller building
+    /// a registry by hand (e.g. a test, or some future config-reload
+    /// feature) gets a clear failure instead of one silently overwriting
+    /// the other in the `mailers` dictionary literal construction.
+    case reservedRelayNameCollision(String)
 }
 
 public actor LassoSMTPMailerRegistry {
@@ -86,7 +96,32 @@ public actor LassoSMTPMailerRegistry {
     ///   - group: The `EventLoopGroup` every relay's connection pool runs
     ///     on — not owned by this registry, matching `RelayTransport`'s own
     ///     "caller owns the group's lifecycle" contract.
-    public init(relays: [String: LassoSMTPRelayDescriptor], defaultRelay: String, group: any EventLoopGroup) throws {
+    ///   - signer: `nil` (the default) means no DKIM signing at all (Phase
+    ///     F, §4.9a) — pass a `DKIMSigner` to sign every message sent
+    ///     through EVERY relay this registry builds, named relays and
+    ///     `directMX` alike. One signer per process, applied uniformly —
+    ///     not a per-relay signer — matching this project's single-
+    ///     tenant-per-process architecture (§4.7's "no cross-tenant
+    ///     isolation boundary to violate" finding, restated here: one
+    ///     operator-controlled sending domain per process is the right
+    ///     cardinality).
+    ///   - directMX: `nil` (the default) means direct-MX delivery isn't
+    ///     available at all (Phase F, §4.9b) — pass an already-constructed
+    ///     `SMTPMailer` (over a `DirectMXTransport`, with `signer` above
+    ///     already applied) to register it under the reserved relay name
+    ///     `"direct-mx"`, selectable via `-host='direct-mx'` exactly like
+    ///     any operator-configured named relay. Throws
+    ///     `LassoSMTPRelayError.reservedRelayNameCollision` if `relays`
+    ///     already contains a `"direct-mx"` key (defense in depth —
+    ///     `ServerConfig.load()` already validates this can't happen for a
+    ///     real config-file-driven server).
+    public init(
+        relays: [String: LassoSMTPRelayDescriptor],
+        defaultRelay: String,
+        group: any EventLoopGroup,
+        signer: (any MessageSigner)? = nil,
+        directMX: SMTPMailer? = nil
+    ) throws {
         guard relays[defaultRelay] != nil else {
             throw LassoSMTPRelayError.unknownDefaultRelay(defaultRelay)
         }
@@ -98,22 +133,40 @@ public actor LassoSMTPMailerRegistry {
                 tls: descriptor.tls,
                 auth: descriptor.auth
             )
-            built[name] = SMTPMailer(transport: RelayTransport(config: config, group: group))
+            built[name] = SMTPMailer(transport: RelayTransport(config: config, group: group), signer: signer)
         }
-        self.mailers = built
+        self.mailers = try Self.merging(built, directMX: directMX)
         self.defaultRelayName = defaultRelay
     }
 
     /// Test-only initializer: takes already-constructed mailers directly
     /// (e.g. wrapping a fake `SMTPTransport`) instead of dialing real
     /// `RelayTransport`s, mirroring `RelayTransport`'s own test-seam
-    /// initializer.
-    init(mailers: [String: SMTPMailer], defaultRelay: String) throws {
+    /// initializer. `directMX`: same reserved-name-collision defense as the
+    /// production initializer above — lets tests exercise `-host='direct-
+    /// mx'` selection/collision behavior against fake mailers with no real
+    /// network access.
+    init(mailers: [String: SMTPMailer], defaultRelay: String, directMX: SMTPMailer? = nil) throws {
         guard mailers[defaultRelay] != nil else {
             throw LassoSMTPRelayError.unknownDefaultRelay(defaultRelay)
         }
-        self.mailers = mailers
+        self.mailers = try Self.merging(mailers, directMX: directMX)
         self.defaultRelayName = defaultRelay
+    }
+
+    /// Shared by both initializers above — inserts `directMX` under the
+    /// reserved `"direct-mx"` key, or returns `mailers` unchanged when
+    /// `directMX` is `nil`. Throws rather than silently letting one
+    /// overwrite the other in a dictionary-literal-style construction if
+    /// `mailers` already happens to contain that key.
+    private static func merging(_ mailers: [String: SMTPMailer], directMX: SMTPMailer?) throws -> [String: SMTPMailer] {
+        guard let directMX else { return mailers }
+        guard mailers["direct-mx"] == nil else {
+            throw LassoSMTPRelayError.reservedRelayNameCollision("direct-mx")
+        }
+        var result = mailers
+        result["direct-mx"] = directMX
+        return result
     }
 
     /// Resolves a relay by name — `nil` (no `-host` given) resolves to the

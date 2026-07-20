@@ -297,6 +297,27 @@ struct ServerConfig: Sendable {
     /// opt in before any template can use `email_smtp` at all. See
     /// `LassoEmailSMTPType.swift`'s `smtpOpen` for the actual gate check.
     let smtpAllowEmailSMTP: Bool
+    /// Resolved, validated, permission-checked DKIM signing config (Phase
+    /// F, §4.9a) — `nil` when `smtp.dkim` wasn't configured at all. See
+    /// `ServerConfig.resolveSMTPDKIM(_:)` for the validation this applies
+    /// and `SMTPDKIMSettings`'s own doc comment for why this type stays
+    /// free of any `PerfectSMTP` import.
+    let smtpDKIM: SMTPDKIMSettings?
+    /// `LASSO_SMTP_ALLOW_DIRECT_MX` / `smtp.allowDirectMX` (Phase F,
+    /// §4.9b) — off-by-default opt-in for direct-MX delivery, mirroring
+    /// `smtpAllowEmailSMTP`'s exact "new network-reaching capability is
+    /// off-by-default" posture. When `true`, `LassoSiteServer.init`'s
+    /// `smtp` wiring block registers one additional mailer under the
+    /// reserved relay name `"direct-mx"` (§4.9b) — selectable via
+    /// `-host='direct-mx'`, no new Lasso-facing dash-param at all.
+    let smtpAllowDirectMX: Bool
+    /// `LASSO_SMTP_MTA_STS_ENFORCE` / `smtp.mtaSTSEnforce` (Phase F,
+    /// §4.9b) — off-by-default; `ServerConfig.load()` throws
+    /// `.mtaSTSEnforceRequiresDirectMX` if this is `true` while
+    /// `smtpAllowDirectMX` is not also `true` (MTA-STS enforcement has no
+    /// meaning without direct-MX delivery — see that error case's own doc
+    /// comment).
+    let smtpMTASTSEnforce: Bool
 
     static func load() throws -> ServerConfig {
         let env = ProcessInfo.processInfo.environment
@@ -421,6 +442,24 @@ struct ServerConfig: Sendable {
         // branching above.
         let smtpAllowEmailSMTP = datasourceFile?.smtp?.allowEmailSMTP ?? Self.isTruthyEnv(env["LASSO_SMTP_ALLOW_EMAIL_SMTP"])
 
+        // DKIM (Phase F, §4.9a) — JSON-only (no `LASSO_SMTP_DKIM_*` env-var
+        // fallback: unlike the single-boolean flags below, DKIM needs four
+        // related fields at once, which doesn't fit this file's flat
+        // env-var-per-setting convention — a deliberate scope decision,
+        // not an oversight).
+        let smtpDKIM = try Self.resolveSMTPDKIM(datasourceFile?.smtp?.dkim)
+
+        // Direct-MX opt-in + MTA-STS enforcement toggle (Phase F, §4.9b) —
+        // same "JSON block first, dedicated env var fallback" shape as
+        // `smtpAllowEmailSMTP` just above.
+        let smtpAllowDirectMX = datasourceFile?.smtp?.allowDirectMX ?? Self.isTruthyEnv(env["LASSO_SMTP_ALLOW_DIRECT_MX"])
+        let smtpMTASTSEnforce = datasourceFile?.smtp?.mtaSTSEnforce ?? Self.isTruthyEnv(env["LASSO_SMTP_MTA_STS_ENFORCE"])
+        try Self.validateDirectMXConfig(
+            allowDirectMX: smtpAllowDirectMX,
+            mtaSTSEnforce: smtpMTASTSEnforce,
+            relayNames: Set(smtpRelays.keys)
+        )
+
         return ServerConfig(
             siteRoot: root,
             port: env["LASSO_SERVER_PORT"].flatMap(Int.init) ?? 8181,
@@ -497,7 +536,10 @@ struct ServerConfig: Sendable {
             fmAdminAPITrustSelfSignedTLS: Self.isTruthyEnv(env["LASSO_FM_ADMIN_TRUST_SELF_SIGNED_TLS"]),
             smtpRelays: smtpRelays,
             smtpDefaultRelay: smtpDefaultRelay,
-            smtpAllowEmailSMTP: smtpAllowEmailSMTP
+            smtpAllowEmailSMTP: smtpAllowEmailSMTP,
+            smtpDKIM: smtpDKIM,
+            smtpAllowDirectMX: smtpAllowDirectMX,
+            smtpMTASTSEnforce: smtpMTASTSEnforce
         )
     }
 
@@ -679,11 +721,34 @@ struct SMTPFileConfig: Decodable {
     var relays: [String: SMTPRelayFileConfig]
     var defaultRelay: String?
     var allowEmailSMTP: Bool?
+    /// `dkim` (Phase F, §4.9a) — `domain`/`selector`/`keyPath` required
+    /// together (`ServerConfig.resolveSMTPDKIM(_:)` throws
+    /// `.smtpIncompleteDKIMConfig` if only one or two are set); `keyType`
+    /// optional, defaults `"rsa"`.
+    var dkim: SMTPDKIMFileConfig?
+    /// `allowDirectMX` (Phase F, §4.9b) — off by default, matching
+    /// `allowEmailSMTP`'s exact "new network-reaching capability is
+    /// off-by-default" posture.
+    var allowDirectMX: Bool?
+    /// `mtaSTSEnforce` (Phase F, §4.9b) — off by default; meaningless (and
+    /// rejected at startup) unless `allowDirectMX` is also `true` — see
+    /// `ServerConfigError.mtaSTSEnforceRequiresDirectMX`.
+    var mtaSTSEnforce: Bool?
 
-    init(relays: [String: SMTPRelayFileConfig] = [:], defaultRelay: String? = nil, allowEmailSMTP: Bool? = nil) {
+    init(
+        relays: [String: SMTPRelayFileConfig] = [:],
+        defaultRelay: String? = nil,
+        allowEmailSMTP: Bool? = nil,
+        dkim: SMTPDKIMFileConfig? = nil,
+        allowDirectMX: Bool? = nil,
+        mtaSTSEnforce: Bool? = nil
+    ) {
         self.relays = relays
         self.defaultRelay = defaultRelay
         self.allowEmailSMTP = allowEmailSMTP
+        self.dkim = dkim
+        self.allowDirectMX = allowDirectMX
+        self.mtaSTSEnforce = mtaSTSEnforce
     }
 
     init(from decoder: Decoder) throws {
@@ -691,9 +756,23 @@ struct SMTPFileConfig: Decodable {
         relays = try container.decodeIfPresent([String: SMTPRelayFileConfig].self, forKey: .relays) ?? [:]
         defaultRelay = try container.decodeIfPresent(String.self, forKey: .defaultRelay)
         allowEmailSMTP = try container.decodeIfPresent(Bool.self, forKey: .allowEmailSMTP)
+        dkim = try container.decodeIfPresent(SMTPDKIMFileConfig.self, forKey: .dkim)
+        allowDirectMX = try container.decodeIfPresent(Bool.self, forKey: .allowDirectMX)
+        mtaSTSEnforce = try container.decodeIfPresent(Bool.self, forKey: .mtaSTSEnforce)
     }
 
-    private enum CodingKeys: String, CodingKey { case relays, defaultRelay, allowEmailSMTP }
+    private enum CodingKeys: String, CodingKey { case relays, defaultRelay, allowEmailSMTP, dkim, allowDirectMX, mtaSTSEnforce }
+}
+
+/// `smtp.dkim` config-file sub-block (Phase F, §4.9a) — see
+/// `SMTPFileConfig.dkim`'s doc comment for the required-together rule and
+/// `ServerConfig.resolveSMTPDKIM(_:)` for the actual validation/loading
+/// this decodes into.
+struct SMTPDKIMFileConfig: Decodable {
+    var domain: String?
+    var selector: String?
+    var keyPath: String?
+    var keyType: String?
 }
 
 /// One named relay's connection settings. `host` is optional here (not
@@ -732,6 +811,32 @@ struct SMTPRelaySettings: Sendable {
     let user: String?
     let password: String?
     let tls: String
+}
+
+/// Resolved (validated, permission-checked, file-contents-read-once) DKIM
+/// signing config for the whole process (Phase F, §4.9a) —
+/// `ServerConfig.smtpDKIM`'s value type, produced by
+/// `ServerConfig.resolveSMTPDKIM(_:)`. Deliberately free of any
+/// `PerfectSMTP` import, matching `SMTPRelaySettings`'s identical
+/// reasoning above — `LassoSiteServer.init`'s `smtp` wiring block (where
+/// `PerfectSMTP` is already imported) is what actually turns
+/// `keyMaterial` into a real `SigningKey`/`DKIMSigner`.
+struct SMTPDKIMSettings: Sendable {
+    let domain: String
+    let selector: String
+    /// `"rsa"` or `"ed25519"` — already validated by `resolveSMTPDKIM(_:)`;
+    /// no other value can reach this point.
+    let keyType: String
+    /// `keyPath`'s raw file bytes, read exactly once here at config-
+    /// resolution time (§4.6's "read it once at startup... never
+    /// per-call" instruction) — UTF-8 PEM text for `"rsa"`, UTF-8 base64
+    /// text for `"ed25519"` (this implementation's own documented file
+    /// format for that key type — see `resolveSMTPDKIM(_:)`'s doc comment
+    /// for why: neither real Lasso doc source mentions DKIM at all, so
+    /// there's no corpus convention to match). The actual UTF-8-decode/
+    /// base64-decode/`SigningKey` construction happens in
+    /// `LassoSiteServer.init`'s `smtp` wiring block.
+    let keyMaterial: Data
 }
 
 /// One `datasources` entry. Decodes either the current shape
@@ -782,7 +887,7 @@ struct DatasourceEntry: Decodable {
     }
 }
 
-enum ServerConfigError: Error, CustomStringConvertible {
+enum ServerConfigError: Error, Equatable, CustomStringConvertible {
     case invalidSiteRoot(String)
     case duplicateDatasourceAlias([String])
     /// A `datasources` entry has `type: "filemaker"` but no `filemaker`
@@ -802,6 +907,33 @@ enum ServerConfigError: Error, CustomStringConvertible {
     /// left unset while `smtp.relays` has more than one entry (ambiguous —
     /// there's no single relay to imply as the default).
     case smtpInvalidDefaultRelay(String)
+    /// `smtp.dkim` had exactly one or two (not all three) of `domain`/
+    /// `selector`/`keyPath` set (Phase F, §4.9a) — required together,
+    /// caught here rather than silently signing with a half-configured
+    /// signer or silently not signing at all.
+    case smtpIncompleteDKIMConfig
+    /// `smtp.dkim.keyType` was set to something other than `"rsa"`/
+    /// `"ed25519"` (case-insensitive) — the only two recognized values.
+    case smtpInvalidDKIMKeyType(String)
+    /// `smtp.dkim.keyPath` names a file that's group- or world-readable
+    /// (`posixPermissions & 0o077 != 0`) — an ENFORCED hard startup
+    /// failure, not a warning (§4.6: a leaked DKIM private key is not
+    /// equivalently rotatable to a leaked password, unlike
+    /// `DatasourceFileConfig`'s chmod-600-is-documentation-only
+    /// precedent).
+    case dkimKeyFilePermissionsTooPermissive(path: String)
+    /// `smtp.mtaSTSEnforce: true` was set while `smtp.allowDirectMX` is not
+    /// also `true` (§4.9b) — MTA-STS enforcement has no effect and no
+    /// meaning unless direct-MX delivery is also enabled (the relay
+    /// operator, not this codebase, would be the one resolving a
+    /// recipient's MX and needing MTA-STS on a named-relay-only path).
+    case mtaSTSEnforceRequiresDirectMX
+    /// `smtp.allowDirectMX: true` was set while `smtp.relays` also happens
+    /// to use the literal, reserved relay name this feature registers
+    /// direct-MX delivery under (`"direct-mx"`) — caught here at
+    /// config-load time rather than silently shadowed by whichever entry
+    /// wins the dictionary-construction race.
+    case smtpReservedRelayName(String)
 
     var description: String {
         switch self {
@@ -818,8 +950,105 @@ enum ServerConfigError: Error, CustomStringConvertible {
             name.isEmpty
                 ? "smtp.relays has more than one entry but smtp.defaultRelay was not set — name which relay email_send should use by default."
                 : "smtp.defaultRelay ('\(name)') does not name any relay configured in smtp.relays."
+        case .smtpIncompleteDKIMConfig:
+            "smtp.dkim requires domain, selector, and keyPath together (set all three, or omit dkim entirely to disable DKIM signing)."
+        case .smtpInvalidDKIMKeyType(let keyType):
+            "smtp.dkim.keyType must be \"rsa\" or \"ed25519\", got '\(keyType)'."
+        case .dkimKeyFilePermissionsTooPermissive(let path):
+            "smtp.dkim.keyPath ('\(path)') is group- or world-readable — chmod it to 600 (owner read/write only) before starting this server. A leaked DKIM private key can't be rotated as easily as a password."
+        case .mtaSTSEnforceRequiresDirectMX:
+            "smtp.mtaSTSEnforce requires smtp.allowDirectMX to also be true — MTA-STS enforcement has no effect on the named-relay-only delivery path."
+        case .smtpReservedRelayName(let name):
+            "smtp.relays must not define a relay named '\(name)' while smtp.allowDirectMX is true — that name is reserved for direct-MX delivery."
         }
     }
+}
+
+extension ServerConfig {
+    /// Pure, directly-testable resolution of the `smtp.dkim` sub-block
+    /// (Phase F, §4.9a) — separated from `load()`'s env-var/file plumbing
+    /// so tests can exercise the incomplete-config/key-type/permission
+    /// validation paths directly (including against a real temp key file)
+    /// without needing a full `LASSO_DATASOURCE_CONFIG_PATH`-driven
+    /// `ServerConfig.load()` round trip — this codebase has no existing
+    /// precedent for testing `load()` end to end via live env vars; every
+    /// other config-shape test in this file exercises a `Decodable`
+    /// conformance or a small, pure resolver function directly instead,
+    /// matching that established style.
+    ///
+    /// Returns `nil` when `dkim` is `nil`, or present but with all three
+    /// of `domain`/`selector`/`keyPath` absent/empty (DKIM simply isn't
+    /// configured at all — not an error). Throws
+    /// `.smtpIncompleteDKIMConfig` when exactly one or two of the three
+    /// are set, `.smtpInvalidDKIMKeyType` for an unrecognized `keyType`,
+    /// and `.dkimKeyFilePermissionsTooPermissive` when `keyPath`'s file is
+    /// group-/world-readable. Any other failure reading `keyPath` (missing
+    /// file, permission denied at the OS level, etc.) propagates as
+    /// whatever `FileManager`/`Data(contentsOf:)` itself throws — this
+    /// mirrors every other "read a config-referenced file, fail fast"
+    /// check in this file (e.g. `DatasourceFileConfig.load(path:)`
+    /// itself), rather than wrapping every possible I/O failure in a
+    /// bespoke case.
+    static func resolveSMTPDKIM(_ dkim: SMTPDKIMFileConfig?) throws -> SMTPDKIMSettings? {
+        guard let dkim else { return nil }
+        let domain = dkim.domain?.trimmingCharacters(in: .whitespacesAndNewlines)
+        let selector = dkim.selector?.trimmingCharacters(in: .whitespacesAndNewlines)
+        let keyPath = dkim.keyPath?.trimmingCharacters(in: .whitespacesAndNewlines)
+        let presentCount = [domain, selector, keyPath].filter { ($0?.isEmpty ?? true) == false }.count
+        guard presentCount > 0 else { return nil }
+        guard presentCount == 3, let domain, let selector, let keyPath else {
+            throw ServerConfigError.smtpIncompleteDKIMConfig
+        }
+
+        let keyType: String
+        if let rawKeyType = dkim.keyType?.trimmingCharacters(in: .whitespacesAndNewlines), rawKeyType.isEmpty == false {
+            keyType = rawKeyType.lowercased()
+        } else {
+            keyType = "rsa"
+        }
+        guard keyType == "rsa" || keyType == "ed25519" else {
+            throw ServerConfigError.smtpInvalidDKIMKeyType(keyType)
+        }
+
+        // Permission check (§4.6/§4.9a) — an ENFORCED hard startup
+        // failure, not a warning, unlike `DatasourceFileConfig`'s
+        // chmod-600-is-documentation-only precedent. Checked BEFORE the
+        // file's contents are ever read.
+        let attributes = try FileManager.default.attributesOfItem(atPath: keyPath)
+        let posixPermissions = (attributes[.posixPermissions] as? NSNumber)?.intValue ?? 0
+        guard posixPermissions & 0o077 == 0 else {
+            throw ServerConfigError.dkimKeyFilePermissionsTooPermissive(path: keyPath)
+        }
+
+        let keyMaterial = try Data(contentsOf: URL(fileURLWithPath: keyPath))
+        return SMTPDKIMSettings(domain: domain, selector: selector, keyType: keyType, keyMaterial: keyMaterial)
+    }
+
+    /// Pure, directly-testable validation of the direct-MX/MTA-STS/
+    /// reserved-relay-name rules (Phase F, §4.9b) — same "separated from
+    /// `load()`'s plumbing" rationale as `resolveSMTPDKIM(_:)` above.
+    static func validateDirectMXConfig(allowDirectMX: Bool, mtaSTSEnforce: Bool, relayNames: Set<String>) throws {
+        guard mtaSTSEnforce == false || allowDirectMX else {
+            throw ServerConfigError.mtaSTSEnforceRequiresDirectMX
+        }
+        guard allowDirectMX == false || relayNames.contains("direct-mx") == false else {
+            throw ServerConfigError.smtpReservedRelayName("direct-mx")
+        }
+    }
+}
+
+/// Thrown by `LassoSiteServer.init`'s `smtp` wiring block when
+/// `config.smtpDKIM.keyType == "ed25519"` but the key file's contents
+/// aren't valid base64. `ServerConfig.resolveSMTPDKIM(_:)` already
+/// validates the file's *permissions* and that `keyType` itself is a
+/// recognized value at config-load time — decoding the actual bytes as
+/// base64 can only be checked once they're being turned into a
+/// `SigningKey`, which needs `PerfectSMTP` (see `SMTPDKIMSettings`'s own
+/// doc comment for why that translation is deferred to here rather than
+/// done inside `ServerConfig.resolveSMTPDKIM(_:)` itself).
+struct SMTPDKIMKeyMaterialError: Error, CustomStringConvertible {
+    let message: String
+    var description: String { message }
 }
 
 struct LassoSiteServer: Sendable {
@@ -1141,12 +1370,53 @@ struct LassoSiteServer: Sendable {
                     tls: Self.tlsMode(settings.tls, port: settings.port)
                 )
             }
+            // Built here, ahead of `registry`/`directMXMailer` below, so
+            // both can reuse the exact same instance -- `email_mxlookup`
+            // (Phase C), direct-MX delivery (Phase F, §4.9b), and MTA-STS
+            // policy lookups (also §4.9b) all share one `DNSResolver`
+            // rather than each spinning up its own.
+            let mxResolver = DNSResolver(group: MultiThreadedEventLoopGroup.singleton)
+
+            // DKIM signer (Phase F, §4.9a) -- one signer per process,
+            // shared across every relay's `SMTPMailer` this block builds
+            // below, named relays AND the direct-mx entry alike (§4.9a's
+            // "one signer, not per-relay" design). `nil` when
+            // `config.smtpDKIM` wasn't configured at all -- every
+            // `SMTPMailer` below then sends unsigned, exactly like every
+            // phase before this one.
+            let dkimSigner: (any MessageSigner)? = try config.smtpDKIM.map { try Self.makeDKIMSigner($0) }
+
+            // Direct-MX opt-in (Phase F, §4.9b) -- reuses `mxResolver`
+            // above (never a second, redundant `DNSResolver`).
+            // `DirectMXConfig()`'s library defaults are used verbatim --
+            // `allowPrivateAddresses` is deliberately NEVER exposed as
+            // operator config here, staying hardcoded at its safe default
+            // (`false`): this is the exact SSRF-relevant knob §5's whole
+            // `-host` redesign exists to keep away from any
+            // caller-reachable surface, and no real deployment need for
+            // internal-address direct-MX delivery has been identified.
+            let directMXMailer: SMTPMailer?
+            if config.smtpAllowDirectMX {
+                let mtaSTSPolicyProvider: (any MTASTSPolicyProviding)? = config.smtpMTASTSEnforce
+                    ? MTASTSPolicyManager(dnsResolver: mxResolver, addressResolver: mxResolver)
+                    : nil
+                let directMXTransport = DirectMXTransport(
+                    resolver: mxResolver,
+                    group: MultiThreadedEventLoopGroup.singleton,
+                    mtaSTSPolicyProvider: mtaSTSPolicyProvider
+                )
+                directMXMailer = SMTPMailer(transport: directMXTransport, signer: dkimSigner)
+            } else {
+                directMXMailer = nil
+            }
+
             let registry = try LassoSMTPMailerRegistry(
                 relays: descriptors,
                 defaultRelay: defaultRelay,
-                group: MultiThreadedEventLoopGroup.singleton
+                group: MultiThreadedEventLoopGroup.singleton,
+                signer: dkimSigner,
+                directMX: directMXMailer
             )
-            let mxResolver = DNSResolver(group: MultiThreadedEventLoopGroup.singleton)
             // `email_smtp`'s live-connection registry (Phase D, §4.8b) —
             // built once here so the reaper Task below and every request's
             // `LassoEmailProviderImpl` (via `emailProvider`) share the
@@ -1225,6 +1495,42 @@ struct LassoSiteServer: Sendable {
         case "starttls": .startTLS
         default: .startTLS
         }
+    }
+
+    /// `SMTPDKIMSettings` -> a real `DKIMSigner` (Phase F, §4.9a) —
+    /// separated from the `smtp` wiring block above purely so tests can
+    /// exercise both the `"rsa"` and `"ed25519"` key-loading paths (and
+    /// the ed25519-invalid-base64 failure path) directly, without needing
+    /// a full `LassoSiteServer` construction. `settings.keyType` is
+    /// already validated to be `"rsa"` or `"ed25519"` by `ServerConfig
+    /// .resolveSMTPDKIM(_:)` — no other value ever reaches this function.
+    static func makeDKIMSigner(_ settings: SMTPDKIMSettings) throws -> any MessageSigner {
+        let key: SigningKey
+        switch settings.keyType {
+        case "ed25519":
+            // This implementation's own documented file format for an
+            // ed25519 DKIM key — base64-encoded raw 32-byte seed — since
+            // neither real Lasso doc source mentions DKIM at all (§4.9a),
+            // there's no corpus convention this needs to match.
+            let base64Text = String(decoding: settings.keyMaterial, as: UTF8.self)
+                .trimmingCharacters(in: .whitespacesAndNewlines)
+            guard let rawKey = Data(base64Encoded: base64Text) else {
+                throw SMTPDKIMKeyMaterialError(
+                    message: "smtp.dkim.keyPath's contents are not valid base64 (required for keyType=\"ed25519\")."
+                )
+            }
+            key = try SigningKey.ed25519(rawRepresentation: rawKey)
+        default:
+            // "rsa" -- the only other value `ServerConfig
+            // .resolveSMTPDKIM(_:)` ever lets through.
+            let pem = String(decoding: settings.keyMaterial, as: UTF8.self)
+            key = try SigningKey.rsa(pem: pem)
+        }
+        // `signedHeaders: []` -- `DKIMSigner.alwaysOversignedHeaders`
+        // already covers every header this codebase's own `EmailMessage`
+        // construction ever populates (§4.9a). `canon` left at
+        // `DKIMSigner`'s own default (`(.relaxed, .relaxed)`, §4.6).
+        return try DKIMSigner(domain: settings.domain, selector: settings.selector, signedHeaders: [], keys: [key])
     }
 
     func routes() throws -> Routes<HTTPRequest, HTTPOutput> {
