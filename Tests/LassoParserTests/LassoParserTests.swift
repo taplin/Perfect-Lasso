@@ -8193,3 +8193,37 @@ struct IncludeURLTests {
     #expect(output == "false")
 }
 
+@Test func nullSuppressesOutputWhileStillEvaluatingItsArgument() async throws {
+    // Ch. 30 pp.422-426's canonical Iterator idiom relies on exactly
+    // this: `Null: $myIterator->Forward;` must silently swallow the
+    // boolean return value while still actually advancing the iterator.
+    // Previously "null" always hard-committed to the `.null` literal
+    // expression in `parsePrefix` before `parsePostfix` ever saw a
+    // trailing `(` or `:`, so both call syntaxes below threw
+    // `unsupportedExpression("Dynamic call")` — a `.call` node whose
+    // callee was `.null` instead of `.identifier("null")`, which
+    // `Evaluator.evaluate`'s `.call` case has no path for.
+    //
+    // Proven here via a divide-by-zero inside the argument (caught by
+    // `[protect]`): if the argument were silently discarded rather than
+    // actually evaluated, no error would ever surface.
+    var context = LassoContext()
+    let output = try await LassoRenderer().render(
+        "[null(1+1)]|[protect][Null: 10 / 0][/protect][error_currenterror(-errorcode)]",
+        context: &context
+    )
+    #expect(output == "|-9950")
+}
+
+@Test func bareNullStillParsesAsTheLiteralNullValueNotACall() async throws {
+    // Guards the other half of the fix: "null" with no following call
+    // syntax must keep parsing as the `.null` literal, so ordinary
+    // comparisons against it are unaffected by the new callable path.
+    var context = LassoContext()
+    let output = try await LassoRenderer().render(
+        "[Var: 'x' = null][$x == null]|[null == null]",
+        context: &context
+    )
+    #expect(output == "true|true")
+}
+

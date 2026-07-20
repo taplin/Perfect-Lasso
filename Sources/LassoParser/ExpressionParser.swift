@@ -235,6 +235,15 @@ struct ExpressionParser {
             switch name.lowercased() {
             case "true": expression = .boolean(true)
             case "false": expression = .boolean(false)
+            case "null" where peek == .symbol("(") || peek == .symbol(":"):
+                // `null(expr)` / `[Null: expr]` — the Language Guide's own
+                // canonical Iterator idiom (Ch. 30 pp.422-426, e.g.
+                // `Null: $myIterator->Forward;`) calling the `null` free
+                // function to evaluate-but-suppress-output an expression.
+                // Bare `null` (no following call syntax) still falls
+                // through to the `.null` literal below, so `x == null`
+                // is unaffected.
+                expression = .identifier(name)
             case "null": expression = .null
             case "void": expression = .void
             case "not": expression = .unary(operator: "not", value: parseExpression(minimumPrecedence: 8))
