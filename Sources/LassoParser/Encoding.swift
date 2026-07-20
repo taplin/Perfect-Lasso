@@ -98,6 +98,16 @@ enum LassoEncoding {
         return decoded
     }
 
+    /// `String->Unescape` (Ch. 25 Table 5): "Converts a string from the
+    /// hexadecimal URL encoding" — the documented inverse of `->encodeUrl`.
+    /// A malformed `%XX` escape (per `removingPercentEncoding`'s own
+    /// contract) leaves the string unchanged rather than producing `nil`,
+    /// matching the rest of this file's convention of a safe fallback over
+    /// a thrown error for a decode-adjacent operation.
+    static func unescape(_ value: String) -> String {
+        value.removingPercentEncoding ?? value
+    }
+
     /// Every documented encoding keyword (`-EncodeNone`, `-EncodeHTML`,
     /// etc.), matched case-insensitively against an argument's label, in
     /// the order the Lasso 8.5 Language Guide lists them. `nil` for

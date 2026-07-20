@@ -1138,6 +1138,104 @@ struct Evaluator {
             let end = min(start + length, characters.count)
             guard end > start else { return .string("") }
             return .string(String(characters[start..<end]))
+        case let (.string(value), "remove"):
+            // Ch. 25 Table 3: "Removes a substring from the string. The
+            // first parameter is the offset at which to start removing
+            // characters. The second parameter is the number of
+            // characters to remove. Defaults to removing to the end of
+            // the string." 1-based offset, matching `->substring`'s own
+            // established convention. Mutating (`"remove"` is already in
+            // `selfMutatingMethods`, shared with `Array->Remove`).
+            let characters = Array(value)
+            let evaluatedArguments = try await evaluate(arguments)
+            let offset = max(Int(evaluatedArguments.positionalValue(at: 0)?.number ?? 1) - 1, 0)
+            guard offset < characters.count else { return .string(value) }
+            let count = evaluatedArguments.positionalValue(at: 1).flatMap { $0.number.map(Int.init) } ?? (characters.count - offset)
+            let end = min(offset + max(count, 0), characters.count)
+            guard end > offset else { return .string(value) }
+            return .string(String(characters[0..<offset]) + String(characters[end...]))
+        case let (.string(value), "merge"):
+            // Ch. 25 Table 3: "Inserts a merge string into the string.
+            // Requires two parameters, the location at which to insert
+            // the merge string and the string to insert. Optional third
+            // and fourth parameters specify an offset into the merge
+            // string and number of characters of the merge string to
+            // insert." 1-based location, matching this file's other
+            // position-based string members. No worked example exists
+            // anywhere in the Guide for this specific tag (Table 3's own
+            // "Note" only points to the separate Lasso Reference) — the
+            // 1-based-offset assumption for the third/fourth parameters
+            // is inferred from this file's own established convention
+            // for every other position-based string member, not
+            // directly verified against a worked example (flagged by
+            // architect review).
+            let characters = Array(value)
+            let evaluatedArguments = try await evaluate(arguments)
+            let location = max(Int(evaluatedArguments.positionalValue(at: 0)?.number ?? 1) - 1, 0)
+            let mergeSource = Array(evaluatedArguments.positionalValue(at: 1)?.outputString ?? "")
+            let mergeOffset = min(max(evaluatedArguments.positionalValue(at: 2).flatMap { $0.number.map(Int.init) }.map { $0 - 1 } ?? 0, 0), mergeSource.count)
+            let mergeCount = evaluatedArguments.positionalValue(at: 3).flatMap { $0.number.map(Int.init) } ?? (mergeSource.count - mergeOffset)
+            let mergeEnd = min(mergeOffset + max(mergeCount, 0), mergeSource.count)
+            let mergeSlice = mergeEnd > mergeOffset ? String(mergeSource[mergeOffset..<mergeEnd]) : ""
+            let insertAt = min(location, characters.count)
+            return .string(String(characters[0..<insertAt]) + mergeSlice + String(characters[insertAt...]))
+        case let (.string(value), "foldcase"):
+            // Ch. 25 Table 5: "Converts all characters in the string for
+            // a case-insensitive comparison." Real Lasso backs this with
+            // ICU case folding; Swift/Foundation expose no direct case-
+            // fold API, so this uses `.folding(options: .caseInsensitive,
+            // locale: nil)` — Foundation's own closest equivalent, and a
+            // strictly closer match to real ICU case folding than plain
+            // `.lowercased()` for characters like German `ß` (which case-
+            // folds to `ss`, not just lowercases to itself) — still a
+            // disclosed approximation, not a full ICU case-fold
+            // implementation (flagged by architect review).
+            return .string(value.folding(options: .caseInsensitive, locale: nil))
+        case let (.string(value), "unescape"):
+            return .string(LassoEncoding.unescape(value))
+        case let (.string(value), member) where member == "tolower" || member == "toupper" || member == "totitle":
+            // Ch. 25 Table 5: `->toLower`/`->toUpper`/`->toTitle` convert
+            // a SINGLE character at a 1-based position, distinct from the
+            // whole-string `->lowercase`/`->uppercase`/`->titlecase`
+            // members above.
+            var characters = Array(value)
+            let position = arguments.first != nil ? Int(try await evaluate(arguments[0].value).number ?? 0) : 0
+            let index = position - 1
+            guard characters.indices.contains(index) else { return .string(value) }
+            let converted: String
+            switch member {
+            case "tolower": converted = String(characters[index]).lowercased()
+            case "toupper": converted = String(characters[index]).uppercased()
+            default:
+                // `->toTitle`: Swift/Foundation expose no per-character
+                // Unicode titlecase mapping, only whole-string
+                // `.capitalized`, so this uses plain uppercasing as the
+                // closest available approximation — identical to true
+                // titlecase for ASCII (everything this file's own tests
+                // exercise), but diverges for the small set of Unicode
+                // digraph characters with a distinct titlecase form
+                // (e.g. U+01C5 `ǅ`), matching this file's disclosed-
+                // narrower-scope convention elsewhere (flagged by
+                // architect review).
+                converted = String(characters[index]).uppercased()
+            }
+            characters.replaceSubrange(index..<(index + 1), with: Array(converted))
+            return .string(String(characters))
+        case let (.string(value), member) where LassoStringInformation.isCharacterMemberName(member):
+            // Ch. 25 Table 11: Character Information Member Tags — every
+            // one of these inspects a SINGLE character at a 1-based
+            // position. `->CharName` (full Unicode Character Database
+            // name lookup, e.g. "LATIN SMALL LETTER B") is deliberately
+            // NOT implemented here — Swift/Foundation expose no UCD name
+            // table, and guessing at one for only some code points would
+            // be worse than a clear, disclosed gap (see
+            // `StringOperations.swift`'s own doc comment).
+            let characters = Array(value)
+            let position = arguments.first != nil ? Int(try await evaluate(arguments[0].value).number ?? 0) : 0
+            let index = position - 1
+            guard characters.indices.contains(index) else { return .null }
+            let radix = arguments.count > 1 ? Int(try await evaluate(arguments[1].value).number ?? 10) : 10
+            return LassoStringInformation.characterMember(member, of: characters[index], radix: radix)
         case let (.integer(value), "asstring"):
             return .string(try await formattedNumber(Double(value), arguments, defaultPrecision: 0))
         case let (.decimal(value), "asstring"):
@@ -1610,6 +1708,13 @@ struct Evaluator {
         // documented "Modifies the string and returns no value",
         // exactly like `->Trim`/`->Append` above.
         "padleading", "padtrailing", "removeleading", "removetrailing", "titlecase",
+        // `String->Merge`/`->Foldcase`/`->toLower`/`->toUpper`/`->toTitle`/
+        // `->Unescape` (Ch. 25 Tables 3/5) — same "modifies the string
+        // and returns no value" convention as the row above. `->Remove`
+        // is already covered by the pre-existing `"remove"` entry
+        // (shared with `Array->Remove`, purely name-based per this set's
+        // own top-level doc comment).
+        "merge", "foldcase", "tolower", "toupper", "totitle", "unescape",
         // `Date->Add`/`Date->Subtract` (Lasso 8.5 Language Guide Ch. 29
         // Table 7) — documented as changing "the values of variables
         // that contain date... data types" when called as a bare

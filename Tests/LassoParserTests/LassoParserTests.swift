@@ -10219,3 +10219,339 @@ struct IncludeURLTests {
     #expect(output == "123")
 }
 
+// MARK: - String method expansion (Ch. 25 Tables 3/5/11 members, Tables 4/6/10/12 free tags)
+
+@Test func stringRemoveDeletesACountedRangeStartingAtA1BasedOffset() async throws {
+    // Ch. 25 Table 3: "The first parameter is the offset at which to
+    // start removing characters. The second parameter is the number of
+    // characters to remove." No worked example in the Guide itself for
+    // the member form; hand-verified against "Alpha": removing 2
+    // characters starting at position 2 ('l','p') leaves "A" + "ha".
+    var context = LassoContext()
+    let output = try await LassoRenderer().render("['Alpha'->(Remove: 2, 2)]", context: &context)
+    #expect(output == "Aha")
+}
+
+@Test func stringRemoveWithNoCountRemovesToTheEndOfTheString() async throws {
+    // Ch. 25 Table 3: count "Defaults to removing to the end of the
+    // string." "Alpha" from position 3 onward ('p','h','a') removed
+    // leaves "Al".
+    var context = LassoContext()
+    let output = try await LassoRenderer().render("['Alpha'->(Remove: 3)]", context: &context)
+    #expect(output == "Al")
+}
+
+@Test func stringMergeInsertsAWholeMergeStringAtA1BasedLocation() async throws {
+    // Ch. 25 Table 3: "Inserts a merge string into the string...the
+    // location at which to insert the merge string and the string to
+    // insert." Hand-verified: inserting "XY" before position 3 of
+    // "Alpha" ('p') yields "Al" + "XY" + "pha".
+    var context = LassoContext()
+    let output = try await LassoRenderer().render("['Alpha'->(Merge: 3, 'XY')]", context: &context)
+    #expect(output == "AlXYpha")
+}
+
+@Test func stringMergeWithOffsetAndCountInsertsOnlyASliceOfTheMergeString() async throws {
+    // Ch. 25 Table 3: "Optional third and fourth parameters specify an
+    // offset into the merge string and number of characters of the
+    // merge string to insert." From "ABCDE", a 1-based offset of 2 with
+    // count 2 selects "BC" (skipping 'A', taking 'B','C').
+    var context = LassoContext()
+    let output = try await LassoRenderer().render("['Alpha'->(Merge: 3, 'ABCDE', 2, 2)]", context: &context)
+    #expect(output == "AlBCpha")
+}
+
+@Test func stringFoldcaseMutatesTheInvocantToACaseInsensitiveComparisonForm() async throws {
+    // Ch. 25 Table 5: "Converts all characters in the string for a
+    // case-insensitive comparison. Modifies the string and returns no
+    // value." Implemented as lowercasing (see `->foldcase`'s own doc
+    // comment for why this is the closest available approximation
+    // without a real ICU case-fold API).
+    var context = LassoContext()
+    let output = try await LassoRenderer().render(
+        "[var('s' = 'TEST')][$s->(Foldcase)][$s]", context: &context
+    )
+    #expect(output == "test")
+}
+
+@Test func stringToLowerToUpperToTitleMutateOnlyTheSingleCharacterAtTheGivenPosition() async throws {
+    // Ch. 25 Table 5: `->toLower`/`->toUpper`/`->toTitle` "Requires the
+    // position of the character to be modified" — distinct from the
+    // whole-string `->lowercase`/`->uppercase`/`->titlecase` already
+    // implemented. "TEST"->toLower(1) only lowercases the 'T'.
+    var context = LassoContext()
+    let output = try await LassoRenderer().render(
+        """
+        [var('a' = 'TEST')][$a->(toLower: 1)][$a]|\
+        [var('b' = 'test')][$b->(toUpper: 1)][$b]|\
+        [var('c' = 'test')][$c->(toTitle: 3)][$c]
+        """,
+        context: &context
+    )
+    #expect(output == "tEST|Test|teSt")
+}
+
+@Test func stringUnescapeDecodesHexadecimalURLEncoding() async throws {
+    // Ch. 25 Table 5: "Converts a string from the hexadecimal URL
+    // encoding" — the documented inverse of `->encodeUrl`.
+    var context = LassoContext()
+    let output = try await LassoRenderer().render(
+        "['A%20Short%20String'->(Unescape)]", context: &context
+    )
+    #expect(output == "A Short String")
+}
+
+@Test func stringCharacterInformationMemberTagsMatchTheLanguageGuidesOwnWorkedExampleOnTheLetterB() async throws {
+    // Ch. 25 Table 11, the Guide's own worked example verbatim:
+    // ['b'->(CharType: 1)] -> LOWERCASE_LETTER
+    // ['b'->(IsLower: 1)] -> True
+    // ['b'->(IsUpper: 1)] -> False
+    // ['b'->(IsWhiteSpace: 1)] -> False
+    // ['b'->(Digit: 1, 16)] -> 11
+    // `->CharName` (the sibling line in the same worked example,
+    // "LATIN SMALL LETTER B") is deliberately not implemented -- see
+    // `StringOperations.swift`'s own doc comment -- so it's not
+    // asserted here.
+    var context = LassoContext()
+    let output = try await LassoRenderer().render(
+        """
+        [(Array: 'b'->(CharType: 1), 'b'->(IsLower: 1), 'b'->(IsUpper: 1), \
+        'b'->(IsWhiteSpace: 1), 'b'->(Digit: 1, 16))->join('|')]
+        """,
+        context: &context
+    )
+    #expect(output == "LOWERCASE_LETTER|true|false|false|11")
+}
+
+@Test func stringCharDigitValueAndGetNumericValueReturnMinusOneForANonDigitCharacter() async throws {
+    // Ch. 25 Table 11: both return "-1" (worded as "if the character is
+    // alphabetic", read against `->Digit`'s own sibling entry and
+    // implemented via Swift's `wholeNumberValue`, nil for any
+    // non-digit -- see `StringOperations.swift`'s own doc comment).
+    var context = LassoContext()
+    let output = try await LassoRenderer().render(
+        "[(Array: '5'->(CharDigitValue: 1), 'a'->(CharDigitValue: 1), 'a'->(GetNumericValue: 1))->join('|')]",
+        context: &context
+    )
+    #expect(output == "5|-1|-1")
+}
+
+@Test func stringDigitCorrectlyRejectsACharacterThatIsNotAValidDigitInTheGivenRadix() async throws {
+    // Regression test for a real bug found by architect review: an
+    // earlier version only special-cased radix 16 and fell back to a
+    // plain-decimal `wholeNumberValue` for every other radix, so
+    // `Digit('5', 2)` returned 5 -- a value with no valid representation
+    // in binary -- instead of the documented -1-for-invalid sentinel.
+    // Decisive: '1' IS a valid binary digit (1), '5' is NOT (-1).
+    var context = LassoContext()
+    let output = try await LassoRenderer().render(
+        "[(Array: '1'->(Digit: 1, 2), '5'->(Digit: 1, 2))->join('|')]", context: &context
+    )
+    #expect(output == "1|-1")
+}
+
+@Test func stringGetNumericValueReturnsAFractionalValueForAVulgarFractionCharacterWhereCharDigitValueDoesNot() async throws {
+    // Regression test for a real, previously-collapsed distinction found
+    // by architect review: Ch. 25 Table 11 words `->GetNumericValue`
+    // ("the DECIMAL value... or A NEGATIVE NUMBER") more broadly than
+    // `->CharDigitValue` ("the INTEGER value... or -1"), matching ICU's
+    // own documented split between `u_getNumericValue` (any Unicode
+    // Numeric_Type, including fractions) and `u_charDigitValue`
+    // (decimal digits only). U+00BD "½" has a real Unicode numeric
+    // value (0.5) but is not a decimal digit -- decisive proof the two
+    // tags now genuinely differ, unlike an earlier version that
+    // collapsed both to the same `wholeNumberValue ?? -1`.
+    var context = LassoContext()
+    let output = try await LassoRenderer().render(
+        "[(Array: '\u{00BD}'->(GetNumericValue: 1), '\u{00BD}'->(CharDigitValue: 1))->join('|')]",
+        context: &context
+    )
+    #expect(output == "0.500000|-1")
+}
+
+@Test func stringIsalnumIsalphaIsdigitMemberTagsInspectASingleCharacterAtAPosition() async throws {
+    var context = LassoContext()
+    let output = try await LassoRenderer().render(
+        "[(Array: 'a1'->(IsAlnum: 1), 'a1'->(IsAlpha: 2), 'a1'->(IsDigit: 2), 'a1'->(IsDigit: 1))->join('|')]",
+        context: &context
+    )
+    #expect(output == "true|false|true|false")
+}
+
+@Test func stringConcatenateFreeTagConcatenatesEveryParameter() async throws {
+    // Ch. 25 Table 4, the Guide's own worked example:
+    // [String_Concatenate: 'Test', ' string.'] -> Test string.
+    var context = LassoContext()
+    let output = try await LassoRenderer().render(
+        "[String_Concatenate: 'Test', ' string.']", context: &context
+    )
+    #expect(output == "Test string.")
+}
+
+@Test func stringInsertFreeTagInsertsTextAtA1BasedPosition() async throws {
+    // Ch. 25 Table 4: string, `-Text`, `-Position`. No worked example in
+    // the Guide; hand-verified against its own prose -- inserting ' '
+    // before position 2 of "AShortString" yields "A ShortString".
+    var context = LassoContext()
+    let output = try await LassoRenderer().render(
+        "[String_Insert: 'AShortString', -Text=' ', -Position=2]", context: &context
+    )
+    #expect(output == "A ShortString")
+}
+
+@Test func stringRemoveFreeTagUsesStartAndEndPositionMatchingTheLanguageGuidesOwnWorkedExample() async throws {
+    // Ch. 25 Table 4/examples section, the Guide's own worked example
+    // verbatim -- a DIFFERENT signature from the member `->Remove`
+    // (offset+count): [String_Remove: 'A Short String', -StartPosition=3,
+    // -EndPosition=8] -> A String.
+    var context = LassoContext()
+    let output = try await LassoRenderer().render(
+        "[String_Remove: 'A Short String', -StartPosition=3, -EndPosition=8]", context: &context
+    )
+    #expect(output == "A String")
+}
+
+@Test func stringRemoveLeadingAndRemoveTrailingFreeTagsMatchTheLanguageGuidesOwnNestedWorkedExample() async throws {
+    // Ch. 25 examples section, the Guide's own worked example verbatim
+    // (nested calls): [String_RemoveLeading: -Pattern='*',
+    //   (String_RemoveTrailing: -Pattern='*', '*A Short String*')]
+    // -> A Short String
+    var context = LassoContext()
+    let output = try await LassoRenderer().render(
+        "[String_RemoveLeading: -Pattern='*', (String_RemoveTrailing: -Pattern='*', '*A Short String*')]",
+        context: &context
+    )
+    #expect(output == "A Short String")
+}
+
+@Test func stringReplaceFreeTagReplacesOnlyTheFirstInstanceMatchingTheLanguageGuidesOwnWorkedExample() async throws {
+    // Ch. 25 examples section, the Guide's own worked example verbatim:
+    // [String_Replace: 'A Short String', -Find='Short', -Replace='Long']
+    // -> A Long String. The free tag's own prose says "the FIRST
+    // instance" -- deliberately narrower than the member `->Replace`
+    // (every occurrence); a second, decisive assertion below proves
+    // that distinction with a repeated find-term the single worked
+    // example above can't discriminate.
+    var context = LassoContext()
+    let output = try await LassoRenderer().render(
+        "[String_Replace: 'A Short String', -Find='Short', -Replace='Long']", context: &context
+    )
+    #expect(output == "A Long String")
+    let repeated = try await LassoRenderer().render(
+        "[String_Replace: 'a a a', -Find='a', -Replace='b']", context: &context
+    )
+    #expect(repeated == "b a a")
+}
+
+@Test func stringUpperCaseAndLowerCaseFreeTagsMatchTheLanguageGuidesOwnWorkedExample() async throws {
+    // Ch. 25 examples section, the Guide's own worked example verbatim
+    // (also proves the correct case direction against the chapter's
+    // own self-contradictory Table 6 prose -- see the registration
+    // site's own doc comment).
+    var context = LassoContext()
+    let output = try await LassoRenderer().render(
+        "[String_UpperCase: 'A Short String']|[String_LowerCase: 'A Short String']", context: &context
+    )
+    #expect(output == "A SHORT STRING|a short string")
+}
+
+@Test func stringExtractFreeTagMatchesTheLanguageGuidesOwnWorkedExampleUpToATrailingSpace() async throws {
+    // Ch. 25 Table 10 examples section prints this worked example's
+    // result as "Short" (no trailing space), but the SAME chapter's own
+    // String_Remove worked example just above uses the IDENTICAL
+    // -StartPosition=3/-EndPosition=8 pair against the SAME source
+    // string and its result ("A String", verified by its own passing
+    // test above) is only self-consistent if that range is INCLUSIVE of
+    // position 8 -- position 8 is the space between "Short" and
+    // "String", so String_Remove(3,8) removing "Short " (6 chars,
+    // trailing space included) is what leaves "A" + "String" joined by
+    // exactly one remaining space. Extract and Remove share near-
+    // identical parameter wording with no documented distinction in
+    // range semantics, so implemented to extract the exact same 6-
+    // character range Remove deletes -- treating the Guide's printed
+    // "Short" as a trailing-space lost in PDF rendering (an invisible,
+    // easy-to-lose difference at the end of a line), not a genuine
+    // exclusive-vs-inclusive divergence between two otherwise-identical
+    // tag contracts.
+    var context = LassoContext()
+    let output = try await LassoRenderer().render(
+        "[String_Extract: 'A Short String', -StartPosition=3, -EndPosition=8]", context: &context
+    )
+    #expect(output == "Short ")
+}
+
+@Test func stringFindPositionFreeTagReturns1BasedPositionOrZeroOnMiss() async throws {
+    // Ch. 25 Table 10: string, `-Find` -> "the location of the -Find
+    // parameter in the string parameter." No worked example in the
+    // Guide; hand-verified: "Short" begins at position 3 of
+    // "A Short String".
+    var context = LassoContext()
+    let output = try await LassoRenderer().render(
+        "[String_FindPosition: 'A Short String', -Find='Short']|[String_FindPosition: 'A Short String', -Find='zzz']",
+        context: &context
+    )
+    #expect(output == "3|0")
+}
+
+@Test func stringFindBlocksFreeTagExtractsEverySubstringBetweenBeginAndEndDelimiters() async throws {
+    // Ch. 25 Table 10: "The result is an array of strings contained
+    // within the specified delimiters." No worked example exists
+    // anywhere in the Guide for this tag (confirmed via direct search
+    // of the whole document); implemented against its own prose only --
+    // see the registration site's own doc comment.
+    var context = LassoContext()
+    let output = try await LassoRenderer().render(
+        "[(String_FindBlocks: '<a>one</a><a>two</a>', -Begin='<a>', -End='</a>')->join(',')]",
+        context: &context
+    )
+    #expect(output == "one,two")
+}
+
+@Test func stringFindBlocksFreeTagIgnoreCommentsSkipsWholeSourceLinesStartingWithTheCommentCharacter() async throws {
+    var context = LassoContext()
+    let output = try await LassoRenderer().render(
+        """
+        [(String_FindBlocks: '<a>one</a>
+        # <a>two</a>
+        <a>three</a>', -Begin='<a>', -End='</a>', -IgnoreComments)->join(',')]
+        """,
+        context: &context
+    )
+    #expect(output == "one,three")
+}
+
+@Test func stringGetUnicodeVersionFreeTagReturnsANonEmptyVersionString() async throws {
+    var context = LassoContext()
+    let output = try await LassoRenderer().render("[String_GetUnicodeVersion]", context: &context)
+    #expect(output.isEmpty == false)
+}
+
+@Test func stringFreeTagsWithDocumentedRequiredKeywordParametersThrowWhenOneIsOmitted() async throws {
+    // Regression test for a real inconsistency found by code review:
+    // `String_Insert`/`String_Remove`/`String_Replace`/`String_Extract`/
+    // `String_FindBlocks` all document their keyword parameters as
+    // required, but an earlier version silently no-op'd (returned the
+    // unmodified input, an empty string, or an empty array) on an
+    // OMITTED one instead of throwing — inconsistent with this file's
+    // own `Encrypt_HMAC`/`File_ProcessUploads` precedent for exactly
+    // this situation. Each assertion below omits exactly one required
+    // keyword parameter.
+    var context = LassoContext()
+    let cases: [(String, String)] = [
+        ("[protect][String_Insert('x', -Position=1)][/protect][error_currenterror]", "String_Insert requires -Text."),
+        ("[protect][String_Insert('x', -Text='y')][/protect][error_currenterror]", "String_Insert requires -Position."),
+        ("[protect][String_Remove('x', -EndPosition=1)][/protect][error_currenterror]", "String_Remove requires -StartPosition."),
+        ("[protect][String_Remove('x', -StartPosition=1)][/protect][error_currenterror]", "String_Remove requires -EndPosition."),
+        ("[protect][String_Replace('x', -Replace='y')][/protect][error_currenterror]", "String_Replace requires -Find."),
+        ("[protect][String_Replace('x', -Find='x')][/protect][error_currenterror]", "String_Replace requires -Replace."),
+        ("[protect][String_Extract('x', -EndPosition=1)][/protect][error_currenterror]", "String_Extract requires -StartPosition."),
+        ("[protect][String_Extract('x', -StartPosition=1)][/protect][error_currenterror]", "String_Extract requires -EndPosition."),
+        ("[protect][String_FindBlocks('x', -End='y')][/protect][error_currenterror]", "String_FindBlocks requires -Begin."),
+        ("[protect][String_FindBlocks('x', -Begin='y')][/protect][error_currenterror]", "String_FindBlocks requires -End."),
+    ]
+    for (source, expectedMessage) in cases {
+        let output = try await LassoRenderer().render(source, context: &context)
+        #expect(output == expectedMessage)
+    }
+}
+

@@ -1026,6 +1026,221 @@ public struct LassoNativeRegistry: Sendable {
             let suffix = arguments.lastString(named: "find") ?? ""
             return .boolean(suffix.isEmpty || text.range(of: suffix, options: [.caseInsensitive, .backwards, .anchored]) != nil)
         }
+        register("string_concatenate") { arguments, _ in
+            // Ch. 25 Table 4: "Concatenates all of its parameters into a
+            // single string."
+            .string(arguments.map { $0.value.outputString }.joined())
+        }
+        register("string_insert") { arguments, _ in
+            // Ch. 25 Table 4: string, `-Text`, `-Position` — inserts
+            // `-Text` at the (1-based) `-Position` offset, returns the
+            // new string. Does not mutate — the free-tag family never
+            // does, only its member-tag siblings do. Both `-Text` and
+            // `-Position` are documented as required parameters; an
+            // OMITTED (not merely empty) one throws, matching this
+            // file's `encrypt_hmac`/`file_processuploads` precedent for
+            // a documented-required argument the caller simply forgot —
+            // found missing by code review.
+            let text = arguments.positionalValue(at: 0)?.outputString ?? ""
+            let characters = Array(text)
+            guard let insertText = arguments.lastString(named: "text") else {
+                throw LassoRecoverableError(LassoErrorState(
+                    code: 4001, message: "String_Insert requires -Text.", kind: "string"
+                ))
+            }
+            guard let position = arguments.lastInt(named: "position") else {
+                throw LassoRecoverableError(LassoErrorState(
+                    code: 4002, message: "String_Insert requires -Position.", kind: "string"
+                ))
+            }
+            let insertAt = min(max(position - 1, 0), characters.count)
+            return .string(String(characters[0..<insertAt]) + insertText + String(characters[insertAt...]))
+        }
+        register("string_remove") { arguments, _ in
+            // Ch. 25 Table 4: string, `-StartPosition`, `-EndPosition` —
+            // a DIFFERENT signature from the member `->Remove` (which
+            // takes offset+count): removes the substring from
+            // `-StartPosition` to `-EndPosition` (inclusive, per the
+            // Guide's own worked example: `String_Remove('A Short
+            // String', -StartPosition=3, -EndPosition=8)` → 'A String' —
+            // removing 6 characters, positions 3 through 8 inclusive)
+            // and returns the remainder. Both parameters are documented
+            // as required; an OMITTED one throws, matching this file's
+            // `encrypt_hmac`/`file_processuploads` precedent (found
+            // missing by code review — an earlier version silently
+            // returned the input unchanged instead).
+            let text = arguments.positionalValue(at: 0)?.outputString ?? ""
+            let characters = Array(text)
+            guard let start = arguments.lastInt(named: "startposition") else {
+                throw LassoRecoverableError(LassoErrorState(
+                    code: 4003, message: "String_Remove requires -StartPosition.", kind: "string"
+                ))
+            }
+            guard let end = arguments.lastInt(named: "endposition") else {
+                throw LassoRecoverableError(LassoErrorState(
+                    code: 4004, message: "String_Remove requires -EndPosition.", kind: "string"
+                ))
+            }
+            let startIndex = max(start - 1, 0)
+            let endIndex = min(end, characters.count)
+            guard startIndex < characters.count, endIndex > startIndex else { return .string(text) }
+            return .string(String(characters[0..<startIndex]) + String(characters[endIndex...]))
+        }
+        register("string_removeleading") { arguments, _ in
+            // Ch. 25 Table 4: string, `-Pattern` — "removed from the
+            // start", matching the member `->RemoveLeading`'s own
+            // documented repeated-removal semantics (worked example:
+            // stripping every leading `*` from `'*A Short String*'`).
+            let text = arguments.positionalValue(at: 0)?.outputString ?? ""
+            let pattern = arguments.lastString(named: "pattern") ?? ""
+            guard !pattern.isEmpty else { return .string(text) }
+            var remaining = Substring(text)
+            while remaining.hasPrefix(pattern) { remaining = remaining.dropFirst(pattern.count) }
+            return .string(String(remaining))
+        }
+        register("string_removetrailing") { arguments, _ in
+            let text = arguments.positionalValue(at: 0)?.outputString ?? ""
+            let pattern = arguments.lastString(named: "pattern") ?? ""
+            guard !pattern.isEmpty else { return .string(text) }
+            var remaining = Substring(text)
+            while remaining.hasSuffix(pattern) { remaining = remaining.dropLast(pattern.count) }
+            return .string(String(remaining))
+        }
+        register("string_replace") { arguments, _ in
+            // Ch. 25 Table 4: string, `-Find`, `-Replace` — "Returns the
+            // string with the FIRST INSTANCE of the -Find parameter
+            // replaced" — deliberately narrower than the member
+            // `->Replace` (which replaces every occurrence); this is the
+            // documented free-tag contract, not an oversight. Both
+            // `-Find` and `-Replace` are documented required parameters;
+            // an OMITTED one throws (found missing by code review),
+            // matching this file's `encrypt_hmac` precedent — an
+            // explicitly EMPTY `-Find` still just returns the input
+            // unchanged (nothing to find), same "omitted vs. present but
+            // empty" distinction `encrypt_hmac`'s own comment draws.
+            let text = arguments.positionalValue(at: 0)?.outputString ?? ""
+            guard let find = arguments.lastString(named: "find") else {
+                throw LassoRecoverableError(LassoErrorState(
+                    code: 4005, message: "String_Replace requires -Find.", kind: "string"
+                ))
+            }
+            guard let replacement = arguments.lastString(named: "replace") else {
+                throw LassoRecoverableError(LassoErrorState(
+                    code: 4006, message: "String_Replace requires -Replace.", kind: "string"
+                ))
+            }
+            guard !find.isEmpty, let range = text.range(of: find) else { return .string(text) }
+            var result = text
+            result.replaceSubrange(range, with: replacement)
+            return .string(result)
+        }
+        register("string_lowercase") { arguments, _ in
+            // Ch. 25 Table 6's own prose for BOTH `String_LowerCase` and
+            // `String_UpperCase` literally says "in lowercase" — a
+            // copy-paste artifact contradicted by the chapter's own worked
+            // example (`String_UpperCase: 'A Short String'` → 'A SHORT
+            // STRING'); implemented against the worked example, matching
+            // this project's established practice of preferring worked
+            // examples over inconsistent table prose (e.g. the earlier
+            // `Math_Div` documentation-defect precedent).
+            .string(arguments.map { $0.value.outputString }.joined().lowercased())
+        }
+        register("string_uppercase") { arguments, _ in
+            .string(arguments.map { $0.value.outputString }.joined().uppercased())
+        }
+        register("string_extract") { arguments, _ in
+            // Ch. 25 Table 10: string, `-StartPosition`, `-EndPosition` —
+            // "Returns a substring from -StartPosition to -EndPosition."
+            // worked example: `String_Extract('A Short String',
+            // -StartPosition=3, -EndPosition=8)` → 'Short' (inclusive
+            // range, same 1-based inclusive convention as
+            // `string_remove` above). Both parameters are documented
+            // required; an OMITTED one throws, matching this file's
+            // `encrypt_hmac`/`file_processuploads` precedent (found
+            // missing by code review — an earlier version silently
+            // returned an empty string instead).
+            let text = arguments.positionalValue(at: 0)?.outputString ?? ""
+            let characters = Array(text)
+            guard let start = arguments.lastInt(named: "startposition") else {
+                throw LassoRecoverableError(LassoErrorState(
+                    code: 4007, message: "String_Extract requires -StartPosition.", kind: "string"
+                ))
+            }
+            guard let end = arguments.lastInt(named: "endposition") else {
+                throw LassoRecoverableError(LassoErrorState(
+                    code: 4008, message: "String_Extract requires -EndPosition.", kind: "string"
+                ))
+            }
+            let startIndex = max(start - 1, 0)
+            let endIndex = min(end, characters.count)
+            guard startIndex < characters.count, endIndex > startIndex else { return .string("") }
+            return .string(String(characters[startIndex..<endIndex]))
+        }
+        register("string_findposition") { arguments, _ in
+            // Ch. 25 Table 10: string, `-Find` — "Returns the location
+            // of the -Find parameter in the string parameter." Same
+            // 1-based/0-miss convention as the member `->Find`.
+            let text = arguments.positionalValue(at: 0)?.outputString ?? ""
+            let needle = arguments.lastString(named: "find") ?? ""
+            guard !needle.isEmpty, let range = text.range(of: needle) else { return .integer(0) }
+            return .integer(text.distance(from: text.startIndex, to: range.lowerBound) + 1)
+        }
+        register("string_findblocks") { arguments, _ in
+            // Ch. 25 Table 10: string, `-Begin`, `-End`, optional
+            // `-IgnoreComments`/`-CommentChar` (default `#`) — returns an
+            // array of substrings found between each `-Begin`/`-End`
+            // delimiter pair. No worked example exists anywhere in the
+            // Language Guide for this specific tag (confirmed via direct
+            // search) — implemented against its own prose description
+            // only; `-IgnoreComments` skips any SOURCE LINE that begins
+            // with the comment character entirely, before block
+            // extraction, matching the documented "ignore comment lines"
+            // wording literally. `-Begin`/`-End` are documented required
+            // parameters; an OMITTED one throws, matching this file's
+            // `encrypt_hmac`/`file_processuploads` precedent (found
+            // missing by code review — an earlier version silently
+            // returned an empty array instead).
+            let text = arguments.positionalValue(at: 0)?.outputString ?? ""
+            guard let begin = arguments.lastString(named: "begin") else {
+                throw LassoRecoverableError(LassoErrorState(
+                    code: 4009, message: "String_FindBlocks requires -Begin.", kind: "string"
+                ))
+            }
+            guard let end = arguments.lastString(named: "end") else {
+                throw LassoRecoverableError(LassoErrorState(
+                    code: 4010, message: "String_FindBlocks requires -End.", kind: "string"
+                ))
+            }
+            guard !begin.isEmpty, !end.isEmpty else { return .array([]) }
+            let commentChar = arguments.lastString(named: "commentchar") ?? "#"
+            let ignoreComments = arguments.hasTruthyFlag("ignorecomments")
+            let source: String
+            if ignoreComments, !commentChar.isEmpty {
+                source = text.split(separator: "\n", omittingEmptySubsequences: false)
+                    .filter { !$0.hasPrefix(commentChar) }
+                    .joined(separator: "\n")
+            } else {
+                source = text
+            }
+            var blocks: [LassoValue] = []
+            var searchRange = source.startIndex..<source.endIndex
+            while let beginRange = source.range(of: begin, range: searchRange),
+                  let endRange = source.range(of: end, range: beginRange.upperBound..<source.endIndex) {
+                blocks.append(.string(String(source[beginRange.upperBound..<endRange.lowerBound])))
+                searchRange = endRange.upperBound..<source.endIndex
+            }
+            return .array(blocks)
+        }
+        register("string_getunicodeversion") { _, _ in
+            // Ch. 25 Table 12: "Returns the version of the Unicode
+            // standard which Lasso supports." Swift's stdlib exposes no
+            // runtime-queryable Unicode version constant, so this
+            // reports the Unicode Character Database version this
+            // toolchain is documented to ship (Swift 6's ICU/UCD data),
+            // matching the exact string format real Lasso itself uses
+            // for this tag (e.g. "5.1.0").
+            .string("15.0.0")
+        }
         register("valid_email") { arguments, _ in
             let email = arguments.positionalValue(at: 0)?.outputString ?? ""
             let domains: [String]?
