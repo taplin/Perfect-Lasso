@@ -114,7 +114,7 @@ struct Evaluator {
                 let leftValue = try await evaluate(left)
                 let rightValue = try await evaluate(right)
                 if let elements = LassoMatcherValue.iterableElements(of: leftValue) {
-                    return .boolean(elements.contains { LassoMatcherValue.matches(rightValue, element: $0, context: context) })
+                    return .boolean(try await LassoMatcherValue.anyMatches(rightValue, in: elements, context: context))
                 }
                 return try binary(leftValue, op, rightValue)
             }
@@ -1220,7 +1220,7 @@ struct Evaluator {
             // comment for why these two now genuinely diverge (Stage 5).
             guard let argument = arguments.first else { return .object(object) }
             let matcherOrKey = try await evaluate(argument.value)
-            let updated = LassoTreeMapValue.removingAllMatchingKey(matcherOrKey, from: object, context: context)
+            let updated = try await LassoTreeMapValue.removingAllMatchingKey(matcherOrKey, from: object, context: context)
             return .object(LassoTreeMapValue.makeObject(kind: LassoTreeMapValue.kind(of: object), entries: updated))
         case let (.array(values), "get"):
             let requested: Double?
@@ -1266,10 +1266,10 @@ struct Evaluator {
             // `->Iterator`-supporting types — verified against the
             // p.423 worked example's own `Array->Iterator` call.
             let matcher = arguments.first != nil ? try await evaluate(arguments[0].value) : nil
-            return LassoIteratorValue.build(from: .array(values), reverse: false, matcher: matcher, context: context) ?? .null
+            return try await LassoIteratorValue.build(from: .array(values), reverse: false, matcher: matcher, context: context) ?? .null
         case let (.array(values), "reverseiterator"):
             let matcher = arguments.first != nil ? try await evaluate(arguments[0].value) : nil
-            return LassoIteratorValue.build(from: .array(values), reverse: true, matcher: matcher, context: context) ?? .null
+            return try await LassoIteratorValue.build(from: .array(values), reverse: true, matcher: matcher, context: context) ?? .null
         case let (.array(values), "join"):
             // `array->join(separator)` — real corpus need: comma/CSV-list
             // and breadcrumb-trail building, previously requiring a manual
@@ -1291,7 +1291,7 @@ struct Evaluator {
             // coercing equality for a non-matcher argument, so this is
             // a behavior-preserving extension for existing callers.
             let needle = arguments.first != nil ? try await evaluate(arguments[0].value) : .null
-            return .boolean(values.contains { LassoMatcherValue.matches(needle, element: $0, context: context) })
+            return .boolean(try await LassoMatcherValue.anyMatches(needle, in: values, context: context))
         case let (.array(values), "find"):
             // Ch. 30 p.390/395-396: returns an ARRAY of every element that
             // matches the parameter, not a boolean and not a position. A
@@ -1305,7 +1305,7 @@ struct Evaluator {
             // to do manually (Table 22: "Only the first part of pairs...
             // is compared").
             let needle = arguments.first != nil ? try await evaluate(arguments[0].value) : .null
-            return .array(values.filter { LassoMatcherValue.matches(needle, element: $0, context: context) })
+            return .array(try await LassoMatcherValue.filterMatching(needle, in: values, context: context))
         case let (.array(values), "findposition"):
             // Ch. 30 p.390 (previously named `->FindIndex`): returns an
             // array of the 1-based indices for EVERY match, not just the
@@ -1348,7 +1348,7 @@ struct Evaluator {
             // `(1,5,6,7)`.
             guard let argument = arguments.first else { return .array(values) }
             let target = try await evaluate(argument.value)
-            return .array(values.filter { !LassoMatcherValue.matches(target, element: $0, context: context) })
+            return .array(try await LassoMatcherValue.filterNotMatching(target, in: values, context: context))
         // `.map` dispatch tries a literal key match FIRST, falling back to
         // these documented methods only on a miss — NOT the other way
         // around. This codebase already uses `.map` for two different
@@ -1415,10 +1415,10 @@ struct Evaluator {
             // p.424 worked example's own key+value `While` loop
             // (`$myIterator->Key + ' = ' + $myIterator->Value`).
             let matcher = arguments.first != nil ? try await evaluate(arguments[0].value) : nil
-            return LassoIteratorValue.build(from: .map(values), reverse: false, matcher: matcher, context: context) ?? .null
+            return try await LassoIteratorValue.build(from: .map(values), reverse: false, matcher: matcher, context: context) ?? .null
         case let (.map(values), "reverseiterator"):
             let matcher = arguments.first != nil ? try await evaluate(arguments[0].value) : nil
-            return LassoIteratorValue.build(from: .map(values), reverse: true, matcher: matcher, context: context) ?? .null
+            return try await LassoIteratorValue.build(from: .map(values), reverse: true, matcher: matcher, context: context) ?? .null
         case let (.map(values), "contains"):
             let key = arguments.first != nil ? try await evaluate(arguments[0].value).outputString : ""
             return .boolean(values[key] != nil)

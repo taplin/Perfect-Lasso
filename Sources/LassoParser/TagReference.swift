@@ -14,27 +14,25 @@ import Foundation
 /// (`\Compare_LessThan` ≡ `(Compare_LessThan)`) — wired into every
 /// existing built-in-comparator consumer (PriorityQueue/TreeMap
 /// construction, Array/List->SortWith, Match_Comparator) with no
-/// additional work. A tag reference naming a genuinely CUSTOM
-/// (user-`Define_Tag`'d) comparator is recognized as a valid reference
-/// (evaluating `\MyCustomComparator` does not throw, as long as
-/// `MyCustomComparator` is actually defined) but is NOT YET dispatched
-/// as a real comparator — every current comparator-consuming call site
-/// falls back to its own existing "unrecognized comparator value"
-/// behavior (natural/lessthan order), exactly as it already does for any
-/// other non-comparator value.
+/// additional work.
 ///
-/// Real custom-comparator dispatch needs a way to invoke a named tag by
-/// evaluated arguments from inside a `LassoNativeType.register` closure
-/// (`NativeTypes.swift`'s `LassoNativeMethod` typealias — receiver/
-/// arguments/`inout context` only, no access to `Evaluator.renderNodes`,
-/// which is what actually runs a tag body). That's a genuine, newly-
-/// discovered architecture gap — `LassoNativeMethod`'s signature would
-/// need to carry tag-invocation capability, a change touching every
-/// already-shipped native-type method table in this codebase (session,
-/// web_request, web_response, and every Collections type), not just
-/// Collections' own code. Deferred alongside custom Matchers via
-/// `onCompare` (already flagged as this plan's highest-risk item) as its
-/// own follow-up scoping pass — see plan §5/§6.
+/// **Custom (user-`Define_Tag`'d) comparators now dispatch for real,
+/// as of Stage 7a+7b**: `LassoTagInvocationService` (`Providers.swift`,
+/// Stage 7a) gives a way to invoke a named tag by evaluated arguments
+/// from inside a `LassoNativeType.register` closure — the architecture
+/// gap this doc comment used to describe as blocking real dispatch.
+/// `LassoComparatorValue.evaluateCustom` (Stage 7b) uses it to actually
+/// run a `\MyCustomComparator` reference's tag body when consumed via
+/// `Match_Comparator`/`LassoMatcherValue.matches`. Still NOT wired into
+/// default collection ordering (`PriorityQueue`/`TreeMap` construction,
+/// `Array`/`List->Sort`/`->SortWith`) — those remain synchronous
+/// (`Evaluator.lassoLessThan`/`LassoComparatorValue.isOrderedBefore`
+/// inside `sorted(by:)`, which has no async-predicate overload in the
+/// standard library), so a custom comparator given there still falls
+/// back to Stage 2's own pre-existing "unrecognized comparator value"
+/// natural/lessthan-order behavior. That's Stage 7c's scope. Custom
+/// Matchers via `Define_Type`+`onCompare` remain wholly undispatched —
+/// still this plan's own highest-risk item, deferred separately.
 enum LassoTagReferenceValue {
     static let typeName = "tagreference"
 

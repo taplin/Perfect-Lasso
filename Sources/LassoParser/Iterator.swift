@@ -73,7 +73,7 @@ enum LassoIteratorValue {
         reverse: Bool,
         matcher: LassoValue? = nil,
         context: LassoContext = LassoContext()
-    ) -> LassoValue? {
+    ) async throws -> LassoValue? {
         var elements: [LassoValue]
         var hasKeys = false
         switch source {
@@ -100,7 +100,7 @@ enum LassoIteratorValue {
         // the same worked example's `While` loop only ever sees the
         // already-filtered set.
         if let matcher {
-            elements = elements.filter { LassoMatcherValue.matches(matcher, element: $0, context: context) }
+            elements = try await LassoMatcherValue.filterMatching(matcher, in: elements, context: context)
         }
         if reverse { elements.reverse() }
         return .object(makeObject(elements: elements, hasKeys: hasKeys))

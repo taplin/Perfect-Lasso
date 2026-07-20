@@ -931,12 +931,12 @@ public struct LassoNativeRegistry: Sendable {
         register("iterator") { arguments, context in
             guard let source = arguments.first?.value else { return .null }
             let matcher = arguments.positionalValue(at: 1)
-            return LassoIteratorValue.build(from: source, reverse: false, matcher: matcher, context: context) ?? .null
+            return try await LassoIteratorValue.build(from: source, reverse: false, matcher: matcher, context: context) ?? .null
         }
         register("reverseiterator") { arguments, context in
             guard let source = arguments.first?.value else { return .null }
             let matcher = arguments.positionalValue(at: 1)
-            return LassoIteratorValue.build(from: source, reverse: true, matcher: matcher, context: context) ?? .null
+            return try await LassoIteratorValue.build(from: source, reverse: true, matcher: matcher, context: context) ?? .null
         }
         register("json_serialize") { arguments, _ in
             let value = arguments.first?.value ?? .null
@@ -1998,4 +1998,18 @@ public enum LassoRuntimeError: Error, Equatable {
     /// mismatch here is a real authoring error worth failing loudly on,
     /// not silently defaulting through.
     case tagInvocationArityMismatch(String)
+    /// `LassoTagInvocationService` (`Providers.swift`) was needed but
+    /// `context.tagInvocationService` was `nil` — matches the
+    /// established `includeRenderService`/`includeNotConfigured`
+    /// convention (`NativeTypes.swift`'s `web_response->include*`
+    /// methods): a missing service throws rather than silently
+    /// degrading. Found by architect review — `evaluateCustom`
+    /// (`Comparators.swift`) originally returned `-1` ("not a valid
+    /// comparison") on a nil service, which is indistinguishable from a
+    /// legitimately non-matching comparator and would silently make
+    /// every `Match_Comparator` wrapping a custom `\TagName` reference
+    /// report "no match" for any `LassoContext` built outside
+    /// `LassoRenderer`/`RendererEngine` (the only place that wires this
+    /// service up).
+    case tagInvocationNotConfigured
 }

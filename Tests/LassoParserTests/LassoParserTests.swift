@@ -9357,6 +9357,121 @@ struct IncludeURLTests {
     #expect(output == "1,5,6,7|Monday,Wednesday,Friday|5,6,7")
 }
 
+@Test func matchComparatorDispatchesARealCustomTagBodyNotJustBuiltIns() async throws {
+    // Stage 7b: `Match_Comparator` wrapping a `\TagName` reference to a
+    // genuine user-`Define_Tag`'d comparator now actually RUNS that
+    // tag's own body (via LassoTagInvocationService, Stage 7a) rather
+    // than falling back to "unrecognized comparator" behavior. `IsEven`
+    // ignores its `-RHS`/`-LHS` operand entirely and only inspects
+    // `Left` — proves real per-element dispatch, not a fixed/cached
+    // result, since different elements must genuinely produce different
+    // outcomes.
+    var context = LassoContext()
+    let output = try await LassoRenderer().render(
+        """
+        [
+        Define_Tag('IsEven', -Required='Left', -Required='Right');
+            Return((Local: 'Left') % 2 == 0 ? 0 | -1);
+        /Define_Tag;
+        var('a' = array(1, 2, 3, 4, 5));
+        ]\
+        [(array: 1, 2, 3, 4, 5) >> (match_comparator: \\IsEven)]|\
+        [$a->Contains(match_comparator(\\IsEven))]|\
+        [var('found' = $a->Find(match_comparator(\\IsEven)))][$found->Join(',')]|\
+        [$a->RemoveAll(match_comparator(\\IsEven))][$a->Join(',')]
+        """,
+        context: &context
+    )
+    #expect(output == "true|true|2,4|1,3,5")
+}
+
+@Test func matchComparatorCustomDispatchHonorsRhsAndLhsFormsLikeBuiltIns() async throws {
+    // Same -RHS/-LHS asymmetry the built-in-comparator worked example
+    // proves (matchComparatorRhsAndLhsFormsMatchTheGuidesOwnWorkedExamples
+    // above), but for a genuine custom tag: `IsLessThan` mirrors
+    // \Compare_LessThan's own semantics by hand, confirming -RHS means
+    // evaluate(element, RHS) and -LHS means evaluate(LHS, element) for
+    // a REAL dispatched tag body too, not just the built-in path.
+    var context = LassoContext()
+    let output = try await LassoRenderer().render(
+        """
+        [
+        Define_Tag('IsLessThan', -Required='Left', -Required='Right');
+            Return((Local: 'Left') < (Local: 'Right') ? 0 | -1);
+        /Define_Tag;
+        ]\
+        [(array: 1, 2, 3) >> (match_comparator: \\IsLessThan, -rhs=5)]|\
+        [(array: 1, 2, 3) >> (match_comparator: \\IsLessThan, -lhs=5)]
+        """,
+        context: &context
+    )
+    #expect(output == "true|false")
+}
+
+@Test func matchComparatorCustomDispatchOnAnEmptyCollectionNeverInvokesTheTag() async throws {
+    // No element means the comparator tag body never runs at all — not
+    // "runs zero times but somehow still returns a sane default,"
+    // genuinely never invoked. Uses a comparator that would throw if
+    // ever actually called, so a wrong invocation would fail the test
+    // rather than silently passing.
+    var context = LassoContext()
+    let output = try await LassoRenderer().render(
+        """
+        [
+        Define_Tag('AlwaysThrows', -Required='Left', -Required='Right');
+            NoSuchTagAtAll();
+        /Define_Tag;
+        var('empty' = array);
+        ]\
+        [$empty->Contains(match_comparator(\\AlwaysThrows))]
+        """,
+        context: &context
+    )
+    #expect(output == "false")
+}
+
+@Test func matchComparatorCustomDispatchPropagatesAnErrorThrownInsideTheTagBody() async throws {
+    // A custom comparator tag that itself throws mid-evaluation must
+    // abort the whole ->Contains/->Find/->RemoveAll/`>>` operation, not
+    // get silently swallowed or treated as "no match."
+    var context = LassoContext()
+    await #expect(throws: LassoRuntimeError.unknownFunction("NoSuchTagAtAll")) {
+        _ = try await LassoRenderer().render(
+            """
+            [
+            Define_Tag('Broken', -Required='Left', -Required='Right');
+                NoSuchTagAtAll();
+            /Define_Tag;
+            ]\
+            [(array: 1, 2, 3) >> (match_comparator: \\Broken)]
+            """,
+            context: &context
+        )
+    }
+}
+
+@Test func matchComparatorCustomDispatchWithTooFewDeclaredArgumentsThrowsArityMismatch() async throws {
+    // A comparator tag declaring MORE required parameters than the
+    // fixed [left, right] this dispatch path always supplies must fail
+    // loudly (LassoTagInvocationService's own disclosed scope limit —
+    // no default-parameter-expression evaluation), not silently bind a
+    // wrong/missing value.
+    var context = LassoContext()
+    await #expect(throws: LassoRuntimeError.tagInvocationArityMismatch("NeedsThree")) {
+        _ = try await LassoRenderer().render(
+            """
+            [
+            Define_Tag('NeedsThree', -Required='Left', -Required='Right', -Required='Extra');
+                Return(-1);
+            /Define_Tag;
+            ]\
+            [(array: 1, 2, 3) >> (match_comparator: \\NeedsThree)]
+            """,
+            context: &context
+        )
+    }
+}
+
 @Test func iteratorWithAMatcherFiltersElementsMatchingTheGuidesOwnWorkedExample() async throws {
     // Ch. 30 p.426: `Iterator($myArray, (Match_Range: 'a', 'm'))` on
     // `('One','Two','Three','Four')` — the Guide's own stated result

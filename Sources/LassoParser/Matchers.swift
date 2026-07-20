@@ -64,7 +64,28 @@ enum LassoMatcherValue {
     /// evaluated, and nothing in Table 22 suggests a `Match_Range`/
     /// `Match_RegExp`/etc. matcher should behave differently against a
     /// pair's second half than a literal matcher does.
-    static func matches(_ matcherOrLiteral: LassoValue, element rawElement: LassoValue, context: LassoContext) -> Bool {
+    ///
+    /// **`async throws`, Stage 7b** — was sync/non-throwing before;
+    /// still takes `context` BY VALUE (not `inout`), deliberately. Only
+    /// the "comparator" case's NEW custom-tag dispatch branch below
+    /// needs to actually invoke a tag body (`LassoTagInvocationService`,
+    /// Stage 7a), which requires `inout` access — rather than making
+    /// `context` `inout` here and rippling that through every one of
+    /// this function's ~12-15 call sites across the codebase (List/Set/
+    /// TreeMap's native methods, Array/Map's Evaluator cases, `>>`,
+    /// Iterator's own matcher-filter), a local mutable COPY is made
+    /// only inside that one branch. This is a disclosed, real scope
+    /// limit: side effects from WITHIN a custom comparator/matcher
+    /// tag's own body (setting a global variable, triggering an
+    /// include, logging) do not propagate back out to the caller's
+    /// context once the match/sort/filter completes — only the tag's
+    /// RETURN VALUE (the actual comparison result) does. A comparator
+    /// tag producing such side effects would be unusual regardless
+    /// (the Guide's own worked example is pure `Return(-1)`/`Return(0)`
+    /// logic, and a comparator may run an unpredictable number of times
+    /// during a sort/filter pass, making side effects there ill-advised
+    /// in real Lasso code even where technically possible).
+    static func matches(_ matcherOrLiteral: LassoValue, element rawElement: LassoValue, context: LassoContext) async throws -> Bool {
         let element: LassoValue
         if case let .pair(key, _) = rawElement {
             element = key
@@ -116,30 +137,58 @@ enum LassoMatcherValue {
             // (`\Compare_LessThan, -RHS=5` → true for every element of
             // `(1,2,3)`; `-LHS=5` → false for the same array, since none
             // of 1,2,3 is greater than 5).
-            guard let comparatorKind = LassoComparatorValue.kind(of: instance.value(for: "_comparator")) else { return false }
-            if instance.value(for: "_haslhs").isTruthy {
-                let lhs = instance.value(for: "_lhs")
+            let comparatorValue = instance.value(for: "_comparator")
+            let hasLHS = instance.value(for: "_haslhs").isTruthy
+            let lhs = instance.value(for: "_lhs")
+            let rhs = instance.value(for: "_rhs")
+            // Stage 7b: a genuine custom (non-built-in) `\TagName`
+            // reference dispatches for real now — see `matches`'s own
+            // doc comment above for the context-by-value/local-copy
+            // tradeoff this requires.
+            if let customTagName = LassoComparatorValue.customTagName(of: comparatorValue) {
+                var mutableContext = context
+                let result = hasLHS
+                    ? try await LassoComparatorValue.evaluateCustom(tagName: customTagName, left: lhs, right: element, context: &mutableContext)
+                    : try await LassoComparatorValue.evaluateCustom(tagName: customTagName, left: element, right: rhs, context: &mutableContext)
+                return result == 0
+            }
+            guard let comparatorKind = LassoComparatorValue.kind(of: comparatorValue) else { return false }
+            if hasLHS {
                 return LassoComparatorValue.evaluate(kind: comparatorKind, left: lhs, right: element, context: context) == 0
             }
-            let rhs = instance.value(for: "_rhs")
             return LassoComparatorValue.evaluate(kind: comparatorKind, left: element, right: rhs, context: context) == 0
         default:
             return false
         }
     }
 
-    /// Case-insensitive counterpart to `Evaluator.lassoLessThan`, used
-    /// ONLY by `Match_Range`/`Match_NotRange` above — see that case's
-    /// own doc comment for why. Mirrors `Evaluator.lassoSortKey`'s own
-    /// "numeric values compare numerically, everything else compares
-    /// as a string" structure, differing only in lowercasing the
-    /// string bucket.
-    private static func lassoLessThanCaseInsensitive(_ lhs: LassoValue, _ rhs: LassoValue) -> Bool {
-        func key(_ value: LassoValue) -> (Int, Double, String) {
-            if let number = value.number, number.isFinite { return (0, number, "") }
-            return (1, 0, value.outputString.lowercased())
+    /// Stage 7b: small shared helpers so every one of `matches`'s
+    /// ~10 call sites (List/Set/TreeMap's native methods, Array/Map's
+    /// Evaluator cases, `>>`, Iterator's own matcher-filter) doesn't
+    /// hand-roll the same async-for-loop-in-place-of-a-sync-closure
+    /// conversion — `.contains{}`/`.filter{}` can't take an `async`
+    /// predicate, so each site would otherwise repeat this by hand.
+    static func anyMatches(_ matcherOrLiteral: LassoValue, in elements: [LassoValue], context: LassoContext) async throws -> Bool {
+        for element in elements where try await matches(matcherOrLiteral, element: element, context: context) {
+            return true
         }
-        return key(lhs) < key(rhs)
+        return false
+    }
+
+    static func filterMatching(_ matcherOrLiteral: LassoValue, in elements: [LassoValue], context: LassoContext) async throws -> [LassoValue] {
+        var result: [LassoValue] = []
+        for element in elements where try await matches(matcherOrLiteral, element: element, context: context) {
+            result.append(element)
+        }
+        return result
+    }
+
+    static func filterNotMatching(_ matcherOrLiteral: LassoValue, in elements: [LassoValue], context: LassoContext) async throws -> [LassoValue] {
+        var result: [LassoValue] = []
+        for element in elements where try await !matches(matcherOrLiteral, element: element, context: context) {
+            result.append(element)
+        }
+        return result
     }
 
     /// Shared by the `>>` operator fix and any future matcher-aware

@@ -24,11 +24,19 @@ import Foundation
 /// and `(Compare_LessThan)` are now equivalent everywhere a Comparator is
 /// consumed. The free-tag form is kept, not removed — real corpus never
 /// uses `\`-prefixed syntax (grepped: zero hits across all corpus
-/// fixtures) and existing tests/call sites already depend on it. Real
-/// CUSTOM (user-`Define_Tag`'d) comparators referenced via `\TagName`
-/// are recognized as valid but not yet dispatched — see
-/// `TagReference.swift`'s own doc comment for the architectural gap
-/// blocking that.
+/// fixtures) and existing tests/call sites already depend on it.
+/// **Stage 7b now dispatches real CUSTOM (user-`Define_Tag`'d)
+/// comparators too** — `evaluateCustom(tagName:left:right:context:)`
+/// below actually invokes the referenced tag's body via
+/// `LassoTagInvocationService` (`Providers.swift`, Stage 7a
+/// plumbing), consumed by `LassoMatcherValue.matches`'s "comparator"
+/// case for `Match_Comparator`. Still NOT wired into default collection
+/// ordering (`PriorityQueue`/`TreeMap` construction, `Array`/
+/// `List->Sort`/`->SortWith`) — those stay on the SYNC `evaluate`/
+/// `isOrderedBefore` below, which have no async-dispatch path; a custom
+/// comparator given there still falls back to natural/lessthan order
+/// (Stage 2's own pre-existing "unrecognized comparator" behavior).
+/// That's Stage 7c's scope, not this one.
 enum LassoComparatorValue {
     static let typeName = "comparator"
 
@@ -63,6 +71,21 @@ enum LassoComparatorValue {
         return nil
     }
 
+    /// The as-written tag name from a `\TagName` reference (`kind(of:)`
+    /// unwraps and normalizes for a BUILT-IN match; this is its
+    /// complement — returns non-`nil` only when the reference does NOT
+    /// name a built-in, i.e. a genuine custom comparator). Stage 7b
+    /// uses this to dispatch real invocation (`evaluateCustom` below);
+    /// every pre-Stage-7b consumer of `kind(of:)` alone still gets
+    /// `nil` for a custom reference and falls back to its own existing
+    /// "unrecognized comparator" behavior unchanged.
+    static func customTagName(of value: LassoValue) -> String? {
+        guard let referencedName = LassoTagReferenceValue.name(of: value) else { return nil }
+        var candidate = referencedName.lowercased()
+        if candidate.hasPrefix("compare_") { candidate.removeFirst("compare_".count) }
+        return builtInKinds.contains(candidate) ? nil : referencedName
+    }
+
     /// The Guide's own documented `(Left, Right) -> Integer` contract:
     /// "Comparators do not return True or False... A valid comparison is
     /// signaled by the return value of 0. Any other result signals that
@@ -82,6 +105,45 @@ enum LassoComparatorValue {
         case "notcontains": !left.outputString.contains(right.outputString) ? 0 : -1
         default: -1
         }
+    }
+
+    /// Stage 7b: real dispatch for a CUSTOM (`\TagName`-referenced,
+    /// user-`Define_Tag`'d) comparator — the counterpart `evaluate`
+    /// above never had (custom kinds fell through its `default: -1`).
+    /// Invokes the tag with exactly `[left, right]` positional
+    /// arguments via `LassoTagInvocationService` (`Providers.swift`,
+    /// Stage 7a), matching Table 21's own worked custom-comparator
+    /// example (`Define_Tag` with exactly 2 required params). Coerces
+    /// the tag's returned `LassoValue` to the same 0/"not 0" contract
+    /// `evaluate` documents — a non-numeric return (a malformed
+    /// comparator tag) degrades to `-1` ("not valid") rather than
+    /// crashing.
+    ///
+    /// `async throws` — genuinely unlike `evaluate`/`isOrderedBefore`
+    /// above, which stay synchronous specifically because they're
+    /// still called from inside `sorted(by:)`/`.filter{}`/`.contains{}`
+    /// closures elsewhere in this codebase that this stage did not
+    /// touch (Stage 7c's own scope, not this one). Only call sites this
+    /// stage itself converted to async (`LassoMatcherValue.matches` and
+    /// its callers) may call this.
+    static func evaluateCustom(
+        tagName: String,
+        left: LassoValue,
+        right: LassoValue,
+        context: inout LassoContext
+    ) async throws -> Int {
+        guard let definition = context.tagRegistry.tag(named: tagName) else {
+            throw LassoRuntimeError.unknownFunction(tagName)
+        }
+        // Extracted to a local `let` before use, per
+        // `LassoTagInvocationService`'s own documented Swift-exclusivity
+        // requirement (`Providers.swift`) — `context.tagInvocationService?
+        // .invoke(..., context: &context)` inline would be overlapping
+        // access to the same storage.
+        let service = context.tagInvocationService
+        guard let service else { throw LassoRuntimeError.tagInvocationNotConfigured }
+        let result = try await service.invoke(definition, positionalArguments: [left, right], context: &context)
+        return Int(result.number ?? -1)
     }
 
     /// The internal Swift-`sorted(by:)`-shaped strict-weak-ordering
