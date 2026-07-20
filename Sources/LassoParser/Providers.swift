@@ -990,14 +990,14 @@ public protocol LassoInlineProvider: Sendable {
     func executeInline(arguments: [EvaluatedArgument], context: LassoContext) async throws -> LassoInlineFrame
 }
 
-/// The dispatch-registration seam for `email_send` (and any future
-/// email-family native functions cheap enough to add alongside it, e.g.
-/// `email_compose`/`email_mxlookup`) — see
-/// `Documentation/lasso-perfect-smtp-integration-plan.md` §4.0. `email_send`
-/// is registered inside `LassoNativeRegistry.registerDefaultFunctions()`,
-/// which lives in `LassoParser` itself and must never import a specific
-/// resurrected library (`LassoParser`'s `Package.swift` depends on `Crypto`
-/// only). This protocol lets a host application (e.g.
+/// The dispatch-registration seam for `email_send`/`email_compose`/
+/// `email_mxlookup` — see
+/// `Documentation/lasso-perfect-smtp-integration-plan.md` §4.0/§4.3b/§4.4.
+/// `email_send` is registered inside
+/// `LassoNativeRegistry.registerDefaultFunctions()`, which lives in
+/// `LassoParser` itself and must never import a specific resurrected
+/// library (`LassoParser`'s `Package.swift` depends on `Crypto` only).
+/// This protocol lets a host application (e.g.
 /// `LassoPerfectSMTP`/`lasso-perfect-server`'s `main.swift`) wire a real
 /// conformer into `LassoContext.emailProvider` from the outside, exactly
 /// the same shape as `LassoInlineProvider`/`inlineProvider` above and
@@ -1007,6 +1007,22 @@ public protocol LassoInlineProvider: Sendable {
 /// protocol (§4.0 point 3): it needs a native *type*, not a free function,
 /// and has no side-channel-slot equivalent yet — a harder, separately
 /// scoped problem.
+///
+/// **`compose`/`mxLookup` are new (Phase C).** `compose`'s evaluated
+/// return value is expected to be `.object(LassoObjectInstance(typeName:
+/// "email_compose", ...))` — the conformer builds that object directly
+/// (`LassoObjectInstance`'s `init(typeName:data:)` is `public`, reachable
+/// from any target that imports `LassoParser`, the same mechanism the
+/// built-in `bytes` type's `_base64` field already uses); `LassoParser`'s
+/// own `email_compose` native-type methods (`NativeTypes.swift`'s
+/// `makeEmailComposeType()`) then read that object's fields back out by
+/// name, with zero knowledge of which concrete library produced them.
+/// `email_compose` itself is registered as BOTH a free function (this
+/// protocol's `compose`, for construction — `email_compose(-to=..., ...)`)
+/// AND a native type (`NativeTypes.swift`, for `->data`/`->from`/
+/// `->recipients`/etc. member access on the constructed object) — the same
+/// two-mechanism split `date`/`bytes` already use (a free-function
+/// constructor plus a native-type method table), not a new pattern.
 public protocol LassoEmailProvider: Sendable {
     /// `context` is currently unused by any shipped conformer (mirroring
     /// `LassoInlineProvider.executeInline`'s own `context` parameter,
@@ -1018,6 +1034,28 @@ public protocol LassoEmailProvider: Sendable {
     /// `LassoPerfectSMTP`'s real conformer ships (milestone review,
     /// architecture pass, finding #1).
     func send(_ arguments: [EvaluatedArgument], context: LassoContext) async throws -> LassoValue
+
+    /// Backs `email_compose(-to=..., -from=..., -subject=..., -body=...)`
+    /// — builds and composes a full MIME message (no relay/transport
+    /// involvement, no DKIM signing — see
+    /// `Documentation/lasso-perfect-smtp-integration-plan.md` §4.3b for the
+    /// full rationale) and returns it as a real `email_compose`-typed
+    /// object (`.object(LassoObjectInstance(typeName: "email_compose",
+    /// ...))`) for `NativeTypes.swift`'s registered methods to read back
+    /// out. This phase's scoped subset supports only full-message
+    /// construction (`-to`/`-from`/`-subject` all present) — a conformer
+    /// should throw a clear, catchable error for the bare-MIME-part mode
+    /// (any of the three absent), never guess at a bespoke single-part
+    /// composer.
+    func compose(_ arguments: [EvaluatedArgument], context: LassoContext) async throws -> LassoValue
+
+    /// Backs `email_mxlookup(domain, -refresh=?, -hostname=?)` — real
+    /// Lasso documents this as a cached lookup (§4.4): repeated calls for
+    /// the same domain return the same cached answer unless `-refresh` is
+    /// given. Returns a `.map` shaped `map(domain=..., host=..., priority=...)`
+    /// per the reference doc's own worked example (see §4.4 for why the
+    /// prose's six-key description is not what's implemented).
+    func mxLookup(_ arguments: [EvaluatedArgument], context: LassoContext) async throws -> LassoValue
 }
 
 public protocol LassoDynamicQueryExecutor: Sendable {

@@ -219,6 +219,30 @@ struct LassoSMTPMessageBuilderTests {
         }
     }
 
+    // Phase C milestone review BLOCKING FIX #3/#4: `-attachment`
+    // (singular)/`-parts`/`-headerType` are all confirmed real, documented
+    // `email_compose` parameters that were previously silently dropped
+    // with zero error/signal — the same "silent content loss" bug class
+    // already found and fixed once in this project (commit `474b48f`).
+
+    @Test func attachmentSingularThrows() throws {
+        #expect(throws: LassoSMTPError.self) {
+            try LassoSMTPMessageBuilder.build(validBaseArguments + [arg("attachment", "report.pdf")])
+        }
+    }
+
+    @Test func partsThrows() throws {
+        #expect(throws: LassoSMTPError.self) {
+            try LassoSMTPMessageBuilder.build(validBaseArguments + [arg("parts", "somepart")])
+        }
+    }
+
+    @Test func headerTypeThrows() throws {
+        #expect(throws: LassoSMTPError.self) {
+            try LassoSMTPMessageBuilder.build(validBaseArguments + [arg("headerType", "MIME")])
+        }
+    }
+
     // MARK: - Phase B: -contentType/-transferEncoding (§4.3, now implemented)
 
     @Test func contentTypeMapsVerbatimOntoBodyContentTypeOverride() throws {

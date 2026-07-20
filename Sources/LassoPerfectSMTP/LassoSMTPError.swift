@@ -68,6 +68,16 @@ public enum LassoSMTPFailureKind: String, Sendable {
     /// validated dash-param shape) file/security failures, not dash-param
     /// parsing failures.
     case attachmentFailed
+    /// `email_mxlookup` (Phase C, §4.4) failed — every
+    /// `DNSResolver.ResolveError` case (`.nullMX`/`.noRecordsFound`/
+    /// `.timeout`/`.malformedResponse`/`.serverFailure`/`.cnameLoop`/
+    /// `.noNameserversConfigured`) converts to this one adapter-stable
+    /// kind, with a distinct, per-case message (see
+    /// `LassoEmailProviderImpl.mxLookup`'s error-mapping switch) — one kind
+    /// rather than seven, matching this file's existing convention of
+    /// broad kinds carrying a specific message (`.deliveryFailed` already
+    /// covers several distinct SMTP-level outcomes the same way).
+    case mxLookupFailed
 
     var code: Int {
         switch self {
@@ -77,6 +87,7 @@ public enum LassoSMTPFailureKind: String, Sendable {
         case .composeFailed: 3004
         case .deliveryFailed: 3005
         case .attachmentFailed: 3006
+        case .mxLookupFailed: 3007
         }
     }
 }

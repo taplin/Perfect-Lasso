@@ -358,6 +358,24 @@ struct Evaluator {
             guard case let .object(object) = baseValue else {
                 throw LassoRuntimeError.invalidAssignment
             }
+            // Native (Swift-implemented) types must never be mutable via
+            // raw field assignment — their `_`-prefixed storage is an
+            // implementation detail, and every enforced invariant (header
+            // injection checks, filename sanitization, etc.) lives in their
+            // registered native methods, not in plain dictionary storage.
+            // A user-defined Lasso type (resolved via `tagRegistry`
+            // instead) legitimately uses this exact same syntax
+            // (`self->propname = value`) as its real instance-property
+            // mutation mechanism, so only the native-type case is rejected
+            // here. If neither registry resolves the type name at all, fall
+            // through to the pre-existing (dictionary-backed) behavior —
+            // no new failure mode is introduced for that untested edge
+            // case. See `LassoRuntimeError.nativeTypeFieldAssignmentNotSupported`'s
+            // doc comment for the full rationale (Phase C milestone review,
+            // BLOCKING FIX #1).
+            if context.nativeTypes.type(named: object.typeName) != nil {
+                throw LassoRuntimeError.nativeTypeFieldAssignmentNotSupported(typeName: object.typeName, field: name)
+            }
             object.set(value, for: name)
         default:
             throw LassoRuntimeError.invalidAssignment

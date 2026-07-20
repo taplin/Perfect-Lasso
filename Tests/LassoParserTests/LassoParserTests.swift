@@ -1087,6 +1087,66 @@ import PerfectSessionCore
     #expect(output.contains("d2=2002-05-22"))
 }
 
+@Test func dateFieldCannotBeMutatedViaRawAssignment() async throws {
+    // Phase C milestone review BLOCKING FIX #1: `Evaluator.assign`'s
+    // `.member` case used to call `object.set(_:for:)` unconditionally for
+    // ANY `.object` field assignment, with no check against
+    // `context.nativeTypes` at all -- silently overwriting a native type's
+    // internal storage and bypassing every invariant its real methods
+    // enforce. `date`'s own stored fields ("year"/"month"/etc., see
+    // `LassoDateParsing.makeObject`) happen to share names with its
+    // registered read accessors, making the bug directly observable:
+    // before the fix, `[$d->year = 5]` silently changed what `[$d->year]`
+    // reported right back (since both read from the same raw field). Now
+    // it must throw the dedicated error instead of silently no-opping.
+    var context = LassoContext()
+    await #expect(throws: LassoRuntimeError.nativeTypeFieldAssignmentNotSupported(typeName: "date", field: "year")) {
+        _ = try await LassoRenderer().render(
+            "[var(d = Date('2002-05-22'))][$d->year = 5]",
+            context: &context
+        )
+    }
+}
+
+@Test func bytesFieldCannotBeMutatedViaRawAssignment() async throws {
+    // Same bug class as the `date` case above, exercised against `bytes`'
+    // private-by-convention `_base64` storage field (`BytesType.swift`).
+    var context = LassoContext()
+    await #expect(throws: LassoRuntimeError.nativeTypeFieldAssignmentNotSupported(typeName: "bytes", field: "_base64")) {
+        _ = try await LassoRenderer().render(
+            "[var(b = bytes('hello'))][$b->_base64 = 'AAAA']",
+            context: &context
+        )
+    }
+}
+
+@Test func userDefinedTypeSelfMemberAssignmentStillWorksAfterTheNativeTypeFix() async throws {
+    // Confirms BLOCKING FIX #1 did NOT break the real, load-bearing
+    // `self->propname = value` instance-property-mutation mechanism for
+    // USER-DEFINED Lasso types (resolved via `context.tagRegistry`, not
+    // `context.nativeTypes`) -- already covered by
+    // `typeDefinitionsConstructObjectsAndDispatchMethods` and the two
+    // legacy `define_type` tests just below it, but this test names that
+    // guarantee explicitly and directly, rather than leaving it merely
+    // implied by pre-existing coverage.
+    var context = LassoContext()
+    let output = try await LassoRenderer().render(
+        """
+        <?lassoscript
+        define Counter => type {
+            data public count::integer
+            public onCreate() => { self->count = 0 }
+            public bump() => { self->count = self->count + 1 }
+        }
+        local(c::Counter = Counter())
+        ?>
+        [#c->bump][#c->bump][#c->bump][#c->count]
+        """,
+        context: &context
+    ).trimmingCharacters(in: .whitespacesAndNewlines)
+    #expect(output == "3")
+}
+
 @Test func mathArithmeticTagsMatchTheLanguageGuidesOwnWorkedExamples() async throws {
     // Lasso 8.5 Language Guide Ch. 28 Table 10, confirmed by reading the
     // PDF directly (including the visual page render, since the raw text
@@ -5661,6 +5721,12 @@ struct IncludeURLTests {
             recorder.record(arguments)
             return .string("queued")
         }
+        // Not exercised by this test — the protocol gained these two
+        // methods in Phase C (§4.0/§4.3b/§4.4); every conformer, including
+        // test doubles, must implement them regardless of whether a given
+        // test cares.
+        func compose(_ arguments: [EvaluatedArgument], context: LassoContext) async throws -> LassoValue { .void }
+        func mxLookup(_ arguments: [EvaluatedArgument], context: LassoContext) async throws -> LassoValue { .void }
     }
     let recorder = EmailProviderRecorder()
     var context = LassoContext(emailProvider: EmailProvider(recorder: recorder))
@@ -5677,6 +5743,120 @@ struct IncludeURLTests {
     #expect(seen.firstValue(named: "from") == .string("b@example.com"))
     #expect(seen.firstValue(named: "subject") == .string("s"))
     #expect(seen.firstValue(named: "body") == .string("b"))
+}
+
+@Test func emailComposeThrowsEmailNotConfiguredWhenNoEmailProviderIsWired() async throws {
+    // Same dispatch seam as `email_send` (§4.0), now also covering
+    // `email_compose` (Phase C, §4.3b) — mirrors
+    // `emailSendThrowsEmailNotConfiguredWhenNoEmailProviderIsWired` exactly.
+    var context = LassoContext()
+    await #expect(throws: LassoRuntimeError.emailNotConfigured) {
+        try await LassoRenderer().render(
+            "[email_compose: -to='a@example.com', -from='b@example.com', -subject='s', -body='b']",
+            context: &context
+        )
+    }
+}
+
+@Test func emailMXLookupThrowsEmailNotConfiguredWhenNoEmailProviderIsWired() async throws {
+    var context = LassoContext()
+    await #expect(throws: LassoRuntimeError.emailNotConfigured) {
+        try await LassoRenderer().render(
+            "[email_mxlookup: 'example.com']",
+            context: &context
+        )
+    }
+}
+
+@Test func emailComposeDispatchesToTheConfiguredEmailProviderAndReturnsItsResult() async throws {
+    // Proves the §4.0 dispatch seam reaches `LassoEmailProvider.compose`
+    // end to end, mirroring
+    // `emailSendDispatchesToTheConfiguredEmailProviderAndReturnsItsResult`.
+    // Uses a test-double conformer returning a real `.object(typeName:
+    // "email_compose")` value, then exercises the registered native-type
+    // methods (`->data`/`->from`/`->recipients`/`->asString`) against it —
+    // proving `NativeTypes.swift`'s `makeEmailComposeType()` and
+    // `Runtime.swift`'s `email_compose` free-function registration work
+    // together end to end, without depending on `LassoPerfectSMTP` (which
+    // has its own, separate end-to-end tests for the real conformer).
+    final class EmailProviderRecorder: @unchecked Sendable {
+        private(set) var composeCalls: [[EvaluatedArgument]] = []
+        func record(_ arguments: [EvaluatedArgument]) { composeCalls.append(arguments) }
+    }
+    struct EmailProvider: LassoEmailProvider {
+        let recorder: EmailProviderRecorder
+        func send(_ arguments: [EvaluatedArgument], context: LassoContext) async throws -> LassoValue { .void }
+        func compose(_ arguments: [EvaluatedArgument], context: LassoContext) async throws -> LassoValue {
+            recorder.record(arguments)
+            return .object(LassoObjectInstance(typeName: "email_compose", data: [
+                "_data": .string("From: b@example.com\r\nTo: a@example.com\r\n\r\nb"),
+                "_from": .string("b@example.com"),
+                "_recipients": .array([.string("a@example.com")]),
+            ]))
+        }
+        func mxLookup(_ arguments: [EvaluatedArgument], context: LassoContext) async throws -> LassoValue { .void }
+    }
+    let recorder = EmailProviderRecorder()
+    var context = LassoContext(emailProvider: EmailProvider(recorder: recorder))
+
+    let output = try await LassoRenderer().render(
+        "[var(message = email_compose(-to='a@example.com', -from='b@example.com', -subject='s', -body='b'))]" +
+        "[$message->from]|[$message->recipients->get(1)]|[$message->data->contains('b@example.com')]|[$message->asString->contains('b@example.com')]",
+        context: &context
+    )
+
+    #expect(recorder.composeCalls.count == 1)
+    #expect(output == "b@example.com|a@example.com|true|true")
+}
+
+@Test func emailMXLookupDispatchesToTheConfiguredEmailProviderAndReturnsItsResult() async throws {
+    struct EmailProvider: LassoEmailProvider {
+        func send(_ arguments: [EvaluatedArgument], context: LassoContext) async throws -> LassoValue { .void }
+        func compose(_ arguments: [EvaluatedArgument], context: LassoContext) async throws -> LassoValue { .void }
+        func mxLookup(_ arguments: [EvaluatedArgument], context: LassoContext) async throws -> LassoValue {
+            .map([
+                "domain": .string(arguments.positionalValue(at: 0)?.outputString ?? ""),
+                "host": .string("mail.example.com"),
+                "priority": .integer(10),
+            ])
+        }
+    }
+    var context = LassoContext(emailProvider: EmailProvider())
+
+    let output = try await LassoRenderer().render(
+        "[email_mxlookup('example.com')->find('host')]",
+        context: &context
+    )
+    #expect(output == "mail.example.com")
+}
+
+@Test func emailComposeMutatingBuilderMethodsThrowTheDedicatedRuntimeErrorNotNull() async throws {
+    // Real corpus's own worked example chains `->addAttachment` right
+    // after construction. Phase C's approved scope defers real mutation
+    // (§4.3b/§4.8 point 2) but must not silently return `.null` for an
+    // unregistered method name -- `NativeTypes.swift`'s
+    // `makeEmailComposeType()` explicitly registers these four names so
+    // each throws `LassoRuntimeError.emailComposeMutationNotYetSupported`
+    // instead.
+    struct EmailProvider: LassoEmailProvider {
+        func send(_ arguments: [EvaluatedArgument], context: LassoContext) async throws -> LassoValue { .void }
+        func compose(_ arguments: [EvaluatedArgument], context: LassoContext) async throws -> LassoValue {
+            .object(LassoObjectInstance(typeName: "email_compose", data: [
+                "_data": .string("data"), "_from": .string("b@example.com"), "_recipients": .array([]),
+            ]))
+        }
+        func mxLookup(_ arguments: [EvaluatedArgument], context: LassoContext) async throws -> LassoValue { .void }
+    }
+    var context = LassoContext(emailProvider: EmailProvider())
+
+    for method in ["addAttachment", "addHTMLPart", "addTextPart", "addPart"] {
+        await #expect(throws: LassoRuntimeError.emailComposeMutationNotYetSupported(method)) {
+            try await LassoRenderer().render(
+                "[var(message = email_compose(-to='a', -from='b@example.com', -subject='s', -body='b'))][$message->\(method)()]",
+                context: &context
+            )
+        }
+    }
 }
 
 @Test func decimalConstructorAndAsStringWithPrecisionFormatFixedDecimalPlaces() async throws {

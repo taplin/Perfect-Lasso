@@ -165,11 +165,37 @@ public enum LassoSMTPMessageBuilder {
     /// separately below). `-contentType`/`-transferEncoding`/
     /// `-attachments`/`-htmlImages` moved OFF this list in Phase B — see
     /// the file doc comment for their real handling.
+    ///
+    /// `-attachment` (singular)/`-parts`/`-headerType` added per the Phase C
+    /// milestone review (BLOCKING FIX #3/#4): all three are confirmed real,
+    /// part of `email_compose`'s documented signature (lassoguide.com:
+    /// `email_compose(..., -attachments=?, -attachment=?, ..., -parts=?,
+    /// ..., -headerType=?, ...)`), and were previously silently dropped
+    /// with zero error/signal — the same "silent content loss" bug class
+    /// already found and fixed once in this project (commit `474b48f`,
+    /// address-parser/attachment-drop fix). Explicitly listed here rather
+    /// than guessed at (`-attachment` singular isn't confirmed to be a
+    /// simple alias for `-attachments`'s array/pair shapes; `-parts` isn't
+    /// confirmed to be `-attachments`-shaped at all — it's plausibly a
+    /// pre-built array of `email_compose` MIME-part objects, a shape this
+    /// builder can't represent yet either way) — per §4.3b's own stated
+    /// rule, "if the shape can't be confirmed with reasonable confidence,
+    /// treat as notYetSupported... rather than guess."
     private static let unsupportedParameterNames: [String] = [
-        "date", "tokens", "merge", "characterSet",
+        "date", "tokens", "merge", "characterSet", "attachment", "parts", "headerType",
     ]
 
-    public static func build(_ arguments: [EvaluatedArgument]) throws -> BuildResult {
+    /// - Parameter functionName: Interpolated into the three
+    ///   "requires -from"/"requires -subject"/"requires at least one of
+    ///   -to/-cc/-bcc" validation messages only — defaults to `"email_send"`
+    ///   so every existing call site/test is unaffected. `email_compose`
+    ///   (Phase C, §4.3b) passes `"email_compose"` instead, since those
+    ///   error messages are what the real caller actually invoked. Every
+    ///   OTHER error message in this file still says "email_send:" verbatim
+    ///   — a deliberate, explicitly scoped-out minor cosmetic
+    ///   inconsistency (see plan prompt), not worth a larger parameterization
+    ///   pass for this phase.
+    public static func build(_ arguments: [EvaluatedArgument], functionName: String = "email_send") throws -> BuildResult {
         for name in unsupportedParameterNames where isPresent(name, in: arguments) {
             throw LassoSMTPError(
                 kind: .notYetSupported,
@@ -184,7 +210,7 @@ public enum LassoSMTPMessageBuilder {
         }
 
         guard let fromRaw = arguments.lastString(named: "from"), fromRaw.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty == false else {
-            throw LassoSMTPError(kind: .invalidParameter, message: "email_send requires -from.")
+            throw LassoSMTPError(kind: .invalidParameter, message: "\(functionName) requires -from.")
         }
         let fromAddresses = try addressList(fromRaw, field: "-from")
         guard fromAddresses.count == 1, let from = fromAddresses.first else {
@@ -192,7 +218,7 @@ public enum LassoSMTPMessageBuilder {
         }
 
         guard isPresent("subject", in: arguments) else {
-            throw LassoSMTPError(kind: .invalidParameter, message: "email_send requires -subject.")
+            throw LassoSMTPError(kind: .invalidParameter, message: "\(functionName) requires -subject.")
         }
         let subject = arguments.lastString(named: "subject") ?? ""
 
@@ -202,7 +228,7 @@ public enum LassoSMTPMessageBuilder {
         let bcc = bccAddresses.map(\.address)
 
         guard to.isEmpty == false || cc.isEmpty == false || bcc.isEmpty == false else {
-            throw LassoSMTPError(kind: .invalidParameter, message: "email_send requires at least one of -to/-cc/-bcc.")
+            throw LassoSMTPError(kind: .invalidParameter, message: "\(functionName) requires at least one of -to/-cc/-bcc.")
         }
 
         var message = EmailMessage(from: from)

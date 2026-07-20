@@ -941,6 +941,35 @@ public struct LassoNativeRegistry: Sendable {
             }
             return try await emailProvider.send(arguments, context: context)
         }
+        // `email_compose` (lassoguide.com, "Sending Email" → "Compose an
+        // Email Message"; Documentation/lasso-perfect-smtp-integration-plan.md
+        // §4.3b) — a genuine native-type CONSTRUCTOR, following the exact
+        // `date`/`bytes` two-mechanism split: this free-function
+        // registration builds the object (dispatching through
+        // `context.emailProvider.compose`, same seam as `email_send`), and
+        // `NativeTypes.swift`'s `makeEmailComposeType()` registers the
+        // `->data`/`->from`/`->recipients`/etc. methods that read the
+        // constructed object's fields back out. Throws
+        // `LassoRuntimeError.emailNotConfigured` when unwired, identical to
+        // `email_send`.
+        register("email_compose") { arguments, context in
+            guard let emailProvider = context.emailProvider else {
+                throw LassoRuntimeError.emailNotConfigured
+            }
+            return try await emailProvider.compose(arguments, context: context)
+        }
+        // `email_mxlookup(domain, -refresh=?, -hostname=?)` (lassoguide.com,
+        // §4.4) — a plain free function (no native-type problem here,
+        // unlike `email_compose`): looks up (and, per real Lasso's
+        // documented caching behavior, caches) the MX records for a
+        // domain. Dispatches through the same `context.emailProvider` seam
+        // as `email_send`/`email_compose`.
+        register("email_mxlookup") { arguments, context in
+            guard let emailProvider = context.emailProvider else {
+                throw LassoRuntimeError.emailNotConfigured
+            }
+            return try await emailProvider.mxLookup(arguments, context: context)
+        }
         register("redirect_url") { arguments, context in
             let url = arguments.firstValue(named: "url")?.outputString ??
                 arguments.first?.value.outputString ?? ""
@@ -1471,6 +1500,43 @@ public enum LassoRuntimeError: Error, Equatable {
     /// role for `[inline]`/`inlineProvider`. See
     /// `Documentation/lasso-perfect-smtp-integration-plan.md` §4.0.
     case emailNotConfigured
+    /// Thrown by `email_compose`'s mutating builder methods
+    /// (`->addAttachment`/`->addHTMLPart`/`->addTextPart`/`->addPart`) --
+    /// deliberately not implemented this phase (see plan §4.3b/§6 Phase C);
+    /// real corpus code chaining these after construction gets a clear,
+    /// catchable error rather than a silent no-op or an incorrect result.
+    /// Carries the actual method name called (e.g. `"addAttachment"`) so
+    /// the error message names exactly what's unsupported. Real until
+    /// Phase D resolves the shared native-type-mutation design (§4.8 point
+    /// 2) for `email_compose` and `email_smtp` together.
+    case emailComposeMutationNotYetSupported(String)
     case tagCallDepthExceeded
     case unsafeDynamicFieldName(String)
+    /// Thrown by `Evaluator.assign(_:to:defaultScope:)`'s `.member` case
+    /// when a raw field assignment (`$obj->fieldName = value`) targets a
+    /// NATIVE (Swift-implemented) type instance — `date`/`bytes`/
+    /// `web_request`/`web_response`/`email_compose` today, resolved via
+    /// `context.nativeTypes.type(named:)`. Found during the Phase C
+    /// milestone review: `object.set(_:for:)` was being called
+    /// unconditionally with no check at all, so e.g.
+    /// `[$message->_data = 'INJECTED']` on an `email_compose` object could
+    /// silently overwrite its composed MIME text, completely bypassing
+    /// every validation its mutating methods/constructor enforce
+    /// (`HeaderEncoder.rejectHeaderInjection`, `MIMEComposer
+    /// .sanitizedFilename`, etc.) through a totally different code path.
+    /// A native type's `_`-prefixed (or otherwise-named) storage fields are
+    /// Swift-implementation details, never meant to be Lasso-visible/
+    /// writable directly — the only legitimate way to affect a native
+    /// object's state is through its registered native methods. This is
+    /// deliberately a distinct case from `.invalidAssignment`: a developer
+    /// hitting this needs to understand it's a deliberate restriction, not
+    /// a typo/scoping mistake. Contrast with a USER-DEFINED Lasso type
+    /// (resolved via `context.tagRegistry.type(named:)`), where
+    /// `self->propname = value` / `#instance->propname = value` remains the
+    /// real, load-bearing instance-property-mutation mechanism and must
+    /// keep working exactly as before. See
+    /// `Documentation/lasso-perfect-smtp-integration-plan.md` §4.8 point 2
+    /// (the shared native-type-mutation design this finding is adjacent
+    /// to) and the Phase C milestone review's BLOCKING FIX #1.
+    case nativeTypeFieldAssignmentNotSupported(typeName: String, field: String)
 }

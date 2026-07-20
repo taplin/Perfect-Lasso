@@ -66,6 +66,7 @@ public struct LassoNativeTypeRegistry: Sendable {
         register(Self.makeWebResponseType())
         register(Self.makeDateType())
         register(Self.makeBytesType())
+        register(Self.makeEmailComposeType())
     }
 }
 
@@ -519,6 +520,129 @@ extension LassoNativeTypeRegistry {
             let text = LassoBytesValue.string(from: receiver)
             let encoded = LassoEncoding.url(text)
             return .object(LassoBytesValue.makeObject(rawBytes: Array(encoded.utf8)))
+        }
+
+        return type
+    }
+
+    // MARK: - email_compose
+    //
+    // See Documentation/lasso-perfect-smtp-integration-plan.md §4.3b for the
+    // full design/rationale. Unlike `web_request`/`web_response` (backed by
+    // `LassoRequestProvider`/`LassoResponseSink` context slots), an
+    // `email_compose` object is CONSTRUCTED with real data by
+    // `Runtime.swift`'s `email_compose` free-function registration
+    // (dispatching through `context.emailProvider.compose`, implemented by
+    // `LassoPerfectSMTP`'s `LassoEmailProviderImpl`) -- this type's methods
+    // are pure readers over whatever fields that conformer stashed on the
+    // `LassoObjectInstance`, with zero knowledge of `LassoPerfectSMTP`
+    // itself (the same `_`-prefixed-field boundary `bytes`' `_base64` field
+    // already establishes).
+    //
+    // ## Field contract (the boundary between this target and
+    // `LassoPerfectSMTP`'s `LassoEmailProviderImpl.compose`)
+    //
+    // - `_data` (`.string`): the fully composed RFC 5322 MIME text (via
+    //   `MIMEComposer(message).compose().serialized()`, lossy-UTF8-decoded
+    //   -- no DKIM signing, see §4.3b for why).
+    // - `_from` (`.string`): the composed message's From address.
+    // - `_recipients` (`.array` of `.string`): every To+Cc+Bcc address,
+    //   combined -- matches the reference doc's own worked example
+    //   (`email_queue(-data=#message->data, -from=#message->from,
+    //   -recipients=#message->recipients)`, where `-recipients` is clearly
+    //   meant to be the full addressee list for the queued send, not just
+    //   `-to`).
+    //
+    // ## `->asString` vs `->data` -- a deliberate, documented choice
+    //
+    // The reference doc's own worked example calls `#message->asString`,
+    // but its method-list table only documents `->data`, not `->asString`.
+    // The Phase C milestone review's protocol/SMTP pass found better
+    // supporting evidence for this alias than "no cross-type precedent
+    // found": `References/Lasso/LP9Docs/Types.txt:86` documents Lasso's own
+    // `asString`/`asInteger`/`asDecimal` family as a general, trait-based
+    // conversion convention (not something invented for this one type),
+    // and `References/Lasso/LP9Docs/Web Request and Response.txt:210,222`
+    // shows real Lasso usage of the identical chaining pattern used here
+    // (`->invoke(...)->asString->encodeHtml`) on a different native type
+    // entirely -- i.e. "call a method, then `->asString`, then keep
+    // chaining" is an established real-corpus idiom, not unique to
+    // `email_compose`. Combined with the guide's own example treating
+    // `->data`/`->asString` as interchangeable in context
+    // (`#message->asString->encodeHtml`, immediately after documenting
+    // `->data` as the accessor that returns the composed MIME text), the
+    // deliberate choice here is to register `->asString` as a plain alias
+    // for `->data` -- same value, no separate field, no separate real
+    // behavior. If real corpus usage ever reveals `->asString` means
+    // something distinct (e.g. a debug/inspector representation rather
+    // than the raw MIME text), this alias should be revisited then, not
+    // guessed at now.
+    //
+    // ## `->data(-prefix=?, -force=?)`
+    //
+    // Neither lassoguide.com nor the local Lasso 8.5 Language Guide spells
+    // out concrete `-prefix`/`-force` semantics anywhere this research pass
+    // could find (flagged unconfirmed in §4.3b itself). Per that section's
+    // own stated fallback, both are accepted (so a real corpus call
+    // doesn't throw `unknownFunction`-style surprises over an extra
+    // keyword argument) but are no-ops -- `->data` always returns the same
+    // composed text regardless of what's passed.
+    //
+    // ## Mutating builder methods -- deferred, not silently ignored
+    //
+    // `->addAttachment`/`->addHTMLPart`/`->addTextPart`/`->addPart` all
+    // throw `LassoRuntimeError.emailComposeMutationNotYetSupported(name)`
+    // rather than returning `.null` (this type's registration is exactly
+    // what prevents the fallback-to-`.null` behavior
+    // `Evaluator.swift`'s `.member`/`.object` case has for any
+    // UNREGISTERED method name -- see this task's own research notes: an
+    // unregistered name would silently return `.null`, exactly the
+    // "silent gap" anti-pattern this project avoids). Real until Phase D
+    // resolves the shared native-type-mutation design (§4.8 point 2) for
+    // `email_compose` and `email_smtp` together.
+    fileprivate static func makeEmailComposeType() -> LassoNativeType {
+        var type = LassoNativeType(name: "email_compose")
+
+        type.register("data") { receiver, _, _ in
+            // `-prefix`/`-force` accepted, deliberately ignored -- see the
+            // MARK comment above.
+            receiver.value(for: "_data")
+        }
+        type.register("asstring") { receiver, _, _ in
+            // Deliberate alias for `->data` -- see the MARK comment above
+            // for why, rather than leaving this unregistered (which would
+            // silently fall back to `.null` per `Evaluator.swift`'s
+            // unregistered-native-method behavior).
+            receiver.value(for: "_data")
+        }
+        type.register("from") { receiver, _, _ in
+            receiver.value(for: "_from")
+        }
+        type.register("recipients") { receiver, _, _ in
+            receiver.value(for: "_recipients")
+        }
+        // `->Summary` -- reference.lassosoft.com's `[Email_Compose]` page
+        // lists it as one of four member tags ("[Email_Compose->Recipients],
+        // [Email_Compose->Data], [Email_Compose->From], and
+        // [Email_Compose->Summary]"), found during the Phase C milestone
+        // review's protocol/SMTP pass (NON-BLOCKING C) -- lower-confidence
+        // than the other three since the local Lasso 8.5 Language Guide's
+        // own method table does NOT list it. Left unregistered, calling
+        // `->summary` would silently return `.null` (`Evaluator.swift`'s
+        // fallback for any unregistered native method name) -- the exact
+        // "silent gap" anti-pattern this project avoids elsewhere (same
+        // reasoning as the mutating methods just below). Registered here
+        // to throw the same clear, catchable "not yet supported" error
+        // those methods use instead, since it's real and documented, just
+        // not implemented this phase.
+        type.register("summary") { _, _, _ in
+            throw LassoRuntimeError.emailComposeMutationNotYetSupported("summary")
+        }
+
+        for mutatingMethodName in ["addAttachment", "addHTMLPart", "addTextPart", "addPart"] {
+            type.register(mutatingMethodName) { _, _, _ in
+                throw LassoRuntimeError.emailComposeMutationNotYetSupported(mutatingMethodName)
+            }
         }
 
         return type

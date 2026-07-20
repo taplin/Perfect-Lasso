@@ -1049,6 +1049,23 @@ struct LassoSiteServer: Sendable {
         // runs on the process-wide singleton group; reusing it here avoids
         // spinning up a second, separately-lifecycled thread pool just for
         // SMTP.
+        //
+        // `email_mxlookup`/`email_compose` (Phase C) share this exact same
+        // on/off gate, even though neither strictly needs a configured
+        // relay -- `email_mxlookup` is a pure DNS lookup with no
+        // relay/credential dependency at all, and `email_compose` never
+        // dials a relay either (§4.3b: composes but does not send). A
+        // deliberate, flagged judgment call: splitting `emailProvider` into
+        // "parts that need relay config" vs. "parts that don't" would add
+        // real complexity (two optional context slots, or a provider type
+        // that's itself partially-configured) for a scenario a real
+        // deployment is unlikely to hit in practice -- an operator who
+        // wants `email_compose`/`email_mxlookup` almost certainly also
+        // wants `email_send`, since all three are part of the same `smtp`
+        // config block conceptually. Keeping one on/off switch is the
+        // pragmatic, defensible choice; a future phase can split it if a
+        // real "MX lookups only, no relay configured" deployment ever
+        // surfaces.
         if config.smtpRelays.isEmpty == false, let defaultRelay = config.smtpDefaultRelay {
             let descriptors = config.smtpRelays.mapValues { settings in
                 LassoSMTPRelayDescriptor(
@@ -1064,7 +1081,13 @@ struct LassoSiteServer: Sendable {
                 defaultRelay: defaultRelay,
                 group: MultiThreadedEventLoopGroup.singleton
             )
-            emailProvider = LassoEmailProviderImpl(registry: registry, siteRoot: config.siteRoot)
+            let mxResolver = DNSResolver(group: MultiThreadedEventLoopGroup.singleton)
+            emailProvider = LassoEmailProviderImpl(
+                registry: registry,
+                siteRoot: config.siteRoot,
+                mxResolver: mxResolver,
+                mxLookupCache: LassoMXLookupCache()
+            )
         } else {
             emailProvider = nil
         }
