@@ -866,13 +866,66 @@ public struct LassoEmailProviderImpl: LassoEmailProvider {
     /// substring match (Foundation's case-insensitive string search, not a
     /// regex engine) — still satisfying "simple literal substring replace,
     /// not regex."
+    ///
+    /// **Single-pass resolution against the ORIGINAL text — milestone
+    /// review fix (protocol pass).** The original implementation mutated
+    /// one running `result` string in a sequential loop over `tokens`,
+    /// applying each token's replacement on top of whatever the *prior*
+    /// iterations had already produced. If a resolved token's own VALUE
+    /// happened to contain another token's literal marker text (e.g.
+    /// token `A`'s value is literally `"#B#"`), whether that got further
+    /// (incorrectly) substituted depended on Swift `Dictionary`'s
+    /// unspecified iteration order — genuinely nondeterministic across
+    /// runs for the same input. Fixed by scanning `text` once for
+    /// `#...#`-shaped spans and resolving each one against `tokens`,
+    /// building the output from copied substrings of the *original* text
+    /// plus resolved values — a resolved value's own content is never
+    /// re-scanned for further markers, so substitution is idempotent
+    /// regardless of dictionary iteration order. Still a literal/substring
+    /// match, not a regex engine: `#` is only ever treated as a marker
+    /// delimiter, and the span between a pair of `#`s is looked up
+    /// case-insensitively as a plain string key, not a pattern.
     private func substitute(_ text: String, tokens: [String: String]) -> String {
         guard tokens.isEmpty == false else { return text }
-        var result = text
+        // Case-insensitive lookup table, built once per call.
+        var lowercasedTokens: [String: String] = [:]
         for (name, value) in tokens {
-            result = result.replacingOccurrences(of: "#\(name)#", with: value, options: [.caseInsensitive])
+            lowercasedTokens[name.lowercased()] = value
         }
-        return result
+
+        var output = ""
+        var cursor = text.startIndex
+        while cursor < text.endIndex {
+            guard let markerStart = text[cursor...].firstIndex(of: "#") else {
+                output += text[cursor...]
+                break
+            }
+            let afterMarkerStart = text.index(after: markerStart)
+            guard afterMarkerStart < text.endIndex,
+                  let markerEnd = text[afterMarkerStart...].firstIndex(of: "#") else {
+                // No closing `#` -- the rest of the text can't contain a
+                // complete marker, so copy it verbatim and stop.
+                output += text[cursor...]
+                break
+            }
+            let name = text[afterMarkerStart..<markerEnd]
+            if let value = lowercasedTokens[name.lowercased()] {
+                output += text[cursor..<markerStart]
+                output += value
+                cursor = text.index(after: markerEnd)
+            } else {
+                // No resolved value for this marker -- left verbatim,
+                // unsubstituted (this method's established, documented
+                // behavior). Copy up through this `#` and resume scanning
+                // right after it, so a `#` that's genuinely just a literal
+                // character (not part of any resolvable marker) doesn't
+                // get treated as the start of an ever-larger unresolved
+                // span.
+                output += text[cursor...markerStart]
+                cursor = afterMarkerStart
+            }
+        }
+        return output
     }
 
     /// `.delivered`/`.queuedForRetry` are both "accepted" outcomes for

@@ -284,6 +284,65 @@ struct LassoSMTPMessageBuilderTests {
         }
     }
 
+    // MARK: - `-tokens`/`-merge` recipient count cap (milestone review, security pass)
+    //
+    // Unlike the uncapped `-to`/`-cc`/`-bcc` address lists, `-tokens`/
+    // `-merge` mode builds one full `EmailMessage` clone (compose + DKIM
+    // signature + SMTP transaction) per `-to` address --
+    // `LassoSMTPMessageBuilder.maximumMergeRecipientCount` bounds that
+    // per-call amplification. Both directions are tested: over the cap
+    // throws a clear pre-send validation error, and right at/under the
+    // cap still succeeds (not an off-by-one rejection).
+
+    @Test func toCountOverTheMergeRecipientCapThrowsInvalidParameter() throws {
+        let manyRecipients = (1...(LassoSMTPMessageBuilder.maximumMergeRecipientCount + 1))
+            .map { "user\($0)@example.com" }
+            .joined(separator: ", ")
+
+        #expect(throws: LassoSMTPError.self) {
+            try LassoSMTPMessageBuilder.build([
+                arg("to", manyRecipients),
+                arg("from", "sender@example.com"),
+                arg("subject", "Hello"),
+                arg("body", "Body text"),
+                EvaluatedArgument(label: "tokens", value: .map(["FirstName": .string("X")])),
+            ])
+        }
+    }
+
+    @Test func toCountExactlyAtTheMergeRecipientCapStillSucceeds() throws {
+        let recipientsAtCap = (1...LassoSMTPMessageBuilder.maximumMergeRecipientCount)
+            .map { "user\($0)@example.com" }
+            .joined(separator: ", ")
+
+        let result = try LassoSMTPMessageBuilder.build([
+            arg("to", recipientsAtCap),
+            arg("from", "sender@example.com"),
+            arg("subject", "Hello"),
+            arg("body", "Body text"),
+            EvaluatedArgument(label: "tokens", value: .map(["FirstName": .string("X")])),
+        ])
+        #expect(result.message.to.count == LassoSMTPMessageBuilder.maximumMergeRecipientCount)
+    }
+
+    @Test func toCountOverTheCapWithoutTokensOrMergeDoesNotThrow() throws {
+        // The cap is specific to merge-mode's per-recipient fan-out --
+        // an ordinary (non-merge) send with a large -to list is exactly
+        // the already-supported, single-compose/single-signature shape
+        // this cap is NOT meant to restrict.
+        let manyRecipients = (1...(LassoSMTPMessageBuilder.maximumMergeRecipientCount + 1))
+            .map { "user\($0)@example.com" }
+            .joined(separator: ", ")
+
+        let result = try LassoSMTPMessageBuilder.build([
+            arg("to", manyRecipients),
+            arg("from", "sender@example.com"),
+            arg("subject", "Hello"),
+            arg("body", "Body text"),
+        ])
+        #expect(result.message.to.count == LassoSMTPMessageBuilder.maximumMergeRecipientCount + 1)
+    }
+
     @Test func characterSetWiresDirectlyOntoEmailMessageCharset() throws {
         let result = try LassoSMTPMessageBuilder.build(validBaseArguments + [arg("characterSet", "iso-8859-1")])
         #expect(result.message.charset == "iso-8859-1")

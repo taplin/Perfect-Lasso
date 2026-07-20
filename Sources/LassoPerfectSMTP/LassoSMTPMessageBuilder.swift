@@ -238,6 +238,37 @@ public enum LassoSMTPMessageBuilder {
         "attachment", "parts", "headerType",
     ]
 
+    /// Milestone review finding (Phase F review, security pass): unlike
+    /// the uncapped `-to`/`-cc`/`-bcc` address lists — which share ONE
+    /// MIME compose + (if DKIM configured) ONE signature across every
+    /// recipient — `-tokens`/`-merge` mode builds one full `EmailMessage`
+    /// clone PER address in `-to` (`LassoEmailProviderImpl
+    /// .personalizedMessages(from:tokens:merge:)`), each costing its own
+    /// full compose + (if configured) its own RSA signature + a real SMTP
+    /// transaction. That's categorically heavier per-recipient, so it
+    /// gets its own explicit cap, matching this project's established
+    /// precedent for this exact class of gap
+    /// (`LassoSMTPAttachmentLoader.maximumFileCount`,
+    /// `LassoEmailProviderImpl.maxConcurrentDeferredSends` — both named,
+    /// documented constants with a stated "why this number" rather than a
+    /// silent, undocumented limit).
+    ///
+    /// No confirmed real-corpus number exists to size this against
+    /// (stated explicitly, not implied — same posture as
+    /// `maximumFileCount`'s own doc comment). 100 is a reasonable
+    /// starting point for a personalized-batch mail-merge use case: well
+    /// above anything either doc source's worked examples show (two
+    /// recipients), generous enough for a genuine small-batch
+    /// mail-merge send (e.g. a department roster or a small customer
+    /// segment), while still bounding the per-call RSA-signature/SMTP-
+    /// transaction amplification a caller-controlled `-to` list could
+    /// otherwise trigger to an unbounded degree. Not meant to be a
+    /// generic bulk-mail/list-server ceiling — a real large-scale
+    /// mail-merge deployment should be batching `email_send` calls (or
+    /// this project should grow a dedicated bulk API) rather than raising
+    /// this number arbitrarily.
+    public static let maximumMergeRecipientCount = 100
+
     /// - Parameter functionName: Interpolated into the three
     ///   "requires -from"/"requires -subject"/"requires at least one of
     ///   -to/-cc/-bcc" validation messages only — defaults to `"email_send"`
@@ -294,6 +325,17 @@ public enum LassoSMTPMessageBuilder {
             throw LassoSMTPError(
                 kind: .invalidParameter,
                 message: "-cc/-bcc are not supported together with -tokens/-merge in this phase."
+            )
+        }
+        // Milestone review finding (security pass, §-tokens/-merge):
+        // pre-send validation, matching `maximumMergeRecipientCount`'s own
+        // doc comment for the full "why this number, why here" reasoning
+        // — a pre-send failure (no job recorded), same precedent as the
+        // -cc/-bcc rejection immediately above.
+        if tokens != nil || merge != nil, to.count > maximumMergeRecipientCount {
+            throw LassoSMTPError(
+                kind: .invalidParameter,
+                message: "email_send: -tokens/-merge personalized batch sends are limited to \(maximumMergeRecipientCount) -to recipients, got \(to.count)."
             )
         }
 

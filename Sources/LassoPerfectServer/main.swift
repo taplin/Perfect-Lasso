@@ -1527,9 +1527,28 @@ struct LassoSiteServer: Sendable {
             key = try SigningKey.rsa(pem: pem)
         }
         // `signedHeaders: []` -- `DKIMSigner.alwaysOversignedHeaders`
-        // already covers every header this codebase's own `EmailMessage`
-        // construction ever populates (§4.9a). `canon` left at
+        // already covers every header a message built WITHOUT
+        // `-extraMIMEHeaders` ever has (§4.9a). `canon` left at
         // `DKIMSigner`'s own default (`(.relaxed, .relaxed)`, §4.6).
+        //
+        // Milestone review finding (protocol pass), now resolved: a
+        // caller-supplied `-extraMIMEHeaders` name is NOT in
+        // `alwaysOversignedHeaders` and is a per-MESSAGE concern (different
+        // `email_send` calls may add different custom header names) --
+        // this one signer, built once here at server startup, has no way
+        // to know any particular message's extra header names in advance.
+        // Fixed on the Perfect-SMTP side instead of here:
+        // `SMTPMailer.composeAndSign` (`Sources/PerfectSMTP/SMTPMailer.swift`)
+        // now widens whichever signer is configured -- when it's a
+        // `DKIMSigner` -- with that specific message's own
+        // `EmailMessage.extraHeaders` names (`DKIMSigner
+        // .signingAdditionalHeaders(_:)`) immediately before calling
+        // `sign(_:)`, every single send. That happens transparently for
+        // every mailer this registry builds (every relay, and the
+        // reserved `"direct-mx"` entry, §4.9b), so this one signer,
+        // constructed once with `signedHeaders: []`, is still the correct
+        // and sufficient construction here -- no per-relay or per-call
+        // signer construction is needed on this side after all.
         return try DKIMSigner(domain: settings.domain, selector: settings.selector, signedHeaders: [], keys: [key])
     }
 

