@@ -39,6 +39,38 @@ struct Evaluator {
                 return try await invokeCustomTag(definition, callArguments: [])
             }
             return context.value(for: name)
+        case let .tagReference(name):
+            // Ch. 30 Table 21 — `\identifier` names an already-defined
+            // tag (built-in or custom) without invoking it. Validated
+            // here (mirrors `.identifier`'s own "does this name resolve
+            // to anything real?" checks just above) so `\NoSuchTag`
+            // fails loudly at the reference site rather than silently
+            // producing an inert value that only misbehaves later,
+            // wherever it's eventually consumed.
+            // Custom TYPES (`Define_Type`) are a real, separate category
+            // from custom TAGS (`Define_Tag`) — `context.tagRegistry`
+            // keeps them in two distinct dictionaries (`TagRegistry.swift`
+            // `tags`/`types`), and `context.nativeTypes.containsType(
+            // named:)` only covers BUILT-IN types, never learns about
+            // user `Define_Type` types (confirmed by architect review:
+            // an earlier version of this guard omitted
+            // `context.tagRegistry.containsType(named:)` entirely, so
+            // `\MyCustomType` on a genuinely defined custom type threw
+            // `unknownFunction` — worse than the disclosed "valid
+            // reference, not yet dispatched" behavior `\MyCustomTag`
+            // already gets). This matters concretely, not just for
+            // completeness: the Guide itself (p.420) says "custom
+            // comparators can be created as custom tags or as custom
+            // types by overriding the onCompare callback tag" — so
+            // `\MyComparatorType` is a real, documented shape this guard
+            // must accept.
+            guard context.natives.contains(name)
+                || context.tagRegistry.containsTag(named: name)
+                || context.tagRegistry.containsType(named: name)
+                || context.nativeTypes.containsType(named: name) else {
+                throw LassoRuntimeError.unknownFunction(name)
+            }
+            return .object(LassoTagReferenceValue.makeObject(name: name))
         case let .assignment(target, value):
             let evaluated = try await evaluate(value)
             try await assign(evaluated, to: target, defaultScope: .unscoped)

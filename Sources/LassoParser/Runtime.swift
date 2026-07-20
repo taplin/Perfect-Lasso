@@ -823,11 +823,12 @@ public struct LassoNativeRegistry: Sendable {
         }
         // Built-in Comparators (Ch. 30 Table 21, p.419) — see
         // `Comparators.swift`'s own top-level doc comment for why these
-        // ship as ordinary free tags (`(Compare_LessThan)` to get a
+        // ALSO ship as ordinary free tags (`(Compare_LessThan)` to get a
         // passable value, `(Compare_LessThan: 1, 2)` to evaluate
-        // directly) instead of the real `\Compare_LessThan` bareword-
-        // reference syntax, which this parser doesn't support yet
-        // (deferred to Stage 6).
+        // directly), alongside the real `\Compare_LessThan` bareword-
+        // reference syntax Stage 6 (`TagReference.swift`) added — both
+        // forms are equivalent and kept, not one deprecated in favor of
+        // the other.
         for kind in LassoComparatorValue.builtInKinds {
             register("compare_\(kind)") { arguments, context in
                 guard arguments.count >= 2 else {

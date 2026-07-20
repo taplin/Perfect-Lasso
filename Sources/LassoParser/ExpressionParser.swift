@@ -6,6 +6,14 @@ private enum Token: Equatable {
     case decimal(Double)
     case named(String)
     case symbol(String)
+    /// `\identifier` — a bareword reference to an already-defined tag
+    /// (Ch. 30 Table 21, `\Compare_LessThan`), NOT a call. Confirmed no
+    /// collision: the only other `\` handling anywhere in this parser is
+    /// INSIDE quoted-string escape sequences (`readString`, entirely
+    /// separate from this top-level lexer dispatch); a bare top-level `\`
+    /// previously fell through to `.symbol("\\")` with no grammar
+    /// production matching it, so this is purely additive.
+    case tagReference(String)
     case eof
 }
 
@@ -38,6 +46,11 @@ private struct ExpressionLexer {
         if character == "-", index + 1 < characters.count, characters[index + 1].isLetter {
             index += 1
             return .named(readIdentifier())
+        }
+        if character == "\\", index + 1 < characters.count,
+           characters[index + 1].isLetter || characters[index + 1] == "_" {
+            index += 1
+            return .tagReference(readIdentifier())
         }
         if character.isLetter || character == "_" { return .identifier(readIdentifier()) }
 
@@ -231,6 +244,7 @@ struct ExpressionParser {
         case let .integer(value): expression = .integer(value)
         case let .decimal(value): expression = .decimal(value)
         case let .variable(name, scope): expression = .variable(name, scope)
+        case let .tagReference(name): expression = .tagReference(name)
         case let .identifier(name):
             switch name.lowercased() {
             case "true": expression = .boolean(true)

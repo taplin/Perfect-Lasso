@@ -154,6 +154,11 @@ public indirect enum LassoExpression: Equatable, Sendable {
     case void
     case variable(String, VariableScope)
     case identifier(String)
+    /// `\identifier` (Ch. 30 Table 21) — a reference to an already-
+    /// defined tag (built-in or custom), evaluated to a passable value
+    /// rather than invoked. See `Evaluator.evaluate(_:)`'s own case for
+    /// how this resolves.
+    case tagReference(String)
     case call(callee: LassoExpression, arguments: [LassoArgument])
     case member(base: LassoExpression, name: String, arguments: [LassoArgument]?)
     case unary(operator: String, value: LassoExpression)

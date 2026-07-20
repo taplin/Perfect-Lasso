@@ -8580,6 +8580,89 @@ struct IncludeURLTests {
     #expect(output == "One")
 }
 
+@Test func backslashTagReferenceToABuiltInComparatorWorksIdenticallyToTheFreeTagForm() async throws {
+    // Stage 6: real `\Compare_GreaterThan` bareword-reference syntax
+    // (Table 21's own actual documented form) now supported — sibling
+    // test to `priorityQueueGreaterThanComparatorReturnsTheLeastElementFirst`
+    // above, which uses the `(compare_greaterthan)` free-tag stand-in
+    // this codebase shipped in Stage 2 pending this exact parser work.
+    // Same worked example, real syntax this time.
+    var context = LassoContext()
+    let output = try await LassoRenderer().render(
+        """
+        [var('myPQ' = (priorityqueue: \\Compare_GreaterThan))]\
+        [$myPQ->Insert('One')][$myPQ->Insert('Two')][$myPQ->First]
+        """,
+        context: &context
+    )
+    #expect(output == "One")
+}
+
+@Test func backslashTagReferenceToAnUndefinedTagThrows() async throws {
+    var context = LassoContext()
+    await #expect(throws: LassoRuntimeError.unknownFunction("NoSuchTagAtAll")) {
+        _ = try await LassoRenderer().render("[\\NoSuchTagAtAll]", context: &context)
+    }
+}
+
+@Test func backslashTagReferenceToACustomDefinedTagIsValidButNotYetDispatchedAsAComparator() async throws {
+    // A `\TagName` reference to a real, user-`Define_Tag`'d custom tag
+    // must be accepted (it names something real) but, per this stage's
+    // own disclosed scope limit (`TagReference.swift`'s doc comment),
+    // does NOT yet dispatch as a real comparator when passed to
+    // PriorityQueue's constructor — falls back to the exact same
+    // "unrecognized comparator value" natural-order behavior any other
+    // non-comparator argument already gets. Proves this degrades
+    // gracefully (no crash, no silently-wrong-but-plausible ordering
+    // claim) rather than being asserted only by doc comment.
+    var context = LassoContext()
+    let output = try await LassoRenderer().render(
+        """
+        [
+        Define_Tag('MyComparator', -Required='Left', -Required='Right');
+            Return(-1);
+        /Define_Tag;
+        var('myPQ' = (priorityqueue: \\MyComparator));
+        $myPQ->Insert('Two');
+        $myPQ->Insert('One');
+        ]\
+        [$myPQ->First]|[$myPQ->Size]
+        """,
+        context: &context
+    )
+    #expect(output == "Two|2")
+}
+
+@Test func backslashTagReferenceToACustomDefinedTypeIsValidNotJustCustomTags() async throws {
+    // Regression test for a real bug architect review found: the
+    // `.tagReference` existence guard originally checked
+    // `context.natives.contains`/`context.tagRegistry.containsTag`/
+    // `context.nativeTypes.containsType` — but `context.nativeTypes`
+    // only covers BUILT-IN types; a genuinely `Define_Type`-defined
+    // custom type lives in `context.tagRegistry`'s own separate `types`
+    // dictionary (`containsType(named:)`), which the guard omitted
+    // entirely. `\MyCustomType` on a real, defined custom type
+    // incorrectly threw `unknownFunction` — worse than the disclosed
+    // "valid reference, not yet dispatched" behavior `\MyCustomTag`
+    // already gets above. This matters concretely, not just for
+    // completeness: Ch. 30 p.420 documents custom comparators as
+    // buildable "as custom tags or as custom types by overriding the
+    // onCompare callback tag" — `\MyComparatorType` is a real,
+    // documented shape. Must not throw.
+    var context = LassoContext()
+    let output = try await LassoRenderer().render(
+        """
+        [
+        Define_Type('MyComparatorType');
+        /Define_Type;
+        var('ref' = \\MyComparatorType);
+        ]OK
+        """,
+        context: &context
+    )
+    #expect(output == "OK")
+}
+
 @Test func priorityQueueGetPopsTheGreatestElementMatchingTheGuidesTwoThenOneResult() async throws {
     // Ch. 30 p.406-407: same disclosed atomic-`->Get` pattern as Queue/
     // Stack — pops "Two" (the current greatest), leaving size 1.
