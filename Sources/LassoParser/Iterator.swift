@@ -68,7 +68,12 @@ enum LassoIteratorValue {
     /// implementation — "[ReverseIterator] The same as [Iterator], but
     /// returns a reverse iterator" (Table 23) needs no separate
     /// backward-walking code path this way.
-    static func build(from source: LassoValue, reverse: Bool) -> LassoValue? {
+    static func build(
+        from source: LassoValue,
+        reverse: Bool,
+        matcher: LassoValue? = nil,
+        context: LassoContext = LassoContext()
+    ) -> LassoValue? {
         var elements: [LassoValue]
         var hasKeys = false
         switch source {
@@ -84,6 +89,18 @@ enum LassoIteratorValue {
             elements = LassoCollectionValue.elements(from: instance)
         default:
             return nil
+        }
+        // "It has a collection of elements which it can return in
+        // order. This could include all of the elements... or a SUBSET
+        // of the elements... if a matcher is used" (p.422) — verified
+        // against the p.426 worked example: `Iterator($myArray,
+        // (Match_Range: 'a', 'm'))` on `('One','Two','Three','Four')`
+        // yields only "Four" (the only element alphabetically within
+        // 'a'-'m'). Filtering happens BEFORE `reverse`, matching how
+        // the same worked example's `While` loop only ever sees the
+        // already-filtered set.
+        if let matcher {
+            elements = elements.filter { LassoMatcherValue.matches(matcher, element: $0, context: context) }
         }
         if reverse { elements.reverse() }
         return .object(makeObject(elements: elements, hasKeys: hasKeys))

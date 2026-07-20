@@ -56,6 +56,36 @@ struct Evaluator {
                 let lhs = try await evaluate(left)
                 return lhs.isTruthy ? .boolean(true) : .boolean(try await evaluate(right).isTruthy)
             }
+            if op == ">>" {
+                // Ch. 30 Table 22 (p.420-421): "The ->Contains member tag
+                // of each compound data type and the contains symbol >>
+                // both accept a matcher as a parameter" — worked example
+                // `(Array: 1,2,3,4,5,6,7) >> 7` → True.
+                //
+                // PRE-EXISTING BUG this fix closes (found during this
+                // stage's own scoping pass, not new): `binary(_:_:_:)`'s
+                // own `>>` case is pure `left.outputString.contains(
+                // right.outputString)` — it never branched on `.array`
+                // (or any other collection type) at all, so
+                // `(Array:1,2,3) >> 7`-shaped array-membership was
+                // silently degrading to string-concatenation-then-
+                // substring-search (worked by coincidence for short/
+                // single-token elements, wrong in general — e.g.
+                // `(Array: 12, 3) >> 23` would false-positive on the
+                // concatenated string "1233" containing "23"). Real
+                // corpus's own ~32-file reliance on `left >> 'substring'`
+                // for host/environment detection (plain strings, not
+                // collections) is completely unaffected — this only
+                // intercepts `>>` when the LEFT side is a collection-
+                // shaped value; a scalar left side falls through to the
+                // exact same `binary(...)` call, unchanged, below.
+                let leftValue = try await evaluate(left)
+                let rightValue = try await evaluate(right)
+                if let elements = LassoMatcherValue.iterableElements(of: leftValue) {
+                    return .boolean(elements.contains { LassoMatcherValue.matches(rightValue, element: $0, context: context) })
+                }
+                return try binary(leftValue, op, rightValue)
+            }
             return try binary(try await evaluate(left), op, try await evaluate(right))
         case let .call(callee, arguments):
             // `expr->get:1` (bare colon-call on a member access, no `(`)
@@ -1153,13 +1183,12 @@ struct Evaluator {
             let updated = LassoTreeMapValue.removingByKey(key, from: object, context: context)
             return .object(LassoTreeMapValue.makeObject(kind: LassoTreeMapValue.kind(of: object), entries: updated))
         case let (.object(object), "removeall") where object.typeName == LassoTreeMapValue.typeName:
-            // Same underlying key-based filter as `->Remove` this stage
-            // — see `LassoTreeMapValue.removingByKey`'s own doc comment
-            // for why these two are documented distinctly (Matcher-vs-
-            // exact-key) but implemented identically until Stage 5.
+            // Matcher-aware, unlike `->Remove` above — see
+            // `LassoTreeMapValue.removingAllMatchingKey`'s own doc
+            // comment for why these two now genuinely diverge (Stage 5).
             guard let argument = arguments.first else { return .object(object) }
-            let key = try await evaluate(argument.value)
-            let updated = LassoTreeMapValue.removingByKey(key, from: object, context: context)
+            let matcherOrKey = try await evaluate(argument.value)
+            let updated = LassoTreeMapValue.removingAllMatchingKey(matcherOrKey, from: object, context: context)
             return .object(LassoTreeMapValue.makeObject(kind: LassoTreeMapValue.kind(of: object), entries: updated))
         case let (.array(values), "get"):
             let requested: Double?
@@ -1204,9 +1233,11 @@ struct Evaluator {
             // Table 23: array is one of the explicitly-named built-in
             // `->Iterator`-supporting types — verified against the
             // p.423 worked example's own `Array->Iterator` call.
-            return LassoIteratorValue.build(from: .array(values), reverse: false) ?? .null
+            let matcher = arguments.first != nil ? try await evaluate(arguments[0].value) : nil
+            return LassoIteratorValue.build(from: .array(values), reverse: false, matcher: matcher, context: context) ?? .null
         case let (.array(values), "reverseiterator"):
-            return LassoIteratorValue.build(from: .array(values), reverse: true) ?? .null
+            let matcher = arguments.first != nil ? try await evaluate(arguments[0].value) : nil
+            return LassoIteratorValue.build(from: .array(values), reverse: true, matcher: matcher, context: context) ?? .null
         case let (.array(values), "join"):
             // `array->join(separator)` — real corpus need: comma/CSV-list
             // and breadcrumb-trail building, previously requiring a manual
@@ -1222,8 +1253,13 @@ struct Evaluator {
             // architect review reading the doc's own text directly (p.390:
             // "[Array->Find] ... Returns an array of elements that match
             // the parameter").
+            // Ch. 30 Table 22 (p.420-421): `->Contains` and `>>` both
+            // accept a Matcher as their parameter — `LassoMatcherValue
+            // .matches` falls back to plain `lassoEquals`-equivalent
+            // coercing equality for a non-matcher argument, so this is
+            // a behavior-preserving extension for existing callers.
             let needle = arguments.first != nil ? try await evaluate(arguments[0].value) : .null
-            return .boolean(values.contains { lassoEquals($0, needle) })
+            return .boolean(values.contains { LassoMatcherValue.matches(needle, element: $0, context: context) })
         case let (.array(values), "find"):
             // Ch. 30 p.390/395-396: returns an ARRAY of every element that
             // matches the parameter, not a boolean and not a position. A
@@ -1232,11 +1268,12 @@ struct Evaluator {
             // half, per the doc's own worked example (p.396,
             // `$Pair_Array->(Find: 'Alpha')`) — confirmed by reading that
             // section directly, not inferred.
+            // Matcher-aware — `LassoMatcherValue.matches` already does
+            // the pair-first-half unwrapping this case's own body used
+            // to do manually (Table 22: "Only the first part of pairs...
+            // is compared").
             let needle = arguments.first != nil ? try await evaluate(arguments[0].value) : .null
-            return .array(values.filter { element in
-                if case let .pair(key, _) = element { return lassoEquals(key, needle) }
-                return lassoEquals(element, needle)
-            })
+            return .array(values.filter { LassoMatcherValue.matches(needle, element: $0, context: context) })
         case let (.array(values), "findposition"):
             // Ch. 30 p.390 (previously named `->FindIndex`): returns an
             // array of the 1-based indices for EVERY match, not just the
@@ -1274,9 +1311,12 @@ struct Evaluator {
             // matches the parameter (confirmed by the worked example:
             // `$Delete_Array->(RemoveAll: 1)` drops every `1` from
             // `(6,1,4,1,5,1,2,3,1)`, leaving `(6,4,5,2,3)`).
+            // Matcher-aware — verified against the p.421 worked example:
+            // `$array->RemoveAll(Match_Range(2, 4))` on `(1..7)` leaves
+            // `(1,5,6,7)`.
             guard let argument = arguments.first else { return .array(values) }
             let target = try await evaluate(argument.value)
-            return .array(values.filter { !lassoEquals($0, target) })
+            return .array(values.filter { !LassoMatcherValue.matches(target, element: $0, context: context) })
         // `.map` dispatch tries a literal key match FIRST, falling back to
         // these documented methods only on a miss — NOT the other way
         // around. This codebase already uses `.map` for two different
@@ -1342,9 +1382,11 @@ struct Evaluator {
             // `->Iterator`-supporting types — verified against the
             // p.424 worked example's own key+value `While` loop
             // (`$myIterator->Key + ' = ' + $myIterator->Value`).
-            return LassoIteratorValue.build(from: .map(values), reverse: false) ?? .null
+            let matcher = arguments.first != nil ? try await evaluate(arguments[0].value) : nil
+            return LassoIteratorValue.build(from: .map(values), reverse: false, matcher: matcher, context: context) ?? .null
         case let (.map(values), "reverseiterator"):
-            return LassoIteratorValue.build(from: .map(values), reverse: true) ?? .null
+            let matcher = arguments.first != nil ? try await evaluate(arguments[0].value) : nil
+            return LassoIteratorValue.build(from: .map(values), reverse: true, matcher: matcher, context: context) ?? .null
         case let (.map(values), "contains"):
             let key = arguments.first != nil ? try await evaluate(arguments[0].value).outputString : ""
             return .boolean(values[key] != nil)
@@ -1548,7 +1590,24 @@ struct Evaluator {
         // Flagged in architect review; low real-world likelihood on this
         // project's corpus, but cheap enough to close outright.
         if let number = value.number, number.isFinite { return (0, number, "") }
-        return (1, 0, value.outputString)
+        // Lowercased: Lasso string comparisons are case-insensitive by
+        // convention throughout this interpreter — `==`/`lassoEquals`'s
+        // own doc comment cites a real production incident for exactly
+        // this (`'Yes'` vs `'yes'`), and Ch. 30's own Match_Range worked
+        // example (p.426, `Match_Range('a','m')` against `('One','Two',
+        // 'Three','Four')` yielding only "Four") only reproduces under
+        // case-insensitive `<` — direct primary-source proof that Lasso's
+        // ordering comparison, not just equality, ignores case. Previously
+        // this bucket used raw `outputString`, and a separate, duplicate
+        // `lassoLessThanCaseInsensitive` lived in `Matchers.swift` used
+        // only by `Match_Range`/`Match_NotRange` — an inconsistency a
+        // user code-review challenge caught directly ("shouldn't the
+        // comparison methods all use the same case sensitivity?").
+        // Unified here instead: no existing `->Sort`/Set/PriorityQueue/
+        // TreeMap test exercises a case-collision, so this changes no
+        // previously-verified behavior, only fixes unverified-and-wrong
+        // behavior to match the one worked example that actually tests it.
+        return (1, 0, value.outputString.lowercased())
     }
 
     // `internal`, same reason as `binary` above.

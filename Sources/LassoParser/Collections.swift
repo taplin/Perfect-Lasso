@@ -266,23 +266,45 @@ enum LassoTreeMapValue {
         return .null
     }
 
-    /// Shared by BOTH `->Remove` and `->RemoveAll` — Table 20's own
-    /// wording for `->RemoveAll` ("the value to compare to EACH KEY of
-    /// the map") means it's also key-based, not value-based like Set/
-    /// List's `->RemoveAll`. Since TreeMap keys are always unique (see
-    /// `inserting` above), a single-exact-key `->Remove` and a
-    /// match-every-key `->RemoveAll` remove IDENTICAL results with
-    /// plain-value comparison — they only diverge once `->RemoveAll`
-    /// gains Matcher-awareness (Stage 5, e.g. `Match_Range` could match
-    /// several distinct keys at once, which `->Remove` structurally
-    /// can't express). Implemented identically here, not merged into
-    /// one method, so each keeps its own doc-comment-cited reasoning
-    /// and is ready for `->RemoveAll` to diverge later without touching
-    /// `->Remove`.
+    /// Used by `->Remove` only — a single EXACT-key removal (structurally
+    /// can't express "remove several distinct keys at once" the way a
+    /// Matcher can; see `removingAllMatchingKey` below for `->RemoveAll`'s
+    /// own, now-diverged, Matcher-aware sibling this doc comment
+    /// originally deferred to "Stage 5").
     static func removingByKey(_ needle: LassoValue, from receiver: LassoObjectInstance, context: LassoContext) -> [LassoValue] {
         entries(from: receiver).filter { entry in
             guard case let .pair(entryKey, _) = entry else { return true }
             return !keysEqual(entryKey, needle, context: context)
+        }
+    }
+
+    /// Used by `->RemoveAll` — Table 20's own wording ("the value to
+    /// compare to EACH KEY of the map") means it's key-based, not
+    /// value-based like Set/List's `->RemoveAll`, AND Matcher-aware
+    /// (e.g. `Match_Range` can match several distinct keys in one call,
+    /// which `->Remove`'s single-exact-key contract structurally can't
+    /// express — the real distinction between these two methods that
+    /// `removingByKey` above could only fully realize once Matchers
+    /// existed).
+    static func removingAllMatchingKey(_ matcherOrLiteral: LassoValue, from receiver: LassoObjectInstance, context: LassoContext) -> [LassoValue] {
+        // A plain literal key must go through `keysEqual`, NOT
+        // `LassoMatcherValue.matches`'s own generic literal fallback
+        // (`LassoCollectionValue.equals`, which compares compound values
+        // via case-insensitive `outputString` concatenation) — that's
+        // exactly the compound-key collision `keysEqual` exists to
+        // prevent (e.g. `(array(1,23))` and `(array(12,3))` both
+        // stringify to `"123"`), already fixed for `->Remove`/`->Insert`/
+        // `->Find` but reintroduced here for `->RemoveAll` until this
+        // fix — found by code review. Only route through the
+        // Matcher-aware predicate when an actual `Match_*` object is
+        // given, so `Match_Range` etc. still work as documented.
+        let isMatcherObject = LassoMatcherValue.kind(of: matcherOrLiteral) != nil
+        return entries(from: receiver).filter { entry in
+            guard case let .pair(entryKey, _) = entry else { return true }
+            if isMatcherObject {
+                return !LassoMatcherValue.matches(matcherOrLiteral, element: entryKey, context: context)
+            }
+            return !keysEqual(entryKey, matcherOrLiteral, context: context)
         }
     }
 
@@ -312,9 +334,11 @@ extension LassoNativeTypeRegistry {
         var type = LassoNativeType(name: "list")
 
         type.register("contains") { receiver, arguments, context in
+            // Ch. 30 Table 22 (p.420-421) — Matcher-aware; falls back to
+            // plain coercing equality for a non-matcher argument.
             guard let needle = arguments.first?.value else { return .boolean(false) }
             let elements = LassoCollectionValue.elements(from: receiver)
-            return .boolean(elements.contains { LassoCollectionValue.equals($0, needle, context: context) })
+            return .boolean(elements.contains { LassoMatcherValue.matches(needle, element: $0, context: context) })
         }
         type.register("difference") { receiver, arguments, context in
             let elements = LassoCollectionValue.elements(from: receiver)
@@ -334,7 +358,7 @@ extension LassoNativeTypeRegistry {
             // see `makeSetType()` below).
             guard let needle = arguments.first?.value else { return .array([]) }
             let elements = LassoCollectionValue.elements(from: receiver)
-            return .array(elements.filter { LassoCollectionValue.equals($0, needle, context: context) })
+            return .array(elements.filter { LassoMatcherValue.matches(needle, element: $0, context: context) })
         }
         type.register("first") { receiver, _, _ in
             LassoCollectionValue.elements(from: receiver).first ?? .null
@@ -406,7 +430,7 @@ extension LassoNativeTypeRegistry {
                 ))
             }
             let elements = LassoCollectionValue.elements(from: receiver)
-                .filter { !LassoCollectionValue.equals($0, needle, context: context) }
+                .filter { !LassoMatcherValue.matches(needle, element: $0, context: context) }
             return .object(LassoCollectionValue.makeObject(typeName: "list", elements: elements))
         }
         type.register("removefirst") { receiver, _, _ in
@@ -451,11 +475,13 @@ extension LassoNativeTypeRegistry {
                 .sorted { LassoComparatorValue.isOrderedBefore(kind: kind, $0, $1) }
             return .object(LassoCollectionValue.makeObject(typeName: "list", elements: sorted))
         }
-        type.register("iterator") { receiver, _, _ in
-            LassoIteratorValue.build(from: .object(receiver), reverse: false) ?? .null
+        type.register("iterator") { receiver, arguments, context in
+            let matcher = arguments.first?.value
+            return LassoIteratorValue.build(from: .object(receiver), reverse: false, matcher: matcher, context: context) ?? .null
         }
-        type.register("reverseiterator") { receiver, _, _ in
-            LassoIteratorValue.build(from: .object(receiver), reverse: true) ?? .null
+        type.register("reverseiterator") { receiver, arguments, context in
+            let matcher = arguments.first?.value
+            return LassoIteratorValue.build(from: .object(receiver), reverse: true, matcher: matcher, context: context) ?? .null
         }
 
         return type
@@ -511,11 +537,13 @@ extension LassoNativeTypeRegistry {
                 return popped
             }
         }
-        type.register("iterator") { receiver, _, _ in
-            LassoIteratorValue.build(from: .object(receiver), reverse: false) ?? .null
+        type.register("iterator") { receiver, arguments, context in
+            let matcher = arguments.first?.value
+            return LassoIteratorValue.build(from: .object(receiver), reverse: false, matcher: matcher, context: context) ?? .null
         }
-        type.register("reverseiterator") { receiver, _, _ in
-            LassoIteratorValue.build(from: .object(receiver), reverse: true) ?? .null
+        type.register("reverseiterator") { receiver, arguments, context in
+            let matcher = arguments.first?.value
+            return LassoIteratorValue.build(from: .object(receiver), reverse: true, matcher: matcher, context: context) ?? .null
         }
 
         return type
@@ -574,11 +602,13 @@ extension LassoNativeTypeRegistry {
                 return popped
             }
         }
-        type.register("iterator") { receiver, _, _ in
-            LassoIteratorValue.build(from: .object(receiver), reverse: false) ?? .null
+        type.register("iterator") { receiver, arguments, context in
+            let matcher = arguments.first?.value
+            return LassoIteratorValue.build(from: .object(receiver), reverse: false, matcher: matcher, context: context) ?? .null
         }
-        type.register("reverseiterator") { receiver, _, _ in
-            LassoIteratorValue.build(from: .object(receiver), reverse: true) ?? .null
+        type.register("reverseiterator") { receiver, arguments, context in
+            let matcher = arguments.first?.value
+            return LassoIteratorValue.build(from: .object(receiver), reverse: true, matcher: matcher, context: context) ?? .null
         }
 
         return type
@@ -600,9 +630,10 @@ extension LassoNativeTypeRegistry {
         var type = LassoNativeType(name: "set")
 
         type.register("contains") { receiver, arguments, context in
+            // Ch. 30 Table 22 (p.420-421) — Matcher-aware.
             guard let needle = arguments.first?.value else { return .boolean(false) }
             let elements = LassoCollectionValue.elements(from: receiver)
-            return .boolean(elements.contains { LassoCollectionValue.equals($0, needle, context: context) })
+            return .boolean(elements.contains { LassoMatcherValue.matches(needle, element: $0, context: context) })
         }
         type.register("size") { receiver, _, _ in
             .integer(LassoCollectionValue.elements(from: receiver).count)
@@ -629,7 +660,7 @@ extension LassoNativeTypeRegistry {
                 return .object(LassoCollectionValue.makeObject(typeName: "set", elements: []))
             }
             let elements = LassoCollectionValue.elements(from: receiver)
-                .filter { LassoCollectionValue.equals($0, needle, context: context) }
+                .filter { LassoMatcherValue.matches(needle, element: $0, context: context) }
             return .object(LassoCollectionValue.makeObject(typeName: "set", elements: elements))
         }
         type.register("insert") { receiver, arguments, context in
@@ -659,7 +690,7 @@ extension LassoNativeTypeRegistry {
                 ))
             }
             let elements = LassoCollectionValue.elements(from: receiver)
-                .filter { !LassoCollectionValue.equals($0, needle, context: context) }
+                .filter { !LassoMatcherValue.matches(needle, element: $0, context: context) }
             return .object(LassoCollectionValue.makeObject(typeName: "set", elements: elements))
         }
         type.register("difference") { receiver, arguments, context in
@@ -695,11 +726,13 @@ extension LassoNativeTypeRegistry {
             elements = LassoCollectionValue.naturalSort(elements)
             return .object(LassoCollectionValue.makeObject(typeName: "set", elements: elements))
         }
-        type.register("iterator") { receiver, _, _ in
-            LassoIteratorValue.build(from: .object(receiver), reverse: false) ?? .null
+        type.register("iterator") { receiver, arguments, context in
+            let matcher = arguments.first?.value
+            return LassoIteratorValue.build(from: .object(receiver), reverse: false, matcher: matcher, context: context) ?? .null
         }
-        type.register("reverseiterator") { receiver, _, _ in
-            LassoIteratorValue.build(from: .object(receiver), reverse: true) ?? .null
+        type.register("reverseiterator") { receiver, arguments, context in
+            let matcher = arguments.first?.value
+            return LassoIteratorValue.build(from: .object(receiver), reverse: true, matcher: matcher, context: context) ?? .null
         }
 
         return type
@@ -774,11 +807,13 @@ extension LassoNativeTypeRegistry {
                 return popped
             }
         }
-        type.register("iterator") { receiver, _, _ in
-            LassoIteratorValue.build(from: .object(receiver), reverse: false) ?? .null
+        type.register("iterator") { receiver, arguments, context in
+            let matcher = arguments.first?.value
+            return LassoIteratorValue.build(from: .object(receiver), reverse: false, matcher: matcher, context: context) ?? .null
         }
-        type.register("reverseiterator") { receiver, _, _ in
-            LassoIteratorValue.build(from: .object(receiver), reverse: true) ?? .null
+        type.register("reverseiterator") { receiver, arguments, context in
+            let matcher = arguments.first?.value
+            return LassoIteratorValue.build(from: .object(receiver), reverse: true, matcher: matcher, context: context) ?? .null
         }
 
         return type
@@ -852,11 +887,13 @@ extension LassoNativeTypeRegistry {
             guard entries.indices.contains(index) else { return .null }
             return entries[index]
         }
-        type.register("iterator") { receiver, _, _ in
-            LassoIteratorValue.build(from: .object(receiver), reverse: false) ?? .null
+        type.register("iterator") { receiver, arguments, context in
+            let matcher = arguments.first?.value
+            return LassoIteratorValue.build(from: .object(receiver), reverse: false, matcher: matcher, context: context) ?? .null
         }
-        type.register("reverseiterator") { receiver, _, _ in
-            LassoIteratorValue.build(from: .object(receiver), reverse: true) ?? .null
+        type.register("reverseiterator") { receiver, arguments, context in
+            let matcher = arguments.first?.value
+            return LassoIteratorValue.build(from: .object(receiver), reverse: true, matcher: matcher, context: context) ?? .null
         }
 
         return type

@@ -880,20 +880,62 @@ public struct LassoNativeRegistry: Sendable {
             }
             return .object(LassoTreeMapValue.makeObject(kind: kind, entries: entries))
         }
+        // Matchers (Ch. 30 Table 22) — see `Matchers.swift`'s own doc
+        // comment for the full design. All five are ordinary
+        // constructors (unlike Comparators, which double as a 0-or-2-arg
+        // value/evaluator — Matchers have no analogous documented
+        // "call directly with a test value" form).
+        register("match_regexp") { arguments, _ in
+            .object(LassoMatcherValue.makeObject(kind: "regexp", data: [
+                "_pattern": arguments.first?.value ?? .string(""),
+            ]))
+        }
+        register("match_notregexp") { arguments, _ in
+            .object(LassoMatcherValue.makeObject(kind: "notregexp", data: [
+                "_pattern": arguments.first?.value ?? .string(""),
+            ]))
+        }
+        register("match_range") { arguments, _ in
+            .object(LassoMatcherValue.makeObject(kind: "range", data: [
+                "_low": arguments.first?.value ?? .null,
+                "_high": arguments.positionalValue(at: 1) ?? .null,
+            ]))
+        }
+        register("match_notrange") { arguments, _ in
+            .object(LassoMatcherValue.makeObject(kind: "notrange", data: [
+                "_low": arguments.first?.value ?? .null,
+                "_high": arguments.positionalValue(at: 1) ?? .null,
+            ]))
+        }
+        register("match_comparator") { arguments, _ in
+            guard let comparatorValue = arguments.first?.value else { return .null }
+            var data: [String: LassoValue] = ["_comparator": comparatorValue]
+            if let rhs = arguments.first(where: { $0.label?.caseInsensitiveCompare("rhs") == .orderedSame }) {
+                data["_rhs"] = rhs.value
+                data["_haslhs"] = .boolean(false)
+            } else if let lhs = arguments.first(where: { $0.label?.caseInsensitiveCompare("lhs") == .orderedSame }) {
+                data["_lhs"] = lhs.value
+                data["_haslhs"] = .boolean(true)
+            }
+            return .object(LassoMatcherValue.makeObject(kind: "comparator", data: data))
+        }
         // `Iterator`/`ReverseIterator` (Ch. 30 Table 23) — "Requires a
         // compound data type as a parameter... A second optional
-        // parameter allows a matcher to be specified" — the matcher
-        // parameter is deferred (Stage 5, Matcher values don't exist
-        // yet) and silently ignored if given, rather than erroring,
-        // matching this project's general "unrecognized flag ignored,
-        // not fatal" convention.
-        register("iterator") { arguments, _ in
+        // parameter allows a matcher to be specified" — now wired
+        // through to `LassoIteratorValue.build(from:reverse:matcher:)`,
+        // which pre-filters the snapshot to only matcher-matching
+        // elements (verified against the p.426 worked example:
+        // `Iterator($myArray, (Match_Range: 'a', 'm'))` on
+        // `('One','Two','Three','Four')` yields only "Four").
+        register("iterator") { arguments, context in
             guard let source = arguments.first?.value else { return .null }
-            return LassoIteratorValue.build(from: source, reverse: false) ?? .null
+            let matcher = arguments.positionalValue(at: 1)
+            return LassoIteratorValue.build(from: source, reverse: false, matcher: matcher, context: context) ?? .null
         }
-        register("reverseiterator") { arguments, _ in
+        register("reverseiterator") { arguments, context in
             guard let source = arguments.first?.value else { return .null }
-            return LassoIteratorValue.build(from: source, reverse: true) ?? .null
+            let matcher = arguments.positionalValue(at: 1)
+            return LassoIteratorValue.build(from: source, reverse: true, matcher: matcher, context: context) ?? .null
         }
         register("json_serialize") { arguments, _ in
             let value = arguments.first?.value ?? .null

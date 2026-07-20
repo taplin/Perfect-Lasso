@@ -8762,6 +8762,26 @@ struct IncludeURLTests {
     #expect(output == "2|A|B")
 }
 
+@Test func treeMapRemoveAllWithLiteralKeyDoesNotCollideOnOutputStringConcatenation() async throws {
+    // Sibling regression test to the one above, for `->RemoveAll`
+    // specifically: code review found `removingAllMatchingKey` routed a
+    // plain literal key through `LassoMatcherValue.matches`'s own
+    // generic fallback (`LassoCollectionValue.equals`, lossy
+    // `outputString`-based), bypassing `keysEqual` entirely and
+    // reintroducing the exact collision the `->Insert`/`->Find` fix
+    // above already closed. `RemoveAll((array(1,23)))` must remove only
+    // that one key, leaving `(array(12,3))` untouched.
+    var context = LassoContext()
+    let output = try await LassoRenderer().render(
+        """
+        [var('tm' = treemap)][$tm->Insert((array(1, 23))='A')][$tm->Insert((array(12, 3))='B')]\
+        [$tm->RemoveAll(array(1, 23))][$tm->Size]|[$tm->Find(array(12, 3))]
+        """,
+        context: &context
+    )
+    #expect(output == "1|B")
+}
+
 @Test func treeMapConstructorAlsoPreservesRealKeyTypesNotJustInsert() async throws {
     // Same proof as the `->Insert`-path test above, but for the
     // CONSTRUCTOR form itself (`treemap(key=value, ...)`, Table 19's
@@ -9164,5 +9184,130 @@ struct IncludeURLTests {
         context: &context
     )
     #expect(output == "1|One|0")
+}
+
+@Test func containsOperatorFixedBugWhereArrayMembershipDegradedToStringConcatenation() async throws {
+    // Regression test for the real, pre-existing bug this stage's own
+    // scoping pass found and fixed: `>>`'s old implementation was pure
+    // `left.outputString.contains(right.outputString)` with no
+    // `.array` branching at all — `(Array: 12, 3) >> 23` would have
+    // false-positived, since the array's own concatenated
+    // `outputString` ("123") coincidentally contains "23" as a
+    // substring even though no element of the array is literally 23.
+    var context = LassoContext()
+    let output = try await LassoRenderer().render(
+        "[(array: 12, 3) >> 23]|[(array: 1, 2, 3, 4, 5, 6, 7) >> 7]",
+        context: &context
+    )
+    #expect(output == "false|true")
+}
+
+@Test func matchRangeAndNotRangeWorkWithTheContainsOperatorMatchingTheGuidesOwnWorkedExamples() async throws {
+    // Ch. 30 p.421: `(Array: 1..7) >> (Match_Range: 1, 4)` → True;
+    // `>> (Match_Range: 8, 10)` → False. Range is inclusive both ends
+    // ("equal to either end-value or within the specified range").
+    var context = LassoContext()
+    let output = try await LassoRenderer().render(
+        """
+        [(array: 1, 2, 3, 4, 5, 6, 7) >> (match_range: 1, 4)]|\
+        [(array: 1, 2, 3, 4, 5, 6, 7) >> (match_range: 8, 10)]|\
+        [(array: 1, 2, 3, 4, 5, 6, 7) >> (match_notrange: 8, 10)]
+        """,
+        context: &context
+    )
+    #expect(output == "true|false|true")
+}
+
+@Test func matchRegExpAndNotRegExpWorkWithTheContainsOperatorMatchingTheGuidesOwnWorkedExamples() async throws {
+    // Ch. 30 p.421: `(Array: 'one','two') >> (Match_RegExp: 'o')` →
+    // True (both contain 'o'); `>> (Match_RegExp: 'f')` → False
+    // (neither word contains an 'f').
+    var context = LassoContext()
+    let output = try await LassoRenderer().render(
+        """
+        [(array: 'one', 'two') >> (match_regexp: 'o')]|\
+        [(array: 'one', 'two') >> (match_regexp: 'f')]|\
+        [(array: 'one', 'two') >> (match_notregexp: 'f')]
+        """,
+        context: &context
+    )
+    #expect(output == "true|false|true")
+}
+
+@Test func matchComparatorRhsAndLhsFormsMatchTheGuidesOwnWorkedExamples() async throws {
+    // Ch. 30 p.421-422, all four worked examples verbatim:
+    // `(Array:1,2,3) >> (Match_Comparator: \Compare_LessThan, -RHS=5)`
+    // → True (every element < 5); `-LHS=5` → False (5 is not less than
+    // any of 1,2,3); `\Compare_EqualTo, -RHS=3` → True (array contains
+    // 3); `\Compare_StrictEqualTo, -RHS='3'` → False (no element is
+    // strictly, type-wise, equal to the STRING '3').
+    var context = LassoContext()
+    let output = try await LassoRenderer().render(
+        """
+        [(array: 1, 2, 3) >> (match_comparator: (compare_lessthan), -rhs=5)]|\
+        [(array: 1, 2, 3) >> (match_comparator: (compare_lessthan), -lhs=5)]|\
+        [(array: 1, 2, 3) >> (match_comparator: (compare_equalto), -rhs=3)]|\
+        [(array: 1, 2, 3) >> (match_comparator: (compare_strictequalto), -rhs='3')]
+        """,
+        context: &context
+    )
+    #expect(output == "true|false|true|false")
+}
+
+@Test func removeAllWithMatchRangeMatchRegExpAndMatchComparatorMatchTheGuidesOwnWorkedExamples() async throws {
+    // Ch. 30 p.421-422, all three ->RemoveAll-with-a-matcher worked
+    // examples: `Match_Range(2,4)` on `(1..7)` leaves `(1,5,6,7)`;
+    // `Match_RegExp('\bT')` removes weekday names starting with T;
+    // `Match_Comparator(\Compare_LessThan, -RHS=5)` on `(1..7)` leaves
+    // `(5,6,7)`.
+    var context = LassoContext()
+    let output = try await LassoRenderer().render(
+        """
+        [var('a' = array(1, 2, 3, 4, 5, 6, 7))][$a->RemoveAll(match_range(2, 4))][$a->Join(',')]|\
+        [var('days' = array('Monday', 'Tuesday', 'Wednesday', 'Thursday', 'Friday'))]\
+        [$days->RemoveAll(match_regexp('\\\\bT'))][$days->Join(',')]|\
+        [var('b' = array(1, 2, 3, 4, 5, 6, 7))]\
+        [$b->RemoveAll(match_comparator((compare_lessthan), -rhs=5))][$b->Join(',')]
+        """,
+        context: &context
+    )
+    #expect(output == "1,5,6,7|Monday,Wednesday,Friday|5,6,7")
+}
+
+@Test func iteratorWithAMatcherFiltersElementsMatchingTheGuidesOwnWorkedExample() async throws {
+    // Ch. 30 p.426: `Iterator($myArray, (Match_Range: 'a', 'm'))` on
+    // `('One','Two','Three','Four')` — the Guide's own stated result
+    // is "Four" alone, taken as ground truth rather than re-derived.
+    var context = LassoContext()
+    let output = try await LassoRenderer().render(
+        """
+        [var('myArray' = array('One', 'Two', 'Three', 'Four'))]\
+        [var('myIterator' = iterator($myArray, (match_range: 'a', 'm')))]\
+        [while($myIterator->atEnd == false)]\
+        [$myIterator->Value] [var('_' = $myIterator->Forward)][/while]
+        """,
+        context: &context
+    )
+    #expect(output == "Four ")
+}
+
+@Test func listAndSetContainsAndRemoveAllAreMatcherAwareTooNotJustArray() async throws {
+    // Not a Table-22-specific worked example (those all use Array),
+    // but Table 22's own intro says Matchers work "with the
+    // […->Iterator], […->RemoveAll]" tags "of a compound data type" —
+    // generically, not Array-only — this test verifies List/Set's own
+    // already-existing ->Contains/->RemoveAll actually got the same
+    // extension, not just Array's.
+    var context = LassoContext()
+    let output = try await LassoRenderer().render(
+        """
+        [var('l' = (list: 1, 2, 3, 4, 5))][$l->Contains(match_range(2, 4))]|\
+        [$l->RemoveAll(match_range(2, 4))][$l->Join(',')]|\
+        [var('s' = set)][$s->Insert('one')][$s->Insert('two')]\
+        [$s->Contains(match_regexp('o'))]|[$s->RemoveAll(match_regexp('o'))][string($s)]
+        """,
+        context: &context
+    )
+    #expect(output == "true|1,5|true|Set: ")
 }
 
