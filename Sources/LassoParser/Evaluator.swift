@@ -1257,6 +1257,16 @@ struct Evaluator {
             // determines direction (`LassoComparatorValue
             // .isOrderedBefore` already encodes GreaterThan's reversal).
             let comparatorArgument: LassoValue = arguments.first != nil ? try await evaluate(arguments[0].value) : .null
+            // Stage 7c: a genuine custom (`\TagName`-referenced) comparator
+            // routes through the hand-rolled async merge sort — the sync
+            // path below is completely untouched for natural order/every
+            // built-in comparator.
+            if let customTagName = LassoComparatorValue.customTagName(of: comparatorArgument) {
+                let sorted = try await LassoComparatorValue.sortedByCustomComparator(
+                    values, tagName: customTagName, context: context
+                )
+                return .array(sorted)
+            }
             guard let kind = LassoComparatorValue.kind(of: comparatorArgument) else {
                 return .array(values)
             }

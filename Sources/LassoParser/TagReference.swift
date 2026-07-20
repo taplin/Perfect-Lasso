@@ -23,16 +23,25 @@ import Foundation
 /// gap this doc comment used to describe as blocking real dispatch.
 /// `LassoComparatorValue.evaluateCustom` (Stage 7b) uses it to actually
 /// run a `\MyCustomComparator` reference's tag body when consumed via
-/// `Match_Comparator`/`LassoMatcherValue.matches`. Still NOT wired into
-/// default collection ordering (`PriorityQueue`/`TreeMap` construction,
-/// `Array`/`List->Sort`/`->SortWith`) — those remain synchronous
-/// (`Evaluator.lassoLessThan`/`LassoComparatorValue.isOrderedBefore`
-/// inside `sorted(by:)`, which has no async-predicate overload in the
-/// standard library), so a custom comparator given there still falls
-/// back to Stage 2's own pre-existing "unrecognized comparator value"
-/// natural/lessthan-order behavior. That's Stage 7c's scope. Custom
-/// Matchers via `Define_Type`+`onCompare` remain wholly undispatched —
-/// still this plan's own highest-risk item, deferred separately.
+/// `Match_Comparator`/`LassoMatcherValue.matches`. **Stage 7c extends
+/// this to `Array->SortWith`/`List->SortWith`** too, via a hand-rolled
+/// async merge sort (`LassoComparatorValue.sortedByCustomComparator`) —
+/// Swift's `sorted(by:)` has no async-predicate overload, so a genuine
+/// custom comparator couldn't reuse the sync `isOrderedBefore` path.
+/// **Still NOT wired into `PriorityQueue`/`TreeMap` construction** —
+/// unlike `->SortWith` (a one-shot call given a comparator argument
+/// directly), those two types STORE their comparator identity once at
+/// construction (as a plain `_kind: String`, with no way to represent
+/// "invoke custom tag X") and reuse it across every future `->Insert`;
+/// supporting that needs an actual storage-model change to those types,
+/// separate scope beyond the sort-algorithm work Stage 7c did. A custom
+/// comparator given to `PriorityQueue`/`TreeMap`'s constructor still
+/// falls back to Stage 2's own pre-existing "unrecognized comparator
+/// value" natural/lessthan-order behavior — unchanged, not a
+/// regression. Custom Matchers via `Define_Type`+`onCompare` remain
+/// wholly undispatched — still this plan's own highest-risk item,
+/// deferred separately (needs an IMPLICIT auto-dispatch trigger, not
+/// an explicit call site the way `Match_Comparator`/`->SortWith` are).
 enum LassoTagReferenceValue {
     static let typeName = "tagreference"
 

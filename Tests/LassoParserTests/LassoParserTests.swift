@@ -8733,6 +8733,94 @@ struct IncludeURLTests {
     #expect(output == "List: a, bb, ccc")
 }
 
+@Test func arraySortWithDispatchesARealCustomComparatorTagBody() async throws {
+    // Stage 7c: Array->SortWith with a genuine custom (`\TagName`-
+    // referenced) comparator now actually sorts by the tag's own
+    // return value, via the hand-rolled async merge sort — not just
+    // the built-in-comparator path. `ReverseOrder` hand-implements the
+    // same descending order `\Compare_GreaterThan` gives, independently
+    // confirming the sort algorithm itself (not just single-comparison
+    // dispatch, already proven by Stage 7b's Match_Comparator tests).
+    var context = LassoContext()
+    let output = try await LassoRenderer().render(
+        """
+        [
+        Define_Tag('ReverseOrder', -Required='Left', -Required='Right');
+            Return((Local: 'Left') > (Local: 'Right') ? 0 | -1);
+        /Define_Tag;
+        var('arr' = array(3, 1, 4, 1, 5, 9, 2, 6));
+        ]\
+        [$arr->SortWith(\\ReverseOrder)][$arr->Join(',')]
+        """,
+        context: &context
+    )
+    #expect(output == "9,6,5,4,3,2,1,1")
+}
+
+@Test func listSortWithDispatchesARealCustomComparatorTagBody() async throws {
+    var context = LassoContext()
+    let output = try await LassoRenderer().render(
+        """
+        [
+        Define_Tag('ReverseOrder', -Required='Left', -Required='Right');
+            Return((Local: 'Left') > (Local: 'Right') ? 0 | -1);
+        /Define_Tag;
+        var('myList' = (list: 'bb', 'a', 'ccc'));
+        ]\
+        [$myList->SortWith(\\ReverseOrder)][string($myList)]
+        """,
+        context: &context
+    )
+    #expect(output == "List: ccc, bb, a")
+}
+
+@Test func arraySortWithCustomComparatorIsStableForTiedElements() async throws {
+    // A custom comparator that only distinguishes by even/odd leaves
+    // genuine ties (both parity groups have more than one element) —
+    // the merge sort must preserve each tied group's original relative
+    // order, matching Swift's own `sorted(by:)` stability guarantee
+    // the pre-existing sync path already relies on. Uses `%`/`<` on
+    // plain NUMBERS deliberately, not strings — the raw `<` operator
+    // has an unrelated, real, pre-existing bug for non-numeric (string)
+    // operands, spawned as its own separate follow-up task, out of
+    // scope here.
+    var context = LassoContext()
+    let output = try await LassoRenderer().render(
+        """
+        [
+        Define_Tag('ByParity', -Required='Left', -Required='Right');
+            Return((Local: 'Left') % 2 < (Local: 'Right') % 2 ? 0 | -1);
+        /Define_Tag;
+        var('arr' = array(3, 4, 1, 6));
+        ]\
+        [$arr->SortWith(\\ByParity)][$arr->Join(',')]
+        """,
+        context: &context
+    )
+    #expect(output == "4,6,3,1")
+}
+
+@Test func listSortWithCustomComparatorIsStableForTiedElements() async throws {
+    // Sibling to the Array test above — both routes share the same
+    // `LassoComparatorValue.sortedByCustomComparator`, but List's own
+    // `->SortWith` registration is a separate call site (`Collections.swift`)
+    // worth its own direct proof, not just inferred from Array's.
+    var context = LassoContext()
+    let output = try await LassoRenderer().render(
+        """
+        [
+        Define_Tag('ByParity', -Required='Left', -Required='Right');
+            Return((Local: 'Left') % 2 < (Local: 'Right') % 2 ? 0 | -1);
+        /Define_Tag;
+        var('myList' = (list: 3, 4, 1, 6));
+        ]\
+        [$myList->SortWith(\\ByParity)][string($myList)]
+        """,
+        context: &context
+    )
+    #expect(output == "List: 4, 6, 3, 1")
+}
+
 @Test func treeMapFindKeysValuesGetAndAutoStringMatchTheDaysOfWeekWorkedExample() async throws {
     // Ch. 30 pp.417-418: the DaysOfWeek worked example, verified across
     // ->Find (by key), ->Keys/->Values (sorted-by-key order, same

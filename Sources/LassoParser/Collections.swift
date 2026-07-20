@@ -466,7 +466,7 @@ extension LassoNativeTypeRegistry {
             if !ascending { sorted.reverse() }
             return .object(LassoCollectionValue.makeObject(typeName: "list", elements: sorted))
         }
-        type.register("sortwith") { receiver, arguments, _ in
+        type.register("sortwith") { receiver, arguments, context in
             // Table 21: same Comparator-driven ordering as
             // `Array->SortWith` (see its own doc comment in
             // `Evaluator.swift` for the worked-example citation) —
@@ -474,6 +474,16 @@ extension LassoNativeTypeRegistry {
             // by a comparator... Modifies the list in place and returns
             // no value" (Table 5).
             let comparatorArgument: LassoValue = arguments.first?.value ?? .null
+            // Stage 7c: a genuine custom (`\TagName`-referenced) comparator
+            // routes through the hand-rolled async merge sort — the sync
+            // path below is completely untouched for natural order/every
+            // built-in comparator.
+            if let customTagName = LassoComparatorValue.customTagName(of: comparatorArgument) {
+                let sorted = try await LassoComparatorValue.sortedByCustomComparator(
+                    LassoCollectionValue.elements(from: receiver), tagName: customTagName, context: context
+                )
+                return .object(LassoCollectionValue.makeObject(typeName: "list", elements: sorted))
+            }
             guard let kind = LassoComparatorValue.kind(of: comparatorArgument) else {
                 return .object(LassoCollectionValue.makeObject(
                     typeName: "list", elements: LassoCollectionValue.elements(from: receiver)
