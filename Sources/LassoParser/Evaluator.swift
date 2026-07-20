@@ -661,14 +661,35 @@ struct Evaluator {
         }
     }
 
-    private mutating func formattedNumber(_ value: Double, _ arguments: [LassoArgument]) async throws -> String {
+    // `defaultPrecision` is the precision to use when the caller passes no
+    // explicit `-precision` argument -- it differs by the invocant's real
+    // type, which this shared helper otherwise has no way to know once
+    // everything's flattened to a `Double`: real Lasso's
+    // `decimal->asString` defaults to six decimal places ("Formatting
+    // Decimal Objects", lassoguide.com Math chapter: "If no parameters are
+    // passed to the method, the string will be the decimal value with six
+    // places of precision"), while `integer->asString` has no such rule
+    // and should print a bare whole number. Previously this always fell
+    // back to plain `String(value)` regardless of invocant type --
+    // `Double`'s own default stringification, which for an integer prints
+    // a trailing `.0` (`123->asString` produced `"123.0"`, not `"123"`)
+    // and for a decimal prints Swift's shortest-round-trip
+    // representation, which leaks raw IEEE-754 binary-fraction noise
+    // straight through for any value not exactly representable in binary
+    // -- almost every two-decimal money amount (`(0.1 + 0.2)->asString`
+    // produced `"0.30000000000000004"`, not the six-place `"0.300000"`
+    // real Lasso guarantees). Found live: FileMaker's own CR_web
+    // order_grandtotal field, after round-tripping through ordinary Lasso
+    // arithmetic (subtotal + tax + shipping - discount), carried exactly
+    // this kind of raw-noise value.
+    private mutating func formattedNumber(_ value: Double, _ arguments: [LassoArgument], defaultPrecision: Int?) async throws -> String {
         var precision: Int?
         for argument in arguments {
             guard argument.label?.caseInsensitiveCompare("precision") == .orderedSame else { continue }
             precision = Int(try await evaluate(argument.value).number ?? 0)
         }
-        guard let precision else { return String(value) }
-        return String(format: "%.\(max(precision, 0))f", value)
+        guard let effectivePrecision = precision ?? defaultPrecision else { return String(value) }
+        return String(format: "%.\(max(effectivePrecision, 0))f", value)
     }
 
     private func unary(_ op: String, _ value: LassoValue) throws -> LassoValue {
@@ -1038,7 +1059,7 @@ struct Evaluator {
             guard end > start else { return .string("") }
             return .string(String(characters[start..<end]))
         case let (.integer(value), "asstring"):
-            return .string(try await formattedNumber(Double(value), arguments))
+            return .string(try await formattedNumber(Double(value), arguments, defaultPrecision: 0))
         case let (.decimal(value), "asstring"):
             // Real corpus: pages/thumbs.page.lasso's
             // `decimal(field('starting_price'))->asString(-precision=2)`
@@ -1047,7 +1068,7 @@ struct Evaluator {
             // lassoBackup/scrubs/LassoApps/ds/_init.lasso's
             // `(...)->asstring(-precision=3)` on a `Double` literal
             // expression, hence the shared `formattedNumber` helper).
-            return .string(try await formattedNumber(value, arguments))
+            return .string(try await formattedNumber(value, arguments, defaultPrecision: 6))
         case let (.decimal(value), "ceil"): return .decimal(value.rounded(.up))
         case let (.integer(value), "ceil"): return .integer(value)
         case let (.pair(key, _), "first"): return key
