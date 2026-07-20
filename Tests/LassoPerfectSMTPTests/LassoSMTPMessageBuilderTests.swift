@@ -181,24 +181,32 @@ struct LassoSMTPMessageBuilderTests {
         #expect(result.message.htmlBody == nil)
     }
 
-    // MARK: - Not-yet-supported params (§4.3/§7): always throw, regardless
-    // of value.
+    // MARK: - `-date`/`-immediate=false` (Phase E, §4.3/§4.7b): real landing
+    // spots on `BuildResult`, not thrown here at all -- interpretation
+    // (parsing `-date`, deciding sync vs. deferred) happens in
+    // `LassoEmailProviderImpl.send`, not in this pure-mapping builder.
 
-    @Test func dateAlwaysThrowsRegardlessOfValue() throws {
-        #expect(throws: LassoSMTPError.self) {
-            try LassoSMTPMessageBuilder.build(validBaseArguments + [arg("date", "2026-01-01")])
-        }
+    @Test func dateGivenIsCarriedThroughAsTheRawUnparsedValue() throws {
+        let result = try LassoSMTPMessageBuilder.build(validBaseArguments + [arg("date", "2026-01-01")])
+        #expect(result.dateValue == .string("2026-01-01"))
+        #expect(result.immediateExplicitlyFalse == false)
     }
 
-    @Test func immediateFalseThrows() throws {
-        #expect(throws: LassoSMTPError.self) {
-            try LassoSMTPMessageBuilder.build(validBaseArguments + [flag("immediate", false)])
-        }
+    @Test func dateAbsentLeavesDateValueNil() throws {
+        let result = try LassoSMTPMessageBuilder.build(validBaseArguments)
+        #expect(result.dateValue == nil)
     }
 
-    @Test func immediateTrueOrAbsentDoesNotThrow() throws {
-        _ = try LassoSMTPMessageBuilder.build(validBaseArguments)
-        _ = try LassoSMTPMessageBuilder.build(validBaseArguments + [flag("immediate", true)])
+    @Test func immediateFalseSetsImmediateExplicitlyFalse() throws {
+        let result = try LassoSMTPMessageBuilder.build(validBaseArguments + [flag("immediate", false)])
+        #expect(result.immediateExplicitlyFalse == true)
+    }
+
+    @Test func immediateTrueOrAbsentDoesNotThrowAndLeavesImmediateExplicitlyFalseFalse() throws {
+        let absent = try LassoSMTPMessageBuilder.build(validBaseArguments)
+        #expect(absent.immediateExplicitlyFalse == false)
+        let explicitTrue = try LassoSMTPMessageBuilder.build(validBaseArguments + [flag("immediate", true)])
+        #expect(explicitTrue.immediateExplicitlyFalse == false)
     }
 
     @Test func tokensThrows() throws {

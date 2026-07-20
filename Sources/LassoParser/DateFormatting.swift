@@ -7,7 +7,7 @@ import Foundation
 /// with "a time zone" in a way that doesn't match, so this interpreter
 /// stores the six wall-clock components directly rather than an instant.
 /// See `Documentation/date-format-plan.md`.
-struct LassoDateComponents: Equatable, Sendable {
+public struct LassoDateComponents: Equatable, Sendable {
     var year: Int
     var month: Int
     var day: Int
@@ -27,7 +27,11 @@ struct LassoDateComponents: Equatable, Sendable {
         return calendar
     }
 
-    var asDate: Date {
+    /// Public (Phase E, §4.3/§4.7b): `LassoPerfectSMTP`'s `-date`-scheduled
+    /// `email_send` needs to convert an already-parsed `-date` value into a
+    /// concrete due-`Date` to sleep until — reuses this exact conversion
+    /// rather than re-deriving one from raw components.
+    public var asDate: Date {
         var components = DateComponents()
         components.year = year
         components.month = month
@@ -90,7 +94,7 @@ struct LassoDateComponents: Equatable, Sendable {
 /// Parses a value into `LassoDateComponents`, matching Lasso 8.5's `[Date]`
 /// tag ("auto-recognizes... a valid date string") and Lasso 9's date
 /// creator method. See `Documentation/date-format-plan.md`.
-enum LassoDateParsing {
+public enum LassoDateParsing {
     /// Recognized formats, tried in order — covers every real corpus shape
     /// this pass targets (Chapter 29's own worked examples plus what's
     /// actually used). A `DateFormatter` per pattern, not one reused
@@ -119,7 +123,7 @@ enum LassoDateParsing {
     /// dateString, -Format='...']`) forcing how an otherwise-ambiguous
     /// string should be read — translated to the same ICU pattern
     /// `LassoDateFormatting` uses for output, then parsed with it first.
-    static func parse(_ value: LassoValue, explicitFormat: String? = nil) -> LassoDateComponents? {
+    public static func parse(_ value: LassoValue, explicitFormat: String? = nil) -> LassoDateComponents? {
         switch value {
         case let .object(object) where object.typeName.caseInsensitiveCompare("date") == .orderedSame:
             return dateComponents(from: object)

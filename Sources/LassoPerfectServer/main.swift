@@ -895,6 +895,20 @@ struct LassoSiteServer: Sendable {
     /// it IS genuinely cancelled on restart, not merely exposed for some
     /// hypothetical future path.
     let smtpConnectionReaperTask: Task<Void, Never>?
+    /// `LassoEmailJobTracker`'s periodic eviction-sweep Task (Phase E,
+    /// §4.7/§4.7b) — `nil` under the exact same condition
+    /// `smtpConnectionReaperTask` is (no `smtp` block configured at all, so
+    /// there's no job tracker any request could ever populate). Follows
+    /// `smtpConnectionReaperTask`'s own established convention identically:
+    /// a cancellable `Task<Void, Never>` owned by whoever wires the
+    /// resource, wired into `LassoAdminDelegate`'s restart action alongside
+    /// `cwpJanitorTask`/`smtpConnectionReaperTask` so it's genuinely
+    /// cancelled on "Restart Server," not merely exposed for some
+    /// hypothetical future path (see that property's own doc comment for
+    /// the identical reasoning, and `LassoEmailJobTracker.swift`'s doc
+    /// comment for why THIS is the one Task Phase E tracks this way, while
+    /// individual per-send deferred-send Tasks deliberately are not).
+    let emailJobSweepTask: Task<Void, Never>?
 
     init(
         config: ServerConfig,
@@ -1140,6 +1154,13 @@ struct LassoSiteServer: Sendable {
             // would mean the reaper sweeps a registry no request ever
             // populates.
             let connectionRegistry = LassoSMTPConnectionRegistry()
+            // `email_result`/`email_status`'s job tracking layer (Phase E,
+            // §4.7/§4.7b) — built once here for the exact same reason
+            // `connectionRegistry` is: shared across every request's
+            // `LassoEmailProviderImpl` AND the periodic eviction-sweep Task
+            // below, so a job one request records is actually readable by a
+            // later request's `email_result`/`email_status` call.
+            let jobTracker = LassoEmailJobTracker()
             emailProvider = LassoEmailProviderImpl(
                 registry: registry,
                 siteRoot: config.siteRoot,
@@ -1147,7 +1168,8 @@ struct LassoSiteServer: Sendable {
                 mxLookupCache: LassoMXLookupCache(),
                 connectionRegistry: connectionRegistry,
                 group: MultiThreadedEventLoopGroup.singleton,
-                allowEmailSMTP: config.smtpAllowEmailSMTP
+                allowEmailSMTP: config.smtpAllowEmailSMTP,
+                jobTracker: jobTracker
             )
             // Idle-timeout reaper: a page that errors out mid `->open`/
             // `->command`/`->send` sequence, or simply forgets `->close`,
@@ -1167,9 +1189,25 @@ struct LassoSiteServer: Sendable {
                     _ = await connectionRegistry.sweepIdleConnections(idleTimeout: 300)
                 }
             }
+            // `LassoEmailJobTracker`'s own periodic eviction sweep (Phase E,
+            // §4.7b's answer to open question #1/#2) — matches
+            // `smtpConnectionReaperTask`'s identical shape immediately
+            // above (60s poll interval; the tracker's own TTL/hard-cap
+            // defaults, 24h/10,000 entries, applied every sweep). This is
+            // the ONE background Task Phase E tracks for restart
+            // cancellation (`LassoEmailJobTracker.swift`'s own doc comment
+            // explains why per-send deferred-send Tasks deliberately are
+            // NOT also tracked this way).
+            emailJobSweepTask = Task {
+                while !Task.isCancelled {
+                    try? await Task.sleep(for: .seconds(60))
+                    _ = await jobTracker.sweepExpiredJobs()
+                }
+            }
         } else {
             emailProvider = nil
             smtpConnectionReaperTask = nil
+            emailJobSweepTask = nil
         }
     }
 
@@ -2265,7 +2303,8 @@ if config.adminConsoleEnabled {
         janitorTracker: janitorTracker,
         cwpAdminAPIClient: cwpAdminAPIClient,
         cwpJanitorTask: cwpJanitorTask,
-        smtpConnectionReaperTask: siteServer.smtpConnectionReaperTask
+        smtpConnectionReaperTask: siteServer.smtpConnectionReaperTask,
+        emailJobSweepTask: siteServer.emailJobSweepTask
     )
     let admin = try AdminConsole(
         port: config.adminConsolePort,

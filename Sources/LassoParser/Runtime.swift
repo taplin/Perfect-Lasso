@@ -1383,7 +1383,38 @@ public struct LassoNativeRegistry: Sendable {
             guard let emailProvider = context.emailProvider else {
                 throw LassoRuntimeError.emailNotConfigured
             }
-            return try await emailProvider.send(arguments, context: context)
+            // Phase E (§4.0/§4.7b): `send` now returns `LassoEmailSendResult`,
+            // not a bare `LassoValue` — this is the one place with `inout
+            // LassoContext` access (the provider layer itself only ever sees
+            // `context` by value), so it's the only place that CAN stash a
+            // job ID into `context.lastEmailJobID` for a later `email_result()`
+            // call to read back. A thrown `LassoEmailSendFailure` carries a
+            // job ID recorded before a delivery failure occurred (as opposed
+            // to a plain `LassoRecoverableError`/other error thrown for a
+            // pre-send validation failure, which never recorded a job at all
+            // and is left to propagate unchanged, un-caught by the clause
+            // below).
+            //
+            // BLOCKING FIX #3 (Phase E milestone review): reset
+            // `context.lastEmailJobID` to `nil` BEFORE attempting this call
+            // at all, so that every OTHER thrown error (every pre-send
+            // validation failure, which isn't `LassoEmailSendFailure` and so
+            // isn't caught below) correctly leaves `lastEmailJobID` `nil`
+            // rather than stale from a PREVIOUS, unrelated `email_send` call
+            // earlier in the same request. Concrete bug this fixes:
+            // `email_send` #1 succeeds (job ID X recorded) -> `email_send`
+            // #2 in the same request fails pre-send validation (e.g.
+            // missing `-subject`) -> a subsequent `email_result()` call must
+            // throw (no job exists for #2), not silently return X.
+            context.lastEmailJobID = nil
+            do {
+                let result = try await emailProvider.send(arguments, context: context)
+                context.lastEmailJobID = result.jobID
+                return result.value
+            } catch let failure as LassoEmailSendFailure {
+                context.lastEmailJobID = failure.jobID
+                throw failure.underlying
+            }
         }
         // `email_compose` (lassoguide.com, "Sending Email" → "Compose an
         // Email Message"; Documentation/lasso-perfect-smtp-integration-plan.md
@@ -1413,6 +1444,29 @@ public struct LassoNativeRegistry: Sendable {
                 throw LassoRuntimeError.emailNotConfigured
             }
             return try await emailProvider.mxLookup(arguments, context: context)
+        }
+        // `email_result()` (Phase E, §4.7/§4.7b) — real Lasso's signature
+        // takes NO arguments at all ("Can be called immediately after
+        // calling email_send to get a unique ID string for the queued
+        // message"); it implicitly refers to whatever `email_send` call
+        // most recently completed, via `context.lastEmailJobID` (set by
+        // `email_send`'s own registration above). Dispatches through the
+        // same `context.emailProvider` seam as every other email-family
+        // function.
+        register("email_result") { arguments, context in
+            guard let emailProvider = context.emailProvider else {
+                throw LassoRuntimeError.emailNotConfigured
+            }
+            return try await emailProvider.result(context: context)
+        }
+        // `email_status(id)` (Phase E, §4.7/§4.7b) — returns exactly one of
+        // "sent"/"queued"/"error" (lowercase) for a job ID previously
+        // returned by `email_result()`.
+        register("email_status") { arguments, context in
+            guard let emailProvider = context.emailProvider else {
+                throw LassoRuntimeError.emailNotConfigured
+            }
+            return try await emailProvider.status(arguments, context: context)
         }
         // `email_smtp` (Lasso 9's low-level raw SMTP connection type —
         // `->open`/`->command`/`->send`/`->close`; §4.8b) — registered as
@@ -1650,6 +1704,19 @@ public struct LassoContext: Sendable {
     /// application (e.g. `LassoPerfectSMTP`'s conformer, wired in from
     /// `main.swift`) exactly like `inlineProvider`/`sessionProvider`.
     public var emailProvider: (any LassoEmailProvider)?
+    /// The job ID `email_send`'s free-function wrapper (`registerDefaultFunctions()`,
+    /// below) most recently recorded — backs `email_result()`'s real,
+    /// argument-less signature (Phase E, §4.7b: "Can be called immediately
+    /// after calling `email_send` to get a unique ID string for the queued
+    /// message," with no parameter of its own). Follows `currentError`'s
+    /// exact precedent as a plain, request-scoped, directly-settable field
+    /// (no stack/restore machinery — job IDs don't nest the way
+    /// `[protect]`/`Error_Push` scopes do). `nil` means either "no
+    /// `email_send` has been called yet this request" or "the most recent
+    /// `email_send` failed before a job was ever recorded" (a pre-send
+    /// validation failure, §4.7b's scoping rule) — `email_result()` throws a
+    /// clear, catchable error for either case rather than guessing.
+    public var lastEmailJobID: String?
     /// Called by `log_critical` with its message text — a hook for the
     /// host application to surface these into its own logging.
     /// `LassoParser` has no direct I/O of its own (same convention as
@@ -1773,6 +1840,7 @@ public struct LassoContext: Sendable {
         self.responseSink = responseSink
         self.inlineProvider = inlineProvider
         self.emailProvider = emailProvider
+        lastEmailJobID = nil
         self.diagnosticLogSink = diagnosticLogSink
         self.tagRegistry = tagRegistry
         loadedLibraries = []
@@ -2172,4 +2240,12 @@ public enum LassoRuntimeError: Error, Equatable {
     /// deliberately doesn't support `email_smtp` at all — an
     /// adapter-configuration gap, not an ordinary expected runtime failure.
     case emailSMTPNotSupportedByProvider(String)
+    /// Thrown by `LassoEmailProvider`'s default `result` implementation
+    /// (`Providers.swift`) — a conformer that predates Phase E and never
+    /// overrode it. Same "adapter-configuration gap, not an ordinary
+    /// expected runtime failure" rationale as `emailSMTPNotSupportedByProvider`.
+    case emailResultNotSupportedByProvider
+    /// Thrown by `LassoEmailProvider`'s default `status` implementation
+    /// (`Providers.swift`) — same rationale as `emailResultNotSupportedByProvider`.
+    case emailStatusNotSupportedByProvider
 }

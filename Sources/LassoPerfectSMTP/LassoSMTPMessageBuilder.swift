@@ -155,6 +155,25 @@ public enum LassoSMTPMessageBuilder {
         /// `-htmlImages`, parsed but not yet resolved — same deal as
         /// `pendingAttachments`.
         public let pendingInlineImages: [LassoSMTPPendingInlineImage]
+        /// `-date`'s raw, unparsed value (Phase E, §4.3/§4.7b) — `nil` when
+        /// `-date` wasn't given at all. Left unparsed here deliberately:
+        /// `LassoSMTPMessageBuilder` is pure mapping logic with no
+        /// dependency on `LassoDateParsing`'s own concept of "now" (parsing
+        /// failure is a real, catchable pre-send validation error, but
+        /// deciding *when* "now" is, for a genuinely relative parse, belongs
+        /// with the caller that's about to act on the result) —
+        /// `LassoEmailProviderImpl.send` parses this via
+        /// `LassoDateParsing.parse(_:)`, matching this file's existing
+        /// "no I/O, no interpretation beyond dash-param shape" scope.
+        public let dateValue: LassoValue?
+        /// `true` only when `-immediate=false` was explicitly given (Phase
+        /// E) — `-immediate` absent, or any other truthy value, keeps the
+        /// default synchronous-send behavior. `-date`'s presence implies
+        /// deferred sending regardless of this flag's value (a future date
+        /// inherently means "not now") — `LassoEmailProviderImpl.send` is
+        /// what combines the two into the actual sync-vs-deferred decision,
+        /// not this builder.
+        public let immediateExplicitlyFalse: Bool
     }
 
     /// Dash-params this builder deliberately does not implement at all —
@@ -181,8 +200,12 @@ public enum LassoSMTPMessageBuilder {
     /// builder can't represent yet either way) — per §4.3b's own stated
     /// rule, "if the shape can't be confirmed with reasonable confidence,
     /// treat as notYetSupported... rather than guess."
+    /// `-date` moved OFF this list in Phase E (§4.3/§4.7b) — now given a
+    /// real landing spot (`BuildResult.dateValue`) now that
+    /// `LassoEmailJobTracker` exists to back real deferred sending. See the
+    /// file doc comment's Phase E section.
     private static let unsupportedParameterNames: [String] = [
-        "date", "tokens", "merge", "characterSet", "attachment", "parts", "headerType",
+        "tokens", "merge", "characterSet", "attachment", "parts", "headerType",
     ]
 
     /// - Parameter functionName: Interpolated into the three
@@ -202,12 +225,12 @@ public enum LassoSMTPMessageBuilder {
                 message: "-\(name) is not yet supported by email_send in this phase; see Documentation/lasso-perfect-smtp-integration-plan.md §4.3/§6."
             )
         }
-        if let immediateValue = lastValueIfPresent("immediate", in: arguments), immediateValue.isTruthy == false {
-            throw LassoSMTPError(
-                kind: .notYetSupported,
-                message: "-immediate=false is not yet supported by email_send — the job tracker it needs (LassoEmailJobTracker) lands in Phase E; see §4.3/§7."
-            )
-        }
+        // Phase E (§4.3/§4.7b): `-immediate=false` now has a real landing
+        // spot (`LassoEmailJobTracker`-backed deferred sending in
+        // `LassoEmailProviderImpl.send`) — no longer thrown here as
+        // `notYetSupported`. Only an EXPLICIT `false` defers; absent, or any
+        // other truthy value, keeps today's synchronous default.
+        let immediateExplicitlyFalse = lastValueIfPresent("immediate", in: arguments)?.isTruthy == false
 
         guard let fromRaw = arguments.lastString(named: "from"), fromRaw.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty == false else {
             throw LassoSMTPError(kind: .invalidParameter, message: "\(functionName) requires -from.")
@@ -274,13 +297,19 @@ public enum LassoSMTPMessageBuilder {
         let pendingAttachments = try collectEntries(arguments, name: "attachments").map(pendingAttachment(from:))
         let pendingInlineImages = try collectEntries(arguments, name: "htmlImages").map(pendingInlineImage(from:))
 
+        // -date: raw value only, unparsed -- see BuildResult.dateValue's own
+        // doc comment for why interpretation is deferred to the caller.
+        let dateValue = arguments.lastValue(named: "date")
+
         return BuildResult(
             message: message,
             bcc: bcc,
             envelopeFrom: .address(from.address),
             relayName: relayName,
             pendingAttachments: pendingAttachments,
-            pendingInlineImages: pendingInlineImages
+            pendingInlineImages: pendingInlineImages,
+            dateValue: dateValue,
+            immediateExplicitlyFalse: immediateExplicitlyFalse
         )
     }
 

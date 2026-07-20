@@ -78,6 +78,27 @@ public enum LassoSMTPFailureKind: String, Sendable {
     /// broad kinds carrying a specific message (`.deliveryFailed` already
     /// covers several distinct SMTP-level outcomes the same way).
     case mxLookupFailed
+    /// `email_result()` (Phase E, §4.7/§4.7b) was called with no prior
+    /// `email_send` recorded in this context — either it's genuinely the
+    /// first call this request, or the most recent `email_send` failed
+    /// before a job was ever recorded (a pre-send validation failure,
+    /// §4.7b's job-ID scoping rule). Neither doc source describes this
+    /// case, so this project's "explicit error over silent guess"
+    /// discipline applies rather than returning an ambiguous `.void`.
+    case noJobRecorded
+    /// A deferred (`-immediate=false`/`-date`) send was rejected because
+    /// too many deferred sends are already in flight (Phase E milestone
+    /// review, BLOCKING FIX #1) — a pre-send validation failure, no job
+    /// recorded, thrown before a background `Task` is ever spawned. See
+    /// `LassoEmailProviderImpl.maxConcurrentDeferredSends`'s own doc
+    /// comment for the chosen cap and reasoning.
+    case tooManyDeferredSendsInFlight
+    /// `-date` named a due time further in the future than this adapter
+    /// allows (Phase E milestone review, BLOCKING FIX #2) — a pre-send
+    /// validation failure, no job recorded. See
+    /// `LassoEmailProviderImpl.maximumFutureScheduleWindow`'s own doc
+    /// comment for the chosen window and reasoning.
+    case dateTooFarInFuture
 
     var code: Int {
         switch self {
@@ -88,6 +109,9 @@ public enum LassoSMTPFailureKind: String, Sendable {
         case .deliveryFailed: 3005
         case .attachmentFailed: 3006
         case .mxLookupFailed: 3007
+        case .noJobRecorded: 3008
+        case .tooManyDeferredSendsInFlight: 3010
+        case .dateTooFarInFuture: 3011
         }
     }
 }

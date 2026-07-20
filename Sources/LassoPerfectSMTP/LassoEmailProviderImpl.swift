@@ -49,6 +49,23 @@
 //    see `RelayTransport.send`'s own doc comment), so this provider is
 //    what turns that data into a catchable failure.
 //
+//  ## Phase E addendum (§4.7/§4.7b): job tracking, `-immediate=false`/
+//  `-date`, `email_result`/`email_status`
+//
+//  `-immediate=false`/`-date` moved OFF the failure list above -- they're
+//  real, implemented deferred-send paths now (see `send(_:context:)`'s own
+//  inline comments for the full three-case design). Every failure that
+//  occurs AFTER a job has been recorded (i.e. after build/attachment-
+//  resolution/relay-resolution have all succeeded) is now wrapped in
+//  `LassoEmailSendFailure` rather than thrown as a bare
+//  `LassoRecoverableError` directly -- see that type's own doc comment
+//  (`Providers.swift`) for why a job ID needs to ride along on the thrown
+//  error itself for `email_result()` to remain able to retrieve it after a
+//  `[protect]`-caught delivery failure. Failures that occur BEFORE a job is
+//  recorded (every failure listed above this addendum) are unaffected --
+//  still a bare, unwrapped `LassoRecoverableError`, matching every phase
+//  before this one, since there is no job ID to carry.
+//
 
 import Foundation
 import LassoParser
@@ -102,6 +119,18 @@ public struct LassoEmailProviderImpl: LassoEmailProvider {
     /// See `LassoEmailSMTPType.swift`'s `smtpOpen` for the actual gate
     /// check (the one place real network dialing happens).
     let allowEmailSMTP: Bool
+    /// Backs `email_result`/`email_status`/`-immediate=false`/`-date`
+    /// (Phase E, §4.7/§4.7b) — the job tracking layer, shared across every
+    /// request this conformer serves so a job recorded by one `email_send`
+    /// call is later readable by any subsequent `email_result`/
+    /// `email_status` call in the same process. Always constructible with
+    /// zero external resources (matching `connectionRegistry`'s own
+    /// "default to a fresh, private instance" convention above) — every
+    /// conformer gets working job tracking unless a caller has some reason
+    /// to share one explicitly (`main.swift` does, so its periodic
+    /// eviction-sweep `Task` sweeps the exact same tracker every request's
+    /// context dispatches through).
+    let jobTracker: LassoEmailJobTracker
     /// `email_smtp->open` dials directly via `SMTPBootstrap.connect`,
     /// bypassing `LassoSMTPMailerRegistry`'s pooled, named-relay
     /// `SMTPMailer`s entirely (§4.8b: real Lasso's `email_smtp` is a raw,
@@ -114,6 +143,54 @@ public struct LassoEmailProviderImpl: LassoEmailProvider {
     /// second one just for `email_smtp`.
     let group: any EventLoopGroup
 
+    /// Hard cap on concurrently in-flight deferred (`-immediate=false`/
+    /// `-date`) sends (Phase E milestone review, BLOCKING FIX #1) —
+    /// enforced only in `send(_:context:)`'s deferred branch, via
+    /// `LassoEmailJobTracker.recordQueuedIfUnderCap`, BEFORE a job is
+    /// recorded and BEFORE its background `Task` is spawned. The
+    /// synchronous path is never subject to this cap (it never lingers
+    /// `.queued` long enough to meaningfully count — see
+    /// `LassoEmailJobTracker.recordQueuedIfUnderCap`'s own doc comment).
+    ///
+    /// This project's own explicit judgment call — no doc source specifies
+    /// a number, matching the discipline already used for
+    /// `LassoEmailJobTracker`'s own TTL/hard-cap numbers. Each in-flight
+    /// deferred send retains its full captured `EmailMessage` (including
+    /// resolved attachment `Data`, up to `LassoSMTPAttachmentLoader.maximumTotalBytes`,
+    /// 8MB) for its entire lifetime, so 1,000 concurrent in-flight caps
+    /// worst-case transient memory at roughly 1,000 × 8MB ≈ 8GB — a real,
+    /// enforced ceiling (versus the previous fully-unbounded exposure,
+    /// which could reach hundreds of GB under an adversarial burst) while
+    /// still generous enough not to reject any plausible legitimate burst
+    /// of scheduled/deferred sends from ordinary corpus usage.
+    ///
+    /// This is the DEFAULT for `maxConcurrentDeferredSends` (the actual,
+    /// per-instance cap `send(_:context:)` enforces) — a real deployment
+    /// always gets this number; `init`'s own parameter exists purely so
+    /// tests can inject a small cap and exercise the rejection path
+    /// deterministically without spawning 1,000 real deferred sends.
+    public static let defaultMaxConcurrentDeferredSends = 1_000
+
+    /// Hard cap on how far into the future `-date` may schedule a send
+    /// (Phase E milestone review, BLOCKING FIX #2) — enforced in
+    /// `send(_:context:)` immediately after `-date` is parsed, before
+    /// `recordQueued()`/`recordQueuedIfUnderCap()` or any Task is created.
+    ///
+    /// 30 days — this project's own explicitly-flagged judgment call, no
+    /// real Lasso doc source specifies a queue-retention window for a
+    /// scheduled send. Bounding this compounds `maxConcurrentDeferredSends`
+    /// above: without it, a single scheduled `Task` could pin its captured
+    /// message in memory for an arbitrarily long duration, worsening the
+    /// same resource-exhaustion concern Fix #1 addresses.
+    static let maximumFutureScheduleWindow: TimeInterval = 30 * 24 * 60 * 60
+
+    /// Per-instance cap `send(_:context:)`'s deferred branch actually
+    /// enforces — defaults to `defaultMaxConcurrentDeferredSends` (the real
+    /// chosen number, see that constant's own doc comment) for every real
+    /// deployment; overridable only so tests can exercise the rejection
+    /// path with a small cap instead of spawning 1,000 real deferred sends.
+    let maxConcurrentDeferredSends: Int
+
     public init(
         registry: LassoSMTPMailerRegistry,
         siteRoot: URL,
@@ -121,7 +198,9 @@ public struct LassoEmailProviderImpl: LassoEmailProvider {
         mxLookupCache: LassoMXLookupCache? = nil,
         connectionRegistry: LassoSMTPConnectionRegistry = LassoSMTPConnectionRegistry(),
         group: any EventLoopGroup = MultiThreadedEventLoopGroup.singleton,
-        allowEmailSMTP: Bool = false
+        allowEmailSMTP: Bool = false,
+        maxConcurrentDeferredSends: Int = LassoEmailProviderImpl.defaultMaxConcurrentDeferredSends,
+        jobTracker: LassoEmailJobTracker = LassoEmailJobTracker()
     ) {
         self.registry = registry
         self.siteRoot = siteRoot
@@ -130,13 +209,22 @@ public struct LassoEmailProviderImpl: LassoEmailProvider {
         self.connectionRegistry = connectionRegistry
         self.group = group
         self.allowEmailSMTP = allowEmailSMTP
+        self.maxConcurrentDeferredSends = maxConcurrentDeferredSends
+        self.jobTracker = jobTracker
     }
 
-    public func send(_ arguments: [EvaluatedArgument], context: LassoContext) async throws -> LassoValue {
+    public func send(_ arguments: [EvaluatedArgument], context: LassoContext) async throws -> LassoEmailSendResult {
         let built: LassoSMTPMessageBuilder.BuildResult
         do {
             built = try LassoSMTPMessageBuilder.build(arguments)
         } catch let error as LassoSMTPError {
+            // Pre-send validation failure (§4.7b's job-ID scoping rule) --
+            // no job is ever recorded for this, so this throws the plain
+            // `LassoRecoverableError` unchanged, exactly as every phase
+            // before this one did. `Runtime.swift`'s `email_send` wrapper
+            // only special-cases `LassoEmailSendFailure`; anything else
+            // (like this) propagates untouched, leaving
+            // `context.lastEmailJobID` at whatever it was before this call.
             throw LassoRecoverableError(error.state)
         }
 
@@ -150,6 +238,7 @@ public struct LassoEmailProviderImpl: LassoEmailProvider {
             message.attachments = files.attachments
             message.inlineImages = files.inlineImages
         } catch let error as LassoSMTPError {
+            // Also pre-send (a path/size/count failure) -- no job recorded.
             throw LassoRecoverableError(error.state)
         }
 
@@ -157,41 +246,251 @@ public struct LassoEmailProviderImpl: LassoEmailProvider {
         do {
             resolved = try await registry.mailer(named: built.relayName)
         } catch let error as LassoSMTPRelayError {
+            // Also pre-send (an unknown relay name) -- no job recorded.
             throw LassoRecoverableError(relayErrorState(error))
         }
 
+        // -date (Phase E, §4.3/§4.7b): parsed here, not in
+        // `LassoSMTPMessageBuilder` (pure mapping logic, no
+        // `LassoDateParsing` dependency -- see `BuildResult.dateValue`'s own
+        // doc comment). A parse failure is a pre-send validation error --
+        // no job recorded, matching every other failure above.
+        //
+        // `LassoDateParsing.parse` is reused as-is here rather than
+        // reimplemented for `-date` specifically -- a deliberate SUPERSET of
+        // what any doc source actually documents for `-date` (real Lasso's
+        // own worked example only ever shows a `[Date]` object), not a
+        // guarantee every format it accepts is independently confirmed for
+        // this parameter. That's safe (permissive, not lossy) and matches
+        // this codebase's existing "reuse the general date parser" instruction
+        // (§4.7b/plan prompt: "parse -date via the existing LassoDateParsing/
+        // date native-type machinery already in this codebase -- reuse it,
+        // don't reinvent date parsing"), just stated explicitly here per the
+        // Phase E milestone review's protocol pass (cheap non-blocking finding D).
+        let dueDate: Date?
+        if let dateValue = built.dateValue {
+            guard let components = LassoDateParsing.parse(dateValue) else {
+                throw LassoRecoverableError(LassoSMTPError(
+                    kind: .invalidParameter,
+                    message: "email_send: -date could not be parsed: '\(dateValue.outputString)'."
+                ).state)
+            }
+            let candidateDueDate = components.asDate
+            // BLOCKING FIX #2 (Phase E milestone review, concurrency pass):
+            // reject a `-date` scheduled further than `maximumFutureScheduleWindow`
+            // into the future -- a pre-send validation error, no job
+            // recorded, thrown before `recordQueued()`/`recordQueuedIfUnderCap()`
+            // or the background Task are ever reached. See that constant's
+            // own doc comment for the chosen window and reasoning.
+            guard candidateDueDate.timeIntervalSinceNow <= Self.maximumFutureScheduleWindow else {
+                let maxDays = Int(Self.maximumFutureScheduleWindow / 86_400)
+                throw LassoRecoverableError(LassoSMTPError(
+                    kind: .dateTooFarInFuture,
+                    message: "email_send: -date is too far in the future (maximum \(maxDays) days from now)."
+                ).state)
+            }
+            dueDate = candidateDueDate
+        } else {
+            dueDate = nil
+        }
+        // `-date`'s presence implies deferred sending regardless of
+        // `-immediate`'s own value (a future date inherently means "not
+        // now"); `-immediate=false` alone (no `-date`) means "send as soon
+        // as possible, but don't block the request" (§4.7b).
+        let deferred = dueDate != nil || built.immediateExplicitlyFalse
+
+        // Everything above this line can fail with NO job ever recorded.
+        // From here on, build/attachment-resolution/relay-resolution have
+        // ALL succeeded -- a real send is genuinely about to be attempted
+        // (synchronously below, or via a background Task for the deferred
+        // cases), so this is exactly the point §4.7b's job-ID scoping rule
+        // draws the line at: a job now exists to track.
+        //
+        // BLOCKING FIX #1 (Phase E milestone review, concurrency pass): the
+        // concurrency cap applies ONLY to the deferred branch -- a
+        // synchronous send resolves to `.sent`/`.error` before this
+        // function even returns, so it never lingers `.queued` and would
+        // never legitimately be blocked by this cap (see
+        // `maxConcurrentDeferredSends`'s own doc comment). `recordQueuedIfUnderCap`
+        // atomically checks-and-inserts within one actor-isolated call, so
+        // there's no separate check-then-insert race across concurrent
+        // deferred `email_send` calls.
+        let jobID: String
+        if deferred {
+            guard let deferredJobID = await jobTracker.recordQueuedIfUnderCap(maxConcurrentDeferredSends) else {
+                throw LassoRecoverableError(LassoSMTPError(
+                    kind: .tooManyDeferredSendsInFlight,
+                    message: "email_send: too many deferred (-immediate=false/-date) sends already in flight; try again shortly."
+                ).state)
+            }
+            jobID = deferredJobID
+        } else {
+            jobID = await jobTracker.recordQueued()
+        }
+
+        if deferred {
+            // Cases 2 (`-immediate=false`) and 3 (`-date`), §4.7b: record
+            // `.queued` (already done above) and return immediately WITHOUT
+            // waiting for the real send -- a background `Task` performs it
+            // and updates the job to `.sent`/`.error(...)` once it
+            // completes. This `Task {}` is deliberately a plain,
+            // unstructured task, NOT a child task of this `async` function
+            // (no `TaskGroup`/`async let` involved) -- it is not scoped to
+            // this call's own async context and is not cancelled when
+            // `send` returns, which is exactly the "genuinely detached,
+            // server-lifetime-scoped" requirement §4.7b's third open
+            // question asks for (verified directly by
+            // `LassoEmailJobTrackerDeferredSendTests`'s
+            // `backgroundTaskSurvivesPastTheTriggeringRequestsOwnCompletion`
+            // test). See `LassoEmailJobTracker.swift`'s own doc comment for
+            // why this Task is deliberately NOT tracked for restart
+            // cancellation the way `smtpConnectionReaperTask`/the tracker's
+            // own periodic sweep Task are.
+            let mailer = resolved.mailer
+            let relayName = resolved.name
+            let bcc = built.bcc
+            let envelopeFrom = built.envelopeFrom
+            let tracker = jobTracker
+            let capturedMessage = message
+            // `self` (this conformer) is a plain `Sendable` struct (the
+            // protocol itself requires `Sendable`) -- capturing it directly
+            // to reuse `isFailureOutcome`/`describeOutcome` is exactly as
+            // safe as capturing any other `Sendable` value here.
+            let provider = self
+            Task {
+                if let dueDate {
+                    let interval = dueDate.timeIntervalSinceNow
+                    if interval > 0 {
+                        let millis = Int((interval * 1000).rounded(.up))
+                        try? await Task.sleep(for: .milliseconds(millis))
+                    }
+                }
+                do {
+                    let results = try await mailer.send(capturedMessage, bcc: bcc, envelopeFrom: envelopeFrom)
+                    if let failure = results.first(where: { provider.isFailureOutcome($0.outcome) }) {
+                        await tracker.update(jobID, to: .error(
+                            "delivery failed for \(failure.recipient) via relay '\(relayName)' (\(provider.describeOutcome(failure.outcome)))."
+                        ))
+                    } else {
+                        await tracker.update(jobID, to: .sent)
+                    }
+                } catch {
+                    await tracker.update(jobID, to: .error(
+                        "sending through relay '\(relayName)' failed (\(error))."
+                    ))
+                }
+            }
+            return LassoEmailSendResult(value: .void, jobID: jobID)
+        }
+
+        // Case 1 (default, §4.7b): behavior UNCHANGED from every phase
+        // before this one, except for the one addition -- recording the job
+        // (`.queued` then immediately `.sent`/`.error(...)`, since it all
+        // happens before this function returns either way) and threading
+        // that job ID back via `LassoEmailSendResult`. Any failure from
+        // here on has ALREADY recorded a job, so it's wrapped in
+        // `LassoEmailSendFailure` rather than thrown as a bare
+        // `LassoRecoverableError` -- `Runtime.swift`'s wrapper unwraps this
+        // to stash the job ID into `context.lastEmailJobID` before
+        // re-throwing the underlying, `[protect]`-catchable error.
         let results: [DeliveryResult]
         do {
             results = try await resolved.mailer.send(message, bcc: built.bcc, envelopeFrom: built.envelopeFrom)
         } catch let error as MIMEComposer.ComposerError {
-            throw LassoRecoverableError(LassoSMTPError(
+            let state = LassoSMTPError(
                 kind: .composeFailed,
                 message: "email_send: message composition failed (\(error)).",
                 detail: String(describing: error)
-            ).state)
+            ).state
+            await jobTracker.update(jobID, to: .error(state.message))
+            throw LassoEmailSendFailure(jobID: jobID, underlying: LassoRecoverableError(state))
         } catch let error as HeaderEncoder.HeaderInjectionError {
-            throw LassoRecoverableError(LassoSMTPError(
+            let state = LassoSMTPError(
                 kind: .composeFailed,
                 message: "email_send: rejected header/address content (\(error)).",
                 detail: String(describing: error)
-            ).state)
+            ).state
+            await jobTracker.update(jobID, to: .error(state.message))
+            throw LassoEmailSendFailure(jobID: jobID, underlying: LassoRecoverableError(state))
         } catch {
-            throw LassoRecoverableError(LassoSMTPError(
+            let state = LassoSMTPError(
                 kind: .deliveryFailed,
                 message: "email_send: sending through relay '\(resolved.name)' failed (\(error)).",
                 detail: String(describing: error)
-            ).state)
+            ).state
+            await jobTracker.update(jobID, to: .error(state.message))
+            throw LassoEmailSendFailure(jobID: jobID, underlying: LassoRecoverableError(state))
         }
 
         if let failure = results.first(where: { isFailureOutcome($0.outcome) }) {
-            throw LassoRecoverableError(LassoSMTPError(
+            let state = LassoSMTPError(
                 kind: .deliveryFailed,
                 message: "email_send: delivery failed for \(failure.recipient) via relay '\(resolved.name)' (\(describeOutcome(failure.outcome))).",
                 detail: describeOutcome(failure.outcome)
-            ).state)
+            ).state
+            await jobTracker.update(jobID, to: .error(state.message))
+            throw LassoEmailSendFailure(jobID: jobID, underlying: LassoRecoverableError(state))
         }
 
-        return .void
+        await jobTracker.update(jobID, to: .sent)
+        return LassoEmailSendResult(value: .void, jobID: jobID)
+    }
+
+    /// Backs `email_result()` (Phase E, §4.7/§4.7b) -- real Lasso's
+    /// signature takes NO arguments; it implicitly refers to whatever
+    /// `email_send` call most recently completed in this context.
+    /// `context.lastEmailJobID` is set by `Runtime.swift`'s `email_send`
+    /// wrapper (the only place with `inout LassoContext` access -- see
+    /// `LassoEmailSendResult`/`LassoEmailSendFailure`'s own doc comments),
+    /// so this method only ever reads it back, never mutates anything.
+    /// Throws a clear, catchable error when no job is on record at all --
+    /// either genuinely the first call this request, or the most recent
+    /// `email_send` failed before a job was ever recorded (a pre-send
+    /// validation failure).
+    public func result(context: LassoContext) async throws -> LassoValue {
+        guard let jobID = context.lastEmailJobID else {
+            throw LassoRecoverableError(LassoSMTPError(
+                kind: .noJobRecorded,
+                message: "email_result: no email_send job is on record for this request (either none has been sent yet, or the most recent attempt failed before a job could be queued)."
+            ).state)
+        }
+        return .string(jobID)
+    }
+
+    /// Backs `email_status(id)` (Phase E) -- looks up `id` (the first
+    /// positional argument, matching `email_status(id)`'s documented bare
+    /// signature) against `jobTracker`, returning exactly one of
+    /// `"sent"`/`"queued"`/`"error"` (lowercase, per lassoguide.com's own
+    /// "Email Sending Status" section) -- `.error`'s own human-readable
+    /// description is deliberately NOT surfaced here (see
+    /// `LassoEmailJobState`'s own doc comment): real Lasso documents only
+    /// the bare three-string return shape, nothing richer.
+    ///
+    /// **An unrecognized/evicted job ID returns `"sent"`, not a thrown
+    /// error (Phase E milestone review, BLOCKING FIX #4).** Confirmed via
+    /// three independent sources (lassoguide.com, an archived
+    /// lassosoft.com reference mirror, and the local Lasso 8.5 Language
+    /// Guide PDF): real Lasso documents "Messages which have been sent (or
+    /// are not found in the queue) will have a status of 'sent'." This
+    /// matters concretely for this codebase's own design: `jobTracker`'s
+    /// 24-hour TTL eviction (`LassoEmailJobTracker.defaultTTL`) means
+    /// legitimate corpus code following the doc's own recommended pattern
+    /// ("store the ID, check sometime later") would poll an evicted ID and
+    /// -- under the previous implementation -- get a thrown, unexpected
+    /// error instead of the documented, benign `"sent"`. A genuinely
+    /// bogus/typo'd ID also reads as `"sent"` under this same path -- that
+    /// IS the documented real-Lasso behavior, not something to
+    /// special-case further.
+    public func status(_ arguments: [EvaluatedArgument], context: LassoContext) async throws -> LassoValue {
+        let jobID = arguments.positionalValue(at: 0)?.outputString ?? arguments.firstValue(named: "id")?.outputString ?? ""
+        guard let state = await jobTracker.status(of: jobID) else {
+            return .string("sent")
+        }
+        switch state {
+        case .queued: return .string("queued")
+        case .sent: return .string("sent")
+        case .error: return .string("error")
+        }
     }
 
     /// Backs `email_compose` (Phase C, §4.3b) — full-message construction

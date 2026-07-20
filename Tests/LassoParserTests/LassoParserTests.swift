@@ -6805,9 +6805,9 @@ struct IncludeURLTests {
     }
     struct EmailProvider: LassoEmailProvider {
         let recorder: EmailProviderRecorder
-        func send(_ arguments: [EvaluatedArgument], context: LassoContext) async throws -> LassoValue {
+        func send(_ arguments: [EvaluatedArgument], context: LassoContext) async throws -> LassoEmailSendResult {
             recorder.record(arguments)
-            return .string("queued")
+            return LassoEmailSendResult(value: .string("queued"), jobID: nil)
         }
         // Not exercised by this test — the protocol gained these two
         // methods in Phase C (§4.0/§4.3b/§4.4); every conformer, including
@@ -6873,7 +6873,7 @@ struct IncludeURLTests {
     }
     struct EmailProvider: LassoEmailProvider {
         let recorder: EmailProviderRecorder
-        func send(_ arguments: [EvaluatedArgument], context: LassoContext) async throws -> LassoValue { .void }
+        func send(_ arguments: [EvaluatedArgument], context: LassoContext) async throws -> LassoEmailSendResult { LassoEmailSendResult(value: .void, jobID: nil) }
         func compose(_ arguments: [EvaluatedArgument], context: LassoContext) async throws -> LassoValue {
             recorder.record(arguments)
             return .object(LassoObjectInstance(typeName: "email_compose", data: [
@@ -6899,7 +6899,7 @@ struct IncludeURLTests {
 
 @Test func emailMXLookupDispatchesToTheConfiguredEmailProviderAndReturnsItsResult() async throws {
     struct EmailProvider: LassoEmailProvider {
-        func send(_ arguments: [EvaluatedArgument], context: LassoContext) async throws -> LassoValue { .void }
+        func send(_ arguments: [EvaluatedArgument], context: LassoContext) async throws -> LassoEmailSendResult { LassoEmailSendResult(value: .void, jobID: nil) }
         func compose(_ arguments: [EvaluatedArgument], context: LassoContext) async throws -> LassoValue { .void }
         func mxLookup(_ arguments: [EvaluatedArgument], context: LassoContext) async throws -> LassoValue {
             .map([
@@ -6918,6 +6918,64 @@ struct IncludeURLTests {
     #expect(output == "mail.example.com")
 }
 
+// MARK: - Cheap non-blocking fix B (Phase E milestone review): `email_result`/
+// `email_status` LassoParser-level dispatch tests, mirroring `email_send`/
+// `email_compose`/`email_mxlookup`'s existing pairs above.
+
+@Test func emailResultThrowsEmailNotConfiguredWhenNoEmailProviderIsWired() async throws {
+    var context = LassoContext()
+    await #expect(throws: LassoRuntimeError.emailNotConfigured) {
+        try await LassoRenderer().render(
+            "[email_result()]",
+            context: &context
+        )
+    }
+}
+
+@Test func emailStatusThrowsEmailNotConfiguredWhenNoEmailProviderIsWired() async throws {
+    var context = LassoContext()
+    await #expect(throws: LassoRuntimeError.emailNotConfigured) {
+        try await LassoRenderer().render(
+            "[email_status('some-id')]",
+            context: &context
+        )
+    }
+}
+
+@Test func emailResultDispatchesToTheConfiguredEmailProviderAndReturnsItsResult() async throws {
+    struct EmailProvider: LassoEmailProvider {
+        func send(_ arguments: [EvaluatedArgument], context: LassoContext) async throws -> LassoEmailSendResult { LassoEmailSendResult(value: .void, jobID: nil) }
+        func compose(_ arguments: [EvaluatedArgument], context: LassoContext) async throws -> LassoValue { .void }
+        func mxLookup(_ arguments: [EvaluatedArgument], context: LassoContext) async throws -> LassoValue { .void }
+        func result(context: LassoContext) async throws -> LassoValue { .string("test-job-id") }
+    }
+    var context = LassoContext(emailProvider: EmailProvider())
+
+    let output = try await LassoRenderer().render(
+        "[email_result()]",
+        context: &context
+    )
+    #expect(output == "test-job-id")
+}
+
+@Test func emailStatusDispatchesToTheConfiguredEmailProviderAndReturnsItsResult() async throws {
+    struct EmailProvider: LassoEmailProvider {
+        func send(_ arguments: [EvaluatedArgument], context: LassoContext) async throws -> LassoEmailSendResult { LassoEmailSendResult(value: .void, jobID: nil) }
+        func compose(_ arguments: [EvaluatedArgument], context: LassoContext) async throws -> LassoValue { .void }
+        func mxLookup(_ arguments: [EvaluatedArgument], context: LassoContext) async throws -> LassoValue { .void }
+        func status(_ arguments: [EvaluatedArgument], context: LassoContext) async throws -> LassoValue {
+            .string("sent")
+        }
+    }
+    var context = LassoContext(emailProvider: EmailProvider())
+
+    let output = try await LassoRenderer().render(
+        "[email_status('test-job-id')]",
+        context: &context
+    )
+    #expect(output == "sent")
+}
+
 @Test func emailComposeMutatingBuilderMethodsThrowTheDedicatedRuntimeErrorNotNull() async throws {
     // Real corpus's own worked example chains `->addAttachment` right
     // after construction. Phase C's approved scope defers real mutation
@@ -6927,7 +6985,7 @@ struct IncludeURLTests {
     // each throws `LassoRuntimeError.emailComposeMutationNotYetSupported`
     // instead.
     struct EmailProvider: LassoEmailProvider {
-        func send(_ arguments: [EvaluatedArgument], context: LassoContext) async throws -> LassoValue { .void }
+        func send(_ arguments: [EvaluatedArgument], context: LassoContext) async throws -> LassoEmailSendResult { LassoEmailSendResult(value: .void, jobID: nil) }
         func compose(_ arguments: [EvaluatedArgument], context: LassoContext) async throws -> LassoValue {
             .object(LassoObjectInstance(typeName: "email_compose", data: [
                 "_data": .string("data"), "_from": .string("b@example.com"), "_recipients": .array([]),

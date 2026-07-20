@@ -1092,6 +1092,54 @@ public protocol LassoInlineProvider: Sendable {
 /// `->recipients`/etc. member access on the constructed object) — the same
 /// two-mechanism split `date`/`bytes` already use (a free-function
 /// constructor plus a native-type method table), not a new pattern.
+/// `email_send`'s widened return value (Phase E, §4.0/§4.7b) — carries the
+/// job ID `LassoEmailJobTracker` (in `LassoPerfectSMTP`) assigned to this
+/// send attempt, alongside `email_send`'s own evaluated value (`.void` for
+/// every real Lasso success case, per `LassoEmailProvider.send`'s own doc
+/// comment). `jobID` is `nil` exactly when `LassoSMTPMessageBuilder.build`/
+/// attachment-resolution/relay-resolution failed before a real send was ever
+/// attempted (§4.7b's job-ID scoping rule) — a conformer that never reaches
+/// an actual send simply never has a job to report. `Runtime.swift`'s
+/// `email_send` free-function wrapper (the one place with `inout
+/// LassoContext` access — see this protocol's own doc comment for why the
+/// provider itself can't stash this directly) stashes `jobID` into
+/// `LassoContext.lastEmailJobID` for a later, argument-less `email_result()`
+/// call to read back.
+public struct LassoEmailSendResult: Sendable {
+    public let value: LassoValue
+    public let jobID: String?
+
+    public init(value: LassoValue, jobID: String?) {
+        self.value = value
+        self.jobID = jobID
+    }
+}
+
+/// Thrown by a `LassoEmailProvider.send` conformer instead of a bare
+/// `LassoRecoverableError` whenever a job WAS already recorded before the
+/// failure occurred (§4.7b: a delivery failure discovered after relay
+/// resolution/an actual send attempt, as opposed to a pre-send validation
+/// failure, which never records a job and keeps throwing `underlying`
+/// directly with no wrapping at all). `Runtime.swift`'s `email_send` wrapper
+/// unwraps this — stashing `jobID` into `LassoContext.lastEmailJobID` before
+/// re-throwing `underlying` — so `email_result()` can still retrieve the
+/// job's ID after a `[protect]`-caught delivery failure, matching real
+/// Lasso's own doc (which shows no exception path for `email_send` at all;
+/// failures are only ever observed later via `email_status`). This is the
+/// ONLY mechanism by which a job ID survives a thrown error: `send`'s own
+/// `throws` clause can't return a value, and `context` isn't `inout` at the
+/// provider layer (see this protocol's doc comment), so the job ID has to
+/// ride along on the thrown error itself for the wrapper to recover it.
+public struct LassoEmailSendFailure: Error, Sendable {
+    public let jobID: String
+    public let underlying: LassoRecoverableError
+
+    public init(jobID: String, underlying: LassoRecoverableError) {
+        self.jobID = jobID
+        self.underlying = underlying
+    }
+}
+
 public protocol LassoEmailProvider: Sendable {
     /// `context` is currently unused by any shipped conformer (mirroring
     /// `LassoInlineProvider.executeInline`'s own `context` parameter,
@@ -1102,7 +1150,16 @@ public protocol LassoEmailProvider: Sendable {
     /// requesting page) doesn't require a breaking protocol change once
     /// `LassoPerfectSMTP`'s real conformer ships (milestone review,
     /// architecture pass, finding #1).
-    func send(_ arguments: [EvaluatedArgument], context: LassoContext) async throws -> LassoValue
+    ///
+    /// **Phase E widening**: return type changed from bare `LassoValue` to
+    /// `LassoEmailSendResult` so a job ID can travel back to
+    /// `Runtime.swift`'s free-function wrapper — see `LassoEmailSendResult`/
+    /// `LassoEmailSendFailure`'s own doc comments for the full mechanism.
+    /// This is a source-breaking protocol change, precedented every phase so
+    /// far (Phase C added `compose`/`mxLookup`, Phase D added the
+    /// `email_smtp` quartet) — every real and test-double conformer needs
+    /// updating, not just `LassoPerfectSMTP`'s.
+    func send(_ arguments: [EvaluatedArgument], context: LassoContext) async throws -> LassoEmailSendResult
 
     /// Backs `email_compose(-to=..., -from=..., -subject=..., -body=...)`
     /// — builds and composes a full MIME message (no relay/transport
@@ -1125,6 +1182,29 @@ public protocol LassoEmailProvider: Sendable {
     /// per the reference doc's own worked example (see §4.4 for why the
     /// prose's six-key description is not what's implemented).
     func mxLookup(_ arguments: [EvaluatedArgument], context: LassoContext) async throws -> LassoValue
+
+    // MARK: - `email_result`/`email_status` (Phase E, §4.7/§4.7b)
+
+    /// Backs `email_result()` — real Lasso's signature takes NO arguments
+    /// at all; it implicitly refers to whatever `email_send` call most
+    /// recently completed. `context.lastEmailJobID` (set by `Runtime.swift`'s
+    /// `email_send` wrapper — see `LassoEmailSendResult`/`LassoEmailSendFailure`)
+    /// is that "most recent job" slot; a conformer reads it straight off the
+    /// passed-in `context` (no mutation needed — `email_result` only ever
+    /// reports, never records). Returns `.string(jobID)` when one is on
+    /// record; throws a clear, catchable error when `email_result()` is
+    /// called with no prior `email_send` in this context at all (neither doc
+    /// source describes that case, so this project's "explicit error over
+    /// silent guess" discipline applies rather than returning an ambiguous
+    /// `.void`).
+    func result(context: LassoContext) async throws -> LassoValue
+
+    /// Backs `email_status(id)` — returns exactly one of `"sent"`/
+    /// `"queued"`/`"error"` (lowercase, per lassoguide.com's own "Email
+    /// Sending Status" section verbatim) for a job ID previously returned by
+    /// `email_result()`. An unrecognized job ID throws a clear, catchable
+    /// error rather than silently returning one of the three strings.
+    func status(_ arguments: [EvaluatedArgument], context: LassoContext) async throws -> LassoValue
 
     // MARK: - `email_smtp` (Phase D, §4.8b)
     //
@@ -1197,6 +1277,18 @@ public extension LassoEmailProvider {
     }
     func smtpClose(_ receiver: LassoObjectInstance, _ arguments: [EvaluatedArgument], context: LassoContext) async throws -> LassoValue {
         throw LassoRuntimeError.emailSMTPNotSupportedByProvider("close")
+    }
+
+    /// Defaulted the same way `email_smtp`'s four members are (see this
+    /// extension's own doc comment above) — a conformer written before
+    /// Phase E existed (test doubles in `LassoParserTests.swift`, etc.)
+    /// keeps compiling unchanged; only a conformer that actually supports
+    /// job tracking needs to override these two.
+    func result(context: LassoContext) async throws -> LassoValue {
+        throw LassoRuntimeError.emailResultNotSupportedByProvider
+    }
+    func status(_ arguments: [EvaluatedArgument], context: LassoContext) async throws -> LassoValue {
+        throw LassoRuntimeError.emailStatusNotSupportedByProvider
     }
 }
 

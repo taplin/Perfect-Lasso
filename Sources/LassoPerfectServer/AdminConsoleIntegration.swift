@@ -73,6 +73,14 @@ final class LassoAdminDelegate: AdminConsoleDelegate {
     /// admin action). `nil` when no `smtp` block is configured at all (see
     /// that property's own doc comment for when it's `nil`).
     private let smtpConnectionReaperTask: Task<Void, Never>?
+    /// Handle to `main.swift`'s `LassoEmailJobTracker` periodic eviction-
+    /// sweep Task (`LassoSiteServer.emailJobSweepTask`, Phase E, §4.7/
+    /// §4.7b), cancelled alongside `smtpConnectionReaperTask`/
+    /// `cwpJanitorTask`/`siteServerTask` on a successful restart handoff —
+    /// same "don't repeat the task-leak class of bug" rationale as
+    /// `smtpConnectionReaperTask`'s own doc comment. `nil` when no `smtp`
+    /// block is configured at all.
+    private let emailJobSweepTask: Task<Void, Never>?
 
     init(
         config: ServerConfig,
@@ -87,7 +95,8 @@ final class LassoAdminDelegate: AdminConsoleDelegate {
         janitorTracker: CWPSessionJanitorTracker = CWPSessionJanitorTracker(),
         cwpAdminAPIClient: FMAdminClient? = nil,
         cwpJanitorTask: Task<Void, Never>? = nil,
-        smtpConnectionReaperTask: Task<Void, Never>? = nil
+        smtpConnectionReaperTask: Task<Void, Never>? = nil,
+        emailJobSweepTask: Task<Void, Never>? = nil
     ) {
         self.config = config
         self.startTime = startTime
@@ -102,6 +111,7 @@ final class LassoAdminDelegate: AdminConsoleDelegate {
         self.cwpAdminAPIClient = cwpAdminAPIClient
         self.cwpJanitorTask = cwpJanitorTask
         self.smtpConnectionReaperTask = smtpConnectionReaperTask
+        self.emailJobSweepTask = emailJobSweepTask
     }
 
     // MARK: - Phase 1: status display
@@ -325,6 +335,7 @@ final class LassoAdminDelegate: AdminConsoleDelegate {
             let siteServerTask = self.siteServerTask
             let cwpJanitorTask = self.cwpJanitorTask
             let smtpConnectionReaperTask = self.smtpConnectionReaperTask
+            let emailJobSweepTask = self.emailJobSweepTask
             let logCapture = self.logCapture
             // Fire-and-forget with a brief delay, matching the crawl-report action's
             // own pattern — this action's HTTP response (below) needs to actually
@@ -338,6 +349,13 @@ final class LassoAdminDelegate: AdminConsoleDelegate {
                 // (BLOCKING #3) — previously never cancelled here at all,
                 // a real task leak on every restart.
                 smtpConnectionReaperTask?.cancel()
+                // Same reasoning again for `LassoEmailJobTracker`'s own
+                // periodic eviction-sweep Task (Phase E, §4.7b) — the one
+                // background Task this phase tracks for restart
+                // cancellation (see `LassoEmailJobTracker.swift`'s doc
+                // comment for why per-send deferred-send Tasks deliberately
+                // are not).
+                emailJobSweepTask?.cancel()
                 siteServerTask.cancel()
                 // Bounded: an actively-executing request or a WebSocket connection has
                 // no drain deadline of its own (see main.swift's siteServerTask doc
