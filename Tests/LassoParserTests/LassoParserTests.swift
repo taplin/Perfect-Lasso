@@ -9394,3 +9394,122 @@ struct IncludeURLTests {
     #expect(output == "true|1,5|true|Set: ")
 }
 
+@Test func tagInvocationServiceInvokesADefinedTagWithPositionalArguments() async throws {
+    // Direct Swift-level test of the new `LassoTagInvocationService`
+    // plumbing (Providers.swift/Renderer.swift) — nothing in Lasso
+    // source can reach it yet (no comparator/matcher dispatch wired to
+    // it in this pass), so this exercises it the only way currently
+    // possible: define a tag via a real render (populating
+    // context.tagRegistry AND wiring context.tagInvocationService via
+    // RendererEngine.init), then invoke it directly with pre-evaluated
+    // positional arguments, bypassing Evaluator.invokeCustomTag's own
+    // AST-argument-evaluation path entirely.
+    var context = LassoContext()
+    _ = try await LassoRenderer().render(
+        """
+        [
+        Define_Tag('AddTwo', -Required='A', -Required='B');
+            Return((Local: 'A') + (Local: 'B'));
+        /Define_Tag;
+        ]
+        """,
+        context: &context
+    )
+    let definition = try #require(context.tagRegistry.tag(named: "AddTwo"))
+    let service = try #require(context.tagInvocationService)
+    let result = try await service.invoke(definition, positionalArguments: [.integer(3), .integer(4)], context: &context)
+    #expect(result == .integer(7))
+}
+
+@Test func tagInvocationServiceThrowsOnArityMismatchRatherThanSilentlyDefaulting() async throws {
+    // Deliberate scope limit (see LassoTagInvocationService's own doc
+    // comment): unlike Evaluator.invokeCustomTag's general call-site
+    // binding, this narrower path does not evaluate default-parameter
+    // expressions — supplying fewer positional arguments than the
+    // definition declares must fail loudly, not silently bind the
+    // missing parameter to .null or some other default.
+    var context = LassoContext()
+    _ = try await LassoRenderer().render(
+        """
+        [
+        Define_Tag('NeedsTwo', -Required='A', -Required='B');
+            Return((Local: 'A') + (Local: 'B'));
+        /Define_Tag;
+        ]
+        """,
+        context: &context
+    )
+    let definition = try #require(context.tagRegistry.tag(named: "NeedsTwo"))
+    let service = try #require(context.tagInvocationService)
+    await #expect(throws: LassoRuntimeError.tagInvocationArityMismatch("NeedsTwo")) {
+        _ = try await service.invoke(definition, positionalArguments: [.integer(3)], context: &context)
+    }
+}
+
+@Test func tagInvocationServiceRestoresCallerLocalsAfterInvocation() async throws {
+    // The narrower invoker must still honor the same fresh-local-scope
+    // isolation Evaluator.invokeCustomTag provides — a called tag's own
+    // #locals must not leak into or clobber the caller's. Sets the
+    // "before" local directly via `LassoContext.set(...)` (Swift-level)
+    // rather than through a rendered `Local(...)` statement, since this
+    // is testing the invocation SERVICE's own scope isolation, not
+    // Lasso-source parsing.
+    var context = LassoContext()
+    _ = try await LassoRenderer().render(
+        """
+        [
+        Define_Tag('SetLocal');
+            Local('untouched' = 'inside');
+            Return('done');
+        /Define_Tag;
+        ]
+        """,
+        context: &context
+    )
+    context.set(.string("before"), for: "untouched", scope: .local)
+    let definition = try #require(context.tagRegistry.tag(named: "SetLocal"))
+    let service = try #require(context.tagInvocationService)
+    let result = try await service.invoke(definition, positionalArguments: [], context: &context)
+    #expect(result == .string("done"))
+    #expect(context.value(for: "untouched", scope: .local) == .string("before"))
+}
+
+@Test func tagInvocationServiceDoesNotDriftBindingsWhenAParameterNameIsUnresolvable() async throws {
+    // Regression test for a real gap code review found: the binding
+    // loop originally used its `enumerated()` loop index directly into
+    // `positionalArguments`, rather than a separate counter that only
+    // advances on an actual bind (matching Evaluator.bindParameters's
+    // own defensive shape). A declared parameter whose name can't be
+    // resolved (unreachable for well-formed `-Required=`/`-Optional=`
+    // declarations, but structurally legal — e.g. a bare literal) would
+    // have silently shifted every SUBSEQUENT parameter's binding one
+    // position off, a wrong-value bug that wouldn't throw. Simulates
+    // that shape directly by prepending a nameless parameter
+    // (`LassoMethodDispatcher.parameterMetadata` only resolves a name
+    // for identifier/string/variable/`::`-typed shapes, so a bare
+    // integer literal parameter resolves to `name == nil`) ahead of two
+    // real, named parameters.
+    var context = LassoContext()
+    _ = try await LassoRenderer().render(
+        """
+        [
+        Define_Tag('AddTwo', -Required='A', -Required='B');
+            Return((Local: 'A') + (Local: 'B'));
+        /Define_Tag;
+        ]
+        """,
+        context: &context
+    )
+    let original = try #require(context.tagRegistry.tag(named: "AddTwo"))
+    let withLeadingUnnamedParameter = LassoCustomTagDefinition(
+        name: original.name,
+        parameters: [LassoArgument(label: nil, value: .integer(999))] + original.parameters,
+        body: original.body
+    )
+    let service = try #require(context.tagInvocationService)
+    let result = try await service.invoke(
+        withLeadingUnnamedParameter, positionalArguments: [.integer(3), .integer(4)], context: &context
+    )
+    #expect(result == .integer(7))
+}
+

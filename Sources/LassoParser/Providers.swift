@@ -552,6 +552,59 @@ public protocol LassoIncludeRenderService: Sendable {
     func performLibrary(path: String, once: Bool, context: inout LassoContext) async throws
 }
 
+/// Lets a `LassoNativeType.register(...)` closure (`NativeTypes.swift`'s
+/// `LassoNativeMethod` — receiver/arguments/`inout context` only, no
+/// access to `Evaluator.renderNodes`) invoke an already-resolved custom
+/// tag with already-evaluated positional arguments. Wired the same way
+/// as `LassoIncludeRenderService` above: `(any LassoTagInvocationService)?`
+/// on `LassoContext`, set imperatively by `RendererEngine.init`. The
+/// concrete conformer, `RendererTagInvocationService`, lives in
+/// `Renderer.swift` for the same reason `RendererIncludeService` does.
+///
+/// Every call site MUST extract `context.tagInvocationService` to a
+/// local `let` before calling into it with `&context` — same Swift
+/// exclusivity-checking reason `LassoIncludeRenderService`'s own doc
+/// comment gives.
+///
+/// **Deliberately NARROWER than `Evaluator.invokeCustomTag`** (the
+/// call-site invocation path used for ordinary `MyTag(...)` calls):
+/// this exists for internal dispatch — custom Comparators/Matchers
+/// (Ch. 30 Tables 21/22) referenced via `\TagName` — where the caller
+/// always supplies a FIXED, small number of already-evaluated
+/// arguments (e.g. exactly `left`/`right` for a comparator) and binds
+/// them positionally to the definition's own declared parameter names.
+/// Default-parameter EXPRESSIONS (`-Optional='x'` with a default value)
+/// are NOT evaluated here — every declared parameter must be
+/// satisfiable by a supplied positional value, or this throws
+/// `LassoRuntimeError.tagInvocationArityMismatch` rather than silently
+/// defaulting through. This matches Ch. 30's own worked custom-
+/// comparator example (p.420), which declares exactly 2 required
+/// parameters with no defaults. A comparator/matcher tag that declares
+/// optional/defaulted parameters beyond what's supplied is a real
+/// authoring error worth failing loudly on, not a case this narrower
+/// path tries to support generally.
+///
+/// **Why the conformer's snapshot/push-tag-call/restore scaffolding is
+/// its own separate copy, not shared with `Evaluator.invokeCustomTag`**:
+/// only the *binding* step genuinely needs `Evaluator` (default-
+/// parameter-expression evaluation is recursive `Evaluator.evaluate`,
+/// which a bare `LassoContext` can't do) — the surrounding scope-
+/// management (`snapshotLocals`/`pushTagCall`/`replaceLocals`/
+/// `loopDepth`/`clearReturnSignal`/`consumeReturnSignal`/`popTagCall`)
+/// is pure `LassoContext` and has no such dependency. Flagged by
+/// architect review as a real, if non-blocking, opportunity: that
+/// scaffolding COULD be factored into one shared `LassoContext` helper
+/// both paths call. Not done in this pass (kept as two verified-
+/// equivalent, independently-tested copies) — left as a disclosed
+/// follow-up rather than expanding this stage's scope.
+public protocol LassoTagInvocationService: Sendable {
+    func invoke(
+        _ definition: LassoCustomTagDefinition,
+        positionalArguments: [LassoValue],
+        context: inout LassoContext
+    ) async throws -> LassoValue
+}
+
 /// A single ordered name/value pair from a request's query string or POST
 /// body. Real Lasso's `params()`/`postParams()`/`queryParams()` are
 /// documented as ordered, duplicate-preserving collections (POST occurring

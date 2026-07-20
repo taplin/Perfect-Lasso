@@ -70,6 +70,9 @@ private struct RendererEngine {
         if evaluator.context.includeRenderService == nil {
             evaluator.context.includeRenderService = RendererIncludeService()
         }
+        if evaluator.context.tagInvocationService == nil {
+            evaluator.context.tagInvocationService = RendererTagInvocationService()
+        }
     }
 
     mutating func render(_ nodes: [LassoNode]) async throws -> String {
@@ -591,5 +594,72 @@ struct RendererIncludeService: LassoIncludeRenderService {
             context = engine.evaluator.context
             throw error
         }
+    }
+}
+
+/// Concrete `LassoTagInvocationService` conformer — the only place that
+/// can reconstruct a `RendererEngine` to actually run a resolved custom
+/// tag's body. Wired onto every context by `RendererEngine.init`, same
+/// convention as `RendererIncludeService` immediately above. See
+/// `LassoTagInvocationService`'s own doc comment (`Providers.swift`) for
+/// why this binds positionally rather than reusing
+/// `Evaluator.invokeCustomTag`'s full call-site binding (default-
+/// parameter expressions require recursive `Evaluator.evaluate`
+/// access, which a bare `LassoContext` doesn't have).
+struct RendererTagInvocationService: LassoTagInvocationService {
+    func invoke(
+        _ definition: LassoCustomTagDefinition,
+        positionalArguments: [LassoValue],
+        context: inout LassoContext
+    ) async throws -> LassoValue {
+        // A separate `positionalIndex` counter, only advanced on an
+        // actual bind — NOT the `enumerated()` loop index directly —
+        // matching `Evaluator.bindParameters`'s own defensive shape
+        // (`Evaluator.swift`). A parameter declaration whose name can't
+        // be resolved (malformed/unusual shape; unreachable for
+        // well-formed `-Required='name'`/`-Optional='name'=default`
+        // declarations) is skipped via `continue` without consuming a
+        // positional slot — using the raw loop index there instead would
+        // silently shift every SUBSEQUENT parameter's binding one
+        // position off, a wrong-value bug that wouldn't throw. Found by
+        // code review during Stage 7a.
+        var bound: [String: LassoValue] = [:]
+        var positionalIndex = 0
+        for parameter in definition.parameters {
+            guard let name = LassoMethodDispatcher.parameterMetadata(parameter.value).name else { continue }
+            guard positionalIndex < positionalArguments.count else {
+                throw LassoRuntimeError.tagInvocationArityMismatch(definition.name)
+            }
+            bound[name.lowercased()] = positionalArguments[positionalIndex]
+            positionalIndex += 1
+        }
+
+        // Same snapshot/restore/push/pop shape as
+        // `Evaluator.invokeCustomTag` (`Evaluator.swift`) — kept in sync
+        // deliberately; see that function's own doc comment for why each
+        // step exists (fresh local scope, loop-depth reset so a stray
+        // Loop_Abort/Continue inside this body doesn't leak to an
+        // enclosing loop the CALLER happened to be inside).
+        let savedLocals = context.snapshotLocals()
+        let savedLoopDepth = context.loopDepth
+        try context.pushTagCall(definition.name)
+        context.replaceLocals(bound)
+        context.loopDepth = 0
+        context.clearReturnSignal()
+        defer {
+            context.replaceLocals(savedLocals)
+            context.popTagCall()
+            context.loopDepth = savedLoopDepth
+        }
+
+        var engine = RendererEngine(context: context)
+        do {
+            _ = try await engine.render(definition.body)
+            context = engine.evaluator.context
+        } catch {
+            context = engine.evaluator.context
+            throw error
+        }
+        return context.consumeReturnSignal() ?? .void
     }
 }

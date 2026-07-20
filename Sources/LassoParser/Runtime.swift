@@ -1528,6 +1528,14 @@ public struct LassoContext: Sendable {
     /// `Evaluator`) trigger a full node render. See
     /// `LassoIncludeRenderService` in `Providers.swift`.
     public var includeRenderService: (any LassoIncludeRenderService)?
+    /// Same wiring convention as `includeRenderService` immediately
+    /// above — lets native-type methods that only see `LassoContext`
+    /// (not a full `Evaluator`) invoke an already-resolved custom tag
+    /// (e.g. a `\TagName` reference, `TagReference.swift`) with
+    /// already-evaluated positional arguments. See
+    /// `LassoTagInvocationService` in `Providers.swift` for the full
+    /// design and its deliberate scope limits.
+    public var tagInvocationService: (any LassoTagInvocationService)?
     /// Paths already processed by `web_response->includeOnce` this
     /// request's render. Deliberately separate from `loadedLibraries` so
     /// an `include` path and a `library` path sharing a string don't
@@ -1981,4 +1989,13 @@ public enum LassoRuntimeError: Error, Equatable {
     case fileSystemNotConfigured
     case tagCallDepthExceeded
     case unsafeDynamicFieldName(String)
+    /// A custom tag invoked via `LassoTagInvocationService` (internal
+    /// dispatch — custom Comparators/Matchers, `Providers.swift`) was
+    /// supplied fewer already-evaluated positional arguments than its
+    /// own declared parameter count. This narrower invocation path
+    /// doesn't evaluate default-parameter expressions (see
+    /// `LassoTagInvocationService`'s own doc comment) — an arity
+    /// mismatch here is a real authoring error worth failing loudly on,
+    /// not silently defaulting through.
+    case tagInvocationArityMismatch(String)
 }
