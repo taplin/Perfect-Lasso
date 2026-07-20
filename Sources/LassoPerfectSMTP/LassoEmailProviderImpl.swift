@@ -52,6 +52,8 @@
 
 import Foundation
 import LassoParser
+import NIOCore
+import NIOPosix
 import PerfectSMTP
 
 public struct LassoEmailProviderImpl: LassoEmailProvider {
@@ -74,12 +76,41 @@ public struct LassoEmailProviderImpl: LassoEmailProvider {
     /// lifetime, matching `LassoSMTPMailerRegistry`'s own "built once,
     /// shared across calls" shape.
     private let mxLookupCache: LassoMXLookupCache?
+    /// Backs `email_smtp` (Phase D, §4.8b) — the live-connection store
+    /// keyed by object identity. Always constructible with zero external
+    /// resources (unlike `mxResolver`), so this defaults to a fresh,
+    /// private registry rather than being optional — every conformer gets
+    /// working `email_smtp` support unless a caller has some reason to
+    /// share one explicitly (`main.swift` does, so its idle-reaper `Task`
+    /// sweeps the exact same registry every request's context dispatches
+    /// through).
+    let connectionRegistry: LassoSMTPConnectionRegistry
+    /// `email_smtp->open` dials directly via `SMTPBootstrap.connect`,
+    /// bypassing `LassoSMTPMailerRegistry`'s pooled, named-relay
+    /// `SMTPMailer`s entirely (§4.8b: real Lasso's `email_smtp` is a raw,
+    /// low-level connection type with its own caller-given host, not a
+    /// selector into the operator's configured relay map) — it needs its
+    /// own `EventLoopGroup` to dial on. Defaults to the same process-wide
+    /// singleton `main.swift` already uses for `LassoSMTPMailerRegistry`/
+    /// `DNSResolver`, so a real deployment shares one thread pool across
+    /// every NIO-backed piece of this server rather than spinning up a
+    /// second one just for `email_smtp`.
+    let group: any EventLoopGroup
 
-    public init(registry: LassoSMTPMailerRegistry, siteRoot: URL, mxResolver: (any MXResolving)? = nil, mxLookupCache: LassoMXLookupCache? = nil) {
+    public init(
+        registry: LassoSMTPMailerRegistry,
+        siteRoot: URL,
+        mxResolver: (any MXResolving)? = nil,
+        mxLookupCache: LassoMXLookupCache? = nil,
+        connectionRegistry: LassoSMTPConnectionRegistry = LassoSMTPConnectionRegistry(),
+        group: any EventLoopGroup = MultiThreadedEventLoopGroup.singleton
+    ) {
         self.registry = registry
         self.siteRoot = siteRoot
         self.mxResolver = mxResolver
         self.mxLookupCache = mxLookupCache
+        self.connectionRegistry = connectionRegistry
+        self.group = group
     }
 
     public func send(_ arguments: [EvaluatedArgument], context: LassoContext) async throws -> LassoValue {
@@ -388,14 +419,19 @@ public struct LassoEmailProviderImpl: LassoEmailProvider {
     /// doesn't provide synchronously anyway). Every other case represents
     /// a real, non-transient (or at least not silently-retryable by this
     /// adapter, which has no retry queue) failure.
-    private func isFailureOutcome(_ outcome: DeliveryResult.Outcome) -> Bool {
+    /// Not `private`: reused by `LassoEmailSMTPType.swift`'s `smtpSend`
+    /// (Phase D, §4.8b) — same "delivery succeeded enough to report
+    /// `email_send`/`email_smtp`'s own call as successful" judgment,
+    /// intentionally not duplicated.
+    func isFailureOutcome(_ outcome: DeliveryResult.Outcome) -> Bool {
         switch outcome {
         case .delivered, .queuedForRetry: false
         case .permanentlyFailed, .expired, .ambiguous, .failed: true
         }
     }
 
-    private func describeOutcome(_ outcome: DeliveryResult.Outcome) -> String {
+    /// Not `private` — see `isFailureOutcome`'s doc comment above.
+    func describeOutcome(_ outcome: DeliveryResult.Outcome) -> String {
         switch outcome {
         case .delivered(let reply): "delivered: \(reply.code)"
         case .queuedForRetry(let nextAttempt, let attempt, let last): "queuedForRetry(attempt: \(attempt), next: \(nextAttempt), last: \(last.code))"

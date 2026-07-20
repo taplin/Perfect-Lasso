@@ -1056,6 +1056,79 @@ public protocol LassoEmailProvider: Sendable {
     /// per the reference doc's own worked example (see §4.4 for why the
     /// prose's six-key description is not what's implemented).
     func mxLookup(_ arguments: [EvaluatedArgument], context: LassoContext) async throws -> LassoValue
+
+    // MARK: - `email_smtp` (Phase D, §4.8b)
+    //
+    // `email_smtp` is a genuine native *type* (`NativeTypes.swift`'s
+    // `makeEmailSMTPType()`), not a free function — its four members
+    // (`->open`/`->command`/`->send`/`->close`) all need to act on the
+    // SAME live network connection across independently-dispatched calls
+    // on one Lasso object. That live connection (a NIO channel wrapper)
+    // has no representable `LassoValue` case at all, so `receiver` below
+    // is used purely as an opaque IDENTITY key — a real conformer (e.g.
+    // `LassoPerfectSMTP`'s `LassoEmailProviderImpl`) keys its own
+    // Swift-side connection registry by `ObjectIdentifier(receiver)`,
+    // never reading or writing `receiver`'s own `[String: LassoValue]`
+    // field storage. `receiver` is the exact `LassoObjectInstance` every
+    // registered `LassoNativeMethod` on the `email_smtp` type receives as
+    // its own first parameter (`NativeTypes.swift:11-15`) — passed
+    // straight through by `makeEmailSMTPType()`'s four method
+    // registrations, which do nothing else but this dispatch.
+    //
+    // Default (throwing) implementations are provided in the extension
+    // below so every conformer written before `email_smtp` existed (test
+    // doubles in `LassoParserTests.swift`, etc.) keeps compiling
+    // unchanged — only a conformer that actually wants to support
+    // `email_smtp` needs to override these four, mirroring this codebase's
+    // established `LassoSessionProvider`/`LassoRequestProvider` "new,
+    // rarely-touched member gets a default" convention.
+
+    /// Backs `->open(-host=?, -port=?, -timeout=?, -username=?,
+    /// -password=?, -ssl=?, -clientIp=?)` — real behavior per the
+    /// reference doc's own worked example: dials, negotiates capabilities
+    /// (EHLO), then authenticates if credentials were given. `-host` is
+    /// required (from either the constructor's stored defaults or this
+    /// call's own arguments) — see §4.8b.
+    func smtpOpen(_ receiver: LassoObjectInstance, _ arguments: [EvaluatedArgument], context: LassoContext) async throws -> LassoValue
+
+    /// Backs `->command(-send=?, -expect=?, -multi=?, -read=?, -timeout=?)`
+    /// — deliberately raw, unsanitized low-level SMTP protocol access (a
+    /// caller sending arbitrary wire content IS the documented point of
+    /// this method, not a header-injection surface to defend against).
+    func smtpCommand(_ receiver: LassoObjectInstance, _ arguments: [EvaluatedArgument], context: LassoContext) async throws -> LassoValue
+
+    /// Backs `->send(-from=?, -recipients=?, -message=?)` — sends one
+    /// already-composed message over the connection this same `receiver`
+    /// previously `->open`ed.
+    func smtpSend(_ receiver: LassoObjectInstance, _ arguments: [EvaluatedArgument], context: LassoContext) async throws -> LassoValue
+
+    /// Backs `->close()`. Must be safe to call twice, or on a
+    /// never-`->open`ed instance — a documented no-op in either case, per
+    /// §4.8b's "connection lifecycle / leak safety net" discussion, never
+    /// a crash.
+    func smtpClose(_ receiver: LassoObjectInstance, _ arguments: [EvaluatedArgument], context: LassoContext) async throws -> LassoValue
+}
+
+public extension LassoEmailProvider {
+    /// See `LassoEmailProvider`'s `email_smtp` MARK section above for why
+    /// these four have defaults at all. `LassoRuntimeError.emailSMTPNotSupportedByProvider`
+    /// is a plain (non-`LassoRecoverableError`) thrown Swift error,
+    /// deliberately: a conformer hitting this default genuinely never
+    /// implemented `email_smtp` support, which is a configuration/adapter
+    /// gap for a developer to notice and fix, not an ordinary expected
+    /// runtime failure a Lasso page's own `[protect]` should be catching.
+    func smtpOpen(_ receiver: LassoObjectInstance, _ arguments: [EvaluatedArgument], context: LassoContext) async throws -> LassoValue {
+        throw LassoRuntimeError.emailSMTPNotSupportedByProvider("open")
+    }
+    func smtpCommand(_ receiver: LassoObjectInstance, _ arguments: [EvaluatedArgument], context: LassoContext) async throws -> LassoValue {
+        throw LassoRuntimeError.emailSMTPNotSupportedByProvider("command")
+    }
+    func smtpSend(_ receiver: LassoObjectInstance, _ arguments: [EvaluatedArgument], context: LassoContext) async throws -> LassoValue {
+        throw LassoRuntimeError.emailSMTPNotSupportedByProvider("send")
+    }
+    func smtpClose(_ receiver: LassoObjectInstance, _ arguments: [EvaluatedArgument], context: LassoContext) async throws -> LassoValue {
+        throw LassoRuntimeError.emailSMTPNotSupportedByProvider("close")
+    }
 }
 
 public protocol LassoDynamicQueryExecutor: Sendable {

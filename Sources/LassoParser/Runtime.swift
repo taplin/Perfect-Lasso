@@ -970,6 +970,43 @@ public struct LassoNativeRegistry: Sendable {
             }
             return try await emailProvider.mxLookup(arguments, context: context)
         }
+        // `email_smtp` (Lasso 9's low-level raw SMTP connection type —
+        // `->open`/`->command`/`->send`/`->close`; §4.8b) — registered as
+        // BOTH a native type (`NativeTypes.swift`'s `makeEmailSMTPType()`,
+        // for member-method dispatch on a constructed object) AND, here,
+        // an ordinary free function for the documented
+        // `email_smtp(-host=..., -port=..., ...)` with-args constructor
+        // form — the exact same two-mechanism split `date`/`email_compose`
+        // already use. Bare `email_smtp` (no parens) never reaches this
+        // registration at all: `Evaluator.swift`'s `.identifier` case
+        // resolves a name matching a registered native type BEFORE
+        // checking native functions (see that case's own comment), so a
+        // bare reference always constructs an empty object directly. This
+        // free function is reached only via the `.call` path
+        // (`email_smtp(...)`, with parens) — and, like `date`'s own
+        // registration, is pure/synchronous: real Lasso's own worked
+        // example (§4.8b) never dials on construction, only `->open`
+        // does. Whatever `-host`/`-port`/`-timeout`/`-username`/
+        // `-password`/`-ssl`/`-clientIp` are given here are stashed as
+        // `_`-prefixed default fields (matching `email_compose`'s
+        // `_data`/`_from`/`_recipients` field-naming convention) for
+        // `->open` to fall back on when its own arguments omit them —
+        // `->open`'s own arguments always take precedence when both are
+        // given (§4.8b).
+        register("email_smtp") { arguments, _ in
+            var data: [String: LassoValue] = [:]
+            let fields: [(label: String, field: String)] = [
+                ("host", "_host"), ("port", "_port"), ("timeout", "_timeout"),
+                ("username", "_username"), ("password", "_password"),
+                ("ssl", "_ssl"), ("clientip", "_clientip"),
+            ]
+            for (label, field) in fields {
+                if let value = arguments.lastValue(named: label) {
+                    data[field] = value
+                }
+            }
+            return .object(LassoObjectInstance(typeName: "email_smtp", data: data))
+        }
         register("redirect_url") { arguments, context in
             let url = arguments.firstValue(named: "url")?.outputString ??
                 arguments.first?.value.outputString ?? ""
@@ -1539,4 +1576,15 @@ public enum LassoRuntimeError: Error, Equatable {
     /// (the shared native-type-mutation design this finding is adjacent
     /// to) and the Phase C milestone review's BLOCKING FIX #1.
     case nativeTypeFieldAssignmentNotSupported(typeName: String, field: String)
+    /// Thrown by `LassoEmailProvider`'s default `smtpOpen`/`smtpCommand`/
+    /// `smtpSend`/`smtpClose` implementations (`Providers.swift`) — a
+    /// conformer that predates `email_smtp` (Phase D, §4.8b) and never
+    /// overrode these four gets a clear, named failure here rather than a
+    /// silent no-op. Carries the method name actually called (e.g.
+    /// `"open"`). Distinct from `LassoRecoverableError`: a real conformer
+    /// (`LassoPerfectSMTP`'s `LassoEmailProviderImpl`) always overrides all
+    /// four, so this is only ever reachable from a provider that
+    /// deliberately doesn't support `email_smtp` at all — an
+    /// adapter-configuration gap, not an ordinary expected runtime failure.
+    case emailSMTPNotSupportedByProvider(String)
 }

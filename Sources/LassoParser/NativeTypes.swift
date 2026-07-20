@@ -67,6 +67,7 @@ public struct LassoNativeTypeRegistry: Sendable {
         register(Self.makeDateType())
         register(Self.makeBytesType())
         register(Self.makeEmailComposeType())
+        register(Self.makeEmailSMTPType())
     }
 }
 
@@ -643,6 +644,74 @@ extension LassoNativeTypeRegistry {
             type.register(mutatingMethodName) { _, _, _ in
                 throw LassoRuntimeError.emailComposeMutationNotYetSupported(mutatingMethodName)
             }
+        }
+
+        return type
+    }
+
+    // MARK: - email_smtp
+    //
+    // See Documentation/lasso-perfect-smtp-integration-plan.md §4.8b.
+    // Unlike `email_compose` (a value-shaped object populated once, at
+    // construction, and never mutated again), `email_smtp` needs genuine
+    // cross-call state — an open network connection surviving between
+    // independently-dispatched `->open`/`->command`/`->send`/`->close`
+    // calls on the SAME Lasso object. That live connection (a NIO channel
+    // wrapper) has no representable `LassoValue` case at all, so it was
+    // never going to live inside this object's own `[String: LassoValue]`
+    // storage regardless of which mutation mechanism was chosen —
+    // `LassoPerfectSMTP`'s concrete `LassoEmailProvider` conformer instead
+    // holds a `LassoSMTPConnectionRegistry` actor keyed by
+    // `ObjectIdentifier(receiver)`, where `receiver` is the exact
+    // `LassoObjectInstance` every method below receives as its first
+    // parameter. Since `LassoObjectInstance` has real reference identity
+    // (`TypeSystem.swift`'s `==` is `===`), two Lasso variables holding the
+    // same `email_smtp` object correctly share the same live connection —
+    // the right semantics for a connection handle (unlike `date`'s value
+    // semantics). This needs NO `Evaluator.swift` change beyond what
+    // already exists: the Phase C native-type field-assignment block
+    // (`nativeTypeFieldAssignmentNotSupported`) only rejects
+    // Lasso-*source*-level `object->_field = value` assignment — it has no
+    // bearing on a native method's own Swift-side calls into a separate
+    // actor, which is all every method below ever does.
+    //
+    // Bare `email_smtp` (no parens) constructs an empty object via
+    // `Evaluator.swift`'s `.identifier` case (the same path `session`/
+    // `date` already use) — no I/O, no provider involvement. The
+    // with-args constructor form (`email_smtp(-host=..., ...)`) is a
+    // separate, ordinary free-function registration in `Runtime.swift`
+    // (mirroring `date`'s own two-mechanism split), also pure/synchronous.
+    // All the real work happens here, in `->open`, dispatched through
+    // `context.emailProvider` exactly like `email_send`/`email_compose`/
+    // `email_mxlookup` — every method below is a thin, identical-shaped
+    // guard-then-delegate, passing `receiver` through so the conformer can
+    // key its connection registry.
+    fileprivate static func makeEmailSMTPType() -> LassoNativeType {
+        var type = LassoNativeType(name: "email_smtp")
+
+        type.register("open") { receiver, arguments, context in
+            guard let emailProvider = context.emailProvider else {
+                throw LassoRuntimeError.emailNotConfigured
+            }
+            return try await emailProvider.smtpOpen(receiver, arguments, context: context)
+        }
+        type.register("command") { receiver, arguments, context in
+            guard let emailProvider = context.emailProvider else {
+                throw LassoRuntimeError.emailNotConfigured
+            }
+            return try await emailProvider.smtpCommand(receiver, arguments, context: context)
+        }
+        type.register("send") { receiver, arguments, context in
+            guard let emailProvider = context.emailProvider else {
+                throw LassoRuntimeError.emailNotConfigured
+            }
+            return try await emailProvider.smtpSend(receiver, arguments, context: context)
+        }
+        type.register("close") { receiver, arguments, context in
+            guard let emailProvider = context.emailProvider else {
+                throw LassoRuntimeError.emailNotConfigured
+            }
+            return try await emailProvider.smtpClose(receiver, arguments, context: context)
         }
 
         return type

@@ -844,6 +844,24 @@ struct LassoSiteServer: Sendable {
     /// Wired into each request's `LassoContext.emailProvider` exactly like
     /// `inlineProvider` is today.
     let emailProvider: (any LassoEmailProvider)?
+    /// `email_smtp`'s idle-connection reaper (Phase D, §4.8b) — `nil`
+    /// exactly when `emailProvider` is `nil` (no `smtp` block configured at
+    /// all, so `email_smtp` has no live connections to ever leak). Follows
+    /// the CWP session janitor's own established convention just below in
+    /// this file (a cancellable `Task<Void, Never>` owned by whoever wires
+    /// the resource, not by the resource type itself — see
+    /// `LassoSMTPConnectionRegistry`'s own doc comment for why): the actor
+    /// just exposes `sweepIdleConnections(idleTimeout:)`, and this Task is
+    /// the periodic caller. `LassoSiteServer` is a `struct` (no `deinit`
+    /// available, matching the CWP janitor's own identical lifecycle —
+    /// `cwpJanitorTask` below has no formal shutdown hook either) and is
+    /// constructed exactly once for the life of the process
+    /// (`main.swift`'s top-level `let siteServer = try LassoSiteServer(...)`),
+    /// so this Task's lifetime is, in practice, the process's — reaped only
+    /// by process exit, not by any explicit cancellation path. Exposed here
+    /// (rather than only captured in a local closure) so a future graceful-
+    /// shutdown path has something to `.cancel()`.
+    let smtpConnectionReaperTask: Task<Void, Never>?
 
     init(
         config: ServerConfig,
@@ -1082,14 +1100,42 @@ struct LassoSiteServer: Sendable {
                 group: MultiThreadedEventLoopGroup.singleton
             )
             let mxResolver = DNSResolver(group: MultiThreadedEventLoopGroup.singleton)
+            // `email_smtp`'s live-connection registry (Phase D, §4.8b) —
+            // built once here so the reaper Task below and every request's
+            // `LassoEmailProviderImpl` (via `emailProvider`) share the
+            // exact same instance; two separately-constructed registries
+            // would mean the reaper sweeps a registry no request ever
+            // populates.
+            let connectionRegistry = LassoSMTPConnectionRegistry()
             emailProvider = LassoEmailProviderImpl(
                 registry: registry,
                 siteRoot: config.siteRoot,
                 mxResolver: mxResolver,
-                mxLookupCache: LassoMXLookupCache()
+                mxLookupCache: LassoMXLookupCache(),
+                connectionRegistry: connectionRegistry,
+                group: MultiThreadedEventLoopGroup.singleton
             )
+            // Idle-timeout reaper: a page that errors out mid `->open`/
+            // `->command`/`->send` sequence, or simply forgets `->close`,
+            // would otherwise leak a live SMTP connection (and a registry
+            // entry) for the rest of the process's life. Matches the CWP
+            // session janitor's own established
+            // `while !Task.isCancelled { ...; try? await Task.sleep(...) }`
+            // shape just below in this file — 60s poll interval, 300s
+            // (5-minute) idle threshold, matching `SMTPConnection`'s own
+            // default `replyTimeout` (§4.8b's suggested, documented
+            // starting point — always-on, not behind a separate opt-in
+            // flag, since this is a leak-prevention safety net, not an
+            // optional feature).
+            smtpConnectionReaperTask = Task {
+                while !Task.isCancelled {
+                    try? await Task.sleep(for: .seconds(60))
+                    _ = await connectionRegistry.sweepIdleConnections(idleTimeout: 300)
+                }
+            }
         } else {
             emailProvider = nil
+            smtpConnectionReaperTask = nil
         }
     }
 
