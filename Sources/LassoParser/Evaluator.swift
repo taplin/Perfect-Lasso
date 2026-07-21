@@ -20,10 +20,35 @@ struct Evaluator {
             // `Captures.swift`'s own doc comment): the capture's body
             // executes later against a COPY of the locals as they exist
             // right now, not a live reference back to this scope.
+            // Stage 2: `homeDepth` records the call-stack depth active
+            // right now (this capture's creating frame's own depth) —
+            // a later `return`/`yield` inside this capture's body
+            // unwinds back down to exactly this depth, no matter how
+            // many frames deep the capture is eventually invoked from.
+            //
+            // Ch. "Captures": "A capture that is created within a
+            // capture that does have a home will have its home set to
+            // its parent capture's home. This means that nested captures
+            // will all have the same home." — a capture literal
+            // evaluated WHILE another capture's own body is currently
+            // executing must inherit THAT capture's home verbatim
+            // (`context.currentCaptureHomeDepth`, itself `nil` if the
+            // enclosing capture is detached — nested captures inherit
+            // detachment too, per "will all have the same home"), not
+            // recompute its own from the raw current stack depth. Found
+            // by code review: using the raw depth here silently caught a
+            // nested capture's non-local return ONE FRAME TOO EARLY (at
+            // the enclosing capture's own invocation boundary) whenever
+            // the OUTER capture itself was invoked from a different
+            // depth than it was created at — invisible for the narrower
+            // "invoked immediately, in place" shape this file's own
+            // nested-capture test exercises, but a real, confirmed
+            // divergence from the documented rule.
             return .capture(LassoCaptureValue(
                 body: body,
                 autoCollect: autoCollect,
-                capturedLocals: context.snapshotLocals()
+                capturedLocals: context.snapshotLocals(),
+                homeDepth: context.currentCaptureHomeDepth ?? context.tagCallStack.count
             ))
         case let .variable(name, scope): return context.value(for: name, scope: scope)
         case let .identifier(name):
@@ -314,6 +339,11 @@ struct Evaluator {
         _ definition: LassoCustomTagDefinition,
         callArguments: [LassoArgument]
     ) async throws -> LassoValue {
+        // Stage 2 (Captures): must not even START this call if a
+        // return/yield is ALREADY mid-propagation — see this file's own
+        // `skipIfNonLocalReturnAlreadyPending()` doc comment for the
+        // real hazard this guards against (found by architect review).
+        if skipIfNonLocalReturnAlreadyPending() { return .void }
         let (givenBlock, evaluatedCallArguments) = Self.extractGivenBlock(from: try await evaluate(callArguments))
         let boundLocals = try await bindParameters(definition.parameters, to: evaluatedCallArguments)
 
@@ -340,7 +370,50 @@ struct Evaluator {
         guard let renderNodes else { return .void }
         context.clearReturnSignal()
         _ = try await renderNodes(definition.body, &context)
-        return context.consumeReturnSignal() ?? .void
+        return consumeReturnValueRespectingNonLocalTarget(activeDepth: context.tagCallStack.count) ?? .void
+    }
+
+    /// Thin wrapper around `LassoContext.consumeReturnSignalRespectingNonLocalTarget`
+    /// (see that method's own doc comment for the full propagation
+    /// mechanism) — shared by `invokeCustomTag`/`invokeMemberMethod`/
+    /// `invokeCapture`. `activeDepth` must be measured BEFORE this
+    /// frame's own `defer`-scheduled `popTagCall()` runs (i.e. while
+    /// `tagCallStack.count` still reflects this frame's own pushed
+    /// depth) — every call site here does that naturally, since this is
+    /// always the last thing evaluated before the function returns.
+    private mutating func consumeReturnValueRespectingNonLocalTarget(activeDepth: Int) -> LassoValue? {
+        context.consumeReturnSignalRespectingNonLocalTarget(activeDepth: activeDepth)
+    }
+
+    /// Guards every invocation boundary (`invokeCustomTag`/
+    /// `invokeMemberMethod`/`invokeCapture`) against a real hazard found
+    /// by architect review: `shouldStopRenderingCurrentBody()` is only
+    /// ever polled at STATEMENT granularity (between top-level nodes, or
+    /// between the pieces of one `.code` node) — never mid-expression.
+    /// So if a capture's non-local `return`/`yield` fires while it's
+    /// being invoked as a SUB-expression (a call argument, an operand of
+    /// `+`, an array element...) and something ELSE that goes through one
+    /// of these three boundaries runs afterward within that SAME
+    /// statement (another capture invocation, a plain tag call, a
+    /// member-method call), that later call would previously run to
+    /// completion as if nothing were happening — silently re-executing
+    /// side effects, and its own `context.clearReturnSignal()` (called
+    /// right before rendering ITS OWN body) would wipe out the still-
+    /// propagating signal before the enclosing statement's poll ever got
+    /// a chance to see it. Concretely: `#cap->invoke + '-' + #cap->invoke`
+    /// would silently invoke `cap`'s body TWICE instead of once once the
+    /// first invocation's `return` starts propagating; two SIBLING
+    /// captures with DIFFERENT homes in the same expression could have
+    /// the wrong one's value win entirely.
+    ///
+    /// The fix: a call that's about to start MUST NOT run at all — not
+    /// even evaluate its own arguments — if a return/yield is already
+    /// live and unconsumed. Real stack-unwinding semantics would never
+    /// even reach this call in the first place once an ancestor's
+    /// non-local exit is underway; this reproduces that by checking as
+    /// early as possible, before doing any of this boundary's own work.
+    private func skipIfNonLocalReturnAlreadyPending() -> Bool {
+        context.returnSignal != nil
     }
 
     /// `capture->invoke(...)` / `#cap(...)` shorthand — see
@@ -362,6 +435,12 @@ struct Evaluator {
         _ capture: LassoCaptureValue,
         arguments: [EvaluatedArgument]
     ) async throws -> LassoValue {
+        // Stage 2 (Captures): see `skipIfNonLocalReturnAlreadyPending()`'s
+        // own doc comment — without this, a SECOND `#cap->invoke` in the
+        // same expression as a first one whose `return`/`yield` is still
+        // propagating would silently re-run this capture's body and
+        // clobber the still-live signal.
+        if skipIfNonLocalReturnAlreadyPending() { return .void }
         var boundLocals = capture.capturedLocals
         for (offset, argument) in arguments.filter({ $0.label == nil }).enumerated() {
             boundLocals[String(offset + 1)] = argument.value
@@ -372,16 +451,24 @@ struct Evaluator {
         try context.pushTagCall("capture")
         context.replaceLocals(boundLocals)
         context.loopDepth = 0
+        // Stage 2: this capture's OWN `homeDepth` (`nil` if `->detach()`ed)
+        // becomes the target a `return`/`yield` fired directly inside this
+        // body should unwind back down to — read via
+        // `context.currentCaptureHomeDepth` by `setNonLocalReturnSignal`.
+        context.pushCaptureHomeDepth(capture.homeDepth)
         defer {
             context.replaceLocals(savedLocals)
             context.popTagCall()
             context.loopDepth = savedLoopDepth
+            context.popCaptureHomeDepth()
         }
 
         guard let renderNodes else { return .void }
         context.clearReturnSignal()
         let output = try await renderNodes(capture.body, &context)
-        if let returned = context.consumeReturnSignal() { return returned }
+        if let returned = consumeReturnValueRespectingNonLocalTarget(activeDepth: context.tagCallStack.count) {
+            return returned
+        }
         // Ch. "Captures": a plain capture that falls off the end without
         // an explicit `return`/`yield` produces `.void`; an auto-collect
         // capture instead "concatenates the result of calling the
@@ -389,7 +476,12 @@ struct Evaluator {
         // capture... and produces that value" — approximated here as the
         // body's own rendered output string, matching every other value
         // this codebase's `asString`-family conversions already reduce
-        // to a plain string representation.
+        // to a plain string representation. Also correctly covers the
+        // "still propagating to an outer target" case: if a nested
+        // return/yield hasn't reached ITS target yet, this capture's own
+        // invocation must not manufacture an auto-collect/void value of
+        // its own — it produces `.void` here and its caller's render loop
+        // keeps unwinding, exactly like `invokeCustomTag`/`invokeMemberMethod`.
         return capture.autoCollect ? .string(output) : .void
     }
 
@@ -620,6 +712,12 @@ struct Evaluator {
         arguments: [LassoArgument],
         missingIsVoid: Bool = false
     ) async throws -> LassoValue? {
+        // Stage 2 (Captures): see `skipIfNonLocalReturnAlreadyPending()`'s
+        // own doc comment. `.void` here (not `nil`) — `nil` specifically
+        // means "no such method", which would incorrectly redirect the
+        // caller to some other fallback dispatch path instead of just
+        // short-circuiting this already-resolved call.
+        if skipIfNonLocalReturnAlreadyPending() { return .void }
         let (givenBlock, evaluatedCallArguments) = Self.extractGivenBlock(from: try await evaluate(arguments))
         guard let resolved = LassoMethodDispatcher.resolve(
             method: name,
@@ -632,6 +730,23 @@ struct Evaluator {
         let boundLocals = try await bindParameters(resolved.definition.parameters, to: resolved.evaluatedArguments)
         let savedLocals = context.snapshotLocals()
         let savedLoopDepth = context.loopDepth
+        // Found missing while wiring up Stage 2's depth-based non-local
+        // return propagation: unlike `invokeCustomTag`, this function
+        // never pushed onto `tagCallStack` at all — meaning every type-
+        // method call shared whatever depth was already active from any
+        // ENCLOSING free-tag call, with no depth increment of its own.
+        // Harmless before Stage 2 (nothing measured depth), but two
+        // real, independent problems once something does: (1) a capture
+        // created inside one method call's body would record the same
+        // `homeDepth` as an unrelated SIBLING or NESTED method call at
+        // the same free-tag nesting level, letting a non-local
+        // return/yield be consumed by the wrong frame; (2) type-method
+        // calls had no recursion-depth guard at all (only free-tag calls
+        // did, via this same `pushTagCall`'s built-in max-depth-20
+        // check) — a self-recursive method with no base case could
+        // recurse unboundedly. Fixed by pushing here too, matching
+        // `invokeCustomTag`'s own discipline exactly.
+        try context.pushTagCall(name)
         context.replaceLocals(boundLocals)
         context.pushSelf(object)
         context.pushGivenBlock(givenBlock)
@@ -640,6 +755,7 @@ struct Evaluator {
         defer {
             context.popGivenBlock()
             context.popSelf()
+            context.popTagCall()
             context.replaceLocals(savedLocals)
             context.loopDepth = savedLoopDepth
         }
@@ -647,7 +763,7 @@ struct Evaluator {
         guard let renderNodes else { return .void }
         context.clearReturnSignal()
         _ = try await renderNodes(resolved.definition.body, &context)
-        return context.consumeReturnSignal() ?? .void
+        return consumeReturnValueRespectingNonLocalTarget(activeDepth: context.tagCallStack.count) ?? .void
     }
 
     /// `Var`/`Variable` and `Global` are read/write tags (Ch. 15 Tables 1
@@ -1377,6 +1493,13 @@ struct Evaluator {
         case let (.integer(value), "ceil"): return .integer(value)
         case let (.capture(capture), "invoke"):
             return try await invokeCapture(capture, arguments: try await evaluate(arguments))
+        case let (.capture(capture), "detach"):
+            // Ch. "Captures": "detaches the capture so that it no longer
+            // has a home capture... After this, calling [capture->home]
+            // will return void" — and "returns itself", so `->detach()`
+            // chains naturally (e.g. `#cap->detach->invoke`).
+            capture.detach()
+            return .capture(capture)
         case let (.pair(key, _), "first"): return key
         case let (.pair(_, value), "second"): return value
         case (.pair, "size"):

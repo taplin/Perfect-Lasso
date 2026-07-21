@@ -23,8 +23,22 @@ public struct LassoRenderer: Sendable {
             // value to the page's output — the same behavior
             // `<?lassoscript ... return json_serialize(...) ?>`-style API
             // pages already relied on before `return` gained real
-            // short-circuiting control flow.
-            if let returned = engine.evaluator.context.consumeReturnSignal() {
+            // short-circuiting control flow. Stage 2 (Captures): must use
+            // the depth-aware consume here too, not a bare
+            // `consumeReturnSignal()` — a capture invoked directly at THIS
+            // page's own top level (home == this exact level) leaves a
+            // still-live, correctly-targeted signal that only reaches this
+            // point because every invocation boundary in between declined
+            // to consume it (see `LassoContext
+            // .consumeReturnSignalRespectingNonLocalTarget`'s own doc
+            // comment); a bare unconditional consume here would also
+            // wrongly swallow a signal that's still non-locally targeting
+            // some OTHER, unrelated depth (impossible for a genuine
+            // top-level document render, whose own active depth this
+            // always is, but shared here for one uniform rule everywhere).
+            if let returned = engine.evaluator.context.consumeReturnSignalRespectingNonLocalTarget(
+                activeDepth: engine.evaluator.context.tagCallStack.count
+            ) {
                 output += returned.outputString
             }
             engine.evaluator.context.finalizeSessions()
@@ -612,6 +626,15 @@ struct RendererTagInvocationService: LassoTagInvocationService {
         positionalArguments: [LassoValue],
         context: inout LassoContext
     ) async throws -> LassoValue {
+        // Stage 2 (Captures): mirrors `Evaluator
+        // .skipIfNonLocalReturnAlreadyPending()` — this call must not
+        // even start (bind parameters, push a new frame, render a body)
+        // if a return/yield is ALREADY mid-propagation from earlier in
+        // the same statement's expression evaluation. Without this, this
+        // boundary's own `context.clearReturnSignal()` below would
+        // silently clobber that still-live signal before the enclosing
+        // statement's poll ever gets a chance to see it.
+        if context.returnSignal != nil { return .void }
         // A separate `positionalIndex` counter, only advanced on an
         // actual bind — NOT the `enumerated()` loop index directly —
         // matching `Evaluator.bindParameters`'s own defensive shape
@@ -660,6 +683,15 @@ struct RendererTagInvocationService: LassoTagInvocationService {
             context = engine.evaluator.context
             throw error
         }
-        return context.consumeReturnSignal() ?? .void
+        // Stage 2 (Captures): same depth-aware consume as
+        // `Evaluator.invokeCustomTag`/`invokeMemberMethod`/`invokeCapture`
+        // (see `LassoContext.consumeReturnSignalRespectingNonLocalTarget`'s
+        // doc comment) — this boundary pushed `definition.name` via
+        // `pushTagCall` above and hasn't popped it yet (that's in the
+        // `defer`), so `context.tagCallStack.count` here is this
+        // invocation's own active depth, exactly like every other boundary.
+        return context.consumeReturnSignalRespectingNonLocalTarget(
+            activeDepth: context.tagCallStack.count
+        ) ?? .void
     }
 }

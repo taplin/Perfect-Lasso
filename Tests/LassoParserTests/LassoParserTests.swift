@@ -10645,11 +10645,25 @@ struct IncludeURLTests {
     // own body -- this parser's statement boundaries are newline-
     // driven; `;` is skipped as lexer trivia, not treated as a
     // statement separator (matches every other multi-statement tag/
-    // type-method body test in this file).
+    // type-method body test in this file). `cap` uses an auto-collect
+    // body with no explicit `return` -- Stage 2 (Captures): a capture
+    // invoked directly at the SAME top-level sequence as its own
+    // creation, whose body DOES `return`, correctly (per Ch. "Captures":
+    // "exiting from the current home as well as itself") aborts the
+    // rest of that same top-level render once invoked -- exactly like a
+    // real `[Return]` at page scope. That's real, deliberate behavior,
+    // just not what THIS test is about (parsing, not non-local control
+    // flow), so it's avoided here by construction rather than worked
+    // around. `outer`/`inner` still use explicit `return`, since
+    // `inner`'s home is `outer`'s own ACTIVE invocation frame (created
+    // while `outer` itself is executing, not at top level) -- so its
+    // non-local unwind is fully absorbed by `outer`'s own invocation and
+    // never reaches top level at all, a good real exercise of nested
+    // non-local propagation resolving cleanly.
     var context = LassoContext()
     let output = try await LassoRenderer().render(
         """
-        [local('cap' = { return 'a}b' })]\
+        [local('cap' = {^ 'a}b' ^})]\
         [#cap()]|\
         [local('outer' = { local('inner' = { return 'nested' })
         return #inner->invoke })]\
@@ -10696,14 +10710,24 @@ struct IncludeURLTests {
     // -- matching `foldAssociatedCapture`'s corrected design (labels the
     // capture "givenblock" and `Evaluator.extractGivenBlock` pulls it
     // out before ordinary parameter binding ever sees it; see that
-    // function's own doc comment for the real bug this fixes).
+    // function's own doc comment for the real bug this fixes). The
+    // associated block auto-collects rather than using an explicit
+    // `return` -- Stage 2 (Captures): `return`/`yield` inside a capture
+    // also exits its home (Ch. "Captures"), so a capture whose body
+    // returns AND whose value is meant to be used inline by the callee's
+    // OWN wrapping `return(...)` is a materially different (and much
+    // rarer) case than this test is actually about -- ordinary
+    // `givenBlock->invoke(...)` threading a ready-made value back to its
+    // caller, matching real corpus usage (`#AIMParams->forEachPair =>
+    // {...}`, `inline(...)=>{records=>{...}}}`), none of which use an
+    // explicit `return` inside the associated block at all.
     var context = LassoContext()
     let output = try await LassoRenderer().render(
         """
         [Define_Tag('UseWith')]\
             [return(givenBlock->invoke('hi'))]\
         [/Define_Tag]\
-        [UseWith => { return 'got: ' + #1 }]
+        [UseWith => {^ 'got: ' + #1 ^}]
         """,
         context: &context
     )
@@ -10725,6 +10749,9 @@ struct IncludeURLTests {
     // this file, e.g. `typeDefinitionsConstructObjectsAndDispatchMethods`
     // just above) -- an ordinary bracket-tag `[...]` expects a single
     // VALUE expression, not a declaration/block statement.
+    // Auto-collect associated block, no explicit `return` -- same reason
+    // as `associationOperatorFoldsACaptureLiteralAsATrailingArgumentOnABareIdentifierCall`
+    // just above.
     var context = LassoContext()
     let output = try await LassoRenderer().render(
         """
@@ -10736,7 +10763,7 @@ struct IncludeURLTests {
         }
         local('w' = widget())
         ?>
-        [#w->usewith => { return 'got: ' + #1 }]
+        [#w->usewith => {^ 'got: ' + #1 ^}]
         """,
         context: &context
     ).trimmingCharacters(in: .whitespacesAndNewlines)
@@ -10747,14 +10774,17 @@ struct IncludeURLTests {
     // Real corpus shape (TS_lasso9's `inline(-host=..., -sql=...)=>{...}`):
     // `=>` following a call that ALREADY has its own explicit `(...)`
     // argument list -- the associated block must not disturb the
-    // existing argument's own binding.
+    // existing argument's own binding. Auto-collect associated block, no
+    // explicit `return` -- same reason as
+    // `associationOperatorFoldsACaptureLiteralAsATrailingArgumentOnABareIdentifierCall`
+    // above.
     var context = LassoContext()
     let output = try await LassoRenderer().render(
         """
         [Define_Tag('UseWith', -Required='First')]\
             [return(#First + ': ' + givenBlock->invoke('hi'))]\
         [/Define_Tag]\
-        [UseWith('one') => { return 'got: ' + #1 }]
+        [UseWith('one') => {^ 'got: ' + #1 ^}]
         """,
         context: &context
     )
@@ -10786,5 +10816,311 @@ struct IncludeURLTests {
         context: &context
     )
     #expect(output == "5|")
+}
+
+// MARK: - Captures Stage 2 (non-local return/yield, ->detach())
+
+@Test func returnInsideACaptureExitsBothTheInvokeCallAndItsHomeMethodSkippingBothTrailingStatements() async throws {
+    // Ch. "Captures": "Because captures are intended to execute as if
+    // they had been invoked directly within their home, return and
+    // yield will both behave by exiting from the current home as well
+    // as itself." This is the Guide's own canonical shape: a capture
+    // created inside one method (`method1`, its home) is handed to and
+    // invoked from a DIFFERENT, more deeply nested method (`method2`) --
+    // `return` inside the capture must unwind past `method2`'s own
+    // trailing statement AND back out of `method1` itself, past ITS
+    // trailing statement too, producing 'hello' as `method1`'s own
+    // return value. NOTE: this interpreter always discards a called
+    // tag/method's own internally-echoed bare-statement text (only its
+    // explicit `return` value, or `.void`, ever crosses a call boundary
+    // -- see `Evaluator.invokeCustomTag`'s `_ = try await
+    // renderNodes(...)`) -- so "not reached"/"also not reached" would
+    // never surface in `output` EITHER way, non-local or not. What
+    // actually discriminates Stage 2 here is `method1`'s own RETURN
+    // VALUE: under Stage 1's purely-local semantics `method1` would fall
+    // off the end with no explicit return of its own and produce
+    // `.void` (empty); Stage 2's non-local propagation instead makes
+    // 'hello' surface all the way out as `method1`'s own return value.
+    var context = LassoContext()
+    let output = try await LassoRenderer().render(
+        """
+        <?lassoscript
+        define method2(cap) => {
+            #cap->invoke
+            'not reached'
+        }
+        define method1() => {
+            local(cap) = { return 'hello' }
+            method2(#cap)
+            'also not reached'
+        }
+        ?>
+        [method1]
+        """,
+        context: &context
+    ).trimmingCharacters(in: .whitespacesAndNewlines)
+    #expect(output == "hello")
+}
+
+@Test func yieldBehavesLikeReturnForNonLocalExitButDoesNotResumeFromWhereItLeftOff() async throws {
+    // Ch. "Captures": `yield`, like `return`, halts the capture and
+    // exits its home non-locally -- exercised here via the SAME
+    // method1/method2 shape as the test above, just with `yield`
+    // instead of `return`. Also documents this stage's own explicitly
+    // narrower scope (see `Captures.swift`'s doc comment): a SECOND
+    // invocation of the same capture does NOT resume execution right
+    // after the `yield` (real Lasso's own documented behavior) -- it
+    // re-runs the body from the top and non-locally exits all over
+    // again, rather than continuing past the `yield`.
+    var context = LassoContext()
+    let output = try await LassoRenderer().render(
+        """
+        <?lassoscript
+        define method2(cap) => {
+            #cap->invoke
+            'not reached'
+        }
+        define method1() => {
+            local(cap) = { yield 'hello' }
+            method2(#cap)
+            'also not reached'
+        }
+        ?>
+        [method1]
+        """,
+        context: &context
+    ).trimmingCharacters(in: .whitespacesAndNewlines)
+    #expect(output == "hello")
+}
+
+@Test func nonLocalReturnFromACaptureInvokedThroughANestedCallSkipsSiblingStatementsAtTheHomeLevel() async throws {
+    // Real-shape analogue of the Guide's own `contains()`/`forEach`
+    // worked example (`->forEach` itself is Stage 4, not yet
+    // implemented; this simulates the same "check each item, stop on
+    // match" pattern via sequential `checkItem` calls instead of a
+    // native `loop`/`iterate` block -- see the found-but-out-of-scope
+    // bug noted just below). A capture created INSIDE `contains()`
+    // itself is invoked from a nested `checkItem` call for each
+    // candidate; `return true` on a match must unwind past `checkItem`'s
+    // own call AND skip every SUBSEQUENT sibling statement in
+    // `contains()`'s own body (the later `checkItem(#cap, 4)` calls and
+    // the trailing `'no match'` fallback), producing `true` as
+    // `contains()`'s own return value.
+    //
+    // Deliberately does NOT use `loop`/`iterate`/`while`/`with`/`records`
+    // here: found, while designing this test, that NONE of those five
+    // native block constructs check `shouldStopRenderingCurrentBody()`
+    // between their own internal iterations (`RendererEngine
+    // .renderBlock`, Renderer.swift) -- only the separate
+    // `consumeLoopControlSignal()`/`Loop_Abort` mechanism halts them
+    // early. This is a genuine, pre-existing gap (a bare `return` inside
+    // e.g. `loop(-from=1,-to=5) => { if(...) => { return x } }`, with NO
+    // capture involved at all, silently keeps iterating all 5 times
+    // instead of stopping at the match) -- entirely independent of
+    // Captures, unrelated to this stage's own scope, and left for
+    // separate follow-up rather than fixed here.
+    var context = LassoContext()
+    let output = try await LassoRenderer().render(
+        """
+        <?lassoscript
+        define checkItem(cap, value) => {
+            #cap->invoke(#value)
+        }
+        define contains(needle) => {
+            local(cap) = {
+                if(#1 == #needle) => { return true }
+            }
+            checkItem(#cap, 1)
+            checkItem(#cap, 2)
+            checkItem(#cap, 3)
+            checkItem(#cap, 4)
+            'no match'
+        }
+        ?>
+        [contains(3)]
+        """,
+        context: &context
+    ).trimmingCharacters(in: .whitespacesAndNewlines)
+    #expect(output == "true")
+}
+
+@Test func detachedCaptureReturnStaysPurelyLocalAndDoesNotExitItsFormerHome() async throws {
+    // Ch. "Captures": "A capture can be detached from its home in order
+    // to escape from this [non-local] behavior... detaches the capture
+    // so that it no longer has a home capture." Same method1/method2
+    // shape as the non-local tests above, but each method now has its
+    // OWN trailing explicit `return` (rather than falling off the end)
+    // so the difference is observable through the one channel that
+    // survives a call boundary in this interpreter -- return VALUES, not
+    // internally-echoed statement text (see the first test above's own
+    // note). Non-detached, `method2`'s own trailing `return` would never
+    // run (skipped by the still-propagating non-local signal) and
+    // `method1` would receive 'hello' directly, exactly like the first
+    // test above. Detached, `return 'hello'` inside the capture stops
+    // being non-local at all -- `#cap->detach->invoke` produces 'hello'
+    // as an perfectly ordinary LOCAL value, `method2`'s OWN trailing
+    // `return` then runs normally afterward, and `method1` sees THAT
+    // value, not the capture's.
+    var context = LassoContext()
+    let output = try await LassoRenderer().render(
+        """
+        <?lassoscript
+        define method2(cap) => {
+            #cap->detach->invoke
+            return 'method2 finished'
+        }
+        define method1() => {
+            local(cap) = { return 'hello' }
+            local(result) = method2(#cap)
+            return 'method1 got: ' + string(#result)
+        }
+        ?>
+        [method1]
+        """,
+        context: &context
+    ).trimmingCharacters(in: .whitespacesAndNewlines)
+    #expect(output == "method1 got: method2 finished")
+}
+
+@Test func nestedCaptureCreatedInsideAHomedCaptureInheritsThatCapturesHomeNotItsOwnRawDepth() async throws {
+    // Ch. "Captures": "A capture that is created within a capture that
+    // does have a home will have its home set to its parent capture's
+    // home. This means that nested captures will all have the same
+    // home." Found by code review: using the raw current call-stack
+    // depth for a capture literal evaluated WHILE ANOTHER capture's own
+    // body is executing (rather than inheriting THAT capture's home
+    // verbatim) silently catches the nested capture's non-local return
+    // one frame too early -- invisible when the outer capture is
+    // invoked immediately, in place (that shape can't distinguish
+    // correct from buggy), but wrong the moment the outer capture is
+    // invoked from a DIFFERENT depth than where it was created, exactly
+    // as here: `cap` is created inside `outerHome`, but not invoked
+    // until `invokeElsewhere` (one frame deeper) calls it. `inner`,
+    // created while `cap`'s own body runs, must inherit `cap`'s home
+    // (`outerHome`'s own frame) -- so `return 'from inner'` unwinds all
+    // the way past `cap`, past `invokeElsewhere`'s own trailing
+    // statement, AND past `outerHome`'s own trailing statement, landing
+    // as `outerHome()`'s own return value.
+    var context = LassoContext()
+    let output = try await LassoRenderer().render(
+        """
+        <?lassoscript
+        define invokeElsewhere(c) => {
+            #c->invoke
+            return 'invokeElsewhere fallback'
+        }
+        define outerHome() => {
+            local(cap) = {
+                local(inner) = { return 'from inner' }
+                #inner->invoke
+                return 'outer fallback'
+            }
+            invokeElsewhere(#cap)
+            return 'outerHome fallback'
+        }
+        ?>
+        [outerHome]
+        """,
+        context: &context
+    ).trimmingCharacters(in: .whitespacesAndNewlines)
+    #expect(output == "from inner")
+}
+
+@Test func aSecondCaptureInvokeInTheSameExpressionDoesNotReRunOrClobberAFirstStillPropagatingReturn() async throws {
+    // Found by architect review: `shouldStopRenderingCurrentBody()` is
+    // only ever polled between STATEMENTS, never mid-expression -- so
+    // without a guard, a SECOND `#cap->invoke` appearing later in the
+    // SAME expression as a first one whose `return` is still
+    // propagating (hasn't reached its target yet) would silently run to
+    // completion as if nothing were happening: re-executing the
+    // capture's body a second time, and its own invocation boundary's
+    // `clearReturnSignal()` (called right before rendering that second
+    // body) would wipe out the first invocation's still-live signal
+    // before `method1_helper`'s own statement-level poll ever saw it.
+    //
+    // `method1`'s own return value alone can't distinguish "ran once"
+    // from "ran twice" here -- BOTH invocations return the same 'X', and
+    // whichever one's signal ultimately survives to reach `method1`'s
+    // own home produces the identical value either way (a genuinely
+    // non-decisive shape, caught by tracing through what the buggy,
+    // unguarded behavior would ALSO produce before finalizing this
+    // test). `$checkedCount` is a GLOBAL-scope variable specifically
+    // because it survives independently of the discarded local-scope/
+    // return-value chain -- a real, observable side effect proving how
+    // many times the capture's body actually executed, unaffected by
+    // which invocation's propagating signal happens to win.
+    var context = LassoContext()
+    let output = try await LassoRenderer().render(
+        """
+        <?lassoscript
+        var(checkedCount) = 0
+        define method1_helper(cap) => {
+            local(combined) = #cap->invoke + '-' + #cap->invoke
+            return 'helper done: ' + #combined
+        }
+        define method1() => {
+            local(cap) = {
+                $checkedCount += 1
+                return 'X'
+            }
+            method1_helper(#cap)
+            return 'after'
+        }
+        ?>
+        [method1]|[$checkedCount]
+        """,
+        context: &context
+    ).trimmingCharacters(in: .whitespacesAndNewlines)
+    #expect(output == "X|1")
+}
+
+@Test func twoSiblingCapturesWithDifferentHomesInTheSameExpressionEachExitTheirOwnHomeCorrectly() async throws {
+    // Found by architect review: same mid-expression hazard as the test
+    // above, but with two SIBLING captures that have DIFFERENT homes --
+    // without the guard, the SECOND capture's own `clearReturnSignal()`
+    // would silently overwrite the FIRST capture's still-propagating
+    // signal (value AND target depth) with its own, so the WRONG home
+    // (`method3`, not `method1`) would "catch" the return, and
+    // `method1`'s own exit would be lost without a trace.
+    var context = LassoContext()
+    let output = try await LassoRenderer().render(
+        """
+        <?lassoscript
+        define method2(capA, capB) => {
+            local(combined) = #capA->invoke + '-' + #capB->invoke
+            return 'after2: ' + #combined
+        }
+        define method3(capA) => {
+            local(capB) = { return 'B' }
+            method2(#capA, #capB)
+            return 'after3'
+        }
+        define method1() => {
+            local(capA) = { return 'A' }
+            method3(#capA)
+            return 'after1'
+        }
+        ?>
+        [method1]
+        """,
+        context: &context
+    ).trimmingCharacters(in: .whitespacesAndNewlines)
+    #expect(output == "A")
+}
+
+@Test func detachReturnsTheCaptureItselfSoItChainsDirectlyIntoInvoke() async throws {
+    // Ch. "Captures": "...and then returns itself" -- `->detach` must
+    // hand back the SAME capture (not void, not a copy) so
+    // `#cap->detach->invoke(...)` chains in one expression, matching
+    // the test above's own usage.
+    var context = LassoContext()
+    let output = try await LassoRenderer().render(
+        """
+        [local('cap' = { return #1 + #2 })]\
+        [#cap->detach->invoke(2, 3)]
+        """,
+        context: &context
+    )
+    #expect(output == "5")
 }
 

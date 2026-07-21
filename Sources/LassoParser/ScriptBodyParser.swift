@@ -622,10 +622,27 @@ struct ScriptBodyParser {
     }
 
 
+    /// Rewrites a bare (paren-less) `return X`/`yield X` statement into
+    /// `return(X)`/`yield(X)` before handing it to `ExpressionParser` --
+    /// without this, a bare keyword followed directly by a value (no
+    /// parens) parses via the generic juxtaposition/string-concatenation
+    /// sugar (`parseJuxtaposedValueTrackingGiveback`: bare identifier
+    /// `return`/`yield`, evaluating to an unrelated undefined variable,
+    /// concatenated with whatever value follows) instead of ever calling
+    /// the real `register("return")`/`register("yield")` native
+    /// function at all. `yield` was missing here entirely until Stage 2
+    /// (Captures) added a real `register("yield")` — found via a
+    /// regression test (`{ yield 'hello' }`, invoked directly) that
+    /// silently produced no output instead of "hello", while the
+    /// identically-shaped `{ return 'hello' }` already worked correctly.
     private func normalizeReturn(_ statement: String) -> String {
-        guard statement.lowercased().hasPrefix("return ") else { return statement }
-        let value = statement.dropFirst("return ".count)
-        return "return(\(value))"
+        for keyword in ["return", "yield"] {
+            let prefix = keyword + " "
+            guard statement.lowercased().hasPrefix(prefix) else { continue }
+            let value = statement.dropFirst(prefix.count)
+            return "\(keyword)(\(value))"
+        }
+        return statement
     }
 
     private mutating func skipTrivia() {

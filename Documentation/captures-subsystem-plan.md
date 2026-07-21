@@ -508,11 +508,153 @@ via this same `givenBlock` mechanism, matching the real docs' own
 `trait_queriable` worked example (`local(gb) = givenBlock`) exactly rather
 than needing its own separate design.
 
-**Stage 2 — `yield`/`return`/`detach`/`restart`/PC semantics.** New
-control-flow state distinct from the existing one-shot
-`clearReturnSignal`/`consumeReturnSignal` pair (assumes complete-or-return,
-never pause-and-resume). Non-local return/yield through homed nested
-captures needs a new signal-propagation path.
+**Stage 2 — `yield`/`return`/`detach`/PC semantics** ✅ done (2026-07-21) —
+non-local `return`/`yield` through a capture's home (Ch. "Captures": "return
+and yield will both behave by exiting from the current home as well as
+itself"), plus `->detach()`. Depth-based, not exception-based: each capture
+records `homeDepth: Int?` (`LassoContext.tagCallStack.count`, measured while
+its OWN creating frame is active) at literal-evaluation time; `->detach()`
+nils it out. `return`/`yield` additionally set a new
+`LassoContext.nonLocalReturnTargetDepth`, alongside the existing
+`returnSignal`. Every invocation boundary — `Evaluator.invokeCustomTag`/
+`invokeMemberMethod`/`invokeCapture`, plus two more found along the way
+(`Renderer.swift`'s top-level page consume, `RendererTagInvocationService
+.invoke`) — now runs a single shared check
+(`LassoContext.consumeReturnSignalRespectingNonLocalTarget(activeDepth:)`)
+before consuming: if a target depth is set and doesn't match this frame's
+own active depth, the frame declines to consume (leaves both signals live)
+and produces `.void`, so the render loop that called it sees
+`shouldStopRenderingCurrentBody()` still true and keeps unwinding too —
+propagation is just every intermediate frame declining in turn, reusing the
+EXISTING cooperative-polling signal architecture rather than adding Swift
+throw/catch-based unwinding. `LassoCaptureValue` (`Captures.swift`) went from
+fully-immutable to lock-protected (`NSLock`, `@unchecked Sendable`, mirroring
+`LassoObjectInstance`'s own pattern) since `->detach()` needs genuine
+post-construction mutation. 545/545 tests passing.
+
+**Deliberately narrower scope, disclosed in code**: `yield` is implemented
+IDENTICALLY to `return` (same non-local-exit-through-home) but does **NOT**
+implement real Lasso's documented PC-preserving resume (a capture that
+reached a `yield` continuing from right after it on its NEXT invocation,
+cycling `1, 2, 3, 4, 1, 2, ...`) — every invocation re-executes the body from
+the top. True resumable execution would need a fundamentally different
+(coroutine-like/CPS) execution model this tree-walking render pipeline has
+nowhere today — a materially larger, separate piece of work, informally
+"Stage 2b", deliberately deferred. `->home()`/`->restart()`/
+`->continuation()`/`->callSite_*`/`->callStack()`/`currentCapture()`
+introspection also deferred — low corpus value, and several genuinely don't
+fit this stage's `homeDepth: Int` model (real Lasso's `->home()` returns an
+actual capture object reference, not a depth marker).
+
+**Two real bugs found and fixed while implementing, both disclosed in code
+comments where they were fixed:**
+1. `invokeMemberMethod` (custom-type method dispatch, e.g. `#widget
+   ->usewith(...)`) never called `pushTagCall`/`popTagCall` at all, unlike
+   `invokeCustomTag` — harmless before this stage (nothing depended on depth
+   tracking), but this stage's depth-based non-local-return mechanism
+   requires every invocation boundary to consistently participate for the
+   depth comparisons to mean anything. Fixing it also closed a genuinely
+   separate, real gap as a side effect: type-method calls previously had
+   ZERO recursion-depth protection (only free-tag calls did, via
+   `pushTagCall`'s built-in max-depth-20 guard).
+2. `ScriptBodyParser`'s bare-statement-keyword rewrite (`return X` →
+   `return(X)`, needed so a paren-less `return` doesn't mis-parse via the
+   unrelated string-juxtaposition-concatenation sugar) had no equivalent for
+   the brand-new `yield` keyword — bare `yield 'x'` silently evaluated as
+   `yield` (an undefined bare identifier) concatenated with `'x'`, never
+   actually invoking `register("yield")` at all. Found via a regression test
+   that produced empty output instead of the yielded value. Fixed by
+   generalizing the rewrite to both keywords.
+
+**Also found, confirmed real, explicitly out of scope for this stage** (own
+follow-up task filed separately): `loop`/`while`/`iterate`/`with`/`records`
+blocks' own internal iteration loops check ONLY the separate
+`Loop_Abort`/`Loop_Continue` signal between iterations, never
+`shouldStopRenderingCurrentBody()` — so a bare `return`/`yield` fired inside
+one of these blocks does not stop that block's own iteration early (it keeps
+running every remaining iteration). Pre-existing, unrelated to Captures;
+this stage's own tests were deliberately designed around explicit nested
+tag/method calls instead of native loop blocks to avoid depending on this
+gap (see the "found a real, pre-existing bug" comment on
+`nonLocalReturnFromACaptureInvokedThroughANestedCallSkipsSiblingStatementsAtTheHomeLevel`
+in `LassoParserTests.swift`).
+
+**Also found, a real correctness hazard in this stage's OWN design, fixed
+during implementation**: `setNonLocalReturnSignal` (backing both
+`register("return")`/`register("yield")`) originally unconditionally
+overwrote any existing `returnSignal`. `[return(givenBlock->invoke(...))]`,
+where `givenBlock`'s own body does an explicit non-local `return`/`yield`,
+fires the INNER signal first (correctly left live, not yet at its target)
+— but since this tree-walking evaluator has no mid-expression interruption
+point, the OUTER `return(...)` call still runs anyway and would silently
+clobber the still-propagating inner signal with its own (built from the
+inner's throwaway `.void` propagation value). Fixed by making
+`setNonLocalReturnSignal` a no-op whenever a signal is already live — this
+only ever happens mid-propagation, so it never affects ordinary,
+one-return-at-a-time code.
+
+**Two more real findings from architect + code-reviewer review, both fixed
+before merge:**
+
+1. **Nested capture literals didn't inherit their parent capture's home.**
+   Ch. "Captures": "A capture that is created within a capture that does
+   have a home will have its home set to its parent capture's home... nested
+   captures will all have the same home." The original `.captureLiteral`
+   evaluation always computed `homeDepth` from the raw current stack depth,
+   ignoring `context.currentCaptureHomeDepth` entirely — invisible when the
+   OUTER capture happens to be invoked immediately, in place (the only shape
+   this file's own nested-capture parsing test exercises), but wrong the
+   moment that outer capture is invoked from a different depth than it was
+   created at (stored and invoked later — the whole point of a depth-
+   independent home mechanism). Fixed: `homeDepth: context
+   .currentCaptureHomeDepth ?? context.tagCallStack.count` — inherits the
+   enclosing capture's home (including `nil` if it's detached) when one is
+   active, falls back to the raw depth otherwise.
+2. **Mid-expression propagation could silently clobber itself.**
+   `shouldStopRenderingCurrentBody()` is only ever polled at STATEMENT
+   granularity (between top-level nodes, or between the pieces of one
+   `.code` node) — never mid-expression. So a capture invoked as a
+   SUB-expression (a call argument, an operand of `+`, ...) whose `return`
+   starts propagating, followed by ANOTHER call through one of the same
+   invocation boundaries later in that SAME statement (a second capture
+   invoke, a plain tag call, a method call), would previously run to
+   completion as if nothing were happening — silently re-executing side
+   effects, and that later call's own unconditional `context
+   .clearReturnSignal()` (called right before rendering ITS OWN body) would
+   wipe out the still-propagating signal before the enclosing statement's
+   poll ever saw it. Two concrete, now-regression-tested shapes: the SAME
+   capture invoked twice in one expression (`#cap->invoke + '-' +
+   #cap->invoke`) silently ran its body twice instead of once; two SIBLING
+   captures with DIFFERENT homes in one expression could have the wrong
+   home "catch" the return entirely, silently discarding the correct one's
+   exit. Fixed with a new shared guard
+   (`Evaluator.skipIfNonLocalReturnAlreadyPending()`, mirrored directly in
+   `RendererTagInvocationService.invoke`): every invocation boundary now
+   checks, as the very FIRST thing it does — before evaluating its own call
+   arguments, before touching any state — whether a return/yield signal is
+   ALREADY live, and immediately short-circuits to `.void` without doing
+   any work at all if so. Real stack-unwinding semantics would never even
+   reach a call like this once an ancestor's non-local exit is underway;
+   this reproduces that without needing Swift throw/catch-based unwinding.
+   Considered and rejected: switching the whole mechanism to a thrown
+   Swift error type (this codebase already has exactly this shape for
+   `[protect]`/`LassoRecoverableError`) — the targeted guard closes both
+   concrete hazards found, and a wholesale unwinding-model change is a much
+   larger, riskier surface than this stage's actual, demonstrated bug
+   needs. Revisit if a future scenario surfaces that the guard doesn't
+   cover.
+
+**Explicitly considered, not a bug**: `abort()`/`web_response->sendFile`/
+`file_serve`/`file_stream` set the return signal directly
+(`LassoContext.setReturnSignal`, NOT `setNonLocalReturnSignal`) and so are
+always scoped to the NEAREST enclosing invocation boundary, capture or not
+— consistent with this codebase's pre-existing, precedented behavior
+(`webResponseAbortStopsRenderingLikeReturn` already only ever tested
+`abort()` at the true top level; every custom-tag/method call boundary
+already unconditionally consumed `abort()`'s signal before Stage 2 ever
+existed). Stage 2 doesn't change this, and doing so would be a materially
+different, out-of-scope change to `abort()`'s own long-standing semantics,
+not a Captures fix.
 
 **Stage 3 — live-reference closure semantics.** Pick and implement §4.2(a)
 or (b). By far the largest and riskiest single stage — see §7.

@@ -1281,7 +1281,24 @@ public struct LassoNativeRegistry: Sendable {
             return .void
         }
         register("return") { arguments, context in
-            context.setReturnSignal(arguments.first?.value ?? .void)
+            context.setNonLocalReturnSignal(arguments.first?.value ?? .void)
+            return .void
+        }
+        // Ch. "Captures": "Captures can produce values by using `yield`
+        // or `return`. Both `yield` and `return` halt the execution of
+        // any of the capture's remaining code and produce the specified
+        // value." Implemented identically to `return` for now — see
+        // `Captures.swift`'s own doc comment for why the documented PC-
+        // preserving resume behavior (a subsequent invocation continuing
+        // right after the last `yield` instead of restarting) is NOT
+        // implemented: it needs genuinely resumable (coroutine-like)
+        // execution this tree-walking renderer has no capability for
+        // anywhere today, a materially larger, separate piece of work.
+        // The documented NON-LOCAL exit-through-home behavior IS real
+        // and shared with `return` here (see
+        // `LassoValue.setNonLocalReturnSignal`).
+        register("yield") { arguments, context in
+            context.setNonLocalReturnSignal(arguments.first?.value ?? .void)
             return .void
         }
         // Break/continue for the nearest enclosing loop/while/iterate/
@@ -1859,6 +1876,7 @@ public struct LassoContext: Sendable {
     var tagCallStack: [String]
     var selfStack: [LassoObjectInstance]
     var givenBlockStack: [LassoValue] = []
+    var captureHomeDepthStack: [Int?] = []
     /// Real Lasso's request-local `error_currentError` state — reset to
     /// `.noError` on every fresh context, updated by `setError`/`clearError`.
     /// `lastError` preserves the previous error across a `clearError()` call,
@@ -2089,9 +2107,79 @@ public struct LassoContext: Sendable {
         returnSignal = value
     }
 
+    /// Shared by `register("return")`/`register("yield")` — sets the
+    /// ordinary return signal exactly like `setReturnSignal(_:)` above,
+    /// but ALSO records the currently-executing capture's own home depth
+    /// (if any) as the target this signal must unwind back down to
+    /// before being consumed. Reading `currentCaptureHomeDepth` (a
+    /// double-optional: outer `nil` = not inside any capture invocation
+    /// at all right now, inner `nil` = inside one but it's detached) and
+    /// flattening both cases to a plain `nil` is exactly what preserves
+    /// ordinary, purely-local `return` behavior for every call site that
+    /// ISN'T inside a homed capture — the overwhelming majority of real
+    /// Lasso code, completely unaffected by this stage.
+    ///
+    /// No-ops entirely if a return signal is ALREADY live
+    /// (`returnSignal != nil`) — found via a real, reproducible hazard:
+    /// `[return(givenBlock->invoke(...))]`, where `givenBlock`'s own body
+    /// does an explicit `return`/`yield` targeting some ancestor's home.
+    /// Evaluating the argument to the OUTER `return(...)` call fires the
+    /// INNER capture's non-local return first, which (correctly) isn't
+    /// consumed yet because its target hasn't been reached — so the
+    /// still-propagating signal is live by the time the OUTER `return`
+    /// call itself runs. Without this guard, the outer call would
+    /// silently clobber the inner, still-unresolved signal with its own
+    /// (built from the inner's throwaway `.void` propagation value, since
+    /// expression evaluation has no mid-expression interruption point in
+    /// this tree-walking evaluator) — losing the real value entirely. A
+    /// signal only becomes live-and-unconsumed this way while a non-local
+    /// return is actively unwinding, so this guard never affects ordinary,
+    /// ONE-return-at-a-time code.
+    mutating func setNonLocalReturnSignal(_ value: LassoValue) {
+        guard returnSignal == nil else { return }
+        returnSignal = value
+        nonLocalReturnTargetDepth = currentCaptureHomeDepth.flatMap { $0 }
+    }
+
     mutating func consumeReturnSignal() -> LassoValue? {
         defer { returnSignal = nil }
         return returnSignal
+    }
+
+    /// Shared by every invocation boundary that can be a capture's home —
+    /// `Evaluator.invokeCustomTag`/`invokeMemberMethod`/`invokeCapture`,
+    /// `RendererTagInvocationService.invoke`, and the top-level
+    /// `LassoRenderer.render(_ document:)` page consume — consumes the
+    /// return signal produced by the just-finished render call, UNLESS a
+    /// non-local target depth is set (Ch. "Captures": `return`/`yield`
+    /// "exiting from the current home as well as itself") and doesn't
+    /// match THIS frame's own active depth — i.e. some capture's
+    /// `return`/`yield` is still unwinding past this frame toward an
+    /// ancestor's home. In that case this frame must NOT consume it:
+    /// `returnSignal` stays set and `nonLocalReturnTargetDepth` stays
+    /// untouched, so the render loop that called THIS frame sees
+    /// `shouldStopRenderingCurrentBody()` still true right after this call
+    /// returns and keeps unwinding too — propagation happens simply by
+    /// every frame in between declining to consume, reusing the EXISTING
+    /// poll-based `returnSignal` mechanism rather than any new exception-
+    /// based unwinding. `activeDepth` must be measured BEFORE this
+    /// frame's own `defer`-scheduled `popTagCall()` runs (i.e. while
+    /// `tagCallStack.count` still reflects this frame's own pushed
+    /// depth) — every call site does that naturally, since this is always
+    /// the last thing evaluated before the function returns. Originally a
+    /// private `Evaluator` helper; found (via the direct/non-nested
+    /// `#cap()`-at-top-level test regressions below) that TWO OTHER
+    /// consume boundaries outside `Evaluator` — the page-level consume in
+    /// `Renderer.swift` and `RendererTagInvocationService.invoke` — also
+    /// needed this exact same target-aware check, not the old
+    /// unconditional `consumeReturnSignal()`; moved here so both files
+    /// can share one implementation.
+    mutating func consumeReturnSignalRespectingNonLocalTarget(activeDepth: Int) -> LassoValue? {
+        if let target = nonLocalReturnTargetDepth, target != activeDepth {
+            return nil
+        }
+        nonLocalReturnTargetDepth = nil
+        return consumeReturnSignal()
     }
 
     mutating func clearReturnSignal() {
@@ -2177,6 +2265,46 @@ public struct LassoContext: Sendable {
     mutating func popGivenBlock() {
         _ = givenBlockStack.popLast()
     }
+
+    /// The home depth of whichever capture is CURRENTLY executing (top
+    /// of a stack, mirroring `givenBlockStack`'s own per-invocation push/
+    /// pop discipline — captures can nest, and a `return`/`yield` always
+    /// targets the INNERMOST active capture's own home, not some
+    /// enclosing one). `nil` at the top of the stack means "the
+    /// currently-executing capture is detached, or this isn't inside any
+    /// capture invocation at all" — either way, `return`/`yield` firing
+    /// right now is a genuinely ORDINARY, purely-local return, exactly
+    /// matching this codebase's pre-Stage-2 behavior. See
+    /// `Evaluator.invokeCapture` for where this is pushed/popped, and the
+    /// `register("return")`/`register("yield")` free functions
+    /// (`Runtime.swift`) for where it's read.
+    var currentCaptureHomeDepth: Int?? {
+        captureHomeDepthStack.last
+    }
+
+    mutating func pushCaptureHomeDepth(_ value: Int?) {
+        captureHomeDepthStack.append(value)
+    }
+
+    mutating func popCaptureHomeDepth() {
+        _ = captureHomeDepthStack.popLast()
+    }
+
+    /// Set by `return`/`yield` (Ch. "Captures": "return and yield will
+    /// both behave by exiting from the current home as well as itself")
+    /// alongside the pre-existing `returnSignal` whenever firing from
+    /// inside a HOMED (non-detached) capture invocation — the call-stack
+    /// depth (`tagCallStack.count`) that must be reached before the
+    /// return signal is actually consumed, rather than just left set so
+    /// the next frame up keeps unwinding. `nil` (the default/no-op case)
+    /// preserves this codebase's pre-Stage-2 behavior EXACTLY: an
+    /// ordinary `return` inside a plain custom tag/type method (never
+    /// touched by this field at all) is still always consumed by the
+    /// nearest enclosing call boundary, unaffected by anything below.
+    /// See `Evaluator.invokeCustomTag`/`invokeMemberMethod`/
+    /// `invokeCapture`'s shared "have I reached the target depth yet?"
+    /// check for how this is consulted and cleared.
+    var nonLocalReturnTargetDepth: Int?
 
     // Each level of Lasso-level tag recursion costs several real Swift
     // stack frames (the renderNodes closure, a fresh RendererEngine, the
