@@ -678,6 +678,7 @@ public enum LassoSMTPMessageBuilder {
         case .map: "map"
         case .object: "object"
         case .pair: "pair"
+        case .capture: "capture"
         }
     }
 }
