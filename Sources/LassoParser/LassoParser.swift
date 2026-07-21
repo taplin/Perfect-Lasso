@@ -258,7 +258,20 @@ private struct TemplateScanner {
                 // handles this correctly) ended the string one character
                 // early, then misread the real closing quote as opening a
                 // new one, losing track of the bracket's true `]`.
-                if character == "\\", index + 1 < characters.count {
+                // Ch. "Literals" > "Ticked Strings": no escape mechanism
+                // inside a ticked string — a literal `\` there is just a
+                // character, not an escape prefix (found by architect +
+                // code-reviewer review of the ticked-string
+                // investigation: without this guard, and without `` ` ``
+                // itself being recognized as a quote-opener just below,
+                // a ticked regex pattern containing its own `]` — e.g.
+                // `` `[0-9]+` `` — would have this scanner mistake that
+                // INNER `]` for the bracket-tag's own close, silently
+                // truncating everything after it; this scanner has no
+                // `[`/`]` depth counter at all, unlike a balanced-pair
+                // scan, so this is the single most exploitable of the
+                // several scanners this same fix applies to).
+                if character == "\\", activeQuote != "`", index + 1 < characters.count {
                     index += 2
                     continue
                 }
@@ -289,7 +302,7 @@ private struct TemplateScanner {
                 index = min(index + 2, characters.count)
                 continue
             }
-            if character == "'" || character == "\"" {
+            if character == "'" || character == "\"" || character == "`" {
                 quote = character
             } else if character == "]" {
                 break

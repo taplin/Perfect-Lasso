@@ -12555,3 +12555,232 @@ struct IncludeURLTests {
     #expect(output == "plain|")
 }
 
+// MARK: - Quoted/ticked string literal escape sequences
+
+@Test func quotedStringSupportsTheFullDocumentedNamedControlCharacterEscapes() async throws {
+    // Ch. "Literals" > "String Literals" > "Supported String Escape
+    // Sequences" (lassoguide.com/language/literals.html) -- \a/\b/\e/\f/
+    // \v joining the previously-implemented \n/\t/\r. An earlier cut of
+    // this parser only recognized \n/\t/\r and silently dropped the
+    // backslash for everything else (`\a` -> plain `a`), which this
+    // fixes.
+    var context = LassoContext()
+    let output = try await LassoRenderer().render(
+        "[bytes('\\a\\b\\e\\f\\v')->size]",
+        context: &context
+    )
+    #expect(output == "5")
+}
+
+@Test func quotedStringEscapesForQuoteCharactersBackslashAndQuestionMark() async throws {
+    // Same table: \" (0x22), \' (0x27), \? (0x3F), \\ (0x5C). \" and \'
+    // already worked via the previous implementation's generic
+    // "unrecognized escape keeps the following character" fallback
+    // (coincidentally correct for exactly these four), so this pins that
+    // behavior explicitly now that it's a real, deliberate table entry
+    // rather than an accident of the old fallback.
+    var context = LassoContext()
+    let output = try await LassoRenderer().render(
+        "['\\\"\\'\\?\\\\']",
+        context: &context
+    )
+    #expect(output == "\"'?\\")
+}
+
+@Test func quotedStringHexUnicodeEscapesSupportOneToTwoDigits() async throws {
+    // "\x dd Unicode character 1-2 hex digits". 0x41 = 'A'.
+    var context = LassoContext()
+    let output = try await LassoRenderer().render(
+        "['\\x41']",
+        context: &context
+    )
+    #expect(output == "A")
+}
+
+@Test func quotedStringUnicodeEscapesRequireExactlyFourOrEightHexDigits() async throws {
+    // "\u dddd Unicode character 4 hex digits" / "\U dddddddd Unicode
+    // character 8 hex digits" -- both 0x41 = 'A', zero-padded to the
+    // documented, EXACT digit count (unlike \x's 1-2 digit range).
+    var context = LassoContext()
+    let output = try await LassoRenderer().render(
+        "['\\u0041' + '\\U00000041']",
+        context: &context
+    )
+    #expect(output == "AA")
+}
+
+@Test func quotedStringOctalEscapesSupportOneToThreeDigits() async throws {
+    // "\ ddd Unicode character 1-3 octal digits". Octal 101 = decimal 65
+    // = 'A'.
+    var context = LassoContext()
+    let output = try await LassoRenderer().render(
+        "['\\101']",
+        context: &context
+    )
+    #expect(output == "A")
+}
+
+@Test func quotedStringBackslashEndOfLineRemovesTheLineBreakAndFollowingWhitespace() async throws {
+    // The doc's own worked example, verbatim: "'This string \ had a
+    // break in it' // => This string had a break in it" -- a backslash
+    // immediately followed by an end-of-line removes that end-of-line
+    // AND all following literal whitespace, resuming at the first
+    // non-whitespace character.
+    var context = LassoContext()
+    let output = try await LassoRenderer().render(
+        "['This string \\\n    had a break in it']",
+        context: &context
+    )
+    #expect(output == "This string had a break in it")
+}
+
+@Test func quotedStringUnrecognizedEscapesPassThroughBothCharactersLiterallyNotJustTheSecondOne() async throws {
+    // THE bug this whole investigation was filed for (during Captures
+    // Stage 5): the documented escape table is closed/exhaustive with no
+    // "anything else" clause, and the previous implementation's
+    // undocumented fallback silently DROPPED the backslash for any
+    // unrecognized escape (`\d` -> plain `d`) -- silently corrupting any
+    // regex pattern shorthand (`\d`/`\w`/`\s`) written as a quoted
+    // string. Now passes through literally instead (`\d` stays `\d`),
+    // the safer, less-destructive reading given the docs don't specify
+    // either way.
+    var context = LassoContext()
+    let output = try await LassoRenderer().render(
+        "['(\\d+)-(\\w+)']",
+        context: &context
+    )
+    #expect(output == "(\\d+)-(\\w+)")
+}
+
+@Test func quotedStringEscapesAreIdenticalForSingleAndDoubleQuoteDelimiters() async throws {
+    // Ch. "Literals": "Lasso supports two kinds of string literals:
+    // quoted and ticked" -- "quoted" covers BOTH single- and double-
+    // quote delimiters with the SAME rules (confirmed directly against
+    // the real docs, correcting an earlier misreading during Captures
+    // Stage 5 that assumed single vs. double quotes had DIFFERENT escape
+    // rules from each other -- the real distinction is quoted-vs-ticked,
+    // an entirely separate axis, not quote-character-vs-quote-character).
+    var context = LassoContext()
+    let output = try await LassoRenderer().render(
+        "['\\x41\\n\\d']|[\"\\x41\\n\\d\"]",
+        context: &context
+    )
+    #expect(output == "A\n\\d|A\n\\d")
+}
+
+@Test func tickedStringLiteralProducesItsRawContentWithNoEscapeProcessingAtAll() async throws {
+    // Ch. "Literals" > "String Literals" > "Ticked Strings": "A ticked
+    // string is a series of zero or more characters surrounded by a
+    // pair of backticks... the backslash character holds no special
+    // meaning." Entirely unimplemented before this fix -- a bare
+    // backtick fell through to a stray `.symbol` token with no grammar
+    // production, not a string literal at all. `\n` here must stay the
+    // two literal characters backslash+n, NOT an actual newline.
+    var context = LassoContext()
+    let output = try await LassoRenderer().render(
+        "[`a\\nb`]",
+        context: &context
+    )
+    #expect(output == "a\\nb")
+}
+
+@Test func tickedStringLiteralCanContainQuoteCharactersAndBackslashesUnescaped() async throws {
+    // The doc's own worked example, verbatim: "`A ticked string can
+    // contain 'single quotes', "double quotes", \backslash characters\
+    // and more - anything except backticks!`" -- exercising exactly
+    // this, confirming quotes and backslashes need no special handling
+    // inside a ticked string (real regex-pattern-friendly motivation the
+    // doc itself states: "particularly useful when using regular
+    // expressions which often require many backslashes").
+    var context = LassoContext()
+    let output = try await LassoRenderer().render(
+        "[`A ticked string can contain 'single quotes', \"double quotes\", \\backslash characters\\ and more - anything except backticks!`]",
+        context: &context
+    )
+    #expect(output == "A ticked string can contain 'single quotes', \"double quotes\", \\backslash characters\\ and more - anything except backticks!")
+}
+
+@Test func tickedStringLiteralIsIdealForRegexPatternsWithMultipleBackslashEscapes() async throws {
+    // The doc's own stated motivation for ticked strings: regex patterns
+    // that would otherwise need doubled backslashes as a quoted string.
+    // A real \d+-\d+ pattern, written as a ticked string, must reach the
+    // regex engine completely unmangled -- pins the end-to-end behavior
+    // this whole investigation exists to guarantee, using
+    // ->forEachMatch (Captures Stage 5), this codebase's own already-
+    // implemented regex matching, with the SAME pattern that previously
+    // needed a doubled backslash as a quoted string
+    // (stringForEachMatchWithACapturingGroupInvokesOncePerMatchNotOncePerGroupFragment).
+    var context = LassoContext()
+    let output = try await LassoRenderer().render(
+        """
+        <?lassoscript
+        var(collected) = array
+        'order 123-456 shipped'->forEachMatch(`\\d+-\\d+`) => { $collected->insert(#1) }
+        ?>
+        [$collected->join(',')]
+        """,
+        context: &context
+    ).trimmingCharacters(in: .whitespacesAndNewlines)
+    #expect(output == "123-456")
+}
+
+@Test func tickedStringContainingAnUnescapedApostropheDoesNotDesyncABareIfConditionScan() async throws {
+    // Real bug found by architect + code-reviewer review (both
+    // independently): this codebase has several OTHER, separate,
+    // pre-existing "find the matching close, quote-aware" raw-text
+    // scanners besides `ExpressionParser`'s own token-level lexer —
+    // `ScriptBodyParser.readBareConditionBeforeBraceBody`/
+    // `readBareConditionBeforeSemicolon`/`readBalanced`/`readStatement`/
+    // `readUntilKeyword`, `TypeBodyParser`'s equivalents, `LassoParser
+    // .scanSquare`, and `ExpressionParser.readCaptureBody` itself — all
+    // used to find statement/argument/bracket-tag boundaries BEFORE
+    // tokenization. None of them recognized backtick as a quote
+    // character when ticked strings were first added, so a ticked
+    // string containing an ODD number of unescaped `'`/`"` characters
+    // (perfectly legal — "can contain 'single quotes', "double quotes"
+    // ... and more") desynced their own independent quote-tracking
+    // state. Confirmed live: before this fix, `if(#x == `it's a test`)`
+    // failed outright with `.unknownFunction("if")` because
+    // `readBareConditionBeforeBraceBody` mistook the `'` inside `it's`
+    // for entering ANOTHER quoted region, losing track of the real `)`.
+    var context = LassoContext()
+    let output = try await LassoRenderer().render(
+        """
+        <?lassoscript
+        local(x) = `it's a test`
+        if(#x == `it's a test`) => { 'MATCHED' }
+        else => { 'NO MATCH' }
+        ?>
+        """,
+        context: &context
+    )
+    #expect(output == "MATCHED")
+}
+
+@Test func tickedRegexPatternContainingACharacterClassBracketDoesNotTruncateItsEnclosingBracketTag() async throws {
+    // The MOST exploitable instance of the same bug class (per
+    // code-reviewer review): `LassoParser.scanSquare` -- which finds the
+    // closing `]` of every `[...]` bracket-tag, the dominant Lasso 9
+    // syntax -- has NO depth counter for `[`/`]` at all; it breaks on
+    // the very FIRST unquoted `]` it sees. A ticked regex pattern
+    // containing its own `]` (a character class, e.g. `[0-9]+` -- the
+    // doc's own stated primary motivation for ticked strings existing at
+    // all: "particularly useful when using regular expressions") would
+    // have its OWN `]` mistaken for the bracket-tag's real close,
+    // silently truncating everything after it and leaking raw Lasso
+    // source as page text. Confirmed live: before this fix, this exact
+    // source produced a truncated tag followed by literal leaked source
+    // text in the page output instead of matching "123" and continuing
+    // normally.
+    var context = LassoContext()
+    let output = try await LassoRenderer().render(
+        """
+        [local('collected') = array]\
+        ['abc123'->forEachMatch(`[0-9]+`) => { #collected->insert(#1) }]\
+        [#collected->join(',')]|[bytes('after')->size]
+        """,
+        context: &context
+    )
+    #expect(output == "123|5")
+}
+

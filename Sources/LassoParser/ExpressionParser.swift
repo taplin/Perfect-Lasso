@@ -47,6 +47,30 @@ private struct ExpressionLexer {
         let character = characters[index]
 
         if character == "'" || character == "\"" { return .string(readString(character)) }
+        // Ch. "Language" > "Literals" > "String Literals": "Lasso
+        // supports two kinds of string literals: quoted and ticked...
+        // A ticked string is a series of zero or more characters
+        // surrounded by a pair of backticks. Within a ticked string,
+        // the backslash character holds no special meaning." A THIRD,
+        // entirely separate string-literal delimiter from the single/
+        // double quotes just above — not a quote-STYLE variant of them
+        // (an earlier investigation, during Captures Stage 5, initially
+        // read lassoguide.com's own `string->unescape()` phrase "the
+        // same escape process used by Lasso for non-ticked string
+        // literals" as implying single- vs double-quoted strings had
+        // DIFFERENT escape rules from each other; re-checked directly
+        // against this page and found that's wrong — "non-ticked" means
+        // "quoted" (single OR double, identical rules, confirmed by this
+        // same page's own worked examples using both interchangeably).
+        // Real, useful, and entirely unimplemented before this fix:
+        // "particularly useful when using regular expressions which
+        // often require many backslashes" (the doc's own stated
+        // motivation) — zero occurrences in either real corpus sampled
+        // by this project (which skews Lasso 8.5-era, predating this
+        // Lasso 9 syntax), but implemented anyway per real-Lasso-9
+        // completeness (see this project's own
+        // corpus-evidence-not-sole-bar convention).
+        if character == "`" { return .string(readTickedString()) }
         if character.isNumber { return readNumber() }
         // A leading-dot decimal literal (`.01`, `.5`) -- real Lasso allows
         // omitting the integer part before the point. Without this, a bare
@@ -114,27 +138,143 @@ private struct ExpressionLexer {
             index += 1
             if character == quote { break }
             if character == "\\", index < characters.count {
-                // Real Lasso string literals support the standard `\n`/
-                // `\t`/`\r` control-character escapes, not just "escape
-                // the quote character" (`\'`/`\"`) — anything else
-                // (including those) is literal, matching the previous
-                // behavior. Found live: real corpus (e.g.
-                // includes/detail_a_sku.lasso) builds page HTML with
-                // string literals like `'...\n|<br>|...'`, relying on
-                // `\n` being an actual newline (invisible in HTML output)
-                // — treating it as literal "drop the backslash, keep the
-                // letter n" instead inserted a visible, spurious "n"
-                // wherever one of these appeared.
-                switch characters[index] {
-                case "n": value.append("\n")
-                case "t": value.append("\t")
-                case "r": value.append("\r")
-                default: value.append(characters[index])
-                }
-                index += 1
+                index = appendEscape(into: &value, startingAt: index)
             } else {
                 value.append(character)
             }
+        }
+        return value
+    }
+
+    /// Ch. "Literals" > "String Literals" > "Quoted Strings" >
+    /// "Supported String Escape Sequences" — the full documented table,
+    /// superseding an earlier cut that only handled `\n`/`\t`/`\r` and
+    /// silently dropped the backslash for everything else (found live:
+    /// real corpus HTML-building string literals like
+    /// `'...\n|<br>|...'` need `\n` as an actual newline).
+    ///
+    /// An UNRECOGNIZED escape (not in the documented table at all) is
+    /// itself not documented one way or the other — this page presents a
+    /// closed, exhaustive list with no "anything else" clause. Passed
+    /// through literally here (BOTH the backslash and the following
+    /// character kept, e.g. `\d` stays `\d`), the safer, less-destructive
+    /// reading versus the previous "drop the backslash" behavior — real
+    /// corpus regex patterns written as quoted strings (not ticked ones,
+    /// which didn't exist in this parser until this same fix) rely on
+    /// `\d`/`\w`/`\s`-style shorthand surviving intact for a downstream
+    /// regex engine, and this codebase's other lookup-miss conventions
+    /// already favor non-corrupting defaults over silent data loss.
+    ///
+    /// `\:NAME:` (Unicode character by name) is the one documented form
+    /// NOT implemented — it would need a full Unicode character-name
+    /// database this Swift/Foundation-based project has no bound access
+    /// to (no such database is used anywhere else in this codebase
+    /// either). Disclosed, not faked; zero corpus evidence for it.
+    mutating private func appendEscape(into value: inout String, startingAt start: Int) -> Int {
+        var index = start
+        let character = characters[index]
+        switch character {
+        case "a": value.append("\u{07}"); index += 1
+        case "b": value.append("\u{08}"); index += 1
+        case "e": value.append("\u{1B}"); index += 1
+        case "f": value.append("\u{0C}"); index += 1
+        case "n": value.append("\n"); index += 1
+        case "r": value.append("\r"); index += 1
+        case "t": value.append("\t"); index += 1
+        case "v": value.append("\u{0B}"); index += 1
+        case "\"", "'", "?", "\\":
+            value.append(character)
+            index += 1
+        case "x":
+            index = appendHexEscape(into: &value, prefix: "x", startingAt: index + 1, digitCount: 1...2)
+        case "u":
+            index = appendHexEscape(into: &value, prefix: "u", startingAt: index + 1, digitCount: 4...4)
+        case "U":
+            index = appendHexEscape(into: &value, prefix: "U", startingAt: index + 1, digitCount: 8...8)
+        case "\r", "\n":
+            // "A backslash followed by an end-of-line... will cause that
+            // end-of-line and all following literal whitespace to be
+            // removed from the resulting string" — a line-continuation
+            // escape, not a character-producing one. `\r\n` counts as
+            // ONE end-of-line (the doc's own wording: "a literal line
+            // feed or carriage return or carriage return/line feed
+            // pair").
+            if character == "\r", index + 1 < characters.count, characters[index + 1] == "\n" {
+                index += 1
+            }
+            index += 1
+            while index < characters.count, characters[index].isWhitespace {
+                index += 1
+            }
+        default:
+            if let digit = character.wholeNumberValue, digit <= 7 {
+                index = appendOctalEscape(into: &value, startingAt: index)
+            } else {
+                value.append("\\")
+                value.append(character)
+                index += 1
+            }
+        }
+        return index
+    }
+
+    /// `\x dd` (1-2 hex digits), `\u dddd` (exactly 4), `\U dddddddd`
+    /// (exactly 8) — a short digit run that doesn't meet the required
+    /// count (malformed) is passed through literally (prefix letter +
+    /// whatever digits WERE found) rather than silently dropped, same
+    /// reasoning as `appendEscape`'s own unrecognized-escape fallback.
+    private func appendHexEscape(
+        into value: inout String, prefix: Character, startingAt start: Int, digitCount: ClosedRange<Int>
+    ) -> Int {
+        var index = start
+        var digits = ""
+        while index < characters.count, digits.count < digitCount.upperBound, characters[index].isHexDigit {
+            digits.append(characters[index])
+            index += 1
+        }
+        if digitCount.contains(digits.count), let codepoint = UInt32(digits, radix: 16),
+           let scalar = Unicode.Scalar(codepoint) {
+            value.append(Character(scalar))
+        } else {
+            value.append("\\")
+            value.append(prefix)
+            value.append(digits)
+        }
+        return index
+    }
+
+    /// `\ ddd` — "Unicode character 1–3 octal digits". Same malformed-
+    /// fallback reasoning as `appendHexEscape`.
+    private func appendOctalEscape(into value: inout String, startingAt start: Int) -> Int {
+        var index = start
+        var digits = ""
+        while index < characters.count, digits.count < 3, let digit = characters[index].wholeNumberValue, digit <= 7 {
+            digits.append(characters[index])
+            index += 1
+        }
+        if let codepoint = UInt32(digits, radix: 8), let scalar = Unicode.Scalar(codepoint) {
+            value.append(Character(scalar))
+        } else {
+            value.append("\\")
+            value.append(contentsOf: digits)
+        }
+        return index
+    }
+
+    /// Ch. "Literals" > "String Literals" > "Ticked Strings": "Within a
+    /// ticked string, the backslash character holds no special
+    /// meaning... a literal backtick character cannot appear within a
+    /// ticked string" — no escape mechanism at all, so there's no way to
+    /// include one; matches the doc's own stated caveat rather than
+    /// inventing an undocumented escape for it.
+    mutating private func readTickedString() -> String {
+        index += 1
+        var value = ""
+        while index < characters.count {
+            let character = characters[index]
+            index += 1
+            if character == "`" { break }
+            value.append(character)
         }
         return value
     }
@@ -172,14 +312,19 @@ private struct ExpressionLexer {
             let character = characters[index]
             if let activeQuote = quote {
                 index += 1
-                if character == "\\" {
+                // Ch. "Literals" > "Ticked Strings": no escape mechanism
+                // inside a ticked string — see the identical fix's own
+                // doc comment in ScriptBodyParser.swift for the full
+                // rationale (found by architect + code-reviewer review
+                // of the ticked-string investigation).
+                if character == "\\", activeQuote != "`" {
                     index = min(index + 1, characters.count)
                 } else if character == activeQuote {
                     quote = nil
                 }
                 continue
             }
-            if character == "'" || character == "\"" {
+            if character == "'" || character == "\"" || character == "`" {
                 quote = character
                 index += 1
             } else if character == "{" {

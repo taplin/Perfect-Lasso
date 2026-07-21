@@ -222,7 +222,12 @@ struct TypeBodyParser {
             let character = characters[index]
             if let activeQuote = quote {
                 index += 1
-                if character == "\\" {
+                // Ch. "Literals" > "Ticked Strings": no escape mechanism
+                // inside a ticked string — see the identical fix's own
+                // doc comment in ScriptBodyParser.swift for the full
+                // rationale (found by architect + code-reviewer review
+                // of the ticked-string investigation).
+                if character == "\\", activeQuote != "`" {
                     index = min(index + 1, characters.count)
                 } else if character == activeQuote {
                     quote = nil
@@ -230,7 +235,7 @@ struct TypeBodyParser {
                 continue
             }
 
-            if character == "'" || character == "\"" {
+            if character == "'" || character == "\"" || character == "`" {
                 quote = character
             } else if character == "(" {
                 parenDepth += 1
@@ -260,7 +265,12 @@ struct TypeBodyParser {
             let character = characters[index]
             if let activeQuote = quote {
                 index += 1
-                if character == "\\" {
+                // Ch. "Literals" > "Ticked Strings": no escape mechanism
+                // inside a ticked string — see the identical fix's own
+                // doc comment in ScriptBodyParser.swift for the full
+                // rationale (found by architect + code-reviewer review
+                // of the ticked-string investigation).
+                if character == "\\", activeQuote != "`" {
                     index = min(index + 1, characters.count)
                 } else if character == activeQuote {
                     quote = nil
@@ -268,7 +278,7 @@ struct TypeBodyParser {
                 continue
             }
 
-            if character == "'" || character == "\"" {
+            if character == "'" || character == "\"" || character == "`" {
                 quote = character
             } else if character == open {
                 depth += 1
@@ -327,7 +337,7 @@ struct TypeBodyParser {
             let character = source[index]
             if let activeQuote = quote {
                 if character == activeQuote { quote = nil }
-            } else if character == "'" || character == "\"" {
+            } else if character == "'" || character == "\"" || character == "`" {
                 quote = character
             } else if character == "(" {
                 parenDepth += 1

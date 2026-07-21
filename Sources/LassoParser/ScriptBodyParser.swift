@@ -705,7 +705,19 @@ struct ScriptBodyParser {
             let character = characters[index]
             if let activeQuote = quote {
                 index += 1
-                if character == "\\" {
+                // Ch. "Literals" > "Ticked Strings": "the backslash
+                // character holds no special meaning" inside a ticked
+                // string, unlike quoted (single/double) strings where it
+                // escapes the next character — a ticked span containing
+                // a literal `\` must not skip the character after it
+                // (found by architect + code-reviewer review of the
+                // ticked-string investigation: without this guard, EVERY
+                // raw-text quote-tracking scanner in this parser — not
+                // just this one — desyncs on a ticked string containing
+                // an unescaped structural character, e.g. a regex
+                // pattern's own `]`/`)`/`}`, silently truncating the
+                // enclosing bracket-tag/capture-body/statement).
+                if character == "\\", activeQuote != "`" {
                     index = min(index + 1, characters.count)
                 } else if character == activeQuote {
                     quote = nil
@@ -713,7 +725,7 @@ struct ScriptBodyParser {
                 continue
             }
 
-            if character == "'" || character == "\"" {
+            if character == "'" || character == "\"" || character == "`" {
                 quote = character
             } else if character == "(" {
                 parenDepth += 1
@@ -787,7 +799,19 @@ struct ScriptBodyParser {
             let character = characters[index]
             if let activeQuote = quote {
                 index += 1
-                if character == "\\" {
+                // Ch. "Literals" > "Ticked Strings": "the backslash
+                // character holds no special meaning" inside a ticked
+                // string, unlike quoted (single/double) strings where it
+                // escapes the next character — a ticked span containing
+                // a literal `\` must not skip the character after it
+                // (found by architect + code-reviewer review of the
+                // ticked-string investigation: without this guard, EVERY
+                // raw-text quote-tracking scanner in this parser — not
+                // just this one — desyncs on a ticked string containing
+                // an unescaped structural character, e.g. a regex
+                // pattern's own `]`/`)`/`}`, silently truncating the
+                // enclosing bracket-tag/capture-body/statement).
+                if character == "\\", activeQuote != "`" {
                     index = min(index + 1, characters.count)
                 } else if character == activeQuote {
                     quote = nil
@@ -795,7 +819,7 @@ struct ScriptBodyParser {
                 continue
             }
 
-            if character == "'" || character == "\"" {
+            if character == "'" || character == "\"" || character == "`" {
                 quote = character
             } else if character == "(" {
                 parenDepth += 1
@@ -828,7 +852,19 @@ struct ScriptBodyParser {
             let character = characters[index]
             if let activeQuote = quote {
                 index += 1
-                if character == "\\" {
+                // Ch. "Literals" > "Ticked Strings": "the backslash
+                // character holds no special meaning" inside a ticked
+                // string, unlike quoted (single/double) strings where it
+                // escapes the next character — a ticked span containing
+                // a literal `\` must not skip the character after it
+                // (found by architect + code-reviewer review of the
+                // ticked-string investigation: without this guard, EVERY
+                // raw-text quote-tracking scanner in this parser — not
+                // just this one — desyncs on a ticked string containing
+                // an unescaped structural character, e.g. a regex
+                // pattern's own `]`/`)`/`}`, silently truncating the
+                // enclosing bracket-tag/capture-body/statement).
+                if character == "\\", activeQuote != "`" {
                     index = min(index + 1, characters.count)
                 } else if character == activeQuote {
                     quote = nil
@@ -836,7 +872,7 @@ struct ScriptBodyParser {
                 continue
             }
 
-            if character == "'" || character == "\"" {
+            if character == "'" || character == "\"" || character == "`" {
                 quote = character
             } else if character == "(" {
                 parenDepth += 1
@@ -876,7 +912,19 @@ struct ScriptBodyParser {
             let character = characters[index]
             if let activeQuote = quote {
                 index += 1
-                if character == "\\" {
+                // Ch. "Literals" > "Ticked Strings": "the backslash
+                // character holds no special meaning" inside a ticked
+                // string, unlike quoted (single/double) strings where it
+                // escapes the next character — a ticked span containing
+                // a literal `\` must not skip the character after it
+                // (found by architect + code-reviewer review of the
+                // ticked-string investigation: without this guard, EVERY
+                // raw-text quote-tracking scanner in this parser — not
+                // just this one — desyncs on a ticked string containing
+                // an unescaped structural character, e.g. a regex
+                // pattern's own `]`/`)`/`}`, silently truncating the
+                // enclosing bracket-tag/capture-body/statement).
+                if character == "\\", activeQuote != "`" {
                     index = min(index + 1, characters.count)
                 } else if character == activeQuote {
                     quote = nil
@@ -884,7 +932,7 @@ struct ScriptBodyParser {
                 continue
             }
 
-            if character == "'" || character == "\"" {
+            if character == "'" || character == "\"" || character == "`" {
                 quote = character
             } else if character == "(" {
                 parenDepth += 1
@@ -939,7 +987,19 @@ struct ScriptBodyParser {
             let character = characters[index]
             if let activeQuote = quote {
                 index += 1
-                if character == "\\" {
+                // Ch. "Literals" > "Ticked Strings": "the backslash
+                // character holds no special meaning" inside a ticked
+                // string, unlike quoted (single/double) strings where it
+                // escapes the next character — a ticked span containing
+                // a literal `\` must not skip the character after it
+                // (found by architect + code-reviewer review of the
+                // ticked-string investigation: without this guard, EVERY
+                // raw-text quote-tracking scanner in this parser — not
+                // just this one — desyncs on a ticked string containing
+                // an unescaped structural character, e.g. a regex
+                // pattern's own `]`/`)`/`}`, silently truncating the
+                // enclosing bracket-tag/capture-body/statement).
+                if character == "\\", activeQuote != "`" {
                     index = min(index + 1, characters.count)
                 } else if character == activeQuote {
                     quote = nil
@@ -947,7 +1007,7 @@ struct ScriptBodyParser {
                 continue
             }
 
-            if character == "'" || character == "\"" {
+            if character == "'" || character == "\"" || character == "`" {
                 quote = character
             } else if character == open {
                 depth += 1
