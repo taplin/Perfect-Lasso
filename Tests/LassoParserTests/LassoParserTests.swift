@@ -8961,6 +8961,24 @@ struct IncludeURLTests {
     #expect(output == "0|0")
 }
 
+@Test func setConstructorWithPositionalArgumentsInsertsAndDedupsThemLikeListQueueStack() async throws {
+    // lassoguide.com/operations/collections.html: "set(key, ...) — A
+    // set is created with zero or more element parameters. The
+    // element values are inserted into the set." Matches List/Queue/
+    // Stack's own constructors, all of which insert their positional
+    // arguments — `set(...)` previously silently dropped them (only
+    // `set()`/bare `set` with zero elements worked). Repeated 'Three'
+    // exercises the same dedup-on-insert behavior as `->Insert` itself
+    // (see `setDeduplicatesRepeatedInsertsMatchingTheGuidesOneThreeWorkedExample`
+    // above) — the constructor must dedup too, not just insert raw.
+    var context = LassoContext()
+    let output = try await LassoRenderer().render(
+        "[string(set('One', 'Three', 'Three'))]|[(set(3, 4))->size]",
+        context: &context
+    )
+    #expect(output == "Set: (One), (Three)|2")
+}
+
 @Test func priorityQueueDefaultComparatorReturnsTheGreatestElementFirst() async throws {
     // Ch. 30 p.405-406: default comparator (`\Compare_LessThan`) —
     // insert 'One' then 'Two', `->First` is "Two" (greatest
@@ -9087,6 +9105,26 @@ struct IncludeURLTests {
         context: &context
     )
     #expect(output == "Two|1")
+}
+
+@Test func priorityQueueConstructorIgnoresPositionalArgumentsAndIsAlwaysCreatedEmpty() async throws {
+    // Unlike `set(...)` (fixed above to insert its positional
+    // arguments per lassoguide.com), PriorityQueue has no updated
+    // lassoguide.com page — reference.lassosoft.com's own
+    // `[PriorityQueue->Remove]` page explicitly defers to "the Lasso 8
+    // Language Guide" for this type, so the 8.5 PDF's Table 10
+    // ("Priority queues are always created empty... Accepts an
+    // optional parameter which specifies a comparator") is still the
+    // authoritative, current spec. `priorityqueue(2, 1)` must NOT
+    // insert 2/1 as elements — only `->Insert` populates a
+    // PriorityQueue. Regression guard against "fixing" this the same
+    // way Set was fixed, which would be wrong per the actual docs.
+    var context = LassoContext()
+    let output = try await LassoRenderer().render(
+        "[string(priorityqueue(2, 1))]|[(priorityqueue(2, 1))->size]",
+        context: &context
+    )
+    #expect(output == "PriorityQueue: |0")
 }
 
 @Test func comparatorDirectCallReturnsZeroForAValidComparisonAndNegativeOneOtherwise() async throws {
