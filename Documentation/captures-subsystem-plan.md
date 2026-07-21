@@ -883,9 +883,90 @@ already-materialized value, wasted CPU only, not a correctness issue).
 3. The SAME wrong citation was duplicated in this stage's own map-forEach
    test's name/comment — corrected there too.
 
-**Stage 5 — string iteration family** (`->eachCharacter`/`->eachWordBreak`/
-`->eachLineBreak`/`->eachMatch`). Same mechanism as Stage 4, applied to
-`StringOperations.swift`.
+**Stage 5 — string iteration family** ✅ done (2026-07-21). Real-doc
+research (lassoguide.com/operations/strings.html) found this stage's
+original naming was ambiguous between TWO genuinely distinct method
+families:
+- **`->forEachCharacter()`/`->forEachWordBreak()`/`->forEachLineBreak()`/
+  `->forEachMatch(exp)`** — real, directly-callable String methods
+  (confirmed present in lassoguide.com's own genindex, unlike Stage 4's
+  collection `->forEach`), each "executes a given capture block once
+  for every [X] in the base string." **This is what got implemented.**
+- **`->eachCharacter()`/`->eachWordBreak()`/`->eachLineBreak()`/
+  `->eachMatch(exp)`** (no "for" prefix) — "Returns an *eacher* that can
+  be used in conjunction with query expressions" — a completely
+  different, `eacher`-object-based mechanism tied to full Query
+  Expressions (Stage 8), which this codebase has no `eacher` type for
+  at all (confirmed: zero references anywhere in `Sources/`).
+  Deliberately NOT implemented here — genuinely gated on Stage 8, not a
+  scope-creep opportunity from this stage.
+
+Implementation directly reuses Stage 4's `invokeForEachCapture` shared
+mechanism — only the ELEMENT-EXTRACTION differs per method:
+`->forEachCharacter` walks `Character`s (already Unicode grapheme-
+cluster-aware); `->forEachWordBreak`/`->forEachLineBreak` use
+Foundation's own `String.enumerateSubstrings(options: .byWords/.byLines)`
+— real ICU-backed Unicode segmentation (UAX #29 word-boundaries; `.byLines`
+already treats the documented "\r", "\n", "\r\n" as one break each,
+matching the doc's own wording exactly with no hand-rolled splitting
+needed) — matching this project's established "default to real ICU/
+Unicode behavior when docs are ambiguous" convention (real Lasso is
+itself ICU-backed). `->forEachMatch(exp::string|regexp)` reuses the
+existing `LassoRegularExpressions.findAll` regex infrastructure
+(Batch2), and a bare string argument is used directly as a pattern,
+matching `Match_RegExp`'s own already-established convention for the
+identical string-vs-regexp-object ambiguity.
+
+574/574 tests passing (6 new, including a non-local-return interaction
+test pinning the exact same Stage 2 semantics Stage 4 verified for
+collections, now for the new string call sites too).
+
+**Architect + code-reviewer review found two real bugs in `->forEachMatch`
+specifically, both fixed before merge**:
+1. **Critical — reused the wrong regex helper.** The first cut built
+   `->forEachMatch` directly on `LassoRegularExpressions.findAll`, which
+   is `String_FindRegExp`'s (Ch. 26 Table 11) own documented helper — "a
+   single FLAT array... full match text followed by each capture group's
+   text." `->forEachMatch` has a genuinely different, incompatible
+   contract: ONE invocation per match, full-match text only. Any pattern
+   with a capture group broke this — e.g. `'(\d+)-(\d+)'` matching twice
+   produced SIX invocations (full+group1+group2, twice) instead of two,
+   with `#1` taking fragment values interleaved with real matches.
+   Neither original test caught this (both used group-free patterns).
+   Fixed with a new, dedicated `LassoRegularExpressions
+   .findAllWholeMatches` that never touches `findAll`'s flattened shape
+   at all — full-match text only, one element per match. Added a
+   regression test with a 2-group pattern.
+2. **`exp` argument evaluated twice.** The match pattern was extracted
+   via a manual `evaluate(arguments[0].value)`, then the WHOLE
+   `arguments` array was evaluated again (re-evaluating `exp` a second,
+   independent time) to build `invokeForEachCapture`'s own argument
+   list — harmless for a literal pattern, a real bug the moment `exp`
+   has a side effect. Fixed by evaluating `arguments` exactly once and
+   reading the pattern back out of that same evaluated list. Added a
+   regression test proving a side-effecting `exp` (a method call) only
+   actually runs once.
+
+**Also found, unrelated, real, potentially significant — filed as its
+own separate follow-up, NOT fixed here**: writing the capture-group
+regression test above required realizing that Lasso string literals in
+THIS interpreter silently DROP an unrecognized backslash escape (`\d` →
+`d`, not `\d`) regardless of quote style — but lassoguide.com's own
+`string->unescape()` doc text references "the same escape process used
+by Lasso for **non-ticked** string literals," implying real Lasso
+distinguishes "ticked" (likely single-quoted) from "non-ticked" (likely
+double-quoted) string literals with DIFFERENT escape rules entirely —
+this interpreter currently applies ONE uniform rule to every string
+literal regardless of quote style. Real, broad potential impact (any
+corpus regex pattern written as a single-quoted string using `\d`/`\w`/
+`\s`/etc. shorthand would be silently corrupted) — but resolving it
+properly needs its own dedicated investigation (confirming which quote
+style is which, and whether the EXISTING corpus-driven `\n`/`\t`/`\r`
+special-casing for single-quoted strings is itself already wrong), not
+something to guess at inside this stage. Worked around in this stage's
+own test with a doubled backslash (`'(\\d+)-(\\d+)'`), which produces
+the correct pattern under BOTH the current and any corrected future
+escape rule.
 
 **Stage 6 — predicate-taking `->find(matching)`.** Needs Stage 1 only.
 

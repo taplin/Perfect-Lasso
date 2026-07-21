@@ -115,6 +115,28 @@ enum LassoRegularExpressions {
         return results
     }
 
+    /// `String->forEachMatch` (Ch. "String Operations",
+    /// operations/strings.html): "Executes a given capture block once
+    /// for every match in the base string... The match can be accessed
+    /// in the capture block through the special local variable #1" — ONE
+    /// element per match, the full matched text only. A genuinely
+    /// DIFFERENT contract from `findAll` just above (`String_FindRegExp`'s
+    /// own documented "full match + every capture group's text,
+    /// flattened") — found by architect + code-reviewer: `forEachMatch`
+    /// was originally built on top of `findAll` directly, so any pattern
+    /// with a capture group produced extra spurious invocations (the
+    /// group text(s)) interleaved with the real per-match ones instead
+    /// of one invocation per actual match. This function exists
+    /// specifically so `forEachMatch` never touches `findAll`'s own
+    /// flattened shape at all.
+    static func findAllWholeMatches(in text: String, pattern: String, ignoreCase: Bool) -> [LassoValue] {
+        guard let regex = makeRegex(pattern: pattern, ignoreCase: ignoreCase) else { return [] }
+        let nsText = text as NSString
+        return regex.matches(in: text, range: NSRange(location: 0, length: nsText.length)).map {
+            .string(nsText.substring(with: $0.range))
+        }
+    }
+
     /// `RegExp->ReplaceAll`/`String_ReplaceRegExp` (no `-ReplaceOnlyOne`).
     static func replaceAll(in text: String, pattern: String, replacement: String, ignoreCase: Bool) -> String {
         guard let regex = makeRegex(pattern: pattern, ignoreCase: ignoreCase) else { return text }
