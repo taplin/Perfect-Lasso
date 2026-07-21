@@ -123,6 +123,11 @@ final class LassoAdminDelegate: AdminConsoleDelegate {
         if let prefix = config.imageProxyPrefix, let target = config.imageProxyTarget {
             items.append(("Image proxy", "\(prefix) -> \(target)"))
         }
+        if config.crawlSitemapEnabled {
+            items.append(("Sitemap discovery", "enabled (\(config.crawlSitemapPath) -> \(config.crawlSitemapOrigin ?? "unconfigured"))"))
+        } else {
+            items.append(("Sitemap discovery", "disabled"))
+        }
         return [
             AdminStatusSection(title: "Lasso Site", items: items),
             AdminStatusSection(title: "CWP Session Janitor", items: await cwpJanitorStatusItems()),
@@ -242,7 +247,7 @@ final class LassoAdminDelegate: AdminConsoleDelegate {
         Task {
             await logCapture?.capture("[crawl-report] started (admin-triggered)")
             await datasourceFailureTracker.reset()
-            let (results, excludedCount, abortedByCircuitBreaker) = await CrawlReport.run(
+            let (results, excludedCount, abortedByCircuitBreaker, sitemapSummary) = await CrawlReport.run(
                 baseURL: baseURL,
                 siteRoot: config.siteRoot,
                 extensions: config.lassoExtensions,
@@ -253,7 +258,13 @@ final class LassoAdminDelegate: AdminConsoleDelegate {
                 currentDatasourceFailureCount: { await datasourceFailureTracker.currentCount() },
                 onProgress: { completed, total in
                     Task { await crawlTracker.progress(completed, total) }
-                }
+                },
+                sitemapEnabled: config.crawlSitemapEnabled,
+                sitemapEntryPath: config.crawlSitemapPath,
+                sitemapAllowedOrigin: config.crawlSitemapOrigin,
+                sitemapMaxSubSitemaps: config.crawlSitemapMaxSubSitemaps,
+                sitemapMaxURLs: config.crawlSitemapMaxURLs,
+                sitemapMaxResponseBytes: config.crawlSitemapMaxResponseBytes
             )
             let cleanCount = results.count { $0.isClean }
             let failingCount = results.count - cleanCount
@@ -271,7 +282,8 @@ final class LassoAdminDelegate: AdminConsoleDelegate {
                 results,
                 outputPath: config.crawlReportOutputPath,
                 excludedCount: excludedCount,
-                abortedByCircuitBreaker: abortedByCircuitBreaker
+                abortedByCircuitBreaker: abortedByCircuitBreaker,
+                sitemapSummary: sitemapSummary
             )
         }
         return .ok("Crawl report started in the background — watch the Logs tab for progress and a completion summary.")

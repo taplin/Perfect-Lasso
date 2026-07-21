@@ -3,6 +3,17 @@ import Foundation
 import FoundationNetworking
 #endif
 
+/// Where a crawled path came from — `.filesystem` (the existing walk) or
+/// `.sitemapOnly` (found via `Sitemap.discoverPaths` and NOT also present in
+/// the filesystem walk's own results; a path found by both stays
+/// `.filesystem`, since that's the pre-existing, better-understood source).
+/// `String`-backed and `Codable` so it round-trips through `printAndWrite`'s
+/// JSON output and `loadBaseline` unchanged.
+public enum CrawlPathSource: String, Sendable, Equatable, Codable {
+    case filesystem
+    case sitemapOnly
+}
+
 /// One page's crawl result. `errorType`/`errorDescription` come from the
 /// server's own JSON error format (`developerErrorOutput`'s
 /// `Accept: application/json` branch) — read structurally, not scraped
@@ -18,13 +29,15 @@ public struct CrawlPageResult: Sendable, Equatable {
     public let errorType: String?
     public let errorDescription: String?
     public let elapsedMS: Int
+    public let source: CrawlPathSource
 
-    public init(path: String, statusCode: Int, errorType: String?, errorDescription: String?, elapsedMS: Int) {
+    public init(path: String, statusCode: Int, errorType: String?, errorDescription: String?, elapsedMS: Int, source: CrawlPathSource = .filesystem) {
         self.path = path
         self.statusCode = statusCode
         self.errorType = errorType
         self.errorDescription = errorDescription
         self.elapsedMS = elapsedMS
+        self.source = source
     }
 
     // A redirect is a real, intentional Lasso outcome (e.g. the bot-exclusion
@@ -138,6 +151,22 @@ public enum CrawlReport {
     /// `DatasourceFailureTracker` — see that type's doc comment for why
     /// this has to be an in-process signal rather than anything derivable
     /// from a page's own HTTP response.
+    /// `sitemapEnabled`/`sitemapEntryPath`/`sitemapAllowedOrigin`/
+    /// `sitemapExtensions`/`sitemapMaxSubSitemaps`/`sitemapMaxURLs`/
+    /// `sitemapMaxResponseBytes` add `Sitemap.discoverPaths` as an
+    /// ADDITIONAL, merged-in source of candidate paths alongside the
+    /// filesystem walk — never a replacement for it (real sitemaps are
+    /// often stale/incomplete, so the filesystem walk stays the safety
+    /// net). Off by default (`sitemapEnabled: false`) so every existing
+    /// caller is unaffected. Silently skipped (not an error) when
+    /// `sitemapAllowedOrigin` is `nil` even if `sitemapEnabled` is true —
+    /// defense in depth; `ServerConfig.load()` already guarantees the two
+    /// travel together for the real `LassoPerfectServer` callers. Also
+    /// skipped entirely when `pathList` is supplied — matching `pathList`'s
+    /// existing "caller already chose exactly what to crawl" contract.
+    /// `sitemapExtensions`, when `nil`, falls back to the same `extensions`
+    /// used for the filesystem walk. See `Sitemap.swift`'s own doc comment
+    /// for the full same-origin/SSRF design.
     public static func run(
         baseURL: String,
         siteRoot: URL,
@@ -149,21 +178,56 @@ public enum CrawlReport {
         datasourceFailureThreshold: Int? = nil,
         currentDatasourceFailureCount: (@Sendable () async -> Int)? = nil,
         urlSession: URLSession? = nil,
-        onProgress: (@Sendable (_ completed: Int, _ total: Int) -> Void)? = nil
-    ) async -> (results: [CrawlPageResult], excludedCount: Int, abortedByCircuitBreaker: Bool) {
+        onProgress: (@Sendable (_ completed: Int, _ total: Int) -> Void)? = nil,
+        sitemapEnabled: Bool = false,
+        sitemapEntryPath: String = "sitemap.xml",
+        sitemapAllowedOrigin: String? = nil,
+        sitemapExtensions: Set<String>? = nil,
+        sitemapMaxSubSitemaps: Int = 50,
+        sitemapMaxURLs: Int = 20_000,
+        sitemapMaxResponseBytes: Int = 10_000_000
+    ) async -> (results: [CrawlPageResult], excludedCount: Int, abortedByCircuitBreaker: Bool, sitemapSummary: Sitemap.FetchSummary?) {
         // `nil` (the default, every real caller) uses the no-redirect
         // session below; tests inject a `URLProtocol`-mocked session to
         // exercise pacing/circuit-breaker behavior without a live server.
         let session = urlSession ?? noRedirectSession
         let paths: [String]
         let excludedCount: Int
+        var sourceByPath: [String: CrawlPathSource] = [:]
+        var sitemapSummary: Sitemap.FetchSummary?
         if let pathList {
             paths = pathList
             excludedCount = 0
         } else {
             let discovered = discoverPaths(siteRoot: siteRoot, extensions: extensions, excludePaths: excludePaths)
-            paths = discovered.paths
             excludedCount = discovered.excludedCount
+            var pathSet = Set(discovered.paths)
+
+            if sitemapEnabled, let sitemapAllowedOrigin {
+                let effectiveSitemapExtensions = sitemapExtensions ?? extensions
+                let (sitemapPaths, summary) = await Sitemap.discoverPaths(
+                    baseURL: baseURL,
+                    entryPath: sitemapEntryPath,
+                    allowedOrigin: sitemapAllowedOrigin,
+                    extensions: effectiveSitemapExtensions,
+                    maxSubSitemaps: sitemapMaxSubSitemaps,
+                    maxURLs: sitemapMaxURLs,
+                    maxResponseBytes: sitemapMaxResponseBytes,
+                    urlSession: session
+                )
+                sitemapSummary = summary
+                for sitemapPath in sitemapPaths
+                where candidateIsEligible(relativePath: sitemapPath, extensions: effectiveSitemapExtensions, excludePaths: excludePaths) {
+                    if pathSet.contains(sitemapPath) == false {
+                        pathSet.insert(sitemapPath)
+                        sourceByPath[sitemapPath] = .sitemapOnly
+                    }
+                    // Already found by the filesystem walk: stays untagged
+                    // here (defaults to `.filesystem` below), matching the
+                    // filesystem walk's own, better-understood source.
+                }
+            }
+            paths = Array(pathSet)
         }
 
         let sortedPaths = paths.sorted()
@@ -171,19 +235,20 @@ public enum CrawlReport {
         results.reserveCapacity(sortedPaths.count)
         var consecutiveBackendFailures = 0
         for (index, path) in sortedPaths.enumerated() {
-            let result = await requestPage(baseURL: baseURL, path: path, urlSession: session)
+            let source = sourceByPath[path] ?? .filesystem
+            let result = await requestPage(baseURL: baseURL, path: path, urlSession: session, source: source)
             results.append(result)
             onProgress?(results.count, sortedPaths.count)
 
             consecutiveBackendFailures = isBackendDistressSignal(result) ? consecutiveBackendFailures + 1 : 0
             if let threshold = circuitBreakerThreshold, consecutiveBackendFailures >= threshold {
-                return (results, excludedCount, true)
+                return (results, excludedCount, true, sitemapSummary)
             }
 
             if let threshold = datasourceFailureThreshold, let currentDatasourceFailureCount {
                 let count = await currentDatasourceFailureCount()
                 if count >= threshold {
-                    return (results, excludedCount, true)
+                    return (results, excludedCount, true, sitemapSummary)
                 }
             }
 
@@ -192,7 +257,7 @@ public enum CrawlReport {
                 try? await Task.sleep(for: .milliseconds(requestDelayMS))
             }
         }
-        return (results, excludedCount, false)
+        return (results, excludedCount, false, sitemapSummary)
     }
 
     /// A single result the circuit breaker in `run(...)` counts toward its
@@ -230,6 +295,34 @@ public enum CrawlReport {
         guard excludePaths.isEmpty == false else { return false }
         let lowercasedPath = path.lowercased()
         return excludePaths.contains { lowercasedPath.contains($0.lowercased()) }
+    }
+
+    /// One shared definition of "eligible to crawl" — extracted from
+    /// `discoverPaths`' own inline filtering (underscore/hidden-segment
+    /// check, extension check, `pathMatchesExclude`) so a sitemap-derived
+    /// candidate path is held to exactly the same bar as a filesystem-
+    /// discovered one, rather than a second, independently-drifting
+    /// definition. Deliberately does NOT include the `.htm`/`.html`
+    /// content-sniff (`looksLikeLassoSource`) — that needs real file bytes
+    /// on disk, which is meaningless for a sitemap-only path that may not
+    /// exist in `siteRoot` at all.
+    ///
+    /// `relativePath` may carry a `?query` suffix (sitemap-derived paths
+    /// are exactly the query-parameterized case this feature exists for) —
+    /// every check here operates on the path portion only, before the
+    /// first `?`.
+    public static func candidateIsEligible(
+        relativePath: String,
+        extensions: Set<String>,
+        excludePaths: [String]
+    ) -> Bool {
+        let pathOnly = relativePath.split(separator: "?", maxSplits: 1, omittingEmptySubsequences: false).first.map(String.init) ?? relativePath
+        guard pathOnly.split(separator: "/").contains(where: { $0.hasPrefix(".") }) == false else { return false }
+        let fileExtension = (pathOnly as NSString).pathExtension.lowercased()
+        guard extensions.contains(fileExtension) else { return false }
+        guard (pathOnly as NSString).lastPathComponent.hasPrefix("_") == false else { return false }
+        guard pathMatchesExclude(pathOnly, excludePaths: excludePaths) == false else { return false }
+        return true
     }
 
     /// Recursively walks `siteRoot` for renderable pages, skipping
@@ -274,7 +367,14 @@ public enum CrawlReport {
             guard extensions.contains(fileExtension) else { continue }
             guard url.lastPathComponent.hasPrefix("_") == false else { continue }
 
-            if pathMatchesExclude(relativePath, excludePaths: excludePaths) {
+            // By this point extension/underscore/hidden-segment already
+            // passed above, so `candidateIsEligible` returning `false` here
+            // can only be its `pathMatchesExclude` check — preserving this
+            // function's original excludedCount semantics exactly, while
+            // routing the actual "is this eligible" decision through the
+            // one shared definition (see `candidateIsEligible`'s own doc
+            // comment).
+            guard candidateIsEligible(relativePath: relativePath, extensions: extensions, excludePaths: excludePaths) else {
                 excludedCount += 1
                 continue
             }
@@ -317,7 +417,14 @@ public enum CrawlReport {
                 statusCode: statusCode,
                 errorType: record["errorType"].flatMap { $0.isEmpty ? nil : $0 },
                 errorDescription: record["errorDescription"].flatMap { $0.isEmpty ? nil : $0 },
-                elapsedMS: Int(record["elapsedMS"] ?? "") ?? 0
+                elapsedMS: Int(record["elapsedMS"] ?? "") ?? 0,
+                // Old baseline files (written before this feature existed)
+                // have no `"source"` key at all — `record["source"]` is
+                // simply `nil` for them, and `?? .filesystem` is exactly
+                // right: every path in a pre-existing baseline came from
+                // the filesystem walk, since sitemap discovery didn't exist
+                // yet.
+                source: record["source"].flatMap(CrawlPathSource.init(rawValue:)) ?? .filesystem
             )
         }
     }
@@ -390,10 +497,82 @@ public enum CrawlReport {
         print("")
     }
 
-    private static func requestPage(baseURL: String, path: String, urlSession: URLSession) async -> CrawlPageResult {
-        guard let encodedPath = path.addingPercentEncoding(withAllowedCharacters: .urlPathAllowed),
+    /// Splits `path` on its first `?` and percent-encodes each portion with
+    /// the correct allowed-character set — `.urlPathAllowed` for the path
+    /// portion (matching every caller's behavior before this fix), and
+    /// `.urlQueryAllowed` for the query portion. Encoding the WHOLE string
+    /// with `.urlPathAllowed` alone (the previous, single-call behavior)
+    /// corrupts `?`/`=` into `%3F`/`%3D`, since `.urlPathAllowed` doesn't
+    /// permit either — invisible for every caller before this feature
+    /// (filesystem-derived paths never carry a query string), but fatal for
+    /// sitemap-derived paths, which are exactly the query-parameterized
+    /// case (`product.lasso?id=42`) this whole feature exists to reach.
+    /// Internal (not `private`) so `Sitemap.swift`, in the same module, can
+    /// build its own (also potentially query-bearing) sitemap-document
+    /// fetch URLs through this identical, tested logic instead of a second,
+    /// independently-drifting copy.
+    ///
+    /// NECESSARY COMPANION TO `Sitemap.relativePath`'s path-internal-`?`
+    /// fix: that function now re-escapes a literal, decoded `?` inside a
+    /// path component back to `%3F` before it ever reaches this function,
+    /// so a value like `foo.lasso%3Fbar.lasso` (one path segment, no real
+    /// query) doesn't get wrongly split here. But `%` is not itself in
+    /// `.urlPathAllowed`/`.urlQueryAllowed` — a plain `pathPortion
+    /// .addingPercentEncoding(withAllowedCharacters:)` call blindly
+    /// re-escapes THAT `%` too, turning `%3F` into `%253F` on the wire (a
+    /// different, non-existent resource, confirmed empirically: a live
+    /// HTTP capture showed the raw request line carrying `%253F`, which a
+    /// server that itself decodes once would see as literal `%3F` text,
+    /// not the intended literal `?`). Splitting each portion around the
+    /// literal `%3F` marker and encoding only the pieces between it (never
+    /// the marker itself) keeps that one, deliberately reintroduced escape
+    /// intact through this second encoding pass while every other
+    /// character is still encoded exactly as before. `Sitemap.relativePath`
+    /// is the only caller that ever reintroduces a pre-escaped sequence,
+    /// and it only ever reintroduces this exact one — a decoded path
+    /// component that happens to already contain the literal text `%3F`
+    /// (only reachable via a doubly-percent-encoded sitemap `<loc>`, an
+    /// unusual, degenerate input) would, in that narrow case, also have its
+    /// `%` left unescaped rather than becoming `%25`; that's an accepted,
+    /// far rarer trade-off against the confirmed, common bug this fixes.
+    static func encodedRequestPath(_ path: String) -> String? {
+        guard let questionMarkIndex = path.firstIndex(of: "?") else {
+            return percentEncodedPreservingReEscapedQuestionMark(path, allowedCharacters: .urlPathAllowed)
+        }
+        let pathPortion = String(path[path.startIndex..<questionMarkIndex])
+        let queryPortion = String(path[path.index(after: questionMarkIndex)...])
+        guard let encodedPath = percentEncodedPreservingReEscapedQuestionMark(pathPortion, allowedCharacters: .urlPathAllowed),
+              let encodedQuery = percentEncodedPreservingReEscapedQuestionMark(queryPortion, allowedCharacters: .urlQueryAllowed) else {
+            return nil
+        }
+        return "\(encodedPath)?\(encodedQuery)"
+    }
+
+    /// Percent-encodes `string` with `allowedCharacters`, except that any
+    /// literal `%3F` substring — the exact marker `Sitemap.relativePath`
+    /// reintroduces for a path-internal, previously-percent-encoded `?` —
+    /// is left untouched instead of having its `%` re-escaped to `%25`. See
+    /// `encodedRequestPath`'s own doc comment for why a plain
+    /// `addingPercentEncoding` call here would otherwise double-escape that
+    /// marker.
+    private static func percentEncodedPreservingReEscapedQuestionMark(_ string: String, allowedCharacters: CharacterSet) -> String? {
+        let marker = "%3F"
+        let segments = string.components(separatedBy: marker)
+        var encodedSegments: [String] = []
+        encodedSegments.reserveCapacity(segments.count)
+        for segment in segments {
+            guard let encoded = segment.addingPercentEncoding(withAllowedCharacters: allowedCharacters) else {
+                return nil
+            }
+            encodedSegments.append(encoded)
+        }
+        return encodedSegments.joined(separator: marker)
+    }
+
+    private static func requestPage(baseURL: String, path: String, urlSession: URLSession, source: CrawlPathSource = .filesystem) async -> CrawlPageResult {
+        guard let encodedPath = encodedRequestPath(path),
               let url = URL(string: "\(baseURL)/\(encodedPath)") else {
-            return CrawlPageResult(path: path, statusCode: 0, errorType: "invalidPath", errorDescription: nil, elapsedMS: 0)
+            return CrawlPageResult(path: path, statusCode: 0, errorType: "invalidPath", errorDescription: nil, elapsedMS: 0, source: source)
         }
         var request = URLRequest(url: url)
         request.setValue("application/json", forHTTPHeaderField: "Accept")
@@ -412,7 +591,7 @@ public enum CrawlReport {
             let (data, response) = try await urlSession.data(for: request)
             let statusCode = (response as? HTTPURLResponse)?.statusCode ?? 0
             guard statusCode >= 400 else {
-                return CrawlPageResult(path: path, statusCode: statusCode, errorType: nil, errorDescription: nil, elapsedMS: elapsedMS())
+                return CrawlPageResult(path: path, statusCode: statusCode, errorType: nil, errorDescription: nil, elapsedMS: elapsedMS(), source: source)
             }
             let payload = try? JSONSerialization.jsonObject(with: data) as? [String: String]
             return CrawlPageResult(
@@ -420,10 +599,11 @@ public enum CrawlReport {
                 statusCode: statusCode,
                 errorType: payload?["errorType"] ?? "unknown",
                 errorDescription: payload?["errorDescription"],
-                elapsedMS: elapsedMS()
+                elapsedMS: elapsedMS(),
+                source: source
             )
         } catch {
-            return CrawlPageResult(path: path, statusCode: 0, errorType: "requestFailed", errorDescription: "\(error)", elapsedMS: elapsedMS())
+            return CrawlPageResult(path: path, statusCode: 0, errorType: "requestFailed", errorDescription: "\(error)", elapsedMS: elapsedMS(), source: source)
         }
     }
 
@@ -453,7 +633,8 @@ public enum CrawlReport {
         _ results: [CrawlPageResult],
         outputPath: String?,
         excludedCount: Int = 0,
-        abortedByCircuitBreaker: Bool = false
+        abortedByCircuitBreaker: Bool = false,
+        sitemapSummary: Sitemap.FetchSummary? = nil
     ) {
         let clean = results.filter(\.isClean)
         let failing = results.filter { $0.isClean == false }
@@ -466,6 +647,26 @@ public enum CrawlReport {
         print("\(clean.count) of \(results.count) pages render cleanly.")
         if excludedCount > 0 {
             print("\(excludedCount) additional pages excluded (path exclude or no Lasso content signal) — not counted above.")
+        }
+        if let sitemapSummary {
+            let sitemapOnlyCount = results.count { $0.source == .sitemapOnly }
+            print(
+                "Sitemap discovery: \(sitemapSummary.sitemapURLsFetched) URL(s) found in sitemap.xml, "
+                    + "\(sitemapOnlyCount) page(s) only found via the sitemap (not by the filesystem walk), "
+                    + "\(sitemapSummary.subSitemapsFollowed) sub-sitemap(s) followed, "
+                    + "\(sitemapSummary.crossOriginSkippedCount) cross-origin <loc> entries skipped, "
+                    + "\(sitemapSummary.malformedLocCount) malformed <loc> entries dropped"
+                    + (sitemapSummary.truncated ? ", TRUNCATED (a discovery cap was reached)." : ".")
+            )
+            if sitemapSummary.fetchErrors.isEmpty == false {
+                print("Sitemap fetch issues:")
+                for error in sitemapSummary.fetchErrors.prefix(10) {
+                    print("  \(error)")
+                }
+                if sitemapSummary.fetchErrors.count > 10 {
+                    print("  ... and \(sitemapSummary.fetchErrors.count - 10) more")
+                }
+            }
         }
 
         if failing.isEmpty == false {
@@ -501,6 +702,7 @@ public enum CrawlReport {
                 "errorType": result.errorType ?? "",
                 "errorDescription": result.errorDescription ?? "",
                 "elapsedMS": String(result.elapsedMS),
+                "source": result.source.rawValue,
             ]
         }
         if let data = try? JSONSerialization.data(withJSONObject: records, options: [.prettyPrinted, .sortedKeys]) {
