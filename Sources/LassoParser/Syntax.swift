@@ -186,13 +186,19 @@ public indirect enum LassoExpression: Equatable, Sendable {
     /// `ExpressionParser`'s own `with`-recognition doc comment for the
     /// exact non-overlapping boundary between the two).
     ///
-    /// Stage 8.1 scope: a single with-clause only (no comma-separated
-    /// multi-clause nesting), `select`/`do` actions only (no
-    /// `sum`/`average`/`min`/`max`), no `where`/`let`/`skip`/`take`/
-    /// `order by`/`group by` operations yet — each a later stage's own
-    /// addition, per `Documentation/captures-subsystem-plan.md`'s Stage
-    /// 8 breakdown.
-    case queryExpression(variable: String, source: LassoExpression, action: QueryAction)
+    /// Stage 8.1 added the core `with...select`/`with...do` pipeline
+    /// (single with-clause, `select`/`do` actions only). Stage 8.2 adds
+    /// `operations` — zero or more `where`/`let`/`skip`/`take` clauses
+    /// (Ch. "Query Expressions", "Operations"), applied IN THE ORDER
+    /// WRITTEN between the with-clause and the action (real Lasso's own
+    /// worked examples show `skip`/`take`'s relative order changing the
+    /// result — `take 4 skip 3` vs `skip 3 take 4` — so this is a real
+    /// sequential pipeline, not a set of independent filters). Still no
+    /// `sum`/`average`/`min`/`max` actions, `order by`/`group by`
+    /// operations, or comma-separated multi with-clause nesting — each a
+    /// later stage's own addition, per
+    /// `Documentation/captures-subsystem-plan.md`'s Stage 8 breakdown.
+    case queryExpression(variable: String, source: LassoExpression, operations: [QueryOperation], action: QueryAction)
     case unknown(String)
 }
 
@@ -203,6 +209,17 @@ public indirect enum LassoExpression: Equatable, Sendable {
 public enum QueryAction: Equatable, Sendable {
     case select(LassoExpression)
     case perform(LassoExpression)
+}
+
+/// A Query Expression operation (Ch. "Query Expressions", "Operations")
+/// — see `LassoExpression.queryExpression`'s own doc comment for scope.
+/// `filter` corresponds to the real `where` keyword (`where` is a Swift
+/// keyword, reserved for pattern-match guards).
+public enum QueryOperation: Equatable, Sendable {
+    case filter(LassoExpression)
+    case `let`(name: String, value: LassoExpression)
+    case skip(LassoExpression)
+    case take(LassoExpression)
 }
 
 public indirect enum LassoNode: Equatable, Sendable {

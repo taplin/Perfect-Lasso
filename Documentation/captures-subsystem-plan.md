@@ -1232,11 +1232,70 @@ removing those two specific diagnostics (the backtrack behavior itself
 is unchanged) — genuinely malformed input still gets real feedback via
 whatever downstream error a failed fallback parse eventually produces.
 
-625/625 tests passing (10 new). Remaining Stage 8 sub-stages (not yet
-started): 8.2 (`where`/`let`/`skip`/`take` operations), 8.3 (`order by` +
-`sum`/`average`/`min`/`max` actions), 8.4 (`group by` +
-`queriable_grouping` type), 8.5 (multiple with-clauses/nesting,
-`generateSeries` type + literal syntax, `eacher`).
+625/625 tests passing (10 new).
+
+**Stage 8.2 — `where`/`let`/`skip`/`take` operations** ✅ done
+(2026-07-21). Real Lasso's own worked examples show `skip`/`take`'s
+RELATIVE ORDER changing the result (`skip 3 take 4` => `3,4,5,6` vs
+`take 4 skip 3` => just `3`) — confirming operations form a genuine
+SEQUENTIAL PIPELINE applied in the order written, not independent
+filters combined in some fixed order. Implemented via a "rows" model:
+`Evaluator.evaluateQueryExpression` tracks `[[String: LassoValue]]` (one
+dictionary per surviving element, mapping variable name → value) —
+starts as just the with-variable, `where` FILTERS rows, `let` ADDS a key
+to each surviving row without changing row count, `skip`/`take` TRIM the
+row list itself. `skip`/`take`'s own count expression is evaluated with
+NO row bound (the ambient outer scope only) — the real docs don't
+specify per-element vs. once-per-sequence evaluation for it, and this
+reading is internally consistent (`select`/`do`'s own action expression
+is always evaluated per-row, in contrast).
+
+Variable binding uses ONE persistent `LassoLocalBox` per name (the
+with-variable + every `.let` operation's own name, known statically from
+the AST before any row is processed), mutated in place per row rather
+than replaced — matches this codebase's own established convention for
+ordinary loop variables (`iterate`/`with`'s block-tag renderer already
+mutates ONE shared box per iteration, doc-verified during Stage 3). A
+real bug was found and fixed DURING implementation (before formal
+review): an earlier draft created a FRESH box per row per stage
+(mirroring Stage 8.1's own fix for corrupting a same-named outer local)
+— but this broke the `do` action's capture-literal payload, since that
+capture is constructed ONCE, before any row is processed, and needs a
+LIVE REFERENCE to a box that later per-row binding steps go on to
+update; fresh-per-row boxes meant the capture's snapshot pointed at a
+box nothing else ever touched again. Caught by re-running the full
+pre-existing suite (regressed Stage 8.1's own
+`queryDoCaptureLiteralPayloadRemainsAttachedToTheSurroundingMethodContextForNonLocalReturn`),
+fixed by switching to the persistent-box design, re-verified clean.
+
+**Architect + code-reviewer review (run in parallel) found no blocking
+issues** — both independently confirmed the persistent-box design is
+sound (traced that every row present at any pipeline stage carries an
+identical key set, so `bind(row)`'s "only mutate boxes for keys present
+in this row" never leaves a stale cross-row value; the final
+`context.replaceLocals(savedLocals)` restore is a full, complete undo),
+that `where`/`let` correctly chain (a later operation genuinely sees an
+earlier `let`'s bound value for the SAME row, not just in the one tested
+example), that `tryParseQueryOperation`'s backtracking (including the
+`let`-without-`NAME=` failure path) fully unwinds through
+`tryParseQueryExpression`'s own outer backtrack with no partial-index
+corruption, and that `order`/`group` (real, documented, but
+Stage-8.3/8.4-only operations) safely fall through to the existing
+bareword-`with` backtrack rather than crashing or silently succeeding
+wrong. One low-severity, disclosed-not-fixed observation from architect
+review: a `select`/`do` payload that stores a capture literal per row
+for invocation LATER (outside this function) would have every such
+capture share the SAME persistent box — a "closure over a shared loop
+variable" effect, consistent with this codebase's own established
+`iterate`/`with` precedent (not a regression), with zero corpus/doc
+evidence for that specific shape (every real worked example reads row
+values immediately) — disclosed via a code comment rather than built
+around.
+
+634/634 tests passing (9 new). Remaining Stage 8 sub-stages (not yet
+started): 8.3 (`order by` + `sum`/`average`/`min`/`max` actions), 8.4
+(`group by` + `queriable_grouping` type), 8.5 (multiple with-clauses/
+nesting, `generateSeries` type + literal syntax, `eacher`).
 
 ## 6. Deferred, With Reasoning
 

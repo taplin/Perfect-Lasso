@@ -715,18 +715,78 @@ struct ExpressionParser {
         }
         index += 1
         let source = parseExpression()
+        // Ch. "Query Expressions", "Operations" (Stage 8.2): zero or
+        // more `where`/`let`/`skip`/`take` clauses, in ANY order, applied
+        // IN THE ORDER WRITTEN — `tryParseQueryOperation` returns `nil`
+        // (with no index mutation) as soon as the next token isn't one of
+        // these four keywords, which is exactly when the action
+        // (`select`/`do`) is expected next. `order`/`group` (later
+        // stages' own real, documented operations) aren't recognized
+        // here yet — a query expression using either falls all the way
+        // through to this function's own full backtrack below, same as
+        // any other unrecognized shape, rather than a targeted "not yet
+        // implemented" diagnostic; disclosed, not a silent wrong answer
+        // (the resulting bareword-`with` reinterpretation fails loudly
+        // downstream, matching this codebase's established "unsupported
+        // input surfaces as a real error, never a silent wrong result"
+        // convention elsewhere).
+        var operations: [QueryOperation] = []
+        while let operation = tryParseQueryOperation() {
+            operations.append(operation)
+        }
         if case let .identifier(actionKeyword) = peek, actionKeyword.caseInsensitiveCompare("select") == .orderedSame {
             index += 1
             let transform = parseExpression()
-            return .queryExpression(variable: variable, source: source, action: .select(transform))
+            return .queryExpression(variable: variable, source: source, operations: operations, action: .select(transform))
         }
         if case let .identifier(actionKeyword) = peek, actionKeyword.caseInsensitiveCompare("do") == .orderedSame {
             index += 1
             let payload = parseExpression()
-            return .queryExpression(variable: variable, source: source, action: .perform(payload))
+            return .queryExpression(variable: variable, source: source, operations: operations, action: .perform(payload))
         }
         index = start
         return nil
+    }
+
+    /// One `where`/`let`/`skip`/`take` operation (Stage 8.2) — `nil`,
+    /// with NO index mutation, as soon as the next token doesn't match
+    /// any of the four keywords (the caller's loop then expects the
+    /// action next). `let` additionally requires `NAME =` after the
+    /// keyword itself (Ch. "Query Expressions": "the word `let` followed
+    /// by a new variable name, the assignment operator (`=`), and then
+    /// an expression") — a `let` keyword not followed by that exact
+    /// shape is treated as a hard parse failure for the WHOLE query
+    /// expression (falls through to `tryParseQueryExpression`'s own
+    /// final backtrack), not silently reinterpreted as some other
+    /// construct, since `let` alone is otherwise meaningless here.
+    mutating private func tryParseQueryOperation() -> QueryOperation? {
+        guard case let .identifier(keyword) = peek else { return nil }
+        switch keyword.lowercased() {
+        case "where":
+            index += 1
+            return .filter(parseExpression())
+        case "skip":
+            index += 1
+            return .skip(parseExpression())
+        case "take":
+            index += 1
+            return .take(parseExpression())
+        case "let":
+            let start = index
+            index += 1
+            guard case let .identifier(name) = peek else {
+                index = start
+                return nil
+            }
+            index += 1
+            guard consume("=") else {
+                index = start
+                return nil
+            }
+            return .let(name: name, value: parseExpression())
+        default:
+            return nil
+        }
     }
 
     /// Parses a Capture literal's already-extracted raw body text

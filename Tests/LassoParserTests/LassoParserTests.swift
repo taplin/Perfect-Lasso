@@ -12992,3 +12992,162 @@ struct IncludeURLTests {
     #expect(output == "999|2,4,6")
 }
 
+// MARK: - Captures Stage 8.2 (Query Expressions: where/let/skip/take operations)
+
+@Test func queryWhereFiltersElementsComputingTheDocsOwnOddNumberExampleVerbatim() async throws {
+    // Ch. "Query Expressions" worked example, verbatim: "with n in
+    // array(0,1,2,...,9) where #n % 2 != 0 select #n // => 1, 3, 5, 7, 9".
+    var context = LassoContext()
+    let output = try await LassoRenderer().render(
+        "[(with n in array(0, 1, 2, 3, 4, 5, 6, 7, 8, 9) where #n % 2 != 0 select #n)->join(',')]",
+        context: &context
+    )
+    #expect(output == "1,3,5,7,9")
+}
+
+@Test func multipleWhereOperationsCombineWithLogicalAndMatchingTheDocsOwnEquivalenceExamples() async throws {
+    // Ch. "Query Expressions": "using multiple where operations is
+    // essentially the same as combining the expressions using the
+    // logical 'and' operator" -- the doc's own three-way comparison,
+    // verbatim: two chained wheres and a single &&-combined where
+    // produce the SAME result (1, 5, 7), while an ||-combined where
+    // produces a DIFFERENT one (1, 2, 3, 4, 5, 7, 8, 9).
+    var context = LassoContext()
+    let chained = try await LassoRenderer().render(
+        "[(with n in array(0, 1, 2, 3, 4, 5, 6, 7, 8, 9) where #n % 2 != 0 where #n % 3 != 0 select #n)->join(',')]",
+        context: &context
+    )
+    var context2 = LassoContext()
+    let anded = try await LassoRenderer().render(
+        "[(with n in array(0, 1, 2, 3, 4, 5, 6, 7, 8, 9) where #n % 2 != 0 && #n % 3 != 0 select #n)->join(',')]",
+        context: &context2
+    )
+    var context3 = LassoContext()
+    let ored = try await LassoRenderer().render(
+        "[(with n in array(0, 1, 2, 3, 4, 5, 6, 7, 8, 9) where #n % 2 != 0 || #n % 3 != 0 select #n)->join(',')]",
+        context: &context3
+    )
+    #expect(chained == "1,5,7")
+    #expect(anded == "1,5,7")
+    #expect(ored == "1,2,3,4,5,7,8,9")
+}
+
+@Test func letIntroducesANewVariableComputingTheDocsOwnSquareExampleVerbatim() async throws {
+    // Ch. "Query Expressions" worked example, verbatim: "with n in
+    // array(0,1,...,9) let n2 = #n * #n select #n2 // => 0, 1, 4, 9, 16,
+    // 25, 36, 49, 64, 81".
+    var context = LassoContext()
+    let output = try await LassoRenderer().render(
+        "[(with n in array(0, 1, 2, 3, 4, 5, 6, 7, 8, 9) let n2 = #n * #n select #n2)->join(',')]",
+        context: &context
+    )
+    #expect(output == "0,1,4,9,16,25,36,49,64,81")
+}
+
+@Test func whereCanReferenceALetIntroducedVariableComputingTheDocsOwnCombinedExampleVerbatim() async throws {
+    // Ch. "Query Expressions" worked example, verbatim: `let n2 = #n *
+    // #n` followed by `where #n2 % 2 != 0` -- proves `where` can see a
+    // variable a PRECEDING `let` introduced, matching the doc's own
+    // stated "using both where and let together" framing.
+    var context = LassoContext()
+    let output = try await LassoRenderer().render(
+        "[(with n in array(0, 1, 2, 3, 4, 5, 6, 7, 8, 9) let n2 = #n * #n where #n2 % 2 != 0 select #n2)->join(',')]",
+        context: &context
+    )
+    #expect(output == "1,9,25,49,81")
+}
+
+@Test func skipDropsTheSpecifiedNumberOfLeadingElementsMatchingTheDocsOwnExampleVerbatim() async throws {
+    // Ch. "Query Expressions" worked example, verbatim: "with n in
+    // array(0,1,...,9) skip 5 select #n // => 5, 6, 7, 8, 9".
+    var context = LassoContext()
+    let output = try await LassoRenderer().render(
+        "[(with n in array(0, 1, 2, 3, 4, 5, 6, 7, 8, 9) skip 5 select #n)->join(',')]",
+        context: &context
+    )
+    #expect(output == "5,6,7,8,9")
+}
+
+@Test func takeKeepsOnlyTheSpecifiedNumberOfLeadingElementsMatchingTheDocsOwnExampleVerbatim() async throws {
+    // Ch. "Query Expressions" worked example, verbatim: "with n in
+    // array(0,1,...,9) take 5 select #n // => 0, 1, 2, 3, 4".
+    var context = LassoContext()
+    let output = try await LassoRenderer().render(
+        "[(with n in array(0, 1, 2, 3, 4, 5, 6, 7, 8, 9) take 5 select #n)->join(',')]",
+        context: &context
+    )
+    #expect(output == "0,1,2,3,4")
+}
+
+@Test func skipAndTakeAreASequentialPipelineWhereRelativeOrderChangesTheResult() async throws {
+    // Ch. "Query Expressions": "the order in which skip and take are
+    // specified is significant" -- the doc's own three-way worked
+    // example, verbatim: `skip 3 take 4` => 3,4,5,6 (skip first, THEN
+    // take 4 of what remains); `take 4 skip 3` => 3 (take 4 first,
+    // leaving 0,1,2,3, THEN skip 3 of THOSE, leaving just 3); a third
+    // snippet using `skip 3 take 1` also => 3, confirming both readings
+    // converge on the same single element by different means. Directly
+    // exercises that this is a genuine sequential pipeline over the
+    // surviving row list, not two independent, order-blind filters.
+    var context = LassoContext()
+    let skipThenTake = try await LassoRenderer().render(
+        "[(with n in array(0, 1, 2, 3, 4, 5, 6, 7, 8, 9) skip 3 take 4 select #n)->join(',')]",
+        context: &context
+    )
+    var context2 = LassoContext()
+    let takeThenSkip = try await LassoRenderer().render(
+        "[(with n in array(0, 1, 2, 3, 4, 5, 6, 7, 8, 9) take 4 skip 3 select #n)->join(',')]",
+        context: &context2
+    )
+    var context3 = LassoContext()
+    let skipThenTakeOne = try await LassoRenderer().render(
+        "[(with n in array(0, 1, 2, 3, 4, 5, 6, 7, 8, 9) skip 3 take 1 select #n)->join(',')]",
+        context: &context3
+    )
+    #expect(skipThenTake == "3,4,5,6")
+    #expect(takeThenSkip == "3")
+    #expect(skipThenTakeOne == "3")
+}
+
+@Test func queryOperationsWorkCorrectlyWithTheDoActionAndNonMutatingBarePayloads() async throws {
+    // Confirms operations (Stage 8.2) correctly compose with the `do`
+    // action (Stage 8.1) -- a where-filtered, let-transformed row set
+    // feeding a bare-expression do payload that collects into an
+    // external array via a self-mutating write-back (the exact mechanism
+    // Stage 8.1's own regression test already covers for the plain,
+    // no-operations case).
+    var context = LassoContext()
+    let output = try await LassoRenderer().render(
+        """
+        <?lassoscript
+        var(collected) = array
+        with n in array(0, 1, 2, 3, 4, 5, 6, 7, 8, 9) let doubled = #n * 2 where #doubled > 10 do $collected->insert(#doubled)
+        ?>
+        [$collected->join(',')]
+        """,
+        context: &context
+    ).trimmingCharacters(in: .whitespacesAndNewlines)
+    #expect(output == "12,14,16,18")
+}
+
+@Test func letIntroducedVariablesDoNotLeakOutsideTheQueryExpressionEvenWhenTheyShadowAnOuterLocal() async throws {
+    // Same scoping guarantee already proven for the with-variable itself
+    // (queryExpressionWithVariableScopesToOnlyTheQueryExpressionEvenWhenAnOuterLocalSharesItsName)
+    // now extended to a `let`-introduced name: Ch. "Query Expressions":
+    // "variables introduced with a let operation have the SAME SCOPE as
+    // those introduced in a with clause. That is, they only exist within
+    // the query expression."
+    var context = LassoContext()
+    let output = try await LassoRenderer().render(
+        """
+        <?lassoscript
+        local(n2) = 999
+        local(result) = with n in array(1, 2, 3) let n2 = #n * #n select #n2
+        ?>
+        [#n2]|[#result->join(',')]
+        """,
+        context: &context
+    ).trimmingCharacters(in: .whitespacesAndNewlines)
+    #expect(output == "999|1,4,9")
+}
+

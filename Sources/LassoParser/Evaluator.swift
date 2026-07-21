@@ -55,8 +55,8 @@ struct Evaluator {
                 capturedLocals: context.snapshotLocals(),
                 homeDepth: context.currentCaptureHomeDepth ?? context.tagCallStack.count
             ))
-        case let .queryExpression(variable, source, action):
-            return try await evaluateQueryExpression(variable: variable, source: source, action: action)
+        case let .queryExpression(variable, source, operations, action):
+            return try await evaluateQueryExpression(variable: variable, source: source, operations: operations, action: action)
         case let .variable(name, scope): return context.value(for: name, scope: scope)
         case let .identifier(name):
             if name.caseInsensitiveCompare("self") == .orderedSame, let object = context.currentSelf {
@@ -713,6 +713,7 @@ struct Evaluator {
     private mutating func evaluateQueryExpression(
         variable: String,
         source: LassoExpression,
+        operations: [QueryOperation],
         action: QueryAction
     ) async throws -> LassoValue {
         let sourceValue = try await evaluate(source)
@@ -722,40 +723,116 @@ struct Evaluator {
         // "New variables introduced by a query expression clause will
         // not be available outside of the query expression that
         // introduces them" — same save/restore discipline `invokeCapture`
-        // uses for its own `#1`/`#2` bindings.
+        // uses for its own `#1`/`#2` bindings. Covers BOTH the
+        // with-variable and every `let`-introduced name (Ch. "Query
+        // Expressions": "variables introduced with a `let` operation have
+        // the SAME SCOPE as those introduced in a `with` clause").
         let savedLocals = context.snapshotLocals()
         defer { context.replaceLocals(savedLocals) }
-        // Real bug found by code-reviewer review: `context.set(_:for:
-        // scope:)` MUTATES an existing box in place when one already
-        // exists for `variable` (Stage 3's own live-reference contract,
-        // `Runtime.swift`'s own doc comment on `set`) — if the enclosing
-        // scope already had a LOCAL of the same name (`local(n) = 999`
-        // before `with n in ... select ...`), every `context.set` call
-        // below would mutate THAT SAME shared box, and the `defer`
-        // above only restores the DICTIONARY MAPPING, not the box's own
-        // value — so the outer `#n` would be left holding the LAST
-        // iteration's value instead of its original 999, violating the
-        // very scoping guarantee this comment describes. Confirmed via a
-        // live reproduction before this fix. Explicitly inserting a
-        // FRESH box into a copy of `savedLocals` (mirroring how
-        // `invokeCapture`/`invokeCustomTag`'s own `bindParameters` +
-        // `replaceLocals` always bind fresh boxes for a call's own
-        // parameters, never reusing whatever box a same-named outer
-        // local happened to already have) guarantees this query
-        // expression's own with-variable is a genuinely NEW box, so the
-        // `defer`'s restore is a real, complete undo — while every OTHER
-        // outer local stays visible to the `select`/`do` payload, since
-        // `scopedLocals` starts as a COPY of the full `savedLocals` map,
-        // not a wholesale replacement.
+        // Every name this query expression can ever bind is known
+        // STATICALLY from its own AST (the with-variable, plus each
+        // `let` operation's own name) — collected up front so ONE box
+        // per name can be created ONCE, before any row is processed, and
+        // then MUTATED in place (`box.value = ...`) as rows/stages
+        // advance, rather than replaced with a fresh box each time.
+        // Real bug found live while implementing this: an earlier cut
+        // created a brand-new box PER ROW PER STAGE (the exact fix Stage
+        // 8.1 needed to stop corrupting a same-named OUTER local — see
+        // that box's own doc comment history) — but a `do` capture
+        // literal is constructed ONCE, BEFORE any row is bound, and
+        // needs a LIVE REFERENCE to the with-variable's box that later
+        // per-row binding steps go on to update; creating fresh boxes
+        // per row broke that reference entirely, since the capture's own
+        // snapshot pointed at a box nothing else ever touched again.
+        // Reusing ONE persistent box per name (still fresh relative to
+        // `savedLocals`, so an outer same-named local is still never
+        // touched) satisfies both constraints at once. Matches this
+        // codebase's own established convention for ordinary loop
+        // variables (`Renderer.swift`'s `iterate`/`with` block tags
+        // already mutate ONE shared box per iteration via `context.set`,
+        // doc-verified against lassoguide.com during Stage 3) — Stage
+        // 8.2's query rows are the same "one box, mutated per element"
+        // shape, not a new pattern. Same caveat applies here too, found
+        // by architect review: a `select`/`do` payload that itself
+        // STORES a capture literal per row for invocation LATER (outside
+        // this function) would have every such capture share the SAME
+        // box, observing whatever value it was left at when the whole
+        // query expression finished — a classic "closure over a shared
+        // loop variable" effect. No real corpus/doc evidence for this
+        // shape (every worked example reads row values immediately), so
+        // disclosed here rather than built around.
+        var queryOwnedBoxes: [String: LassoLocalBox] = [variable.lowercased(): LassoLocalBox(.void)]
+        for operation in operations {
+            if case let .let(name, _) = operation {
+                queryOwnedBoxes[name.lowercased()] = LassoLocalBox(.void)
+            }
+        }
         var scopedLocals = savedLocals
-        scopedLocals[variable.lowercased()] = LassoLocalBox(.void)
+        for (name, box) in queryOwnedBoxes { scopedLocals[name] = box }
         context.replaceLocals(scopedLocals)
+
+        func bind(_ row: [String: LassoValue]) {
+            for (name, value) in row {
+                queryOwnedBoxes[name]?.value = value
+            }
+        }
+
+        // Stage 8.2: each surviving element is now a ROW — a dictionary
+        // of every variable name bound for it so far (starts with just
+        // the with-variable; `let` operations below ADD keys without
+        // changing row count; `where` FILTERS rows; `skip`/`take` trim
+        // the row list itself). Real Lasso's own worked examples show
+        // `skip`/`take`'s relative ORDER changing the result (`take 4
+        // skip 3` vs `skip 3 take 4`), confirming operations form a real
+        // SEQUENTIAL PIPELINE over the row list, not independent filters
+        // applied in some fixed order.
+        var rows: [[String: LassoValue]] = elements.map { [variable.lowercased(): $0] }
+        for operation in operations {
+            switch operation {
+            case let .filter(expr):
+                var kept: [[String: LassoValue]] = []
+                for row in rows {
+                    bind(row)
+                    if try await evaluate(expr).isTruthy { kept.append(row) }
+                    if context.shouldStopRenderingCurrentBody() { break }
+                }
+                rows = kept
+            case let .let(name, expr):
+                var updated: [[String: LassoValue]] = []
+                for row in rows {
+                    bind(row)
+                    let value = try await evaluate(expr)
+                    var newRow = row
+                    newRow[name.lowercased()] = value
+                    updated.append(newRow)
+                    if context.shouldStopRenderingCurrentBody() { break }
+                }
+                rows = updated
+            case let .skip(expr):
+                // Ch. "Query Expressions": "a `skip` operation permits a
+                // specified number of values... to be skipped" — a
+                // SEQUENCE-level count, not tied to any particular
+                // element, so evaluated with NO row bound (the ambient
+                // surrounding scope only, matching how `select`/`do`'s
+                // own action expression is never implicitly evaluated
+                // "per nothing" either).
+                context.replaceLocals(savedLocals)
+                let count = try await evaluate(expr).number.map(Int.init) ?? 0
+                context.replaceLocals(scopedLocals)
+                rows = Array(rows.dropFirst(max(0, count)))
+            case let .take(expr):
+                context.replaceLocals(savedLocals)
+                let count = try await evaluate(expr).number.map(Int.init) ?? 0
+                context.replaceLocals(scopedLocals)
+                rows = Array(rows.prefix(max(0, count)))
+            }
+        }
         switch action {
         case let .select(transform):
             var results: [LassoValue] = []
-            results.reserveCapacity(elements.count)
-            for element in elements {
-                context.set(element, for: variable, scope: .local)
+            results.reserveCapacity(rows.count)
+            for row in rows {
+                bind(row)
                 results.append(try await evaluate(transform))
                 if context.shouldStopRenderingCurrentBody() { break }
             }
@@ -769,10 +846,11 @@ struct Evaluator {
             // payload is evaluated ONCE (so its home/capturedLocals
             // reflect the ambient surrounding context, matching every
             // other capture literal's own semantics) and then invoked
-            // once per element, mirroring `invokeForEachCapture`'s own
+            // once per row, mirroring `invokeForEachCapture`'s own
             // established pattern; a bare-expression payload has no
             // capture semantics at all and is simply re-evaluated fresh
-            // each iteration, reading the with-variable directly.
+            // for each row, reading the with-variable (and any
+            // `let`-introduced names) directly.
             if case let .captureLiteral(body, autoCollect) = payload {
                 let capture = LassoCaptureValue(
                     body: body,
@@ -780,8 +858,8 @@ struct Evaluator {
                     capturedLocals: context.snapshotLocals(),
                     homeDepth: context.currentCaptureHomeDepth ?? context.tagCallStack.count
                 )
-                for element in elements {
-                    context.set(element, for: variable, scope: .local)
+                for row in rows {
+                    bind(row)
                     _ = try await invokeCapture(capture, arguments: [])
                     if context.shouldStopRenderingCurrentBody() { break }
                 }
@@ -799,10 +877,10 @@ struct Evaluator {
                 // same mechanism a real top-level `[...]`/script-mode
                 // statement already goes through via
                 // `Renderer.renderExpression`, which this do-loop must
-                // replicate since it's evaluating each iteration OUTSIDE
-                // that normal per-statement render path.
-                for element in elements {
-                    context.set(element, for: variable, scope: .local)
+                // replicate since it's evaluating each row OUTSIDE that
+                // normal per-statement render path.
+                for row in rows {
+                    bind(row)
                     _ = try await evaluateStatement(payload)
                     if context.shouldStopRenderingCurrentBody() { break }
                 }
