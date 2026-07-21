@@ -4,6 +4,8 @@ A Swift reimplementation of the Lasso web-scripting language and server (`lasso-
 
 This repo has no pre-built binary releases yet — you build it from source, against your own toolchain and Homebrew setup. That turns out to be simple: builds are proven to work from a completely standalone clone, with no other repos or sibling checkouts required nearby.
 
+> **Note:** this repository is not yet published on GitHub. The clone URLs below describe where it will live once it is — until then, build from whatever local copy you already have.
+
 ## Requirements
 
 - **Xcode 27 or later** (Swift 6.4 toolchain, confirmed working). `Package.swift` declares a `swift-tools-version: 6.2` minimum, but only Xcode 27 has been verified.
@@ -63,3 +65,5 @@ git clone --branch vX.Y.Z https://github.com/taplin/Perfect-Lasso.git
 ```
 
 or download that tag's "Source code" archive directly from its Release page, unpack it, and build the same way as above. Each tagged release commits a known-good `Package.resolved`, so you get the exact dependency versions that were verified working at that point — not whatever the tracked `main` branches of this project's dependencies have drifted to since.
+
+(Maintainers: see [`Documentation/releasing.md`](Documentation/releasing.md) for the release-cutting process itself.)
