@@ -537,6 +537,91 @@ struct Evaluator {
         return (givenBlock, remaining)
     }
 
+    /// Stage 4 (Captures): the real, shared `->forEach` mechanism —
+    /// invokes the call's associated `=>` block (its `givenBlock`) once
+    /// per element of `elements`, in order. NOT itself a genuine
+    /// invocation boundary the way `invokeCustomTag`/`invokeMemberMethod`/
+    /// `invokeCapture` are (no `pushTagCall`/depth tracking of its own):
+    /// it's sugar over a Swift-level loop of ordinary `invokeCapture`
+    /// calls, deliberately mirroring `loop`/`iterate`/`with`'s own
+    /// existing "native block construct, not a call boundary" shape
+    /// (`Renderer.swift`) — checking `context.shouldStopRenderingCurrentBody()`
+    /// after each invocation and stopping early is exactly what those
+    /// blocks do too (recently fixed to do so for `return`/`yield`, not
+    /// just `Loop_Abort`/`Loop_Continue`), so a non-local `return`/`yield`
+    /// fired from inside the block correctly aborts remaining iterations
+    /// and propagates on up to its real target — matching Ch. "Captures"'s
+    /// own `contains()` worked example (`#a->forEach => { #val == #1 ?
+    /// return true }`) exactly. Returns `.void` if no capture was
+    /// associated at all (real Lasso's own forEach has no meaningful
+    /// return value of its own; callers rely on side effects or a
+    /// non-local exit, never this function's own result).
+    private mutating func invokeForEachCapture(
+        over elements: [LassoValue],
+        evaluatedArguments: [EvaluatedArgument]
+    ) async throws -> LassoValue {
+        let (givenBlock, _) = Self.extractGivenBlock(from: evaluatedArguments)
+        guard case let .capture(capture) = givenBlock else { return .void }
+        for element in elements {
+            _ = try await invokeCapture(capture, arguments: [EvaluatedArgument(label: nil, value: element)])
+            if context.shouldStopRenderingCurrentBody() { break }
+        }
+        return .void
+    }
+
+    /// The real, documented Lasso 9.3 contract (Ch. "Query Expressions",
+    /// "Making an Object Queriable") ties `forEach`-style iteration to
+    /// `trait_forEach`/`trait_queriable` conformance in the abstract —
+    /// concretely, for the collection types this interpreter already
+    /// implements, that always cashes out to "produce this value's own
+    /// element sequence." Shared by `->forEach` (this file) and
+    /// `->insertFrom` (`Collections.swift`, Queue only — the one real,
+    /// documented Lasso 9.3 `trait_forEach`-typed parameter) so both
+    /// accept the SAME set of sources. A `.map` yields `Pair(key, value)`
+    /// per element, sorted by key — matching `LassoIteratorValue.build`'s
+    /// own already-established element-extraction shape
+    /// (`Iterator.swift`), not `iterate`/`with`'s (`Renderer.swift`):
+    /// found by review that those two iterate a `.map`'s raw, hash-order
+    /// Swift `Dictionary` directly, with NO sorting, and `with` doesn't
+    /// even yield `Pair`s for a map source (bare values only) — a real,
+    /// pre-existing, benign inconsistency between `->forEach` (this
+    /// stage, deterministic) and `iterate`/`with` (unspecified order)
+    /// over the identical Map value, worth a future look but out of
+    /// scope for this stage to fix. Not itself a separate documented
+    /// `->forEachPair` method (real Lasso 9.3 has no such method;
+    /// checked directly against lassoguide.com and
+    /// reference.lassosoft.com, see the plan doc's own Stage 4 note).
+    /// `nil` (not `.array([])`) for a value that doesn't conform at all,
+    /// so callers can distinguish "empty collection" from "not a
+    /// collection" if they need to. `static` (needs no `Evaluator`
+    /// instance/`LassoContext`) so `Collections.swift`'s native-type
+    /// method closures — which only ever receive `(receiver, arguments,
+    /// context)`, never a full `Evaluator` — can call it directly for
+    /// `->insertFrom`, exactly like this file's own `member(_:_:_:)` does
+    /// for `->forEach`.
+    static func forEachElements(of value: LassoValue) -> [LassoValue]? {
+        switch value {
+        case let .array(values): return values
+        case let .map(entries):
+            return entries.keys.sorted().map { .pair(.string($0), entries[$0] ?? .null) }
+        case let .object(object):
+            switch object.typeName.lowercased() {
+            case "list", "queue", "stack", "set":
+                return LassoCollectionValue.elements(from: object)
+            case "priorityqueue":
+                return LassoPriorityQueueValue.elements(from: object)
+            case "treemap":
+                // Already `.pair(key, value)` entries — matching the
+                // `.map` case above's own Pair-yielding convention.
+                return LassoTreeMapValue.entries(from: object)
+            default:
+                return nil
+            }
+        default:
+            return nil
+        }
+    }
+
     /// Every bound parameter gets its OWN fresh box — a tag/method call
     /// always starts an entirely new, isolated local scope (see
     /// `invokeCustomTag`'s own doc comment: "a fresh, isolated local scope
@@ -1571,6 +1656,24 @@ struct Evaluator {
             case 2: return value
             default: return .null
             }
+        case (_, "foreach") where Self.forEachElements(of: base) != nil:
+            // Stage 4 (Captures): one shared case for every built-in
+            // collection this interpreter implements (array, map, list,
+            // queue, stack, set, priorityqueue, treemap) — see
+            // `forEachElements(of:)`/`invokeForEachCapture`'s own doc
+            // comments for the element-extraction and non-local-return
+            // mechanics (Ch. "Captures" `contains()` worked example).
+            // Placed ahead of the generic `.object` dispatch below so it
+            // wins for THESE known collection type names specifically —
+            // `forEachElements(of:)` returns `nil` for any OTHER
+            // `.object` (a user-defined type), correctly falling through
+            // to that type's OWN `forEach` method instead (already fully
+            // supported via ordinary `=>`-association + `givenBlock`,
+            // unchanged by this stage).
+            return try await invokeForEachCapture(
+                over: Self.forEachElements(of: base) ?? [],
+                evaluatedArguments: evaluate(arguments)
+            )
         case let (.array(values), "size"): return .integer(values.count)
         case let (.array(values), "first"): return values.first ?? .null
         case let (.array(values), "insert"):
@@ -2004,6 +2107,11 @@ struct Evaluator {
     /// recursive `evaluate(_:)` — see that method's doc for why.
     static let selfMutatingMethods: Set<String> = [
         "insert", "replace", "append", "trim",
+        // `Queue->InsertFrom` (Ch. 30, operations/collections.html) is
+        // documented the same "modifies the receiver" way `->Insert`
+        // already is — same write-back shape, just for Stage 4
+        // (Captures)'s new method.
+        "insertfrom",
         // `Array->Sort`/`->Reverse`/`->Remove`/`->RemoveAll` are documented
         // (Lasso 8.5 Language Guide Ch. 30) as invocant-mutating, exactly
         // like `->Insert` above — real corpus need: sorted product/category

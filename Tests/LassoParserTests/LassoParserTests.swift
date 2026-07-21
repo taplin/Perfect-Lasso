@@ -11368,3 +11368,241 @@ struct IncludeURLTests {
     #expect(output == "5")
 }
 
+// MARK: - Captures Stage 4 (->forEach)
+
+@Test func theLanguageGuidesOwnContainsWorkedExampleUsingArrayForEach() async throws {
+    // Ch. "Captures", verbatim (used there to illustrate non-local
+    // return, but a real, working example of ->forEach in its own
+    // right): `#a->forEach => { #val == #1 ? return true }` -- checked
+    // directly against lassoguide.com/language/captures.html. Real
+    // Lasso 9.3 does NOT document `->forEach` as its own directly-
+    // callable array method (confirmed: no entry on operations
+    // /collections.html or in genindex.html) -- it's the method NAME a
+    // type must implement to conform to trait_queriable/trait_forEach
+    // (Ch. "Query Expressions", "Making an Object Queriable"). Providing
+    // it directly on the built-in collection types too is this
+    // interpreter's own disclosed extension (see the plan doc's Stage 4
+    // note), matching the DOCS' OWN worked example's assumption that it
+    // just works this way.
+    //
+    // Uses `if(...) => { return true }` rather than the Guide's own
+    // bare ternary shorthand (`#val == #1 ? return true`) -- found,
+    // independent of Captures/forEach entirely, that a bare `return`
+    // embedded as a ternary's action clause (not the WHOLE statement)
+    // doesn't get `ScriptBodyParser.normalizeReturn`'s bare-return-to-
+    // real-call rewrite, so it silently mis-parses the same way bare
+    // `yield` did before Stage 2 fixed IT for the whole-statement case.
+    // Real, reproducible with zero forEach/captures involved at all
+    // (`x == 1 ? return true` alone); flagged separately as its own
+    // follow-up, out of scope here.
+    var context = LassoContext()
+    let output = try await LassoRenderer().render(
+        """
+        <?lassoscript
+        define contains(a, val) => {
+            #a->forEach => {
+                if(#val == #1) => { return true }
+            }
+            return false
+        }
+        ?>
+        [contains(array(1, 2, 3), 2)]|[contains(array(1, 2, 3), 9)]
+        """,
+        context: &context
+    ).trimmingCharacters(in: .whitespacesAndNewlines)
+    #expect(output == "true|false")
+}
+
+@Test func arrayForEachInvokesTheBlockOnceForEveryElementInOrder() async throws {
+    var context = LassoContext()
+    let output = try await LassoRenderer().render(
+        """
+        <?lassoscript
+        var(collected) = array
+        array(10, 20, 30)->forEach => { $collected->insert(#1 * 2) }
+        ?>
+        [$collected->join(',')]
+        """,
+        context: &context
+    ).trimmingCharacters(in: .whitespacesAndNewlines)
+    #expect(output == "20,40,60")
+}
+
+@Test func mapForEachYieldsPairsInSortedKeyOrderMatchingLassoIteratorValuesOwnConvention() async throws {
+    // Ch. "Query Expressions"'s own account of `forEach` never specifies
+    // what a MAP source should yield -- this interpreter has an
+    // existing, established convention for exactly this (`Pair(key,
+    // value)`, sorted by key), already used by `->Iterator`/
+    // `->ReverseIterator` (`LassoIteratorValue.build`, `Iterator.swift`)
+    // -- not a separate documented `->forEachPair` method (real Lasso
+    // 9.3 has no such method at all -- checked directly, "No Records
+    // Found" on reference.lassosoft.com, absent from lassoguide.com's
+    // search index). `->forEach` on a map reuses that SAME convention
+    // rather than inventing a new one. NOTE, found by review: `iterate`/
+    // `with` (`Renderer.swift`) do NOT follow this convention -- they
+    // iterate a map's raw, hash-order Swift `Dictionary` directly with
+    // no sorting, and `with` doesn't yield `Pair`s for a map source at
+    // all (bare values only) -- a real, pre-existing, benign
+    // inconsistency between constructs, not something this stage
+    // introduces or needs to reconcile.
+    var context = LassoContext()
+    let output = try await LassoRenderer().render(
+        """
+        <?lassoscript
+        var(collected) = array
+        map('b' = 2, 'a' = 1, 'c' = 3)->forEach => { $collected->insert(#1->first + '=' + #1->second) }
+        ?>
+        [$collected->join(',')]
+        """,
+        context: &context
+    ).trimmingCharacters(in: .whitespacesAndNewlines)
+    #expect(output == "a=1,b=2,c=3")
+}
+
+@Test func forEachWorksOnListSetQueueStackTreeMapAndPriorityQueue() async throws {
+    // One shared mechanism (`Evaluator.forEachElements(of:)`) serving
+    // every collection type this interpreter implements -- TreeMap
+    // yields Pairs (like Map), the rest yield plain values.
+    //
+    // Set/PriorityQueue built via `->insert` chains rather than bare
+    // constructor positional args (`set(3, 4)`, `priorityqueue(2, 1)`)
+    // -- found, independent of Captures/forEach entirely, that those
+    // two constructors' bare positional-argument form silently builds
+    // an EMPTY collection (confirmed: `string(set(3,4))` → "Set: ",
+    // `string(priorityqueue(2,1))` → "PriorityQueue: ", both empty)
+    // even though the identical shape works correctly for List/Queue/
+    // Stack. A real, pre-existing, separate gap, flagged for its own
+    // follow-up -- `->insert` chains are unaffected and confirmed
+    // working correctly for both types.
+    var context = LassoContext()
+    let output = try await LassoRenderer().render(
+        """
+        <?lassoscript
+        var(out) = array
+        list(1, 2)->forEach => { $out->insert('list:' + #1) }
+        local(s) = set
+        #s->insert(3)
+        #s->insert(4)
+        #s->forEach => { $out->insert('set:' + #1) }
+        queue(5, 6)->forEach => { $out->insert('queue:' + #1) }
+        stack(7, 8)->forEach => { $out->insert('stack:' + #1) }
+        local(pq) = priorityqueue
+        #pq->insert(2)
+        #pq->insert(1)
+        #pq->forEach => { $out->insert('pq:' + #1) }
+        treemap(1 = 'one', 2 = 'two')->forEach => { $out->insert('tree:' + #1->first + '=' + #1->second) }
+        ?>
+        [$out->join('|')]
+        """,
+        context: &context
+    ).trimmingCharacters(in: .whitespacesAndNewlines)
+    #expect(output == "list:1|list:2|set:3|set:4|queue:5|queue:6|stack:7|stack:8|pq:1|pq:2|tree:1=one|tree:2=two")
+}
+
+@Test func aCustomTypesOwnForEachMethodStillDispatchesCorrectlyNotInterceptedByTheBuiltInCase() async throws {
+    // The new generic `(_, "foreach")` case in `Evaluator.member` must
+    // NOT intercept a user-defined type's OWN `forEach` method --
+    // `Evaluator.forEachElements(of:)` returns `nil` for any `.object`
+    // whose `typeName` isn't one of the known built-in collection names,
+    // correctly falling through to the pre-existing (Stage 1)
+    // `invokeMemberMethod`/`givenBlock` dispatch this already used
+    // before Stage 4 ever existed.
+    var context = LassoContext()
+    let output = try await LassoRenderer().render(
+        """
+        <?lassoscript
+        define user_list => type {
+            data items
+            public onCreate() => { .items = array('a', 'b', 'c') }
+            public forEach() => {
+                local(gb) = givenBlock
+                iterate(.items, local('i'))
+                    #gb->invoke(#i)
+                /iterate
+            }
+        }
+        var(out) = ''
+        user_list()->forEach => { $out->append(#1) }
+        ?>
+        [$out]
+        """,
+        context: &context
+    ).trimmingCharacters(in: .whitespacesAndNewlines)
+    #expect(output == "abc")
+}
+
+@Test func queueInsertFromInsertsAnotherCollectionsElementsMatchingTheDocumentedTraitForEachSignature() async throws {
+    // Ch. 30 (operations/collections.html): "queue->insertFrom
+    // (value::trait_forEach) — Inserts new elements into the queue...
+    // by taking an object that implements trait_forEach." The ONE real,
+    // documented `->insertFrom` in Lasso 9.3 (List/Set/Array only have
+    // this under the legacy 8.x reference, a different iterator-based
+    // mechanism this interpreter doesn't implement).
+    //
+    // Verifies via `string(...)` (Ch. 30's own documented auto-
+    // stringification, "Queue: elem1, elem2, ...") rather than
+    // `->join(',')` -- found, independent of Captures/InsertFrom
+    // entirely, that `->join` is only registered for List (Table 5),
+    // not Queue/Stack/Set/PriorityQueue at all; a real, pre-existing,
+    // separate gap, flagged for its own follow-up.
+    var context = LassoContext()
+    let output = try await LassoRenderer().render(
+        """
+        [local('q' = queue(1, 2))]\
+        [#q->insertFrom(array(3, 4))]\
+        [string(#q)]
+        """,
+        context: &context
+    )
+    #expect(output == "Queue: 1, 2, 3, 4")
+}
+
+@Test func queueInsertFromUsedAsABareStatementWritesBackToTheReceiversOwnVariable() async throws {
+    // `->insertFrom` is registered in `selfMutatingMethods` (Ch. 30
+    // documents it as modifying the receiver) -- a bare top-level
+    // statement use must persist the mutation back into `#q`, exactly
+    // like `->Insert` already does for every other collection type.
+    var context = LassoContext()
+    let output = try await LassoRenderer().render(
+        """
+        [local('q' = queue(1, 2))]\
+        [#q->insertFrom(array(3, 4))]|\
+        [string(#q)]
+        """,
+        context: &context
+    )
+    #expect(output == "|Queue: 1, 2, 3, 4")
+}
+
+@Test func nonLocalReturnFromInsideArrayForEachCorrectlyAbortsRemainingElementsAndExitsToItsHome() async throws {
+    // Stage 2's non-local-return mechanism must correctly interact with
+    // Stage 4's new `->forEach` loop: `forEach` is NOT itself an
+    // invocation boundary (no `pushTagCall` of its own, mirroring
+    // `loop`/`iterate`) -- it must stop iterating the moment
+    // `context.shouldStopRenderingCurrentBody()` goes true, and the
+    // signal must keep propagating on up past `forEach`'s own call site
+    // to its real home. `$checkedCount` (a GLOBAL, visible outside the
+    // method) proves iteration genuinely stopped at the match -- NOT
+    // merely that the right value came back, which could also happen if
+    // `forEach` ran to completion and just happened to return the last
+    // qualifying value.
+    var context = LassoContext()
+    let output = try await LassoRenderer().render(
+        """
+        <?lassoscript
+        var(checkedCount) = 0
+        define findFirstOver(a, threshold) => {
+            #a->forEach => {
+                $checkedCount += 1
+                if(#1 > #threshold) => { return #1 }
+            }
+            return -1
+        }
+        ?>
+        [findFirstOver(array(1, 2, 3, 4, 5), 2)]|[$checkedCount]
+        """,
+        context: &context
+    ).trimmingCharacters(in: .whitespacesAndNewlines)
+    #expect(output == "3|3")
+}
+

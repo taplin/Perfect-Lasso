@@ -777,11 +777,111 @@ model doesn't have anywhere else either.
 554/554 tests passing after all review fixes (was 552; +2 from the
 `instantiate` regression test and the loop-scoping pinning test).
 
-**Stage 4 — `->forEach` (array/list/set/etc.) + `Set->ForEach`/
-`->InsertFrom`.** Once Stage 1 exists, wire to invoke the associated capture
-once per element, matching §1.9's worked example shape. Directly closes
-`Collections.swift:330-339`'s disclosed deferral. Needs only snapshot
-semantics (Stage 1) — could ship right after Stage 1, deferring Stages 2/3.
+**Stage 4 — `->forEach` (array/list/set/etc.) + `->InsertFrom`** ✅ done
+(2026-07-21). Real-doc research (lassoguide.com + reference.lassosoft.com,
+via `curl`, not WebFetch) significantly revised this stage's original
+assumption before implementation started:
+
+- **`->forEach` is NOT documented as a directly-callable built-in method on
+  Array/List/Map/etc. in Lasso 9.3** — no entry on operations/collections.html
+  or in genindex.html. It's the METHOD NAME a user-defined type must
+  implement to conform to `trait_queriable` (Ch. "Query Expressions",
+  "Making an Object Queriable": "a type must implement the forEach member
+  method... always called with a capture block... the object being queried
+  should invoke the capture block, passing it each available element in
+  turn"). **This exact mechanism already worked with ZERO new code** — a
+  custom type's own `public forEach() => { local(gb) = givenBlock ...
+  #gb->invoke(...) }`, called via ordinary `=>` association
+  (`#customObj->forEach => {...}`), was already fully supported by Stage 1's
+  `givenBlock`/`foldAssociatedCapture` machinery (confirmed via a live
+  reproduction before writing any Stage 4 code at all).
+- Providing `->forEach` directly on the BUILT-IN collection types
+  (array/map/list/queue/stack/set/treemap/priorityqueue) is this
+  interpreter's OWN disclosed extension beyond strict 9.3 docs — matches
+  the spirit of `trait_forEach` (a real, documented parameter-type
+  constraint used elsewhere, e.g. `queue->insertFrom(value::trait_forEach)`)
+  and the Guide's own `contains()` worked example's implicit assumption
+  that it "just works," but isn't itself a literally-documented built-in
+  method. Implemented as one shared mechanism:
+  `Evaluator.forEachElements(of:)` (static, extracts a value's element
+  sequence — `nil` for anything that doesn't conform, correctly falling
+  through to a CUSTOM type's own `forEach` method instead of being
+  intercepted) + `Evaluator.invokeForEachCapture` (invokes the associated
+  block once per element via ordinary `invokeCapture`, checking
+  `shouldStopRenderingCurrentBody()` after each — NOT its own invocation
+  boundary, deliberately mirroring `loop`/`iterate`'s "native block
+  construct" shape so Stage 2's non-local return correctly aborts
+  remaining iterations and propagates to its real home, exactly matching
+  the docs' own `contains()` example).
+- **`->forEachPair` is NOT a real Lasso 9.3 method** — checked directly
+  ("No Records Found" on reference.lassosoft.com, absent from
+  lassoguide.com's search index) despite being the exact method name real
+  corpus code uses (`#AIMParams->forEachPair`, the original motivating
+  evidence for this stage). `->forEach` on a `.map` yields `Pair(key,
+  value)` per element instead, reusing this codebase's OWN pre-existing
+  `iterate`/`with` map-iteration convention rather than inventing an
+  undocumented method name — serves the same real underlying need, but
+  literal `->forEachPair` calls (matching that one corpus file's exact
+  spelling) still throw unknown-method, a disclosed, real gap relative to
+  that specific corpus usage.
+- **`->InsertFrom` is real Lasso 9.3 ONLY for Queue**
+  (`queue->insertFrom(value::trait_forEach)`, Ch. 30) — List/Set/Array's
+  own `->InsertFrom` is 8.x-only (a different, iterator-based mechanism
+  this Lasso 9 interpreter doesn't implement). The ORIGINAL plan's own
+  characterization ("Set->ForEach/->InsertFrom... `Collections.swift`'s
+  disclosed deferral") conflated this with the legacy 8.x version;
+  corrected here. Implemented for Queue only, sharing
+  `forEachElements(of:)` for its own `value::trait_forEach` argument, added
+  to `Evaluator.selfMutatingMethods` for correct bare-statement write-back.
+
+564/564 tests passing (8 new). **Three real, pre-existing gaps found
+incidentally while writing tests, all confirmed unrelated to Captures/
+forEach/Stage 4, all filed as separate follow-up tasks rather than fixed
+here (scope discipline, matching Stage 2's own precedent with the loop-
+block early-return gap)**: (1) a bare `return`/`yield` embedded in a
+ternary shorthand's ACTION clause (`x == 1 ? return true`, not the whole
+statement) doesn't get `ScriptBodyParser.normalizeReturn`'s bare-return-
+rewrite, silently producing no output — reproducible with zero
+Captures/forEach involved; the Guide's own `contains()` worked example
+uses exactly this shorthand, so this stage's own regression test uses
+`if(...) => { return true }` instead. (2) `->join` is only registered for
+List — Queue/Stack/Set/PriorityQueue don't have it at all. (3)
+`set(...)`/`priorityqueue(...)` constructors silently drop bare positional
+arguments (build an empty collection); List/Queue/Stack accept the
+identical call shape correctly — `->insert(...)` chains work fine on
+Set/PriorityQueue, only their own constructors are affected.
+
+**Architect + code-reviewer review found the core design sound** (both
+independently confirmed: the `typeName`-collision guard is airtight since
+native collection constructors always win over a same-named user type
+definition in call dispatch, `forEach`'s lack of its own `pushTagCall`
+frame is correct and load-bearing — pushing one would incorrectly catch
+the docs' own `contains()` example's non-local return one frame too
+early — and the double-evaluation of `forEachElements(of: base)` in the
+new `member` switch case's guard-then-body is a pure function over an
+already-materialized value, wasted CPU only, not a correctness issue).
+**Three real findings, all fixed**:
+1. Two pre-existing doc comments in `Collections.swift` (List's and
+   Set's own top-level comments) still listed `->ForEach` among methods
+   "deliberately deferred... need a passable tag-reference value (Stage
+   6's `\TagName` primitive)" — stale as of this diff, which implements
+   it generically via the shared Stage 4 mechanism instead. Updated both.
+2. This file's own `forEachElements(of:)` doc comment claimed its
+   sorted-`Pair`-for-Map convention matches "`iterate`/`with`'s own
+   already-established... convention" — checked by both reviewers
+   independently and found FALSE: `iterate`/`with` (`Renderer.swift`)
+   iterate a map's raw, hash-order Swift `Dictionary` directly with no
+   sorting, and `with` doesn't even yield `Pair`s for a map source at
+   all (bare values only). The REAL existing precedent for sorted-`Pair`
+   map iteration is `LassoIteratorValue.build` (`Iterator.swift`,
+   `->Iterator`/`->ReverseIterator`) — corrected the citation, and
+   disclosed the real (if benign — deterministic beats unspecified)
+   inconsistency between `->forEach` and `iterate`/`with` over the
+   identical Map value as a separate, out-of-scope follow-up candidate
+   (not filed as its own task — low priority, no corpus evidence either
+   way needs it resolved).
+3. The SAME wrong citation was duplicated in this stage's own map-forEach
+   test's name/comment — corrected there too.
 
 **Stage 5 — string iteration family** (`->eachCharacter`/`->eachWordBreak`/
 `->eachLineBreak`/`->eachMatch`). Same mechanism as Stage 4, applied to
