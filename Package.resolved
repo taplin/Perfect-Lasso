@@ -3,7 +3,7 @@
   "pins" : [
     {
       "identity" : "perfect-crud",
-      "kind" : "localSourceControl",
+      "kind" : "remoteSourceControl",
       "location" : "https://github.com/taplin/Perfect-CRUD.git",
       "state" : {
         "branch" : "main",
@@ -12,7 +12,7 @@
     },
     {
       "identity" : "perfect-filemaker",
-      "kind" : "localSourceControl",
+      "kind" : "remoteSourceControl",
       "location" : "https://github.com/taplin/Perfect-FileMaker.git",
       "state" : {
         "branch" : "main",
@@ -21,7 +21,7 @@
     },
     {
       "identity" : "perfect-filemaker-adminapi",
-      "kind" : "localSourceControl",
+      "kind" : "remoteSourceControl",
       "location" : "https://github.com/taplin/Perfect-FileMaker-AdminAPI.git",
       "state" : {
         "branch" : "main",
@@ -30,7 +30,7 @@
     },
     {
       "identity" : "perfect-mysql",
-      "kind" : "localSourceControl",
+      "kind" : "remoteSourceControl",
       "location" : "https://github.com/taplin/Perfect-MySQL.git",
       "state" : {
         "branch" : "main",
@@ -39,7 +39,7 @@
     },
     {
       "identity" : "perfect-nio",
-      "kind" : "localSourceControl",
+      "kind" : "remoteSourceControl",
       "location" : "https://github.com/taplin/Perfect-NIO.git",
       "state" : {
         "branch" : "main",
@@ -66,7 +66,7 @@
     },
     {
       "identity" : "perfect-session",
-      "kind" : "localSourceControl",
+      "kind" : "remoteSourceControl",
       "location" : "https://github.com/taplin/Perfect-Session.git",
       "state" : {
         "branch" : "main",
@@ -204,8 +204,8 @@
       "kind" : "remoteSourceControl",
       "location" : "https://github.com/apple/swift-nio.git",
       "state" : {
-        "revision" : "cd3e1152083706d77b223fb29110e590efcc70c0",
-        "version" : "2.101.2"
+        "revision" : "0b18836bd8b0162e7e17a995a3fbee20ed8f3b2b",
+        "version" : "2.101.3"
       }
     },
     {
@@ -231,8 +231,8 @@
       "kind" : "remoteSourceControl",
       "location" : "https://github.com/apple/swift-nio-ssl.git",
       "state" : {
-        "revision" : "407d82d5b6cc00e1c3fb83a81b1539b70c788c5e",
-        "version" : "2.37.1"
+        "revision" : "d930168b86f46ca51a4bc09c5ca45c1833db8067",
+        "version" : "2.37.2"
       }
     },
     {
