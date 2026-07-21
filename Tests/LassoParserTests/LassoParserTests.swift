@@ -5797,6 +5797,128 @@ private final class MapIncludeLoader: LassoIncludeLoader, @unchecked Sendable {
     #expect(falseOutput.contains("after"), "Content after a false guard must still render")
 }
 
+@Test func bareReturnAndYieldWorkAsATernaryActionClause() async throws {
+    // `ScriptBodyParser.normalizeReturn` rewrites a bare (paren-less)
+    // `return X`/`yield X` into `return(X)`/`yield(X)` -- but only by
+    // checking whether the WHOLE STATEMENT TEXT starts with "return "/
+    // "yield " (a `hasPrefix` check). When bare `return`/`yield` appears
+    // as a ternary short-form's action clause instead of the whole
+    // statement (`x == 1 ? return true`, no `|` else-branch), the
+    // rewrite never fires, and the bare keyword falls through to the
+    // generic juxtaposition/string-concatenation sugar (an unrelated
+    // undefined variable named "return", concatenated with "true")
+    // instead of ever invoking the real `register("return")` native
+    // function. Confirmed real via the Language Guide's own canonical
+    // `contains()` worked example -- see the `arrayForEach...` test
+    // below whose doc comment first flagged this, independent of
+    // Captures/forEach entirely (`x == 1 ? return true` alone
+    // reproduces it with a plain `define`).
+    var context = LassoContext()
+    let output = try await LassoRenderer().render(
+        """
+        <?lassoscript
+        define testit(x) => {
+            x == 1 ? return true
+            return false
+        }
+        ?>
+        [testit(1)]|[testit(2)]
+        """,
+        context: &context
+    ).trimmingCharacters(in: .whitespacesAndNewlines)
+    #expect(output == "true|false", "Bare `return` in a ternary's action clause must actually invoke return")
+
+    var yieldContext = LassoContext()
+    let yieldOutput = try await LassoRenderer().render(
+        """
+        <?lassoscript
+        define generator() => {
+            loop(-count=3) => {
+                loop_count == 2 ? yield 'two'
+            }
+        }
+        ?>
+        [generator()]
+        """,
+        context: &yieldContext
+    ).trimmingCharacters(in: .whitespacesAndNewlines)
+    #expect(yieldOutput == "two", "Bare `yield` in a ternary's action clause must actually invoke yield")
+
+    var elseBranchContext = LassoContext()
+    let elseBranchOutput = try await LassoRenderer().render(
+        """
+        <?lassoscript
+        define testit2(x) => {
+            x == 1 ? return true | return false
+        }
+        ?>
+        [testit2(1)]|[testit2(2)]
+        """,
+        context: &elseBranchContext
+    ).trimmingCharacters(in: .whitespacesAndNewlines)
+    #expect(elseBranchOutput == "true|false", "Bare `return` must work in both the `?` and `|` branches")
+
+    // Non-regression: the already-working parenthesized form must be untouched.
+    var parenContext = LassoContext()
+    let parenOutput = try await LassoRenderer().render(
+        """
+        <?lassoscript
+        define testit3(x) => {
+            x == 1 ? return(true)
+            return(false)
+        }
+        ?>
+        [testit3(1)]|[testit3(2)]
+        """,
+        context: &parenContext
+    ).trimmingCharacters(in: .whitespacesAndNewlines)
+    #expect(parenOutput == "true|false", "Parenthesized return(...) in a ternary action clause must keep working")
+}
+
+@Test func valuelessBareReturnAsATernaryActionStillReturnsVoidWithoutCorruptingParsing() async throws {
+    // `register("return")`/`register("yield")` (Runtime.swift) already
+    // default a MISSING argument to `.void` -- a bare `return`/`yield`
+    // with no value at all is a real, supported shape, not just the
+    // valued form `return X` this fix started from. Found by code
+    // review of the value-form fix above: naively assuming a value
+    // always follows a bare `return`/`yield` in ternary position either
+    // throws (nothing follows at all -- the parser tries to parse the
+    // statement's own end-of-input as a value) or, worse, silently eats
+    // the ternary's own `|` separator (single `|` isn't a registered
+    // binary operator, so it falls to the prefix parser's generic
+    // symbol catch-all as a bogus value), corrupting the whenFalse
+    // branch entirely. Both shapes below reproduce the two ways that
+    // went wrong.
+    var noElseContext = LassoContext()
+    let noElseOutput = try await LassoRenderer().render(
+        """
+        <?lassoscript
+        define testit5(x) => {
+            x == 1 ? return
+            return('not-returned')
+        }
+        ?>
+        [testit5(1)]|[testit5(2)]
+        """,
+        context: &noElseContext
+    ).trimmingCharacters(in: .whitespacesAndNewlines)
+    #expect(noElseOutput == "|not-returned", "A valueless bare return with nothing following it must halt with void, not throw")
+
+    var withElseContext = LassoContext()
+    let withElseOutput = try await LassoRenderer().render(
+        """
+        <?lassoscript
+        define testit6(x) => {
+            x == 1 ? return | return('fallback-branch-ran')
+        }
+        ?>
+        [testit6(1)]|[testit6(2)]
+        """,
+        context: &withElseContext
+    ).trimmingCharacters(in: .whitespacesAndNewlines)
+    #expect(withElseOutput == "|fallback-branch-ran", "A valueless bare return in the `?` branch must not swallow the `|` separator")
+}
+
 @Test func stringReplaceMutatesTheInvocantInPlaceAndProducesNoOutputAsABareStatement() async throws {
     // string->replace(find, replaceWith) mutates its invocant in place —
     // like array/map ->insert — rather than merely computing a new
@@ -11385,24 +11507,23 @@ struct IncludeURLTests {
     // note), matching the DOCS' OWN worked example's assumption that it
     // just works this way.
     //
-    // Uses `if(...) => { return true }` rather than the Guide's own
-    // bare ternary shorthand (`#val == #1 ? return true`) -- found,
-    // independent of Captures/forEach entirely, that a bare `return`
-    // embedded as a ternary's action clause (not the WHOLE statement)
-    // doesn't get `ScriptBodyParser.normalizeReturn`'s bare-return-to-
-    // real-call rewrite, so it silently mis-parses the same way bare
-    // `yield` did before Stage 2 fixed IT for the whole-statement case.
-    // Real, reproducible with zero forEach/captures involved at all
-    // (`x == 1 ? return true` alone); flagged separately as its own
-    // follow-up, out of scope here.
+    // Uses the Guide's own bare ternary shorthand verbatim
+    // (`#val == #1 ? return true`) -- a bare `return`/`yield` embedded as
+    // a ternary's action clause (not the WHOLE statement) used to not
+    // get `ScriptBodyParser.normalizeReturn`'s bare-return-to-real-call
+    // rewrite (that rewrite only ever sees the ternary's FULL statement
+    // text), silently mis-parsing the same way bare `yield` did before
+    // Stage 2 fixed IT for the whole-statement case. Real, reproducible
+    // with zero forEach/captures involved at all (`x == 1 ? return true`
+    // alone) -- fixed via `ExpressionParser.parseTernaryAction` (see
+    // `bareReturnAndYieldWorkAsATernaryActionClause` for the focused
+    // regression test).
     var context = LassoContext()
     let output = try await LassoRenderer().render(
         """
         <?lassoscript
         define contains(a, val) => {
-            #a->forEach => {
-                if(#val == #1) => { return true }
-            }
+            #a->forEach => { #val == #1 ? return true }
             return false
         }
         ?>

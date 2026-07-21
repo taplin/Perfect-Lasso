@@ -374,9 +374,9 @@ struct ExpressionParser {
         // complete value expression (e.g. a call argument), not nested
         // inside a larger binary/assignment expression.
         if minimumPrecedence == 0, consume("?") {
-            let whenTrue = parseExpression()
+            let whenTrue = parseTernaryAction()
             if consume("|") {
-                let whenFalse = parseExpression()
+                let whenFalse = parseTernaryAction()
                 left = .ternary(condition: left, whenTrue: whenTrue, whenFalse: whenFalse)
             } else {
                 // Lasso 8's bare statement-guard form — `condition ?
@@ -394,6 +394,69 @@ struct ExpressionParser {
             giveback = nil
         }
         return (left, giveback)
+    }
+
+    /// Parses a ternary's action clause (the `whenTrue`/`whenFalse` after
+    /// `?`/`|`), applying the same bare-`return`/`yield`-to-real-call
+    /// rewrite `ScriptBodyParser.normalizeReturn` applies to a WHOLE
+    /// statement — without this, `x == 1 ? return true` falls through to
+    /// the generic juxtaposition/string-concatenation sugar (bare
+    /// identifier `return`, evaluating to an unrelated undefined
+    /// variable, concatenated with `true`) instead of ever calling the
+    /// real `register("return")`/`register("yield")` native function,
+    /// because `normalizeReturn`'s own `hasPrefix` check only ever sees
+    /// the ternary's FULL statement text (`x == 1 ? return true`), which
+    /// doesn't start with "return "/"yield ". A bare keyword immediately
+    /// followed by `(` (`return(true)`) is left alone here — that shape
+    /// already parses correctly as an ordinary call via
+    /// `parsePostfixTrackingGiveback`'s own `(` handling.
+    ///
+    /// A *valueless* bare `return`/`yield` (`$done ? return`, or
+    /// `$done ? return | 5`) must NOT fall into the value-parsing branch
+    /// below — `register("return")`/`register("yield")` (Runtime.swift)
+    /// already default a missing argument to `.void`, matching real
+    /// Lasso's zero-arg `return`/`yield`. Found by code review: blindly
+    /// calling `parseExpression()` for "the value" when there isn't one
+    /// either throws (next token is `.eof`, consumed as `.unknown("")`,
+    /// which `Evaluator` rejects) or, worse, silently eats the ternary's
+    /// own `|` separator (single `|` isn't a registered binary operator,
+    /// so it falls to the prefix parser's symbol catch-all as
+    /// `.unknown("|")`), corrupting the whenFalse branch. `canStartValue`
+    /// below whitelists exactly the tokens `parsePrefixTrackingGiveback`
+    /// can actually start a real expression from — anything else (`|`,
+    /// `)`, `,`, `:`, EOF, ...) means no value follows, and this emits a
+    /// zero-argument call instead of guessing one into existence.
+    mutating private func parseTernaryAction() -> LassoExpression {
+        if case let .identifier(name) = peek,
+           ["return", "yield"].contains(name.lowercased()) {
+            let next = tokens[min(index + 1, tokens.count - 1)]
+            if next != .symbol("(") {
+                index += 1
+                guard Self.canStartValue(next) else {
+                    return .call(callee: .identifier(name), arguments: [])
+                }
+                let value = parseExpression()
+                return .call(callee: .identifier(name), arguments: [LassoArgument(value: value)])
+            }
+        }
+        return parseExpression()
+    }
+
+    /// Whether `token` can legitimately begin a fresh expression — i.e.
+    /// is one of the cases `parsePrefixTrackingGiveback` actually has a
+    /// real production for, as opposed to falling into its `.symbol`/
+    /// `.eof` catch-alls (`.unknown(...)`). Used by `parseTernaryAction`
+    /// to tell "a value follows" from "nothing follows" (see its own
+    /// doc comment).
+    private static func canStartValue(_ token: Token) -> Bool {
+        switch token {
+        case .string, .integer, .decimal, .variable, .tagReference, .identifier, .named, .captureBody:
+            return true
+        case let .symbol(value):
+            return ["(", "!", "-", "+", "."].contains(value)
+        case .eof:
+            return false
+        }
     }
 
     mutating private func parsePrefix() -> LassoExpression {
