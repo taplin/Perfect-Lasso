@@ -171,7 +171,38 @@ public indirect enum LassoExpression: Equatable, Sendable {
     /// every other nested block body in this parser uses) at the point
     /// this expression node is constructed.
     case captureLiteral(body: [LassoNode], autoCollect: Bool)
+    /// A Lasso 9 Query Expression's `with` clause (Ch. "Query
+    /// Expressions", lassoguide.com/language/query-expressions.html) —
+    /// `with NAME in SOURCE select EXPR` / `with NAME in SOURCE do
+    /// (EXPR|CAPTURE)`. A SEPARATE, additive construct from the
+    /// pre-existing `with NAME in EXPR do { body }` STATEMENT/block form
+    /// (`ScriptBodyParser.parseWithOpening`/`Renderer.swift`'s own
+    /// `case "with":`) — that one is a narrower, real-corpus-driven
+    /// block-body iteration tag, untouched by this addition; this case
+    /// is recognized only in EXPRESSION position (assignable, nestable,
+    /// matching the real docs' "query expressions can be treated as
+    /// objects"), and only for the bare-expression/capture-value form of
+    /// `do` the block-tag form doesn't accept at all (see
+    /// `ExpressionParser`'s own `with`-recognition doc comment for the
+    /// exact non-overlapping boundary between the two).
+    ///
+    /// Stage 8.1 scope: a single with-clause only (no comma-separated
+    /// multi-clause nesting), `select`/`do` actions only (no
+    /// `sum`/`average`/`min`/`max`), no `where`/`let`/`skip`/`take`/
+    /// `order by`/`group by` operations yet — each a later stage's own
+    /// addition, per `Documentation/captures-subsystem-plan.md`'s Stage
+    /// 8 breakdown.
+    case queryExpression(variable: String, source: LassoExpression, action: QueryAction)
     case unknown(String)
+}
+
+/// The action ending a Query Expression (Ch. "Query Expressions",
+/// "Actions") — see `LassoExpression.queryExpression`'s own doc comment
+/// for this stage's scope. `perform` corresponds to the real `do`
+/// keyword (`do` is a Swift reserved word).
+public enum QueryAction: Equatable, Sendable {
+    case select(LassoExpression)
+    case perform(LassoExpression)
 }
 
 public indirect enum LassoNode: Equatable, Sendable {

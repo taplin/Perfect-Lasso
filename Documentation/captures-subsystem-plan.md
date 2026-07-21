@@ -1111,9 +1111,132 @@ gaps found beyond the one fixed above.
 
 **Stage 8 — Query Expressions** (`where`/`let`/`skip`/`take`/`order by`/
 `group by`/`select`/`sum`/`average`/`min`/`max`, `generateSeries`,
-`trait_queriable`, `eacher`). Largest new-parser-surface stage; gated on
-Stage 1 (strict superset of already-implemented `with...do`) and, for full
-nested-control-flow correctness, Stage 2.
+`trait_queriable`, `eacher`). By far the largest remaining stage — a
+genuine new SQL-like DSL (Ch. "Query Expressions",
+lassoguide.com/language/query-expressions.html: `with NAME in SOURCE
+[operations] ACTION`), broken into internal sub-stages rather than
+implemented in one pass, matching this project's own established
+"batch"/"collections stage N" precedent for large features. Zero corpus
+evidence in either real corpus (TS_lasso9/bugcity9) for ANY of this
+family — built anyway per real Lasso 9 completeness (this project's own
+corpus-evidence-not-sole-bar convention), and per explicit direction:
+"this area of the language is not heavily used if at all in the
+corpus... but full lasso9 feature support is important."
+
+**Stage 8.1 — core `with...select`/`with...do`, single with-clause** ✅
+done (2026-07-21). Real-doc research found this codebase ALREADY has a
+separate, narrower, real-corpus-driven STATEMENT-level `with NAME in
+EXPR do { body }` block tag (`ScriptBodyParser.parseWithOpening`,
+`Renderer.swift`'s own `case "with":`) — requires braces, treats its
+body as a parsed statement block like `iterate`/`loop`, NOT a capture
+literal value. This stage does NOT touch or replace that mechanism at
+all (real corpus still needs it); it adds a SEPARATE, additive
+EXPRESSION-level `with NAME in SOURCE (select EXPR | do (EXPR|CAPTURE))`
+construct, recognized in `ExpressionParser`'s own prefix-parsing
+(assignable, nestable, usable as a call argument — matching "query
+expressions can be treated as objects"). The two coexist safely because
+they're recognized by different parser LAYERS at different structural
+positions: a bare top-level `with` STATEMENT is tried by the OLD
+mechanism first; on ANY mismatch (no braces after `do`, or `select`
+instead of `do`) it backtracks fully and falls through to general
+expression-statement parsing, which is where the NEW mechanism applies.
+Verified via a dedicated coexistence test exercising BOTH forms in the
+same source.
+
+New `LassoExpression.queryExpression(variable:source:action:)` +
+`QueryAction` (`.select`/`.perform` — `perform` = real `do`, renamed
+since `do` is a Swift reserved word). Parsing (`ExpressionParser
+.tryParseQueryExpression`) is fully speculative: saves the token index,
+tries `IDENTIFIER "in" EXPR ("select" EXPR | "do" EXPR)`, restores on
+ANY mismatch and falls back to `.identifier("with")` — verified this
+doesn't regress the pre-existing `with = 5` fallback regression test,
+plus two new fallback edge cases of its own (`with n` with no `in`).
+
+Evaluation is fully EAGER — the with-source is materialized immediately
+via the existing `Evaluator.forEachElements(of:)` (shared with
+`->forEach`/`->insertFrom`) and every action runs to completion as soon
+as the query-expression EXPRESSION itself is evaluated, producing a
+plain `.array`/`.void` rather than a reusable lazily-drawn object. A
+disclosed, deliberate departure from the real docs' documented lazy
+evaluation model — laziness only differs OBSERVABLY when source/captured
+state mutates between creation and consumption, or when short-circuiting
+(a later stage's `take`) should skip upstream work, neither of which
+appears in any of the real docs' own worked examples (all show only a
+query expression's PRODUCED VALUE) — building genuine deferred execution
+would be a materially larger, separate undertaking disproportionate to
+this stage's own scope. A CUSTOM user-defined `trait_queriable` type
+(the docs' own `user_list`/`forEach` example) is a similarly disclosed
+gap — `forEachElements` only recognizes this interpreter's native
+collection types, and materializing from a custom type's own `forEach`
+method would need synthesizing a Swift-native capture, a separate
+mechanism with zero corpus evidence either way.
+
+**Architect + code-reviewer review found the core design sound**
+(backtracking in `tryParseQueryExpression` is airtight — every failure
+path restores the token index with no partial-match leakage checked
+across the parser's only two mutable fields; no word-based binary
+operators exist in this grammar at all, so `parseExpression()` parsing
+the with-source can never accidentally consume a legitimate trailing
+`select`/`do` as an operator continuation; the non-local-return
+propagation through a `do` capture literal — "the block of code given
+to a `do` remains attached to the surrounding method context, such that
+one could return or yield" — was traced end-to-end and confirmed
+correct, reusing `invokeCapture`'s existing Stage 2 machinery
+unchanged). **Two real findings, both fixed**:
+1. **A bare-expression `do` payload silently discarded self-mutating
+   method write-backs** (`$collected->insert(x)` on a plain `.array`,
+   a Swift value type). The capture-literal `do` form worked correctly
+   from the start (its body runs through the normal
+   `renderNodes`/statement-render pipeline), but the bare-expression
+   form called plain `evaluate(_:)` per iteration, which computes but
+   discards a self-mutating call's result — write-back for such calls
+   only happens through `Evaluator.evaluateStatement`'s own dedicated
+   check, normally invoked only for a genuine top-level statement via
+   `Renderer.renderExpression`. Fixed by calling `evaluateStatement`
+   instead, replicating that same check manually since this do-loop
+   evaluates each iteration outside the normal per-statement render
+   path. Verified against the docs' own worked example
+   (`with n in #ary do #n->upperCase`, upper-cased and collected
+   correctly) and confirmed the capture-literal and bare-expression
+   forms now "operate identically," matching the docs' own explicit
+   framing of that comparison.
+2. **The with-variable's scoping silently corrupted a same-named outer
+   local instead of leaving it untouched.** `LassoContext.set(_:for:
+   scope:)` mutates an EXISTING box in place when one already exists for
+   a name (Stage 3's own live-reference contract) — the original code
+   used `context.set(...)` to bind the with-variable each iteration,
+   which (whenever the enclosing scope already had a `local` of the same
+   name) mutated that SAME shared box; the save/restore `defer` only
+   undoes the dictionary MAPPING, not a box's own value, so the outer
+   variable was left holding the query expression's LAST iteration value
+   instead of being restored — a real, confirmed violation of the docs'
+   own "new variables introduced by a query expression clause will not
+   be available outside of the query expression that introduces them."
+   Confirmed via a live reproduction (`local(n)=999` before
+   `with n in array(1,2,3) select #n*2` left `#n` as `3`, not `999`).
+   Fixed by explicitly inserting a FRESH box for the with-variable into
+   a copy of the saved locals (mirroring how `invokeCapture`/
+   `invokeCustomTag`'s own parameter binding always uses fresh boxes,
+   never reusing whatever box a same-named outer local already had).
+   None of the original 9 tests caught this — every one used a
+   with-variable name never previously declared in the same scope.
+
+Also found, minor, non-blocking, disclosed rather than fixed: the
+PRE-EXISTING `with...do {...}` block tag's own backtrack-on-mismatch
+paths (`ScriptBodyParser.parseWithOpening`) used to append a "Malformed
+with... expected 'do'"/"...expected '{'" diagnostic before backtracking
+— harmless before this stage (nothing else started with `with` and
+wasn't that exact shape), but now fires MUCH more often since `select`
+and bare-`do` are newly valid alternate syntax this stage adds. Fixed by
+removing those two specific diagnostics (the backtrack behavior itself
+is unchanged) — genuinely malformed input still gets real feedback via
+whatever downstream error a failed fallback parse eventually produces.
+
+625/625 tests passing (10 new). Remaining Stage 8 sub-stages (not yet
+started): 8.2 (`where`/`let`/`skip`/`take` operations), 8.3 (`order by` +
+`sum`/`average`/`min`/`max` actions), 8.4 (`group by` +
+`queriable_grouping` type), 8.5 (multiple with-clauses/nesting,
+`generateSeries` type + literal syntax, `eacher`).
 
 ## 6. Deferred, With Reasoning
 

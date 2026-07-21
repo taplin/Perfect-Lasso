@@ -12784,3 +12784,211 @@ struct IncludeURLTests {
     #expect(output == "123|5")
 }
 
+// MARK: - Captures Stage 8.1 (Query Expressions: core with/select/do)
+
+@Test func querySelectComputesTheDocsOwnSquareExampleVerbatim() async throws {
+    // Ch. "Query Expressions" worked example, verbatim: "with n in
+    // array(1,2,3,4,5,6,7,8,9) select #n * #n // => 1, 4, 9, 16, 25, 36,
+    // 49, 64, 81".
+    var context = LassoContext()
+    let output = try await LassoRenderer().render(
+        "[(with n in array(1, 2, 3, 4, 5, 6, 7, 8, 9) select #n * #n)->join(',')]",
+        context: &context
+    )
+    #expect(output == "1,4,9,16,25,36,49,64,81")
+}
+
+@Test func queryExpressionsCanBeAssignedNestedAndUsedAsAnotherQuerysSource() async throws {
+    // Ch. "Query Expressions" worked example, verbatim: a query
+    // expression assigned to a local, then used as ANOTHER query
+    // expression's own `with...in` source -- "query expressions can be
+    // treated as objects... assigned to variables and used repeatedly."
+    var context = LassoContext()
+    let output = try await LassoRenderer().render(
+        """
+        <?lassoscript
+        local(qe) = with n in array(1, 2, 3, 4, 5, 6, 7, 8, 9) select #n * #n
+        local(result) = with newN in #qe select #newN * #newN
+        ?>
+        [#result->join(',')]
+        """,
+        context: &context
+    ).trimmingCharacters(in: .whitespacesAndNewlines)
+    #expect(output == "1,16,81,256,625,1296,2401,4096,6561")
+}
+
+@Test func queryDoWithABareExpressionPayloadRunsOnceForEveryElementProducingNoResultValue() async throws {
+    // Ch. "Query Expressions" worked example, verbatim (the bare-
+    // expression `do` form -- "with n in #ary do #n->upperCase"). Real
+    // bug found live while implementing this: a bare-expression `do`
+    // payload occupies the SAME "statement root" position a real
+    // top-level statement would, so a self-mutating value-type method
+    // call (`->insert` on an `.array`) needs `Evaluator.evaluateStatement`'s
+    // dedicated write-back check, not plain `evaluate(_:)` -- otherwise
+    // the computed result is silently discarded instead of persisted,
+    // exactly like calling a self-mutating method nested inside a larger
+    // expression (not at statement root) already does elsewhere in this
+    // codebase.
+    var context = LassoContext()
+    let output = try await LassoRenderer().render(
+        """
+        <?lassoscript
+        local(ary) = array('the', 'quick', 'brown', 'fox', 'jumped', 'the', 'shark')
+        var(collected) = array
+        with n in #ary do $collected->insert(#n->upperCase)
+        ?>
+        [$collected->join(',')]
+        """,
+        context: &context
+    ).trimmingCharacters(in: .whitespacesAndNewlines)
+    #expect(output == "THE,QUICK,BROWN,FOX,JUMPED,THE,SHARK")
+}
+
+@Test func queryDoWithACaptureLiteralPayloadProducesTheIdenticalResultToTheBareExpressionForm() async throws {
+    // Ch. "Query Expressions": "Both query expressions operate
+    // identically" -- the doc's own side-by-side comparison of the bare-
+    // expression and `{...}`-capture forms of `do`.
+    var context = LassoContext()
+    let output = try await LassoRenderer().render(
+        """
+        <?lassoscript
+        local(ary) = array('the', 'quick', 'brown', 'fox', 'jumped', 'the', 'shark')
+        var(collected) = array
+        with n in #ary do { $collected->insert(#n->upperCase) }
+        ?>
+        [$collected->join(',')]
+        """,
+        context: &context
+    ).trimmingCharacters(in: .whitespacesAndNewlines)
+    #expect(output == "THE,QUICK,BROWN,FOX,JUMPED,THE,SHARK")
+}
+
+@Test func queryDoCaptureLiteralPayloadRemainsAttachedToTheSurroundingMethodContextForNonLocalReturn() async throws {
+    // Ch. "Query Expressions": "The block of code given to a `do`
+    // remains attached to the surrounding method context, such that one
+    // could return or yield." A `return` inside the do-capture's own
+    // body must exit the ENCLOSING method (skipping its own trailing
+    // statement) and skip any remaining query-expression elements, not
+    // just locally exit the capture -- the same non-local-return
+    // discipline Stage 2/Stage 4's own `->forEach` already established.
+    var context = LassoContext()
+    let output = try await LassoRenderer().render(
+        """
+        [Define_Tag('FindFirstEven')]\
+            [with n in array(1, 3, 5, 4, 7, 6) do { #n % 2 == 0 ? return #n }]\
+            [return('none')]\
+        [/Define_Tag]\
+        [FindFirstEven]
+        """,
+        context: &context
+    )
+    #expect(output == "4")
+}
+
+@Test func queryExpressionCanBePassedDirectlyAsACallArgument() async throws {
+    // Ch. "Query Expressions": "query expressions can be treated as
+    // objects... and they can be passed as parameters."
+    var context = LassoContext()
+    let output = try await LassoRenderer().render(
+        "[(with n in array(1, 2, 3) select #n + 10)->join('-')]",
+        context: &context
+    )
+    #expect(output == "11-12-13")
+}
+
+@Test func bareWithFollowedByAnIdentifierButNoInStillFallsBackToAnOrdinaryIdentifier() async throws {
+    // Extends the pre-existing regression guard
+    // (malformedWithFallsBackToOrdinaryCodeWithoutSwallowingNextStatement,
+    // which covers `with = 5`) to the NEW speculative-parse path this
+    // stage adds: `with n` with an identifier but no following `in` at
+    // all must ALSO gracefully fall back to treating `with` as a plain
+    // identifier, not corrupt the rest of the statement or crash.
+    var context = LassoContext()
+    let output = try await LassoRenderer().render(
+        """
+        <?lassoscript
+        with n
+        $after = 'reached'
+        ?>
+        [$after]
+        """,
+        context: &context
+    ).trimmingCharacters(in: .whitespacesAndNewlines)
+    #expect(output == "reached")
+}
+
+@Test func statementLevelWithInDoBraceBlockFormStillWorksUnchangedAlongsideTheNewExpressionForm() async throws {
+    // The pre-existing STATEMENT-level `with NAME in EXPR do { body }`
+    // block tag (`ScriptBodyParser.parseWithOpening`/`Renderer.swift`'s
+    // own `case "with":`) is a separate, real-corpus-driven construct
+    // this stage must not regress -- exercised here in the SAME source
+    // as the new expression-level query-expression form, confirming
+    // neither interferes with the other.
+    var context = LassoContext()
+    let output = try await LassoRenderer().render(
+        """
+        <?lassoscript
+        var(fromBlockTag) = array
+        with x in array(10, 20, 30) do {
+            $fromBlockTag->insert(#x)
+        }
+        local(fromQueryExpr) = with n in array(1, 2, 3) select #n * 100
+        ?>
+        [$fromBlockTag->join(',')]|[#fromQueryExpr->join(',')]
+        """,
+        context: &context
+    ).trimmingCharacters(in: .whitespacesAndNewlines)
+    #expect(output == "10,20,30|100,200,300")
+}
+
+@Test func queryExpressionOverANonQueriableSourceThrowsRatherThanSilentlyProducingAnEmptyResult() async throws {
+    // Real Lasso restricts the with-source to "any object whose type
+    // supports the `trait_queriable` trait" -- a plain integer doesn't
+    // conform. Disclosed Stage 8.1 scope: this reuses
+    // `Evaluator.forEachElements(of:)`, which only recognizes this
+    // interpreter's own native collection types (array/map/list/queue/
+    // stack/set/priorityqueue/treemap) -- a custom user-defined
+    // `trait_queriable` type (via its own `forEach` method) is a
+    // disclosed, not-yet-supported source, and this test's plain integer
+    // pins the SAME rejection path a real non-queriable source hits.
+    var context = LassoContext()
+    await #expect(throws: Error.self) {
+        _ = try await LassoRenderer().render(
+            "[(with n in 5 select #n)->join(',')]",
+            context: &context
+        )
+    }
+}
+
+@Test func queryExpressionWithVariableScopesToOnlyTheQueryExpressionEvenWhenAnOuterLocalSharesItsName() async throws {
+    // Real bug found by code-reviewer review: `LassoContext.set(_:for:
+    // scope:)` mutates an EXISTING box in place when one already exists
+    // for a name (Stage 3's own live-reference contract) -- an earlier
+    // cut of `evaluateQueryExpression` called `context.set(...)` to bind
+    // the with-variable, which (if the enclosing scope already had a
+    // LOCAL of the same name) mutated that SAME shared box on every
+    // iteration. The save/restore `defer` only undoes the DICTIONARY
+    // MAPPING, not a box's own value, so the outer variable was left
+    // holding the query expression's LAST iteration value instead of
+    // being correctly restored -- a real, confirmed violation of Ch.
+    // "Query Expressions"'s own documented scoping rule ("new variables
+    // introduced by a query expression clause will not be available
+    // outside of the query expression that introduces them"). Fixed by
+    // explicitly inserting a fresh box for the with-variable into a copy
+    // of the saved locals (mirroring how `invokeCapture`/
+    // `invokeCustomTag`'s own parameter binding always uses fresh boxes,
+    // never reusing whatever box a same-named outer local already had).
+    var context = LassoContext()
+    let output = try await LassoRenderer().render(
+        """
+        <?lassoscript
+        local(n) = 999
+        local(result) = with n in array(1, 2, 3) select #n * 2
+        ?>
+        [#n]|[#result->join(',')]
+        """,
+        context: &context
+    ).trimmingCharacters(in: .whitespacesAndNewlines)
+    #expect(output == "999|2,4,6")
+}
+

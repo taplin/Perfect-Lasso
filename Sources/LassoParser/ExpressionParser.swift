@@ -638,6 +638,22 @@ struct ExpressionParser {
             case "null": expression = .null
             case "void": expression = .void
             case "not": expression = .unary(operator: "not", value: parseExpression(minimumPrecedence: 8))
+            case "with":
+                // Ch. "Query Expressions": `with NAME in SOURCE (select
+                // EXPR | do (EXPR|CAPTURE))` — see
+                // `tryParseQueryExpression`'s own doc comment for the
+                // full speculative-parse/backtrack design and how this
+                // coexists with the pre-existing STATEMENT-level `with
+                // NAME in EXPR do { body }` block tag.
+                if let queryExpression = tryParseQueryExpression() {
+                    expression = queryExpression
+                    // Already a self-contained, unambiguous unit, same
+                    // reasoning as the capture-literal/parenthesized-
+                    // group cases below.
+                    eligibleForGiveback = false
+                } else {
+                    expression = .identifier(name)
+                }
             default: expression = .identifier(name)
             }
         case let .symbol(op) where ["!", "-", "+"].contains(op):
@@ -660,6 +676,57 @@ struct ExpressionParser {
         case .eof: return (.unknown(""), nil)
         }
         return parsePostfixTrackingGiveback(expression, eligibleForGiveback: eligibleForGiveback)
+    }
+
+    /// `with NAME in SOURCE (select EXPR | do (EXPR|CAPTURE))` — Ch.
+    /// "Query Expressions". Reached only from expression position (the
+    /// leading "with" token is already consumed by the caller); fully
+    /// speculative with backtrack-to-`nil` on ANY mismatch, restoring
+    /// `index` to right after "with" — so a bare `with` used as an
+    /// ordinary identifier (real corpus regression guard:
+    /// `malformedWithFallsBackToOrdinaryCodeWithoutSwallowingNextStatement`,
+    /// e.g. `with = 5`) is completely unaffected; the caller falls back
+    /// to `.identifier("with")` exactly as before this addition existed.
+    ///
+    /// Deliberately does NOT recognize `do { block }` (a parsed
+    /// STATEMENT body) — only a bare EXPRESSION or a CAPTURE LITERAL
+    /// VALUE for `do`'s payload, matching the real docs' own wording
+    /// ("a `do` clause consists of the word `do` followed by either a
+    /// single expression or a capture"). The pre-existing, separate
+    /// STATEMENT-level `with NAME in EXPR do { body }` block tag
+    /// (`ScriptBodyParser.parseWithOpening`) already owns that exact
+    /// shape and is recognized BEFORE this expression parser ever runs
+    /// on a bare top-level `with` statement — this function only ever
+    /// sees `with` when it's already nested inside a LARGER expression
+    /// (an assignment's right-hand side, a call argument, etc.), a
+    /// structural position the statement-level tag never reaches. A
+    /// `{...}`/`{^...^}` capture-literal `do` payload here is parsed as
+    /// an ordinary `.captureLiteral` expression via `parseExpression`
+    /// (the lexer already tokenizes a leading `{` as `.captureBody`
+    /// regardless of surrounding context), so no special-casing is
+    /// needed to distinguish the two `do` payload shapes at parse time.
+    mutating private func tryParseQueryExpression() -> LassoExpression? {
+        let start = index
+        guard case let .identifier(variable) = peek else { return nil }
+        index += 1
+        guard case let .identifier(inKeyword) = peek, inKeyword.caseInsensitiveCompare("in") == .orderedSame else {
+            index = start
+            return nil
+        }
+        index += 1
+        let source = parseExpression()
+        if case let .identifier(actionKeyword) = peek, actionKeyword.caseInsensitiveCompare("select") == .orderedSame {
+            index += 1
+            let transform = parseExpression()
+            return .queryExpression(variable: variable, source: source, action: .select(transform))
+        }
+        if case let .identifier(actionKeyword) = peek, actionKeyword.caseInsensitiveCompare("do") == .orderedSame {
+            index += 1
+            let payload = parseExpression()
+            return .queryExpression(variable: variable, source: source, action: .perform(payload))
+        }
+        index = start
+        return nil
     }
 
     /// Parses a Capture literal's already-extracted raw body text

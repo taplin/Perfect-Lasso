@@ -55,6 +55,8 @@ struct Evaluator {
                 capturedLocals: context.snapshotLocals(),
                 homeDepth: context.currentCaptureHomeDepth ?? context.tagCallStack.count
             ))
+        case let .queryExpression(variable, source, action):
+            return try await evaluateQueryExpression(variable: variable, source: source, action: action)
         case let .variable(name, scope): return context.value(for: name, scope: scope)
         case let .identifier(name):
             if name.caseInsensitiveCompare("self") == .orderedSame, let object = context.currentSelf {
@@ -666,6 +668,146 @@ struct Evaluator {
             }
         default:
             return nil
+        }
+    }
+
+    /// Ch. "Query Expressions" — see `LassoExpression.queryExpression`'s
+    /// own doc comment for this stage's scope (single with-clause,
+    /// `select`/`do` actions only).
+    ///
+    /// The with-source is materialized via the SAME `forEachElements(of:)`
+    /// used by `->forEach`/`->insertFrom` — real Lasso ties query-
+    /// expression sourcing to `trait_queriable` in the abstract, which for
+    /// every collection type this interpreter implements already cashes
+    /// out to exactly that same element sequence (Ch. "Query Expressions",
+    /// "Making an Object Queriable": "any object whose type supports the
+    /// `trait_queriable` trait, such as an array or a list"). A CUSTOM
+    /// user-defined type implementing its own `forEach` member (the
+    /// docs' own worked `user_list` example) is a disclosed, real gap —
+    /// `forEachElements` returns `nil` for those (by design, so
+    /// `->forEach`'s OWN dispatch can fall through to the user's method
+    /// instead), and materializing a with-source from one here would need
+    /// synthesizing a Swift-native capture to collect its elements, a
+    /// genuinely new mechanism with zero corpus evidence either way —
+    /// out of scope for this stage.
+    ///
+    /// Real Lasso evaluates query expressions LAZILY ("creating the query
+    /// expression does not execute it... only when something else
+    /// attempts to draw elements from it") except `do`, which is always
+    /// immediate. This implementation is EAGER for `select` too — the
+    /// with-source is fully materialized and every operation/action runs
+    /// to completion as soon as the query-expression EXPRESSION itself is
+    /// evaluated, producing a plain `.array`/`.void` result rather than a
+    /// reusable, re-drawable deferred object. A disclosed, deliberate
+    /// simplification: laziness only differs OBSERVABLY from eager
+    /// evaluation when the source/captured state mutates between
+    /// creation and consumption, or when short-circuiting (`take`, a
+    /// later stage) should skip upstream work entirely — neither shows
+    /// up in any of the real docs' own worked examples, all of which show
+    /// only a query expression's PRODUCED VALUE, and building a genuine
+    /// deferred-execution runtime would be a materially larger, separate
+    /// undertaking disproportionate to this project's zero corpus
+    /// evidence for Query Expressions at all (built anyway for real
+    /// Lasso 9 completeness, not corpus need — see this project's own
+    /// corpus-evidence-not-sole-bar convention).
+    private mutating func evaluateQueryExpression(
+        variable: String,
+        source: LassoExpression,
+        action: QueryAction
+    ) async throws -> LassoValue {
+        let sourceValue = try await evaluate(source)
+        guard let elements = Self.forEachElements(of: sourceValue) else {
+            throw LassoRuntimeError.unsupportedExpression("with \(variable) in <non-queriable source>")
+        }
+        // "New variables introduced by a query expression clause will
+        // not be available outside of the query expression that
+        // introduces them" — same save/restore discipline `invokeCapture`
+        // uses for its own `#1`/`#2` bindings.
+        let savedLocals = context.snapshotLocals()
+        defer { context.replaceLocals(savedLocals) }
+        // Real bug found by code-reviewer review: `context.set(_:for:
+        // scope:)` MUTATES an existing box in place when one already
+        // exists for `variable` (Stage 3's own live-reference contract,
+        // `Runtime.swift`'s own doc comment on `set`) — if the enclosing
+        // scope already had a LOCAL of the same name (`local(n) = 999`
+        // before `with n in ... select ...`), every `context.set` call
+        // below would mutate THAT SAME shared box, and the `defer`
+        // above only restores the DICTIONARY MAPPING, not the box's own
+        // value — so the outer `#n` would be left holding the LAST
+        // iteration's value instead of its original 999, violating the
+        // very scoping guarantee this comment describes. Confirmed via a
+        // live reproduction before this fix. Explicitly inserting a
+        // FRESH box into a copy of `savedLocals` (mirroring how
+        // `invokeCapture`/`invokeCustomTag`'s own `bindParameters` +
+        // `replaceLocals` always bind fresh boxes for a call's own
+        // parameters, never reusing whatever box a same-named outer
+        // local happened to already have) guarantees this query
+        // expression's own with-variable is a genuinely NEW box, so the
+        // `defer`'s restore is a real, complete undo — while every OTHER
+        // outer local stays visible to the `select`/`do` payload, since
+        // `scopedLocals` starts as a COPY of the full `savedLocals` map,
+        // not a wholesale replacement.
+        var scopedLocals = savedLocals
+        scopedLocals[variable.lowercased()] = LassoLocalBox(.void)
+        context.replaceLocals(scopedLocals)
+        switch action {
+        case let .select(transform):
+            var results: [LassoValue] = []
+            results.reserveCapacity(elements.count)
+            for element in elements {
+                context.set(element, for: variable, scope: .local)
+                results.append(try await evaluate(transform))
+                if context.shouldStopRenderingCurrentBody() { break }
+            }
+            return .array(results)
+        case let .perform(payload):
+            // "It is important to note that when using `do` the query is
+            // immediately evaluated and that the query expression
+            // produces no result value... The block of code given to a
+            // `do` remains attached to the surrounding method context,
+            // such that one could return or yield" — a capture literal
+            // payload is evaluated ONCE (so its home/capturedLocals
+            // reflect the ambient surrounding context, matching every
+            // other capture literal's own semantics) and then invoked
+            // once per element, mirroring `invokeForEachCapture`'s own
+            // established pattern; a bare-expression payload has no
+            // capture semantics at all and is simply re-evaluated fresh
+            // each iteration, reading the with-variable directly.
+            if case let .captureLiteral(body, autoCollect) = payload {
+                let capture = LassoCaptureValue(
+                    body: body,
+                    autoCollect: autoCollect,
+                    capturedLocals: context.snapshotLocals(),
+                    homeDepth: context.currentCaptureHomeDepth ?? context.tagCallStack.count
+                )
+                for element in elements {
+                    context.set(element, for: variable, scope: .local)
+                    _ = try await invokeCapture(capture, arguments: [])
+                    if context.shouldStopRenderingCurrentBody() { break }
+                }
+            } else {
+                // A bare-expression `do` payload occupies the SAME
+                // "statement root" position a real top-level statement
+                // would — the docs' own example is a bare self-mutating
+                // method call (`with n in #ary do #n->upperCase`). Found
+                // live: calling plain `evaluate(_:)` here silently
+                // computed `$collected->insert(...)`'s result and threw
+                // it away instead of writing it back, since `.array` is
+                // a Swift value type and self-mutating write-back
+                // (`->insert`/`->replace`/etc.) only happens via
+                // `evaluateStatement`'s own dedicated check — the exact
+                // same mechanism a real top-level `[...]`/script-mode
+                // statement already goes through via
+                // `Renderer.renderExpression`, which this do-loop must
+                // replicate since it's evaluating each iteration OUTSIDE
+                // that normal per-statement render path.
+                for element in elements {
+                    context.set(element, for: variable, scope: .local)
+                    _ = try await evaluateStatement(payload)
+                    if context.shouldStopRenderingCurrentBody() { break }
+                }
+            }
+            return .void
         }
     }
 

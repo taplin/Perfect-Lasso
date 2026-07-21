@@ -502,14 +502,31 @@ struct ScriptBodyParser {
         skipHorizontalWhitespace()
 
         guard readKeyword("do") else {
-            diagnostics.append(Diagnostic(message: "Malformed 'with \(variableName) in ...': expected 'do'", range: range))
+            // NOT a diagnostic-worthy failure: this exact shape (`with
+            // NAME in SOURCE` followed by anything other than `do`) is
+            // now ALSO the valid start of the expression-level Query
+            // Expression's own `select` action (Stage 8.1) — e.g. `with
+            // n in array(1,2,3) select #n * n`. Recording a "Malformed
+            // with... expected 'do'" diagnostic here for perfectly
+            // legitimate syntax would be actively misleading if a
+            // developer debugging some UNRELATED real error in the same
+            // request also sees this line in `document.diagnostics`.
+            // Genuinely malformed input still gets real feedback: either
+            // the fallback expression-level parse below also fails to
+            // recognize it (falling back to a bare `with` identifier,
+            // which then surfaces its own downstream error normally), or
+            // it succeeds as a real query expression.
             index = start
             return false
         }
         skipTrivia()
 
         guard index < characters.count, characters[index] == "{" else {
-            diagnostics.append(Diagnostic(message: "Malformed 'with \(variableName) in ... do': expected '{'", range: range))
+            // Same reasoning as the `do`-keyword check above: `do EXPR`
+            // (no braces) is now ALSO the valid bare-expression form of
+            // the Query Expression `do` action (Stage 8.1) — e.g. `with
+            // n in #ary do #n->upperCase`, the real docs' own worked
+            // example. Not diagnostic-worthy for the same reason.
             index = start
             return false
         }
