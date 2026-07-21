@@ -1,6 +1,96 @@
 {
-  "originHash" : "70353b3faa547fa5648d37ffb51c3c89b86517849b2fc68758e3fffa3eb2adc1",
+  "originHash" : "aa20df1b07ca4c75af0782df85326e80778fe4af50c240719a4bce323d0fe6fa",
   "pins" : [
+    {
+      "identity" : "perfect-crud",
+      "kind" : "localSourceControl",
+      "location" : "https://github.com/taplin/Perfect-CRUD.git",
+      "state" : {
+        "branch" : "main",
+        "revision" : "5174a753a671fa56adb113c7015169d55e7f5d4b"
+      }
+    },
+    {
+      "identity" : "perfect-filemaker",
+      "kind" : "localSourceControl",
+      "location" : "https://github.com/taplin/Perfect-FileMaker.git",
+      "state" : {
+        "branch" : "main",
+        "revision" : "a120b2b83b415299b39371b8b699122a0b93f0d5"
+      }
+    },
+    {
+      "identity" : "perfect-filemaker-adminapi",
+      "kind" : "localSourceControl",
+      "location" : "https://github.com/taplin/Perfect-FileMaker-AdminAPI.git",
+      "state" : {
+        "branch" : "main",
+        "revision" : "bf72bd37d3632694b45aaa9f4a002787028b11a1"
+      }
+    },
+    {
+      "identity" : "perfect-mysql",
+      "kind" : "localSourceControl",
+      "location" : "https://github.com/taplin/Perfect-MySQL.git",
+      "state" : {
+        "branch" : "main",
+        "revision" : "17cd91b8099390c22c3b09ba0d36ec713c731f61"
+      }
+    },
+    {
+      "identity" : "perfect-nio",
+      "kind" : "localSourceControl",
+      "location" : "https://github.com/taplin/Perfect-NIO.git",
+      "state" : {
+        "branch" : "main",
+        "revision" : "a78cc44352ca3fc26d168cb94ad06dc9e8d0fc98"
+      }
+    },
+    {
+      "identity" : "perfect-postgresql",
+      "kind" : "remoteSourceControl",
+      "location" : "https://github.com/taplin/Perfect-PostgreSQL.git",
+      "state" : {
+        "branch" : "main",
+        "revision" : "b86c20f93680cf9b7b3e156c5b596349d7e8f81f"
+      }
+    },
+    {
+      "identity" : "perfect-redis",
+      "kind" : "remoteSourceControl",
+      "location" : "https://github.com/taplin/Perfect-Redis.git",
+      "state" : {
+        "branch" : "main",
+        "revision" : "edf051a8b79ae1f1599a001db228f1fcba09ade2"
+      }
+    },
+    {
+      "identity" : "perfect-session",
+      "kind" : "localSourceControl",
+      "location" : "https://github.com/taplin/Perfect-Session.git",
+      "state" : {
+        "branch" : "main",
+        "revision" : "6b0b6cfb39fb6a7e6119e7104f7735d4eee7ae69"
+      }
+    },
+    {
+      "identity" : "perfect-sqlite",
+      "kind" : "remoteSourceControl",
+      "location" : "https://github.com/taplin/Perfect-SQLite.git",
+      "state" : {
+        "branch" : "main",
+        "revision" : "3f8a22b89ee5b76b892bf14e6d79c7198712b6b7"
+      }
+    },
+    {
+      "identity" : "perfect-xml",
+      "kind" : "remoteSourceControl",
+      "location" : "https://github.com/taplin/Perfect-XML.git",
+      "state" : {
+        "branch" : "main",
+        "revision" : "87f06dd0ee3a9261a0c5ccbc10fc09fdd3ffcf32"
+      }
+    },
     {
       "identity" : "redistack",
       "kind" : "remoteSourceControl",
