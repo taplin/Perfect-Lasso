@@ -184,6 +184,7 @@ private struct RendererEngine {
                     evaluator.context.set(.integer(iteration), for: "loop_count", scope: .local)
                     output += try await render(body)
                     if evaluator.context.consumeLoopControlSignal() { break }
+                    if evaluator.context.shouldStopRenderingCurrentBody() { break }
                 }
             }
             return output
@@ -203,6 +204,7 @@ private struct RendererEngine {
                 output += try await render(body)
                 iterations += 1
                 if evaluator.context.consumeLoopControlSignal() { break }
+                if evaluator.context.shouldStopRenderingCurrentBody() { break }
             }
             return output
         case "protect":
@@ -289,6 +291,7 @@ private struct RendererEngine {
                 evaluator.context.set(.integer(index + 1), for: "row_count", scope: .local)
                 output += try await render(body)
                 if evaluator.context.consumeLoopControlSignal() { break }
+                if evaluator.context.shouldStopRenderingCurrentBody() { break }
             }
             evaluator.context.setCurrentRow(nil)
             return output
@@ -338,6 +341,7 @@ private struct RendererEngine {
                 evaluator.context.set(mapKeys?[index] ?? .integer(index + 1), for: "loop_key", scope: .local)
                 output += try await render(body)
                 if evaluator.context.consumeLoopControlSignal() { break }
+                if evaluator.context.shouldStopRenderingCurrentBody() { break }
             }
             return output
         case "with":
@@ -362,6 +366,7 @@ private struct RendererEngine {
                 evaluator.context.set(value, for: variableName, scope: .local)
                 withOutput += try await render(body)
                 if evaluator.context.consumeLoopControlSignal() { break }
+                if evaluator.context.shouldStopRenderingCurrentBody() { break }
             }
             return withOutput
         case "output_none":

@@ -7389,6 +7389,44 @@ struct IncludeURLTests {
     #expect(output.contains("count=1"))
 }
 
+@Test func returnInsideALoopBlockStopsIterationImmediatelyInsteadOfRunningToCompletion() async throws {
+    // Real pre-existing bug, unrelated to Captures: the "loop" case in
+    // `RendererEngine.renderBlock` only checked `consumeLoopControlSignal()`
+    // (the `Loop_Abort`/`Loop_Continue` mechanism) after each iteration's
+    // `render(body)` call, never `shouldStopRenderingCurrentBody()` (which
+    // is what actually goes true for a `return`/`yield`). `render(_:)`'s own
+    // per-node check only polls the flag AFTER a node runs, not before — so
+    // with no equivalent check in the "loop" case's own Swift `for` loop,
+    // iterations 4 and 5 still ran, and their `insert` call (the very FIRST
+    // node of each iteration's body, so nothing skips it) executed anyway.
+    // Must be a single line with no text/whitespace node between `[loop(5)]`
+    // and the `insert` call — an incidental leading text node would itself
+    // absorb the stale-signal check and mask the bug, making this
+    // non-decisive (caught by reverting the fix and confirming failure).
+    var context = LassoContext()
+    _ = try await LassoRenderer().render(
+        "[var(collected=array)][loop(5)][$collected->insert(loop_count)][if(loop_count==3)][return('done')][/if][/loop]",
+        context: &context
+    )
+    #expect(context.value(for: "collected", scope: .global) == .array([.integer(1), .integer(2), .integer(3)]))
+}
+
+@Test func returnInsideAnIterateBlockStopsIterationImmediatelyInsteadOfRunningToCompletion() async throws {
+    // Same bug shape as the `loop` case above, in `renderBlock`'s
+    // "iterate" case: `consumeLoopControlSignal()` alone can't see a
+    // `return`/`yield`'s `returnSignal`, so without also checking
+    // `shouldStopRenderingCurrentBody()`, `iterate` kept walking the rest
+    // of the source array after the matching element instead of stopping.
+    // Same single-line requirement as the `loop` test above, for the same
+    // reason.
+    var context = LassoContext()
+    _ = try await LassoRenderer().render(
+        "[var(collected=array)][iterate(array(10,20,30,40,50), var(x))][$collected->insert($x)][if($x==30)][return('done')][/if][/iterate]",
+        context: &context
+    )
+    #expect(context.value(for: "collected", scope: .global) == .array([.integer(10), .integer(20), .integer(30)]))
+}
+
 @Test func loopAbortWithNoEnclosingLoopIsATrueNoOpNotAPageTruncation() async throws {
     // Real bug caught by architect + code review of this stage's own
     // diff: `RendererEngine.render(_:)`'s two shared early-exit checks
