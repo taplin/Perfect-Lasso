@@ -165,6 +165,12 @@ public indirect enum LassoExpression: Equatable, Sendable {
     case binary(left: LassoExpression, operator: String, right: LassoExpression)
     case assignment(target: LassoExpression, value: LassoExpression)
     case ternary(condition: LassoExpression, whenTrue: LassoExpression, whenFalse: LassoExpression)
+    /// A Lasso 9 Capture literal (`{ ... }`/auto-collect `{^ ... ^}`) —
+    /// see `Captures.swift`'s own doc comment. `body` is already fully
+    /// parsed (via the same ScriptBodyParser + BlockBuilder pipeline
+    /// every other nested block body in this parser uses) at the point
+    /// this expression node is constructed.
+    case captureLiteral(body: [LassoNode], autoCollect: Bool)
     case unknown(String)
 }
 

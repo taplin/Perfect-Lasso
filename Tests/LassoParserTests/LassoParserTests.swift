@@ -10555,3 +10555,236 @@ struct IncludeURLTests {
     }
 }
 
+// MARK: - Captures Stage 1 (capture literal + non-closure invoke)
+
+@Test func captureLiteralCanBeStoredAndInvokedViaTheInvokeMemberMethod() async throws {
+    // Ch. "Captures": "Captures are executed by calling their `invoke`
+    // method."
+    var context = LassoContext()
+    let output = try await LassoRenderer().render(
+        """
+        [local('cap' = { return 'hello' })]\
+        [#cap->invoke]
+        """,
+        context: &context
+    )
+    #expect(output == "hello")
+}
+
+@Test func captureLiteralCanBeInvokedViaTheShorthandCallSyntax() async throws {
+    // Ch. "Captures": "`#cap() // Shorthand invocation`"
+    var context = LassoContext()
+    let output = try await LassoRenderer().render(
+        """
+        [local('cap' = { return 'hello' })]\
+        [#cap()]
+        """,
+        context: &context
+    )
+    #expect(output == "hello")
+}
+
+@Test func captureBodyThatFallsOffTheEndWithoutAReturnProducesVoid() async throws {
+    // Regression test for a real gap found by code review: an earlier
+    // version of this test used a body (`local('unused' = 1)`) that
+    // produces no incidental rendered output either way, so it would
+    // have passed even with a plausible bug that made non-auto-collect
+    // captures also return their rendered body output as a string
+    // (`invokeCapture`'s own `capture.autoCollect ? .string(output) :
+    // .void` ternary, simplified to always take the `.string` branch).
+    // A literal string with no `return` produces real, visible
+    // incidental output that MUST be discarded (not returned) for a
+    // plain, non-auto-collect capture — decisive.
+    var context = LassoContext()
+    let output = try await LassoRenderer().render(
+        """
+        [local('cap' = { 'leaked' })]\
+        [#cap()]|after
+        """,
+        context: &context
+    )
+    #expect(output == "|after")
+}
+
+@Test func captureLiteralBindsPositionalArgumentsToNumberedLocals() async throws {
+    // Ch. "Captures": "Parameters arrive via positional special locals":
+    // `#1`, `#2`, etc.
+    var context = LassoContext()
+    let output = try await LassoRenderer().render(
+        """
+        [local('cap' = { return #1 + #2 })]\
+        [#cap(2, 3)]
+        """,
+        context: &context
+    )
+    #expect(output == "5")
+}
+
+@Test func autoCollectCaptureLiteralConcatenatesItsOwnRenderedOutputAsItsReturnValue() async throws {
+    // Ch. "Captures": "An auto-collect capture concatenates the result
+    // of calling the `asString` method on every value produced inside
+    // the capture when the capture is executed, and produces that
+    // value."
+    var context = LassoContext()
+    let output = try await LassoRenderer().render(
+        """
+        [local('cap' = {^ 'a' 'b' 'c' ^})]\
+        [#cap()]
+        """,
+        context: &context
+    )
+    #expect(output == "abc")
+}
+
+@Test func nestedCaptureLiteralsAndStringLiteralsContainingBracesParseCorrectly() async throws {
+    // The brace-balanced extraction (`ExpressionLexer.readCaptureBody`)
+    // must correctly skip over a `}` inside a string literal and
+    // correctly balance a capture literal nested inside another one --
+    // both real risks flagged by this stage's own scoping pass. Real
+    // newlines (not `;`) separate the two statements inside `outer`'s
+    // own body -- this parser's statement boundaries are newline-
+    // driven; `;` is skipped as lexer trivia, not treated as a
+    // statement separator (matches every other multi-statement tag/
+    // type-method body test in this file).
+    var context = LassoContext()
+    let output = try await LassoRenderer().render(
+        """
+        [local('cap' = { return 'a}b' })]\
+        [#cap()]|\
+        [local('outer' = { local('inner' = { return 'nested' })
+        return #inner->invoke })]\
+        [#outer()]
+        """,
+        context: &context
+    )
+    #expect(output == "a}b|nested")
+}
+
+@Test func captureLiteralUsesSnapshotSemanticsNotLiveReferenceClosure() async throws {
+    // Stage 1's own explicitly disclosed limitation (see
+    // `Captures.swift`'s doc comment and
+    // `Documentation/captures-subsystem-plan.md` §4.2): a capture's body
+    // runs against a COPY of the locals as they existed at the moment
+    // the literal was evaluated, not a live reference back to its
+    // creation scope. Real Lasso's own documented semantics are live-
+    // reference (a capture invoked elsewhere would see "second", not
+    // "first") -- this test exists to PROVE and DOCUMENT the current
+    // narrower behavior, not to claim it matches the real Language
+    // Guide's own worked example.
+    var context = LassoContext()
+    let output = try await LassoRenderer().render(
+        """
+        [local('x' = 'first')]\
+        [local('cap' = { return #x })]\
+        [local('x' = 'second')]\
+        [#cap()]
+        """,
+        context: &context
+    )
+    #expect(output == "first")
+}
+
+@Test func associationOperatorFoldsACaptureLiteralAsATrailingArgumentOnABareIdentifierCall() async throws {
+    // Real corpus shape (bugcity9/StartUpTags/AuthorizeNet_AIM_9.inc,
+    // TS_lasso9/index.lasso): `someCall => { ... }` -- the general `=>`
+    // path (NOT one of the six already-hardcoded keyword forms
+    // if/while/loop/match/iterate/define), landing on a bare identifier
+    // with no call syntax of its own, which must be promoted to a real
+    // call so the capture has an argument slot to attach to. The tag
+    // reads the associated block back via the real, documented
+    // `givenBlock` keyword (Ch. "Captures") -- NOT a declared parameter
+    // -- matching `foldAssociatedCapture`'s corrected design (labels the
+    // capture "givenblock" and `Evaluator.extractGivenBlock` pulls it
+    // out before ordinary parameter binding ever sees it; see that
+    // function's own doc comment for the real bug this fixes).
+    var context = LassoContext()
+    let output = try await LassoRenderer().render(
+        """
+        [Define_Tag('UseWith')]\
+            [return(givenBlock->invoke('hi'))]\
+        [/Define_Tag]\
+        [UseWith => { return 'got: ' + #1 }]
+        """,
+        context: &context
+    )
+    #expect(output == "got: hi")
+}
+
+@Test func associationOperatorFoldsACaptureLiteralOntoABareMemberAccessWithNoExistingArguments() async throws {
+    // Same mechanism as the free-tag case above, but folding onto
+    // `.member(base, name, arguments: nil)` (a BARE property-style
+    // member access, no parens at all) -- must be promoted to
+    // `arguments: [captureArg]`, matching real corpus's
+    // `#ary->forEachPair => {...}` shape (Stage 4's own eventual
+    // `->forEach` work reuses this identical parse path; this test
+    // exercises the parse+fold+invoke chain end-to-end using a plain
+    // custom-type method instead, since `->forEach` itself isn't
+    // implemented until Stage 4). `define`/`local` declaration
+    // statements need `<?lassoscript ?>` script-mode wrapping to be
+    // recognized at all (matching every other type-definition test in
+    // this file, e.g. `typeDefinitionsConstructObjectsAndDispatchMethods`
+    // just above) -- an ordinary bracket-tag `[...]` expects a single
+    // VALUE expression, not a declaration/block statement.
+    var context = LassoContext()
+    let output = try await LassoRenderer().render(
+        """
+        <?lassoscript
+        define widget => type {
+            public usewith() => {
+                return givenBlock->invoke('hi')
+            }
+        }
+        local('w' = widget())
+        ?>
+        [#w->usewith => { return 'got: ' + #1 }]
+        """,
+        context: &context
+    ).trimmingCharacters(in: .whitespacesAndNewlines)
+    #expect(output == "got: hi")
+}
+
+@Test func associationOperatorAppendsACaptureLiteralWithoutDisturbingExistingArguments() async throws {
+    // Real corpus shape (TS_lasso9's `inline(-host=..., -sql=...)=>{...}`):
+    // `=>` following a call that ALREADY has its own explicit `(...)`
+    // argument list -- the associated block must not disturb the
+    // existing argument's own binding.
+    var context = LassoContext()
+    let output = try await LassoRenderer().render(
+        """
+        [Define_Tag('UseWith', -Required='First')]\
+            [return(#First + ': ' + givenBlock->invoke('hi'))]\
+        [/Define_Tag]\
+        [UseWith('one') => { return 'got: ' + #1 }]
+        """,
+        context: &context
+    )
+    #expect(output == "one: got: hi")
+}
+
+@Test func associationOperatorDoesNotCorruptATrailingOptionalParameterWhenFewerExplicitArgumentsAreGivenThanDeclared() async throws {
+    // Regression test for the real bug architect review found in an
+    // earlier version of `foldAssociatedCapture`: it appended the
+    // capture as an ORDINARY UNLABELED positional argument, so a call
+    // providing fewer explicit arguments than the callee declares
+    // parameters for (relying on the trailing one being unbound/
+    // defaulted, a completely normal shape) would have the capture
+    // silently misbound into that later parameter's slot instead of
+    // being kept separate -- e.g. `Wrap(5) => {...}` on a tag declaring
+    // `-Required='Value', -Optional='Times'` would bind `#Times` to the
+    // CAPTURE VALUE itself, not leave it unbound. Now that the capture
+    // is threaded via `givenBlock` instead of ordinary positional
+    // binding, `#Times` must still come through as its own genuinely
+    // unbound (`.null`, empty string output) self, not the capture.
+    var context = LassoContext()
+    let output = try await LassoRenderer().render(
+        """
+        [Define_Tag('Wrap', -Required='Value', -Optional='Times')]\
+            [return(string(#Value) + '|' + string(#Times))]\
+        [/Define_Tag]\
+        [Wrap(5) => { return 'unused' }]
+        """,
+        context: &context
+    )
+    #expect(output == "5|")
+}
+

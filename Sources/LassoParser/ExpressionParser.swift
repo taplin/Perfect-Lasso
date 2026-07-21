@@ -14,6 +14,15 @@ private enum Token: Equatable {
     /// previously fell through to `.symbol("\\")` with no grammar
     /// production matching it, so this is purely additive.
     case tagReference(String)
+    /// A Lasso 9 Capture literal's raw, unparsed body text — `{ ... }`
+    /// (regular) or `{^ ... ^}` (auto-collect). Extracted by a brace-
+    /// balanced, quote-aware scan directly on the source text (mirroring
+    /// `ScriptBodyParser.readBalanced`, since generic single-character
+    /// tokenizing can't correctly find the matching close without it —
+    /// see `Captures.swift`'s own doc comment). Parsed into `[LassoNode]`
+    /// by `ExpressionParser.parsePrefix()`, not here — the lexer has no
+    /// access to `ScriptBodyParser`/`BlockBuilder`'s node-tree machinery.
+    case captureBody(source: String, autoCollect: Bool)
     case eof
 }
 
@@ -65,6 +74,7 @@ private struct ExpressionLexer {
             return .tagReference(readIdentifier())
         }
         if character.isLetter || character == "_" { return .identifier(readIdentifier()) }
+        if character == "{" { return readCaptureBody() }
 
         // Compound assignment (`+=`/`-=`/`*=`/`/=`) — real corpus: hundreds
         // of `$html += '...'`-shaped accumulator statements across the
@@ -136,6 +146,61 @@ private struct ExpressionLexer {
             index += 1
         }
         return String(characters[start..<index])
+    }
+
+    /// Extracts a Capture literal's raw body text via a brace-balanced,
+    /// quote-aware scan directly on the source characters — mirroring
+    /// `ScriptBodyParser.readBalanced`'s own quote-escape handling, since
+    /// the body can legitimately contain nested `{...}` (a capture
+    /// literal inside another) and string literals with unrelated `{`/`}`
+    /// characters inside them. `{^...^}` (auto-collect) is distinguished
+    /// only by a leading `^` right after `{` and a trailing `^` right
+    /// before the matching `}` — plain brace-depth counting on `{`/`}`
+    /// alone already finds the correct matching close for both forms
+    /// (the `^` characters never affect that balance), so no separate
+    /// delimiter-matching logic is needed beyond stripping those two
+    /// marker characters from the extracted body.
+    mutating private func readCaptureBody() -> Token {
+        index += 1 // consume "{"
+        let autoCollect = index < characters.count && characters[index] == "^"
+        if autoCollect { index += 1 }
+        let bodyStart = index
+        var depth = 1
+        var quote: Character?
+        var closedProperly = false
+        while index < characters.count {
+            let character = characters[index]
+            if let activeQuote = quote {
+                index += 1
+                if character == "\\" {
+                    index = min(index + 1, characters.count)
+                } else if character == activeQuote {
+                    quote = nil
+                }
+                continue
+            }
+            if character == "'" || character == "\"" {
+                quote = character
+                index += 1
+            } else if character == "{" {
+                depth += 1
+                index += 1
+            } else if character == "}" {
+                depth -= 1
+                index += 1
+                if depth == 0 {
+                    closedProperly = true
+                    break
+                }
+            } else {
+                index += 1
+            }
+        }
+        var bodyEnd = closedProperly ? index - 1 : index
+        if autoCollect, bodyEnd > bodyStart, characters[bodyEnd - 1] == "^" {
+            bodyEnd -= 1
+        }
+        return .captureBody(source: String(characters[bodyStart..<max(bodyEnd, bodyStart)]), autoCollect: autoCollect)
     }
 
     mutating private func readNumber() -> Token {
@@ -379,9 +444,40 @@ struct ExpressionParser {
             eligibleForGiveback = false
         case let .named(name): expression = .unknown("-\(name)")
         case let .symbol(value): expression = .unknown(value)
+        case let .captureBody(source, autoCollect):
+            expression = Self.parseCaptureLiteral(source: source, autoCollect: autoCollect)
+            // Already a self-contained, unambiguous unit, same reasoning
+            // as the parenthesized-group case above.
+            eligibleForGiveback = false
         case .eof: return (.unknown(""), nil)
         }
         return parsePostfixTrackingGiveback(expression, eligibleForGiveback: eligibleForGiveback)
+    }
+
+    /// Parses a Capture literal's already-extracted raw body text
+    /// (`ExpressionLexer.readCaptureBody`) into `[LassoNode]`, via the
+    /// SAME two-pass pipeline every other nested block body in this
+    /// parser uses (`define X => {...}`'s own method body,
+    /// `Ex_Square`-style type-body methods, etc.): a fresh
+    /// `ScriptBodyParser` produces a flat open/close-tag stream, then a
+    /// `BlockBuilder` pass re-nests it into real `.block`-shaped nodes.
+    /// Nested diagnostics are discarded — `ExpressionParser` has no
+    /// diagnostics-collection mechanism of its own to append them to
+    /// (unlike `ScriptBodyParser`/`TypeBodyParser`, both of which already
+    /// have one) — a disclosed, Stage 1 limitation: a malformed capture
+    /// body's parse errors won't surface as a diagnostic, only as
+    /// whatever downstream effect the malformed node tree produces at
+    /// evaluation time.
+    private static func parseCaptureLiteral(source: String, autoCollect: Bool) -> LassoExpression {
+        let placeholderRange = SourceRange(
+            start: SourcePosition(offset: 0, line: 0, column: 0),
+            end: SourcePosition(offset: 0, line: 0, column: 0)
+        )
+        var nestedParser = ScriptBodyParser(source: source, range: placeholderRange)
+        let flatBody = nestedParser.parse()
+        var nestedBuilder = BlockBuilder(nodes: flatBody, diagnostics: [], openFormFires: [:])
+        let nestedResult = nestedBuilder.build()
+        return .captureLiteral(body: nestedResult.nodes, autoCollect: autoCollect)
     }
 
     /// Parses `initial`'s own postfix chain (`(...)`/`:...`/`->member`),
@@ -464,9 +560,81 @@ struct ExpressionParser {
                     arguments = consume("(") ? parseArguments(closing: ")") : nil
                 }
                 expression = .member(base: expression, name: name, arguments: arguments)
+            } else if peek == .symbol("=>") {
+                // The association operator — Ch. "Captures": "When using
+                // the association operator (`=>`) to invoke an object by
+                // passing it a capture, the capture is known as the
+                // object's associated block or capture block." Real
+                // Lasso is NOT `forEach`-specific here: `if`/`while`/
+                // `loop`/`match`/`iterate`/`define` are ALSO documented
+                // as "a method invoked with an associated capture
+                // block" — this codebase already hardcodes `=>`
+                // recognition for exactly those six keywords at the
+                // ScriptBodyParser/TypeBodyParser character level (see
+                // `consumeArrowBlockStartIfPresent`), entirely separate
+                // from and unaffected by this general path. This is the
+                // GENERAL case: any other call/member/identifier
+                // expression followed by `=> {...}`/`=> {^...^}` — real
+                // corpus: `bugcity9/StartUpTags/AuthorizeNet_AIM_9.inc`'s
+                // `#AIMParams->forEachPair => { ... }`,
+                // `TS_lasso9/index.lasso`'s
+                // `inline(-host=..., -sql=...)=>{ records=>{...} }`.
+                // Only reached AFTER the postfix loop above has already
+                // consumed every `(`/`:`/`->` step, so this can never
+                // collide with those six keywords' own, earlier,
+                // character-level recognition.
+                index += 1 // consume "=>"
+                let capture = parsePrefix()
+                expression = Self.foldAssociatedCapture(expression, capture)
+                // Same reasoning as the `consume("(")`/`consume(":")`
+                // branches above: this transformation makes `expression`
+                // a new, self-contained value, so any earlier giveback
+                // point is now stale relative to it.
+                giveback = nil
+                return (expression, giveback)
             } else {
                 return (expression, giveback)
             }
+        }
+    }
+
+    /// Folds a Capture literal supplied via `=>` into its associated
+    /// call as a new trailing, unlabeled argument — real Lasso's own
+    /// `givenBlock` keyword (how a method reads back the capture it was
+    /// associated with) has no natural slot in this codebase's existing
+    /// native-function/custom-tag call signatures, so Stage 1
+    /// represents "this call has an associated capture block" the same
+    /// way this codebase already represents every other "pass a callable
+    /// reference as a value" case (`Match_Comparator(\TagName, ...)`,
+    /// etc.) — as an ordinary argument a later stage's native
+    /// implementations (`Array->forEach` etc.) can look for. A bare
+    /// `.identifier` callee with no call syntax of its own (`myTag =>
+    /// {...}`) is promoted to a real `.call` so the capture has
+    /// somewhere to attach.
+    private static func foldAssociatedCapture(_ callee: LassoExpression, _ capture: LassoExpression) -> LassoExpression {
+        // Labeled "givenblock" (Ch. "Captures": "A method that receives
+        // an associated block accesses it via the `givenBlock` keyword,
+        // not a normal parameter"), NOT an ordinary unlabeled positional
+        // argument — `Evaluator.extractGivenBlock`'s own doc comment has
+        // the full reasoning (a real bug an earlier version of this fold
+        // had: an unlabeled trailing argument can silently misbind into
+        // an unrelated declared parameter, or be silently dropped
+        // entirely, whenever the call site's own explicit argument count
+        // doesn't exactly match the callee's declared parameter count).
+        let captureArgument = LassoArgument(label: "givenblock", value: capture)
+        switch callee {
+        case let .call(innerCallee, arguments):
+            return .call(callee: innerCallee, arguments: arguments + [captureArgument])
+        case let .member(base, name, arguments):
+            return .member(base: base, name: name, arguments: (arguments ?? []) + [captureArgument])
+        case let .identifier(name):
+            return .call(callee: .identifier(name), arguments: [captureArgument])
+        default:
+            // No real corpus shape found for `=>` attaching to anything
+            // else (a plain value, a binary expression, etc.) — folds as
+            // a single-argument call on the callee itself rather than
+            // silently dropping the capture.
+            return .call(callee: callee, arguments: [captureArgument])
         }
     }
 

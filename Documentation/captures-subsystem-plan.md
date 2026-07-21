@@ -464,17 +464,49 @@ all show **zero** corpus hits, not just lower priority.
 
 ## 5. Staged Implementation Plan (if pursued — see §7 for whether/when)
 
-**Stage 1 — `.capture` value + literal parsing + non-closure invoke.** New
-`LassoValue.capture(LassoCaptureValue)` (reference-typed class wrapping
-`body: [LassoNode]`, PC/yield-position slot, detached flag, home pointer).
-Parser: recognize bare `{...}`/`{^...^}` as a primary expression, and `=>` as
-a genuine trailing modifier on any call-shaped expression (not just the
-fixed keyword set) supplying a capture as `givenBlock`. `capture->invoke`/
-`#cap()`, positional `#1`/`#2`/... binding. Snapshot semantics only,
-disclosed. Unblocks nothing in the corpus by itself; structural prerequisite
-for every later stage. Risk: new expression-grammar surface touching
-`ExpressionParser.swift`'s core precedence table alongside the six existing
-hardcoded `=>` consumers.
+**Stage 1 — `.capture` value + literal parsing + non-closure invoke** ✅ done
+(2026-07-21) — `LassoValue.capture(LassoCaptureValue)` (an immutable class:
+`body: [LassoNode]`, `autoCollect: Bool`, `capturedLocals` snapshot — no PC/
+yield-position slot yet, that's Stage 2). Parser: `{...}`/`{^...^}` recognized
+as a primary expression via a brace-balanced, quote-aware raw-text scan
+(`ExpressionLexer.readCaptureBody`) feeding the same `ScriptBodyParser`+
+`BlockBuilder` two-pass every other nested block body already uses; `=>`
+recognized as a genuine trailing modifier on any call-shaped expression (not
+just the six already-hardcoded keywords). `capture->invoke`/`#cap()`
+shorthand, positional `#1`/`#2`/... binding, snapshot semantics only
+(disclosed). 670/670 tests passing.
+
+**Design correction found by architect re-review, before merge**: the
+original sketch above ("supplying a capture as `givenBlock`") was under-
+specified in the FIRST implementation — the capture was folded as an
+ordinary UNLABELED trailing positional argument, not through any real
+`givenBlock` channel. This shipped a genuine bug: whenever a call provided
+FEWER explicit arguments than the callee declared parameters (a completely
+normal shape relying on trailing optional/default parameters), the appended
+capture would silently land in and overwrite that later parameter's slot
+instead of being kept separate — and when the explicit argument count
+already matched exactly, the capture was silently dropped with no signal at
+all. Fixed properly, not just guarded: the capture argument is labeled
+`"givenblock"` at fold time (`ExpressionParser.foldAssociatedCapture`), and
+a new `Evaluator.extractGivenBlock` helper pulls it out of the evaluated
+argument list — before it ever reaches `bindParameters`/
+`LassoMethodDispatcher.resolve` — threading it instead through a genuine new
+per-call context slot (`LassoContext.givenBlockStack`, mirroring
+`selfStack`'s own push/pop-per-invocation discipline) that the invoked body
+reads back via a real, bare (no `#`/`$` sigil) `givenBlock` identifier,
+matching the real Language Guide's own documented contract exactly ("A
+method that receives an associated block accesses it via the `givenBlock`
+keyword, not a normal parameter"). Verified decisive by reverting the label
+change in an isolated copy and confirming the regression test (`association
+OperatorDoesNotCorruptATrailingOptionalParameterWhenFewerExplicitArgumentsA
+reGivenThanDeclared`) fails exactly as predicted (`"5|capture"` instead of
+`"5|"`).
+
+Unblocks nothing in the corpus by itself; structural prerequisite for every
+later stage — Stage 4's `->forEach` work will read its own associated block
+via this same `givenBlock` mechanism, matching the real docs' own
+`trait_queriable` worked example (`local(gb) = givenBlock`) exactly rather
+than needing its own separate design.
 
 **Stage 2 — `yield`/`return`/`detach`/`restart`/PC semantics.** New
 control-flow state distinct from the existing one-shot
@@ -510,6 +542,29 @@ nested-control-flow correctness, Stage 2.
 
 - **Everything in §5 as a whole** — see §7; not merely sequenced carefully,
   not recommended to start at all given current corpus evidence.
+- **Repeated-invocation accumulation across calls** — architect re-review of
+  Stage 1 flagged, concretely, that real Lasso's live-reference semantics
+  mean a stored capture invoked repeatedly (e.g. inside a `forEach`-style
+  loop) naturally accumulates state, since there's only ever one real copy of
+  the variable being mutated — exactly the shape of the real corpus example
+  motivating Stage 4 (`#AIMParams->forEachPair => { #AIMParamArray
+  ->insert(...) }`, accumulating into `#AIMParamArray` across iterations).
+  Stage 1's `capturedLocals` snapshot is an immutable `let` set once at
+  construction, so each invocation starts fresh from the same unchanged
+  snapshot — this specific real corpus idiom will NOT work correctly even
+  once Stage 4's `->forEach` exists, until a later stage makes closure
+  semantics genuinely live-reference (§4.2/Stage 3), not just this one
+  particular narrow case. Not a new gap — the same already-disclosed §4.2
+  limitation — but worth this concrete illustration for whoever picks up
+  Stage 4, so the exact real corpus line that motivated it doesn't get
+  assumed-working without checking.
+- **`capture->autoCollectBuffer()`** (Ch. "Captures" §1.7) — documented but
+  not implemented; Stage 1's `invokeCapture` approximates auto-collect
+  semantics by returning the body's own rendered output directly as the
+  invocation's return value, without a separately-retrievable buffer
+  property. Low priority — no corpus evidence for the explicit-retrieval
+  form specifically, only for auto-collect capture invocation itself
+  (already covered).
 - **`invoke` type-level callback and `onCompare` auto-dispatch** — real,
   documented, but a distinct implicit-callback architecture, not Captures
   itself. `onCompare` already tracked as the Collections plan's own

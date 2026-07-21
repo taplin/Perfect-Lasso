@@ -26,6 +26,9 @@ public indirect enum LassoValue: Equatable, Sendable {
     /// `$skuArrayItem->insert(field('scrubs_sku') = $temp_array)`, read
     /// back via `->second` (includes/detail_by_color.lasso).
     case pair(LassoValue, LassoValue)
+    /// A Lasso 9 Capture — see `Captures.swift`'s own doc comment for the
+    /// full design (Stage 1: snapshot closure semantics only).
+    case capture(LassoCaptureValue)
 
     public var isTruthy: Bool {
         switch self {
@@ -38,6 +41,7 @@ public indirect enum LassoValue: Equatable, Sendable {
         case let .map(value): !value.isEmpty
         case .object: true
         case .pair: true
+        case .capture: true
         }
     }
 
@@ -107,6 +111,14 @@ public indirect enum LassoValue: Equatable, Sendable {
             // reading Ch. 30's Pair section for Stage 4's `->First=`/
             // `->Second=` work.
             "(\(key.outputString))=(\(value.outputString))"
+        case .capture:
+            // No documented bare-output contract found for a capture
+            // value (unlike `bytes`/List/Set/etc.'s own worked examples)
+            // — falls back to its type name, matching this codebase's
+            // existing convention for every other native type with no
+            // such contract (date/web_request/web_response, see the
+            // `.object` case's own doc comment just above).
+            "capture"
         }
     }
 
@@ -131,6 +143,7 @@ public indirect enum LassoValue: Equatable, Sendable {
         case .map: "map"
         case let .object(value): value.typeName
         case .pair: "pair"
+        case .capture: "capture"
         }
     }
 }
@@ -1642,6 +1655,17 @@ extension LassoValue {
             value.snapshotData().mapValues(\.jsonObject)
         case let .pair(key, value):
             ["first": key.jsonObject, "second": value.jsonObject]
+        case .capture:
+            // A capture (stored code + a locals snapshot) has no
+            // meaningful JSON representation — this conversion exists for
+            // session-variable persistence (see this property's own doc
+            // comment), and storing a capture in a session isn't a real,
+            // documented use case. Falls back to `NSNull()`, matching the
+            // `.void`/`.null` case just above, rather than throwing —
+            // this property has no `throws` in its signature and every
+            // other case already degrades gracefully rather than
+            // crashing.
+            NSNull()
         }
     }
 
@@ -1834,6 +1858,7 @@ public struct LassoContext: Sendable {
     var loopDepth: Int
     var tagCallStack: [String]
     var selfStack: [LassoObjectInstance]
+    var givenBlockStack: [LassoValue] = []
     /// Real Lasso's request-local `error_currentError` state — reset to
     /// `.noError` on every fresh context, updated by `setError`/`clearError`.
     /// `lastError` preserves the previous error across a `clearError()` call,
@@ -2131,6 +2156,26 @@ public struct LassoContext: Sendable {
 
     mutating func popSelf() {
         _ = selfStack.popLast()
+    }
+
+    /// The capture (if any) associated with the CURRENT call via `=>`
+    /// (Ch. "Captures": "A method that receives an associated block
+    /// accesses it via the `givenBlock` keyword"). Stack-based like
+    /// `selfStack` just above — every call pushes its OWN given block
+    /// (`.void` if it wasn't invoked with one), so a nested call never
+    /// sees its caller's given block by accident, and popping restores
+    /// the caller's own on return. See `Evaluator.invokeCustomTag`/
+    /// `invokeMemberMethod` for where this is pushed/popped.
+    var currentGivenBlock: LassoValue {
+        givenBlockStack.last ?? .void
+    }
+
+    mutating func pushGivenBlock(_ value: LassoValue) {
+        givenBlockStack.append(value)
+    }
+
+    mutating func popGivenBlock() {
+        _ = givenBlockStack.popLast()
     }
 
     // Each level of Lasso-level tag recursion costs several real Swift

@@ -669,6 +669,19 @@ struct ScriptBodyParser {
     private mutating func readStatement() -> String {
         let start = index
         var parenDepth = 0
+        // A Capture literal (`{...}`/`{^...^}`) embedded in an ordinary
+        // statement — e.g. `local(cap) = { ... }` or
+        // `#ary->forEachPair => { ... }` (real corpus:
+        // bugcity9/StartUpTags/AuthorizeNet_AIM_9.inc's
+        // `#AIMParams->forEachPair => { #AIMParamArray->insert(...) }`).
+        // Without tracking this, the FIRST `}` inside the capture's own
+        // body would be mistaken for THIS statement's terminator,
+        // truncating everything after it — this statement's raw text
+        // must include the capture's entire body, unparsed, so
+        // `ExpressionParser`'s own brace-balanced `readCaptureBody` can
+        // later re-extract and parse it correctly (see that function's
+        // own doc comment).
+        var braceDepth = 0
         var quote: Character?
 
         while index < characters.count {
@@ -689,9 +702,15 @@ struct ScriptBodyParser {
                 parenDepth += 1
             } else if character == ")" {
                 parenDepth = max(parenDepth - 1, 0)
+            } else if character == "{" {
+                braceDepth += 1
             } else if character == "}" {
-                if parenDepth == 0 { break }
-            } else if character == "\n", parenDepth == 0 {
+                if braceDepth > 0 {
+                    braceDepth -= 1
+                } else if parenDepth == 0 {
+                    break
+                }
+            } else if character == "\n", parenDepth == 0, braceDepth == 0 {
                 // A bare (unparenthesized) newline normally ends a
                 // statement here — most script-mode code relies on that as
                 // an implicit terminator, since trailing `;` is often

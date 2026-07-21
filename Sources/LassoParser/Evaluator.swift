@@ -15,10 +15,30 @@ struct Evaluator {
         case let .boolean(value): return .boolean(value)
         case .null: return .null
         case .void: return .void
+        case let .captureLiteral(body, autoCollect):
+            // Stage 1 (snapshot closure semantics only — see
+            // `Captures.swift`'s own doc comment): the capture's body
+            // executes later against a COPY of the locals as they exist
+            // right now, not a live reference back to this scope.
+            return .capture(LassoCaptureValue(
+                body: body,
+                autoCollect: autoCollect,
+                capturedLocals: context.snapshotLocals()
+            ))
         case let .variable(name, scope): return context.value(for: name, scope: scope)
         case let .identifier(name):
             if name.caseInsensitiveCompare("self") == .orderedSame, let object = context.currentSelf {
                 return .object(object)
+            }
+            // Ch. "Captures": "A method that receives an associated
+            // block accesses it via the `givenBlock` keyword" — a bare
+            // identifier, not `#givenBlock`/`$givenBlock`, matching the
+            // real docs' own worked example (`local(gb) = givenBlock`).
+            // `.void` (not an error) when the current call has no
+            // associated block, matching this codebase's established
+            // "no lookup-miss throws by default" convention elsewhere.
+            if name.caseInsensitiveCompare("givenblock") == .orderedSame {
+                return context.currentGivenBlock
             }
             // Checked before native functions: a couple of names (e.g.
             // "session") are registered as both a zero-arg-callable native
@@ -130,6 +150,16 @@ struct Evaluator {
                 return try await member(try await evaluate(base), name, arguments)
             }
             guard case let .identifier(name) = callee else {
+                // `#cap(...)` — Ch. "Captures": "`#cap() // Shorthand
+                // invocation`" — a capture value stored in a variable
+                // (or produced by any other non-identifier expression)
+                // called directly with `()`. Falls back to the existing
+                // "Dynamic call" error for every other callee shape,
+                // unchanged.
+                let calleeValue = try await evaluate(callee)
+                if case let .capture(capture) = calleeValue {
+                    return try await invokeCapture(capture, arguments: try await evaluate(arguments))
+                }
                 throw LassoRuntimeError.unsupportedExpression("Dynamic call")
             }
             if let scope = Self.declarationScope(for: name) {
@@ -284,13 +314,14 @@ struct Evaluator {
         _ definition: LassoCustomTagDefinition,
         callArguments: [LassoArgument]
     ) async throws -> LassoValue {
-        let evaluatedCallArguments = try await evaluate(callArguments)
+        let (givenBlock, evaluatedCallArguments) = Self.extractGivenBlock(from: try await evaluate(callArguments))
         let boundLocals = try await bindParameters(definition.parameters, to: evaluatedCallArguments)
 
         let savedLocals = context.snapshotLocals()
         let savedLoopDepth = context.loopDepth
         try context.pushTagCall(definition.name)
         context.replaceLocals(boundLocals)
+        context.pushGivenBlock(givenBlock)
         // A tag call starts a fresh scope with no loop of its own yet —
         // without this, a stray Loop_Abort/Loop_Continue inside this
         // tag's own body (which has no loop) would be mistaken by
@@ -300,6 +331,7 @@ struct Evaluator {
         // iteration is calling this tag. See `LassoContext.loopDepth`.
         context.loopDepth = 0
         defer {
+            context.popGivenBlock()
             context.replaceLocals(savedLocals)
             context.popTagCall()
             context.loopDepth = savedLoopDepth
@@ -309,6 +341,98 @@ struct Evaluator {
         context.clearReturnSignal()
         _ = try await renderNodes(definition.body, &context)
         return context.consumeReturnSignal() ?? .void
+    }
+
+    /// `capture->invoke(...)` / `#cap(...)` shorthand — see
+    /// `Captures.swift`'s own doc comment for Stage 1's scope. Mirrors
+    /// `invokeCustomTag` above almost exactly (same snapshot/restore
+    /// discipline, same per-call return-signal reuse, same fresh
+    /// `loopDepth`/recursion-depth-guarded call-stack push) — the one
+    /// real difference is WHICH locals a capture's invocation starts
+    /// from: `capturedLocals` (a snapshot of the scope the capture
+    /// literal was evaluated in), not a fresh empty dictionary the way a
+    /// custom tag call always starts from just its own bound parameters.
+    /// Positional arguments bind to `#1`/`#2`/... (Ch. "Captures":
+    /// "Parameters arrive via positional special locals"), OVERWRITING
+    /// any same-named entry already present in `capturedLocals` — the
+    /// call site's own arguments win over whatever the capture's
+    /// creation scope happened to have stored under the same numeric
+    /// name.
+    private mutating func invokeCapture(
+        _ capture: LassoCaptureValue,
+        arguments: [EvaluatedArgument]
+    ) async throws -> LassoValue {
+        var boundLocals = capture.capturedLocals
+        for (offset, argument) in arguments.filter({ $0.label == nil }).enumerated() {
+            boundLocals[String(offset + 1)] = argument.value
+        }
+
+        let savedLocals = context.snapshotLocals()
+        let savedLoopDepth = context.loopDepth
+        try context.pushTagCall("capture")
+        context.replaceLocals(boundLocals)
+        context.loopDepth = 0
+        defer {
+            context.replaceLocals(savedLocals)
+            context.popTagCall()
+            context.loopDepth = savedLoopDepth
+        }
+
+        guard let renderNodes else { return .void }
+        context.clearReturnSignal()
+        let output = try await renderNodes(capture.body, &context)
+        if let returned = context.consumeReturnSignal() { return returned }
+        // Ch. "Captures": a plain capture that falls off the end without
+        // an explicit `return`/`yield` produces `.void`; an auto-collect
+        // capture instead "concatenates the result of calling the
+        // `asString` method on every value produced inside the
+        // capture... and produces that value" — approximated here as the
+        // body's own rendered output string, matching every other value
+        // this codebase's `asString`-family conversions already reduce
+        // to a plain string representation.
+        return capture.autoCollect ? .string(output) : .void
+    }
+
+    /// Pulls a `=>`-associated capture block out of an already-evaluated
+    /// argument list, returning it separately from the REMAINING
+    /// arguments — used by every call site that can be invoked with an
+    /// associated block (`invokeCustomTag`/`invokeMemberMethod`) so the
+    /// block never participates in ordinary positional parameter
+    /// binding or multiple-dispatch arity/type resolution.
+    ///
+    /// `foldAssociatedCapture` (`ExpressionParser.swift`) labels the
+    /// capture argument `"givenblock"` specifically so it can be found
+    /// and removed HERE, before `bindParameters`/`LassoMethodDispatcher
+    /// .resolve` ever see it — architect review found a real bug in an
+    /// earlier version that instead appended the capture as an ordinary
+    /// UNLABELED positional argument: whenever a call provided fewer
+    /// explicit arguments than a tag/method declares parameters (a
+    /// completely normal shape, relying on trailing defaults), the
+    /// appended capture would silently land in and overwrite an
+    /// unrelated later parameter's default value instead of throwing or
+    /// being recognizable — and when the explicit argument count already
+    /// matched the parameter count exactly, the capture argument would
+    /// be silently dropped with no signal at all, since `bindParameters`'
+    /// own loop only ever binds up to `parameters.count`. Labeling it
+    /// removes it from `callArguments.filter { $0.label == nil }`
+    /// entirely, so neither failure mode can occur — the body reads it
+    /// back via the real, documented `givenBlock` keyword (see
+    /// `Evaluator.evaluate(_:)`'s own `.identifier` case) instead of an
+    /// ordinary declared parameter.
+    private static func extractGivenBlock(
+        from arguments: [EvaluatedArgument]
+    ) -> (givenBlock: LassoValue, remaining: [EvaluatedArgument]) {
+        var remaining: [EvaluatedArgument] = []
+        remaining.reserveCapacity(arguments.count)
+        var givenBlock: LassoValue = .void
+        for argument in arguments {
+            if argument.label?.caseInsensitiveCompare("givenblock") == .orderedSame {
+                givenBlock = argument.value
+            } else {
+                remaining.append(argument)
+            }
+        }
+        return (givenBlock, remaining)
     }
 
     private mutating func bindParameters(
@@ -496,7 +620,7 @@ struct Evaluator {
         arguments: [LassoArgument],
         missingIsVoid: Bool = false
     ) async throws -> LassoValue? {
-        let evaluatedCallArguments = try await evaluate(arguments)
+        let (givenBlock, evaluatedCallArguments) = Self.extractGivenBlock(from: try await evaluate(arguments))
         guard let resolved = LassoMethodDispatcher.resolve(
             method: name,
             on: type,
@@ -510,9 +634,11 @@ struct Evaluator {
         let savedLoopDepth = context.loopDepth
         context.replaceLocals(boundLocals)
         context.pushSelf(object)
+        context.pushGivenBlock(givenBlock)
         // See the matching comment in `invokeCustomTag`.
         context.loopDepth = 0
         defer {
+            context.popGivenBlock()
             context.popSelf()
             context.replaceLocals(savedLocals)
             context.loopDepth = savedLoopDepth
@@ -1249,6 +1375,8 @@ struct Evaluator {
             return .string(try await formattedNumber(value, arguments, defaultPrecision: 6))
         case let (.decimal(value), "ceil"): return .decimal(value.rounded(.up))
         case let (.integer(value), "ceil"): return .integer(value)
+        case let (.capture(capture), "invoke"):
+            return try await invokeCapture(capture, arguments: try await evaluate(arguments))
         case let (.pair(key, _), "first"): return key
         case let (.pair(_, value), "second"): return value
         case (.pair, "size"):
