@@ -12304,3 +12304,254 @@ struct IncludeURLTests {
     #expect(output == "a|4")
 }
 
+// MARK: - Captures Stage 7 (currentCapture/givenBlock/restart/autoCollectBuffer)
+
+@Test func currentCaptureIsVoidOutsideAnyCaptureInvocation() async throws {
+    // Ch. "Captures", "Capture Methods": "currentCapture() -- Returns a
+    // reference to the capture that is currently executing." This
+    // codebase never materializes a `LassoCaptureValue` for a plain
+    // page/method invocation (only for capture LITERALS), so calling it
+    // with no capture actively invoked is a disclosed partial reading --
+    // `.void`, not a real capture reference. `.void` renders as an empty
+    // string when placed directly in an output block, matching this
+    // codebase's established convention elsewhere for confirming
+    // void-ness (`->type` is NOT used here -- `.void->type` deliberately
+    // reads as a plain empty string per this codebase's own reviewed
+    // "void degrades to string for member access" rule, so it answers
+    // `"String"`, not `"void"`; unrelated to this stage).
+    var context = LassoContext()
+    let output = try await LassoRenderer().render(
+        "[currentCapture]",
+        context: &context
+    )
+    #expect(output == "")
+}
+
+@Test func currentCaptureReturnsTheSameLiveObjectCurrentlyBeingInvoked() async throws {
+    // Proves `currentCapture()` hands back the SAME live
+    // `LassoCaptureValue` instance being invoked, not a copy or
+    // placeholder: `cap->autoCollectBuffer` is set to a sentinel from
+    // OUTSIDE, then `cap`'s own body reads `currentCapture-
+    // >autoCollectBuffer` and returns it -- only identical if
+    // `currentCapture` resolved to the literal same object `#cap` refers
+    // to. (Deliberately sidesteps `->detach`/non-local-return timing:
+    // `capture.homeDepth` is snapshotted onto `LassoContext
+    // .captureHomeDepthStack` at the START of `invokeCapture`, before the
+    // body runs, so a mid-body self-detach cannot retroactively affect
+    // that SAME invocation's own return targeting -- a correct,
+    // intentional consequence of the existing Stage 2 design, not
+    // something to test around here.)
+    var context = LassoContext()
+    let output = try await LassoRenderer().render(
+        """
+        [local('cap' = { return currentCapture->autoCollectBuffer })]\
+        [#cap->autoCollectBuffer = 'sentinel']\
+        [#cap->invoke]
+        """,
+        context: &context
+    )
+    #expect(output == "sentinel")
+}
+
+@Test func currentCaptureCorrectlyTracksTheInnermostActiveCaptureAcrossNestedInvocations() async throws {
+    // Same identity proof as above, but confirms
+    // `LassoContext.currentCaptureStack` correctly pushes to the INNER
+    // capture while it's active and pops back to the OUTER one
+    // afterward: `cap` reads its own `autoCollectBuffer` before and
+    // after invoking a nested `inner` capture, which reads ITS OWN
+    // (different) sentinel while active. If the stack leaked `inner`'s
+    // identity into `cap`'s "after" reading (or vice versa), the
+    // recorded sequence would show the wrong sentinel at the wrong
+    // point.
+    var context = LassoContext()
+    let output = try await LassoRenderer().render(
+        """
+        <?lassoscript
+        var(readings) = array
+        local(inner) = { $readings->insert('inner:' + currentCapture->autoCollectBuffer) }
+        local(cap) = {
+            $readings->insert('before:' + currentCapture->autoCollectBuffer)
+            #inner->invoke
+            $readings->insert('after:' + currentCapture->autoCollectBuffer)
+        }
+        #cap->autoCollectBuffer = 'CAP'
+        #inner->autoCollectBuffer = 'INNER'
+        #cap->invoke
+        ?>
+        [$readings->join(',')]
+        """,
+        context: &context
+    ).trimmingCharacters(in: .whitespacesAndNewlines)
+    #expect(output == "before:CAP,inner:INNER,after:CAP")
+}
+
+@Test func captureGivenBlockMemberMethodIsVoidWhenNoAssociatedBlockWasGiven() async throws {
+    // Ch. "Captures": "capture-> givenBlock ( ) -- Returns the capture
+    // block associated with the current capture object, if any." `cap`
+    // is invoked directly (`->invoke`, no `=>`), so it has no associated
+    // block at all. `->detach` first (an already-proven Stage 2
+    // mechanism) so this explicit `return` stays purely local instead of
+    // aborting the rest of this render -- unrelated to what's actually
+    // being tested here.
+    var context = LassoContext()
+    let output = try await LassoRenderer().render(
+        """
+        [local('cap' = { return currentCapture->givenBlock })]\
+        [#cap->detach->invoke]
+        """,
+        context: &context
+    )
+    #expect(output == "")
+}
+
+@Test func captureGivenBlockMemberMethodReflectsTheBlockThatCaptureItselfWasInvokedWith() async throws {
+    // Real bug found by architect review, fixed in the SAME commit as
+    // this test: `#cap->invoke => {...}` reaches `Evaluator.invokeCapture`
+    // with a `"givenblock"`-labeled argument (`foldAssociatedCapture` is
+    // fully general -- ANY call/member expression followed by `=>`, not
+    // `->forEach`-specific, per its own doc comment). Before the fix,
+    // `invokeCapture` silently discarded that labeled argument instead
+    // of pushing it onto `context.givenBlockStack` the way
+    // `invokeCustomTag`/`invokeMemberMethod` already do -- so `cap`'s OWN
+    // associated block was dropped, and `givenBlock`/`currentCapture->
+    // givenBlock()` read from inside `cap`'s body would leak whatever
+    // value an ENCLOSING tag/method call frame happened to have pushed,
+    // or answer void with no such frame. `Evaluator.invokeCapture` now
+    // calls the same `extractGivenBlock`/`pushGivenBlock`/`popGivenBlock`
+    // sequence around its own body. `cap` is invoked with a DISTINCT
+    // block of its own (`{^ 'mine' ^}`, not shared with anything else in
+    // this test), so seeing its own value back proves the fix, not just
+    // that SOME non-void capture reference was returned.
+    var context = LassoContext()
+    let output = try await LassoRenderer().render(
+        """
+        [local('cap' = { return currentCapture->givenBlock->invoke })]\
+        [#cap->invoke => {^ 'mine' ^}]
+        """,
+        context: &context
+    )
+    #expect(output == "mine")
+}
+
+@Test func capturesOwnGivenBlockDoesNotLeakFromAnEnclosingTagsUnrelatedGivenBlock() async throws {
+    // The other half of the same bug: a capture invoked with NO
+    // associated block of its own, from WITHIN a custom tag that DOES
+    // have one, must not see the ENCLOSING tag's given block as if it
+    // were its own -- `currentCapture->givenBlock` should be void, not a
+    // leaked, unrelated value. Directly reproduces the exact failure
+    // mode the architect's review surfaced (a live probe against the
+    // pre-fix code returned the outer tag's block here instead of void).
+    var context = LassoContext()
+    let output = try await LassoRenderer().render(
+        """
+        [Define_Tag('Outer')]\
+            [local('cap' = { return currentCapture->givenBlock })]\
+            [return(#cap->invoke)]\
+        [/Define_Tag]\
+        [Outer => {^ 'outer' ^}]
+        """,
+        context: &context
+    )
+    #expect(output == "")
+}
+
+@Test func captureRestartReExecutesTheCaptureBodyFromTheTopLikeInvoke() async throws {
+    // Ch. "Captures": "capture-> restart ( ) -- Resets the program
+    // counter (PC) for the capture and begins executing the capture's
+    // code again." This interpreter has no persistent PC to reset --
+    // every invocation already restarts from the top (Stage 2's own
+    // documented limitation) -- so `->restart()` and `->invoke()` are
+    // behaviorally identical today; this pins that `->restart()` is a
+    // real, callable method (not an unknown-method error) that fully
+    // re-runs the body (observed via a mutated external counter) and
+    // returns the freshly computed value. `->detach` first (unrelated to
+    // what's being tested -- purely so the two explicit `return`s below
+    // stay local instead of aborting the render after the first one).
+    var context = LassoContext()
+    let output = try await LassoRenderer().render(
+        """
+        <?lassoscript
+        var(count) = 0
+        var(cap) = {
+            $count += 1
+            return $count
+        }
+        var(discard) = $cap->detach
+        ?>
+        [$cap->invoke]|[$cap->restart]|[$count]
+        """,
+        context: &context
+    ).trimmingCharacters(in: .whitespacesAndNewlines)
+    #expect(output == "1|2|2")
+}
+
+@Test func autoCollectBufferReflectsTheValueProducedByTheMostRecentPlainInvoke() async throws {
+    // Ch. "Captures" worked example: "#distance(8, 2, 10, 5) // =>
+    // 3.605551 #distance -> autoCollectBuffer // => 3.605551" -- a
+    // SEPARATE, later read of `->autoCollectBuffer()` must see the same
+    // value the capture's own invocation just produced.
+    var context = LassoContext()
+    let output = try await LassoRenderer().render(
+        """
+        [local('cap' = {^ 'a' 'b' 'c' ^})]\
+        [#cap->invoke]|[#cap->autoCollectBuffer]
+        """,
+        context: &context
+    )
+    #expect(output == "abc|abc")
+}
+
+@Test func autoCollectBufferIsSettableAndReadableIndependentlyOfInvoke() async throws {
+    // `capture-> autoCollectBuffer= ( value )` is listed as its own
+    // distinct documented method alongside the getter -- a direct write
+    // must be visible to a later read with no invocation in between.
+    var context = LassoContext()
+    let output = try await LassoRenderer().render(
+        """
+        [local('cap' = {^ 'x' ^})]\
+        [#cap->autoCollectBuffer = 'preset']\
+        [#cap->autoCollectBuffer]
+        """,
+        context: &context
+    )
+    #expect(output == "preset")
+}
+
+@Test func invokeAutoCollectComputesTheAutoCollectValueWithoutUpdatingTheStoredBuffer() async throws {
+    // "Invokes the capture. If it is an auto-collect capture, this will
+    // return the auto-collect value, but will NOT update
+    // capture->autoCollectBuffer." Distinguishes this from a plain
+    // `->invoke()`: the RETURN value must still be the freshly computed
+    // auto-collect string, but a later `->autoCollectBuffer()` read must
+    // still see whatever was there BEFORE this call (a sentinel set
+    // explicitly, here), not the fresh value.
+    var context = LassoContext()
+    let output = try await LassoRenderer().render(
+        """
+        [local('cap' = {^ 'fresh' ^})]\
+        [#cap->autoCollectBuffer = 'sentinel']\
+        [#cap->invokeAutoCollect]|[#cap->autoCollectBuffer]
+        """,
+        context: &context
+    )
+    #expect(output == "fresh|sentinel")
+}
+
+@Test func autoCollectBufferStaysVoidForANonAutoCollectCaptureEvenAfterInvoke() async throws {
+    // The buffer is specifically an auto-collect-capture concept (Ch.
+    // "Captures": "If the capture is an auto-collect capture, this will
+    // store..."/"...will set..."). A plain (non-`{^...^}`) capture's
+    // `->invoke()` must never populate it. `->detach` first so the
+    // explicit `return` inside `cap` stays local, matching the same
+    // unrelated page-abort avoidance used by the other tests above.
+    var context = LassoContext()
+    let output = try await LassoRenderer().render(
+        """
+        [local('cap' = { return 'plain' })]\
+        [#cap->detach->invoke]|[#cap->autoCollectBuffer]
+        """,
+        context: &context
+    )
+    #expect(output == "plain|")
+}
+

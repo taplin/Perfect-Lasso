@@ -1341,6 +1341,19 @@ public struct LassoNativeRegistry: Sendable {
             context.setLoopContinueSignal()
             return .void
         }
+        // Ch. "Captures", "Capture Methods": "currentCapture() — Returns
+        // a reference to the capture that is currently executing." A
+        // disclosed partial reading (Stage 7, see `currentCaptureStack`'s
+        // own doc comment in this file): only capture LITERALS invoked
+        // via `->invoke`/`()` push onto that stack, not the implicit
+        // per-method capture the real docs describe every method
+        // invocation as running inside (this codebase never materializes
+        // one) — so this correctly returns the innermost actively-
+        // executing capture LITERAL, and `.void` when called from
+        // ordinary method/page code with no capture invocation active.
+        register("currentcapture") { _, context in
+            context.currentCapture.map { .capture($0) } ?? .void
+        }
         register("field") { arguments, context in
             let name = arguments.firstValue(named: "name")?.outputString ??
                 arguments.first?.value.outputString ?? ""
@@ -2122,6 +2135,18 @@ public struct LassoContext: Sendable {
     var selfStack: [LassoObjectInstance]
     var givenBlockStack: [LassoValue] = []
     var captureHomeDepthStack: [Int?] = []
+    /// Stage 7: parallel to `captureHomeDepthStack`, but holds the actual
+    /// `LassoCaptureValue` reference (not just its `homeDepth`) for
+    /// whichever capture is CURRENTLY executing — backs `currentCapture()`
+    /// and the member-method form of `->givenBlock()`. Pushed/popped
+    /// alongside `captureHomeDepthStack` in `Evaluator.invokeCapture`; a
+    /// method-tag invocation (not a capture invocation) never pushes here
+    /// at all, so `currentCapture()` correctly returns `.void` when called
+    /// from ordinary method code with no capture actively executing — a
+    /// disclosed partial reading of the real docs' claim that EVERY method
+    /// invocation implicitly runs inside its own capture (this codebase
+    /// never materializes a `LassoCaptureValue` for a plain method call).
+    var currentCaptureStack: [LassoCaptureValue] = []
     /// Real Lasso's request-local `error_currentError` state — reset to
     /// `.noError` on every fresh context, updated by `setError`/`clearError`.
     /// `lastError` preserves the previous error across a `clearError()` call,
@@ -2580,6 +2605,21 @@ public struct LassoContext: Sendable {
 
     mutating func popCaptureHomeDepth() {
         _ = captureHomeDepthStack.popLast()
+    }
+
+    /// Stage 7 (`currentCapture()`): the capture actively executing right
+    /// now, or `nil` outside any capture invocation. See
+    /// `currentCaptureStack`'s own doc comment above.
+    var currentCapture: LassoCaptureValue? {
+        currentCaptureStack.last
+    }
+
+    mutating func pushCurrentCapture(_ value: LassoCaptureValue) {
+        currentCaptureStack.append(value)
+    }
+
+    mutating func popCurrentCapture() {
+        _ = currentCaptureStack.popLast()
     }
 
     /// Set by `return`/`yield` (Ch. "Captures": "return and yield will

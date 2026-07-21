@@ -35,11 +35,23 @@ import Foundation
 /// such capability anywhere today — a materially larger, separate piece of
 /// work than the non-local-propagation mechanism this stage does implement,
 /// deliberately deferred (see the plan doc's own Stage 2 status note).
-/// `->home()`/`->restart()`/`->continuation()`/`->callSite_*`/
-/// `->callStack()`/`currentCapture()` introspection are also deferred —
-/// low corpus value, and several of them (a real home CAPTURE reference,
-/// not just a depth marker) don't fit this stage's simpler `homeDepth: Int`
-/// model without deeper rework.
+/// **Stage 7 adds**: `currentCapture()`, the member-method form of
+/// `->givenBlock()` (distinct from the pre-existing bare `givenBlock`
+/// keyword, which reads the same underlying per-invocation state via
+/// `context.currentGivenBlock`), `->restart()`, and the auto-collect
+/// buffer family (`->autoCollectBuffer()`/`->autoCollectBuffer=`/
+/// `->invokeAutoCollect()`). See `Evaluator.invokeCapture`/
+/// `LassoContext.currentCaptureStack` for `currentCapture()`'s tracking
+/// mechanism, and this type's own `_autoCollectBuffer` below.
+///
+/// `->home()`/`->continuation()`/`->callSite_*`/`->callStack()`/
+/// `->methodName()`/`->calledName()` remain deferred — a real home
+/// CAPTURE reference (not just this type's own `homeDepth: Int` marker),
+/// source-location tracking on AST nodes, and an implicit per-method-
+/// invocation capture object (this codebase executes method bodies
+/// directly via the tree-walking evaluator, never materializing a
+/// `LassoCaptureValue` for them) are all deeper architectural rework this
+/// stage's own research found zero corpus evidence justifying.
 ///
 /// A dedicated `LassoValue` case rather than the usual
 /// `.object(LassoObjectInstance)` wrapper every other native type in this
@@ -85,6 +97,16 @@ public final class LassoCaptureValue: @unchecked Sendable, Equatable {
     /// Ch. "Captures": "A capture can be detached from its home in order
     /// to escape from this [non-local] behavior."
     private var _homeDepth: Int?
+    /// Ch. "Captures": "When you invoke an auto-collect capture, the
+    /// auto-collected value will be returned and can be accessed using
+    /// `capture->autoCollectBuffer`" — the worked example invokes a
+    /// distance-calculating auto-collect capture, then separately reads
+    /// `#distance->autoCollectBuffer` afterward and gets the SAME value
+    /// back, meaning it must be retained on the capture itself after
+    /// `->invoke()` returns, not just handed back as the call's own
+    /// result and discarded. `.void` for a non-auto-collect capture, or
+    /// before an auto-collect capture has ever been invoked (Stage 7).
+    private var _autoCollectBuffer: LassoValue = .void
 
     public init(body: [LassoNode], autoCollect: Bool, capturedLocals: [String: LassoLocalBox], homeDepth: Int?) {
         self.body = body
@@ -97,6 +119,24 @@ public final class LassoCaptureValue: @unchecked Sendable, Equatable {
         lock.lock()
         defer { lock.unlock() }
         return _homeDepth
+    }
+
+    public func autoCollectBuffer() -> LassoValue {
+        lock.lock()
+        defer { lock.unlock() }
+        return _autoCollectBuffer
+    }
+
+    /// `capture->autoCollectBuffer = value` (Ch. "Captures": "can be used
+    /// as the left parameter of an assignment operator" is not literally
+    /// documented for this member, but the plain getter/setter pairing —
+    /// `autoCollectBuffer=(value)` — is listed as its own distinct method
+    /// right below the getter, so a direct write is real, documented API,
+    /// not an inferred convenience).
+    public func setAutoCollectBuffer(_ value: LassoValue) {
+        lock.lock()
+        _autoCollectBuffer = value
+        lock.unlock()
     }
 
     /// "Detaches the capture so that it no longer has a home capture...

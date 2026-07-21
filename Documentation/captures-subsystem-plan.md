@@ -1008,8 +1008,106 @@ capture-based matcher, so building one here would be speculative feature
 invention with no grounding and no demand. No code or test changes; this
 doc update is the only change for this stage.
 
-**Stage 7 — `currentCapture()`/`givenBlock`/introspection family.** Low
-corpus need; bookkeeping once Stage 1-2 exist.
+**Stage 7 — `currentCapture()`/`givenBlock`/introspection family** ✅ done
+(2026-07-21). Real-doc research (lassoguide.com/language/captures.html)
+found a much larger documented surface than this stage's own terse
+original framing suggested — a free `currentCapture()` function plus
+eleven `capture` member methods: `->invoke`/`->detach` (already real,
+Stages 1-2), `->restart`, `->continuation`, `->home`,
+`->callSite_file`/`->callSite_line`/`->callSite_col`, `->callStack`,
+`->givenBlock`, `->autoCollectBuffer`/`->autoCollectBuffer=`,
+`->calledName`, `->methodName`, `->invokeAutoCollect`. Zero corpus hits
+for any of this family in either real corpus (TS_lasso9/bugcity9) —
+consistent with the plan's own "low corpus need" framing — but built
+anyway per Tim's explicit direction: "this area of the language is not
+heavily used if at all in the corpus... but full lasso9 feature support
+is important. Some of these features are exactly what make Lasso9 so
+powerful."
+
+**Implemented, all real and directly doc-grounded**:
+- `currentCapture()` (free function, `Runtime.swift`) — returns the
+  capture currently being invoked, backed by a new
+  `LassoContext.currentCaptureStack: [LassoCaptureValue]` pushed/popped
+  in `Evaluator.invokeCapture`, mirroring the pre-existing
+  `captureHomeDepthStack` pattern exactly. A disclosed PARTIAL reading:
+  this codebase never materializes a `LassoCaptureValue` for a plain
+  method/page invocation (only for capture LITERALS), so `currentCapture()`
+  correctly answers `.void` outside any capture invocation rather than
+  the real docs' claim that every method call implicitly runs inside its
+  own capture.
+- `capture->givenBlock()` (the MEMBER-method form, distinct from the
+  pre-existing bare `givenBlock` keyword from Stage 1) — returns
+  `context.currentGivenBlock` only when `capture` is identical (`===`)
+  to the top of `currentCaptureStack`, `.void` otherwise (this codebase
+  has no per-capture given-block storage outside an active invocation).
+- `capture->restart()` — a disclosed exact-match implementation: this
+  interpreter has no persistent PC to reset at all (every invocation
+  already restarts from the top, a pre-existing Stage 2 limitation), so
+  "reset the PC and run again" and a plain `->invoke()` are already
+  behaviorally identical; implemented as a thin delegation to the same
+  `invokeCapture` machinery.
+- `capture->autoCollectBuffer()`/`->autoCollectBuffer=`/
+  `->invokeAutoCollect()` — a new lock-protected `_autoCollectBuffer`
+  field on `LassoCaptureValue`, matching the docs' own worked example
+  exactly (`#distance(8,2,10,5)` then a SEPARATE
+  `#distance->autoCollectBuffer` read sees the same value). Only updated
+  on the normal fall-off-the-end path, not the explicit-return path — the
+  docs are silent on that interaction, so this deliberately doesn't
+  guess. `->invokeAutoCollect()` reuses `invokeCapture` with a new
+  `updatesAutoCollectBuffer: Bool = true` parameter set to `false`.
+
+**Deliberately still deferred** (disclosed in `Captures.swift`'s own
+top-of-file doc comment): `->home()` (would need a real home CAPTURE
+reference, not just this codebase's existing `homeDepth: Int` marker),
+`->continuation()` (no continuation-tracking model exists at all),
+`->callSite_file`/`->callSite_line`/`->callSite_col`/`->callStack()` (no
+source-location tracking on AST nodes; `tagCallStack` is bare method-name
+strings only), `->methodName()`/`->calledName()` (would need the same
+implicit per-method capture object `currentCapture()` itself doesn't
+model). None of these have any corpus evidence either, and all would need
+materially deeper architecture than this stage's realistically-buildable
+subset.
+
+**Architect + code-reviewer review found the core design sound**
+(lock discipline on the new `_autoCollectBuffer` field matches the
+pre-existing `_homeDepth` pattern exactly; the four parallel stacks
+`invokeCapture` pushes/pops — `tagCallStack`/`captureHomeDepthStack`/
+`currentCaptureStack`/`givenBlockStack`, see below — are provably
+balanced on every path, including the early-throw guard in
+`pushTagCall`; `capture === context.currentCapture` is the correct
+identity check, `==` would behave identically here since it's already
+defined as `lhs === rhs`). **One real, pre-existing bug found by
+architect review, fixed in this stage**:
+
+`Evaluator.invokeCapture` never managed `LassoContext.givenBlockStack` at
+all — `ExpressionParser.foldAssociatedCapture` is fully general (folds a
+trailing `=>` block onto ANY call/member expression, not `->forEach`-
+specific, per its own doc comment), so `#cap->invoke => {...}`/
+`#cap() => {...}` reaches `invokeCapture` with a `"givenblock"`-labeled
+argument exactly like any other call — but unlike `invokeCustomTag`/
+`invokeMemberMethod` (which both call `extractGivenBlock` and push/pop
+`givenBlockStack` around their own body), `invokeCapture` silently
+discarded that labeled argument entirely. This predates Stage 7
+architecturally (true since Stage 1/2), but Stage 7 is what makes it
+directly observable (`currentCapture->givenBlock()`) and this stage's
+OWN first-draft test happened to normalize the resulting leak as
+"correct" by only exercising the degenerate case where a capture's given
+block coincides with its enclosing tag's own — confirmed as a REAL bug
+via a live reproduction (a capture given its own distinct `=>` block from
+inside a custom tag with a DIFFERENT given block: the capture's own block
+was silently dropped and the outer tag's leaked through instead). Fixed
+by threading `extractGivenBlock`/`pushGivenBlock`/`popGivenBlock` through
+`invokeCapture` the same way the other two dispatch paths already do.
+Verified decisive by reverting (confirmed the exact predicted failure —
+the leaked-through value threw `.unsupportedExpression` when invoked,
+since it wasn't the real block) and restoring. The misleading original
+test was rewritten to exercise a capture given its own DISTINCT block
+(proving the fix, not just "some non-void reference came back"), and a
+second, new regression test pins the negative case (no leak from an
+enclosing frame's unrelated given block).
+
+602/602 tests passing (12 new, one rewritten). Zero new source-of-truth
+gaps found beyond the one fixed above.
 
 **Stage 8 — Query Expressions** (`where`/`let`/`skip`/`take`/`order by`/
 `group by`/`select`/`sum`/`average`/`min`/`max`, `generateSeries`,

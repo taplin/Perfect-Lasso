@@ -438,7 +438,8 @@ struct Evaluator {
     /// name.
     private mutating func invokeCapture(
         _ capture: LassoCaptureValue,
-        arguments: [EvaluatedArgument]
+        arguments: [EvaluatedArgument],
+        updatesAutoCollectBuffer: Bool = true
     ) async throws -> LassoValue {
         // Stage 2 (Captures): see `skipIfNonLocalReturnAlreadyPending()`'s
         // own doc comment — without this, a SECOND `#cap->invoke` in the
@@ -446,8 +447,29 @@ struct Evaluator {
         // propagating would silently re-run this capture's body and
         // clobber the still-live signal.
         if skipIfNonLocalReturnAlreadyPending() { return .void }
+        // Stage 7 fix (found by architect review): a capture invoked
+        // WITH its own `=>`-associated block (`#cap->invoke => {...}`,
+        // `#cap() => {...}`) reaches here with a `"givenblock"`-labeled
+        // argument, exactly like any other call `foldAssociatedCapture`
+        // folds onto (`ExpressionParser.swift`'s own comment: "any other
+        // call/member/identifier expression followed by `=> {...}`" —
+        // NOT `->forEach`-specific). Every OTHER call-dispatch path
+        // (`invokeCustomTag`/`invokeMemberMethod`) extracts this via
+        // `extractGivenBlock` and pushes/pops it on
+        // `context.givenBlockStack` around the body so `givenBlock`/
+        // `currentCapture->givenBlock()` reads it back correctly. Before
+        // this fix, `invokeCapture` never did either — the block was
+        // evaluated (for side effects) then silently discarded, and
+        // `givenBlock`/`currentCapture->givenBlock()` read inside the
+        // capture's own body leaked whatever unrelated value an
+        // ENCLOSING `invokeCustomTag`/`invokeMemberMethod` frame had
+        // pushed (or `.void` with no such frame) instead — confirmed via
+        // a live reproduction (a capture given its own distinct block
+        // from inside a custom tag with a DIFFERENT given block; the
+        // capture's own block was dropped and the tag's leaked through).
+        let (givenBlock, remaining) = Self.extractGivenBlock(from: arguments)
         var boundLocals = capture.capturedLocals
-        for (offset, argument) in arguments.filter({ $0.label == nil }).enumerated() {
+        for (offset, argument) in remaining.filter({ $0.label == nil }).enumerated() {
             // Stage 3 (Captures): a FRESH box per invocation, not a
             // mutation of whatever box (if any) already occupied this
             // slot — `#1`/`#2`/... are this call's own arguments, never
@@ -466,17 +488,30 @@ struct Evaluator {
         // body should unwind back down to — read via
         // `context.currentCaptureHomeDepth` by `setNonLocalReturnSignal`.
         context.pushCaptureHomeDepth(capture.homeDepth)
+        // Stage 7: `currentCapture()`/the member form of `->givenBlock()`
+        // both read the top of this stack — see its own doc comment.
+        context.pushCurrentCapture(capture)
+        context.pushGivenBlock(givenBlock)
         defer {
             context.replaceLocals(savedLocals)
             context.popTagCall()
             context.loopDepth = savedLoopDepth
             context.popCaptureHomeDepth()
+            context.popCurrentCapture()
+            context.popGivenBlock()
         }
 
         guard let renderNodes else { return .void }
         context.clearReturnSignal()
         let output = try await renderNodes(capture.body, &context)
         if let returned = consumeReturnValueRespectingNonLocalTarget(activeDepth: context.tagCallStack.count) {
+            // An explicit `return`/`yield` bypasses auto-collect
+            // concatenation entirely (pre-existing Stage 2 behavior,
+            // unchanged here) — the docs' own `autoCollectBuffer` worked
+            // example only covers the normal fall-off-the-end
+            // concatenation path below, so this Stage 7 addition
+            // deliberately leaves the buffer untouched here rather than
+            // guessing at undocumented explicit-return interaction.
             return returned
         }
         // Ch. "Captures": a plain capture that falls off the end without
@@ -492,7 +527,19 @@ struct Evaluator {
         // invocation must not manufacture an auto-collect/void value of
         // its own — it produces `.void` here and its caller's render loop
         // keeps unwinding, exactly like `invokeCustomTag`/`invokeMemberMethod`.
-        return capture.autoCollect ? .string(output) : .void
+        let result: LassoValue = capture.autoCollect ? .string(output) : .void
+        // Stage 7: "the auto-collected value will be returned and can be
+        // accessed using `capture->autoCollectBuffer`" — retained on the
+        // capture itself after a normal `->invoke()`/`()` call so a LATER,
+        // separate `->autoCollectBuffer()` read sees the same value, per
+        // the docs' own worked example. `->invokeAutoCollect()` explicitly
+        // "will not update `capture->autoCollectBuffer`" (skipped via
+        // `updatesAutoCollectBuffer: false`), and a non-auto-collect
+        // capture never touches the buffer at all (stays `.void`).
+        if capture.autoCollect, updatesAutoCollectBuffer {
+            capture.setAutoCollectBuffer(result)
+        }
+        return result
     }
 
     /// Pulls a `=>`-associated capture block out of an already-evaluated
@@ -987,6 +1034,17 @@ struct Evaluator {
                 baseValue = .object(object)
             } else {
                 baseValue = try await evaluate(base)
+            }
+            // Stage 7 (Captures): `capture->autoCollectBuffer = value` —
+            // the getter (`->autoCollectBuffer()`) and this setter are
+            // both listed as their own distinct documented methods (Ch.
+            // "Captures", "Capture Methods"). `LassoCaptureValue` is a
+            // reference type (like `.object`, unlike `.pair`/`.map`
+            // below), so this mutates the existing instance directly —
+            // no recursive reassignment needed.
+            if normalizedName == "autocollectbuffer", case let .capture(capture) = baseValue {
+                capture.setAutoCollectBuffer(value)
+                return
             }
             // `Pair->First=`/`->Second=` (Ch. 30 Table 9, p.404: "Can be
             // used as the left parameter of an assignment operator to
@@ -1747,6 +1805,39 @@ struct Evaluator {
             // chains naturally (e.g. `#cap->detach->invoke`).
             capture.detach()
             return .capture(capture)
+        case let (.capture(capture), "restart"):
+            // Ch. "Captures": "Resets the program counter (PC) for the
+            // capture and begins executing the capture's code again." A
+            // disclosed exact match, not an approximation: this
+            // interpreter has no persistent PC at all — "every
+            // invocation of a capture (yielded-from or not) re-executes
+            // its body from the top" already (see this file's own
+            // `LassoCaptureValue` doc comment, Stage 2) — so "reset the
+            // PC and run again" and a plain `->invoke()` with no
+            // arguments are already behaviorally identical today.
+            return try await invokeCapture(capture, arguments: [])
+        case let (.capture(capture), "givenblock"):
+            // The MEMBER-method form (distinct from the pre-existing bare
+            // `givenBlock` keyword — see `Evaluator.evaluate(_:)`'s
+            // `.identifier` case): "Returns the capture block associated
+            // with the CURRENT capture object, if any." Only meaningful
+            // for the capture actively executing right now — `capture`
+            // must be the top of `context.currentCaptureStack`, the same
+            // frame `context.currentGivenBlock` already reflects; `.void`
+            // for any other (not currently executing) capture reference,
+            // since this codebase doesn't retain a given-block per
+            // capture object outside its own active invocation.
+            return capture === context.currentCapture ? context.currentGivenBlock : .void
+        case let (.capture(capture), "autocollectbuffer"):
+            // Ch. "Captures": "the auto-collected value will be returned
+            // and can be accessed using capture->autoCollectBuffer" — see
+            // `LassoCaptureValue._autoCollectBuffer`'s own doc comment.
+            return capture.autoCollectBuffer()
+        case let (.capture(capture), "invokeautocollect"):
+            // "Invokes the capture. If it is an auto-collect capture,
+            // this will return the auto-collect value, but will not
+            // update capture->autoCollectBuffer."
+            return try await invokeCapture(capture, arguments: try await evaluate(arguments), updatesAutoCollectBuffer: false)
         case let (.pair(key, _), "first"): return key
         case let (.pair(_, value), "second"): return value
         case (.pair, "size"):
