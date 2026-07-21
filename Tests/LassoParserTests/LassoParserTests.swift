@@ -10674,17 +10674,18 @@ struct IncludeURLTests {
     #expect(output == "a}b|nested")
 }
 
-@Test func captureLiteralUsesSnapshotSemanticsNotLiveReferenceClosure() async throws {
-    // Stage 1's own explicitly disclosed limitation (see
-    // `Captures.swift`'s doc comment and
-    // `Documentation/captures-subsystem-plan.md` §4.2): a capture's body
-    // runs against a COPY of the locals as they existed at the moment
-    // the literal was evaluated, not a live reference back to its
-    // creation scope. Real Lasso's own documented semantics are live-
-    // reference (a capture invoked elsewhere would see "second", not
-    // "first") -- this test exists to PROVE and DOCUMENT the current
-    // narrower behavior, not to claim it matches the real Language
-    // Guide's own worked example.
+@Test func captureLiteralUsesLiveReferenceClosureSemanticsNotASnapshot() async throws {
+    // Superseded by Stage 3 (Captures, see `Documentation
+    // /captures-subsystem-plan.md` §4.2(a)): Stage 1 shipped a narrower
+    // value-type SNAPSHOT of the enclosing scope's locals (this test used
+    // to assert exactly that narrower behavior, expecting "first"). Real
+    // Lasso's own documented semantics are live-reference -- Ch.
+    // "Captures" §1.5: "it will have access to the surrounding local
+    // variables where the capture was created even when the capture is
+    // being executed in code that has a different scope" -- so a
+    // re-assignment of `#x` AFTER the capture literal was created, but
+    // BEFORE it's invoked, must be visible when the capture finally runs:
+    // "second", not "first".
     var context = LassoContext()
     let output = try await LassoRenderer().render(
         """
@@ -10695,7 +10696,212 @@ struct IncludeURLTests {
         """,
         context: &context
     )
-    #expect(output == "first")
+    #expect(output == "second")
+}
+
+// MARK: - Captures Stage 3 (live-reference closure semantics)
+
+@Test func theLanguageGuidesOwnCanonicalWorkedExampleForLiveReferenceClosures() async throws {
+    // Ch. "Captures" §1.5's own load-bearing citation, verbatim: "Stored
+    // captures can be executed at any point and the code contained
+    // within will operate as if it had been executed in the context in
+    // which it was created... it will have access to the surrounding
+    // local variables where the capture was created even when the
+    // capture is being executed in code that has a different scope."
+    // `method1` declares `my_local` (no value), creates a capture closing
+    // over it, THEN assigns 'Hello' to `my_local`, THEN hands the capture
+    // to `method2` -- a COMPLETELY DIFFERENT method -- which invokes it
+    // with ', world.'. The capture's own `#my_local->append(#1)`
+    // (self-mutating `String->append`) must reach back into `method1`'s
+    // own (already-assigned) `my_local` storage cell, so `method1`'s own
+    // trailing `return #my_local` sees the mutation: "Hello, world."
+    var context = LassoContext()
+    let output = try await LassoRenderer().render(
+        """
+        <?lassoscript
+        define method1() => {
+            local(my_local)
+            local(my_cap) = {
+                #my_local->append(#1)
+            }
+            #my_local = 'Hello'
+            method2(#my_cap)
+            return #my_local
+        }
+        define method2(cap) => {
+            #cap(', world.')
+        }
+        ?>
+        [method1]
+        """,
+        context: &context
+    ).trimmingCharacters(in: .whitespacesAndNewlines)
+    #expect(output == "Hello, world.")
+}
+
+@Test func aBareLocalDeclarationWithNoValueStillGetsARealStorageCellBeforeAssignment() async throws {
+    // Found while implementing Stage 3: `local(name)` (no `=` value) was
+    // previously a pure no-op READ (returns whatever's already there, or
+    // `.null`) that never actually created a storage cell -- harmless
+    // under Stage 1's snapshot semantics, but a real gap for live-
+    // reference closures: if the capture literal below were evaluated
+    // BEFORE `my_local`'s storage cell existed, it would capture a
+    // dictionary with no "my_local" entry at all, and the LATER `#my_local
+    // = 'Hello'` would create a BRAND NEW, entirely disconnected cell --
+    // silently breaking the exact mechanism this stage exists to provide.
+    // `LassoContext.ensureLocalExists`, wired into bare `local(name)`
+    // declarations, fixes this. This test is deliberately narrower than
+    // the Guide's own worked example above: it isolates JUST the bare-
+    // declaration-creates-a-cell requirement, independent of `method1`/
+    // `method2`'s own cross-method invocation shape.
+    var context = LassoContext()
+    let output = try await LassoRenderer().render(
+        """
+        [local('my_local')]\
+        [local('cap' = { return #my_local })]\
+        [local('my_local' = 'Hello')]\
+        [#cap()]
+        """,
+        context: &context
+    )
+    #expect(output == "Hello")
+}
+
+@Test func aCapturesOwnNewlyCreatedLocalDoesNotLeakBackIntoTheCallersScope() async throws {
+    // The other side of live-reference closures: sharing box REFERENCES
+    // for names the creating scope already had must NOT be confused with
+    // sharing the whole SCOPE going forward. A brand new local the
+    // capture body itself declares (never present in the creating
+    // scope's own locals at capture-literal-evaluation time) gets its own
+    // fresh, capture-invocation-local cell -- `Evaluator.invokeCapture`'s
+    // own `defer { context.replaceLocals(savedLocals) }` restores the
+    // CALLER's own dictionary wholesale afterward, discarding it. If this
+    // regressed (e.g. captures started sharing the live dictionary
+    // object itself, not just individual box references), `#leaked`
+    // would incorrectly read "leaked value" here instead of empty.
+    var context = LassoContext()
+    let output = try await LassoRenderer().render(
+        """
+        [local('cap' = { local('leaked' = 'leaked value') })]\
+        [#cap()]\
+        [string(#leaked)]
+        """,
+        context: &context
+    )
+    #expect(output == "")
+}
+
+@Test func twoInvocationsOfTheSameCaptureWithDifferentPositionalArgumentsDoNotInterfere() async throws {
+    // `#1`/`#2`/... get a FRESH box per invocation
+    // (`Evaluator.invokeCapture`'s `LassoLocalBox(argument.value)`, not a
+    // mutation of whatever box previously occupied that slot) --
+    // otherwise a capture that closes over an outer local AND reads its
+    // own positional argument could have one invocation's `#1` leak into
+    // a later invocation that didn't pass one, or two overlapping
+    // invocations (impossible in this single-threaded evaluator, but
+    // worth pinning down explicitly) could stomp on each other's
+    // arguments. Auto-collect, no explicit `return` -- an explicit
+    // `return` here would be a Stage 2 non-local exit whose home is THIS
+    // top level (the capture is invoked directly where it was created),
+    // which correctly aborts the rest of the page after the FIRST
+    // invocation -- real, unrelated Stage 2 behavior this test isn't
+    // about, sidestepped the same way Stage 2's own tests do.
+    var context = LassoContext()
+    let output = try await LassoRenderer().render(
+        """
+        [local('cap' = {^ #1 ^})]\
+        [#cap('first')]\
+        |\
+        [#cap('second')]\
+        |\
+        [#cap()]
+        """,
+        context: &context
+    )
+    #expect(output == "first|second|")
+}
+
+@Test func capturesCreatedAcrossLoopIterationsAllShareTheirHomesSingleLocalsBagNotAPerIterationCopy() async throws {
+    // Pinning test for a question raised by code review: does a capture
+    // created and STORED (not invoked) during one loop iteration, then
+    // invoked again after the loop finishes, see ITS OWN iteration's
+    // value for a loop-bound variable (`loop_value`), or the value the
+    // variable held by the time the loop ended? Checked directly against
+    // lassoguide.com/language/captures.html, which settles this
+    // explicitly: "A capture with a home will always take the following
+    // environment values from its home: self, locals, params, and
+    // current call name." -- a capture's `locals` come from its home as
+    // ONE shared, mutable bag (there is no per-iteration/block-scope
+    // concept anywhere in the docs), not a value frozen at the capture's
+    // own creation moment. So EVERY capture created across every
+    // iteration of a loop within the SAME home shares that home's SAME
+    // `loop_value` storage cell -- invoking any of them after the loop
+    // ends correctly reflects `loop_value`'s FINAL value, matching how
+    // an ordinary repeated `#x = ...` reassignment works elsewhere in
+    // that same scope. This is the CORRECT, doc-faithful behavior, not a
+    // bug -- deliberately NOT "fixed" to give loop bodies their own
+    // per-iteration scope, which real Lasso's own local-variable model
+    // (this codebase's existing single-flat-dictionary-per-call-frame
+    // design already matches it) simply doesn't have.
+    var context = LassoContext()
+    let output = try await LassoRenderer().render(
+        """
+        <?lassoscript
+        define collectCaptures() => {
+            local(caps) = array
+            iterate(array('a', 'b', 'c'), local(item))
+                #caps->insert({^ #item ^})
+            /iterate
+            local(results) = array
+            iterate(#caps, local(cap))
+                #results->insert(#cap->invoke)
+            /iterate
+            return #results->join('')
+        }
+        ?>
+        [collectCaptures]
+        """,
+        context: &context
+    ).trimmingCharacters(in: .whitespacesAndNewlines)
+    #expect(output == "ccc")
+}
+
+@Test func typeConstructorsDoNotPermanentlyCorruptACallingScopesOwnLocalNamedParams() async throws {
+    // Found by architect review: a real, capture-UNRELATED bug --
+    // `Evaluator.instantiate`'s "legacy constructor params" shadowing
+    // used to `context.set(...)` an ambient local named "params"
+    // (Documentation/legacy-define-tag-type-plan.md's own "Constructor
+    // params" note) and restore it afterward via `context
+    // .replaceLocals(savedLocals)`. Stage 3's boxed locals broke this:
+    // `set(...)` on an ALREADY-EXISTING name mutates that box in place
+    // (exactly what makes closures work) -- so if the CALLING scope
+    // already had its own local literally named "params" (a real,
+    // plausible name -- it's the built-in pseudo-var for a method's own
+    // arguments), the constructor call would silently overwrite that
+    // box's value with its own constructor argument array, and
+    // `replaceLocals` afterward would NOT undo it (same box object
+    // either way -- restoring the name→box mapping doesn't restore a
+    // mutated box's contents). No captures are involved in this
+    // reproduction at all.
+    var context = LassoContext()
+    let output = try await LassoRenderer().render(
+        """
+        <?lassoscript
+        define local_type => type {
+            data i
+            public onCreate(x) => { .i = #x }
+        }
+        define method1() => {
+            local(params) = 'sentinel'
+            local(obj) = local_type(42)
+            return #params
+        }
+        ?>
+        [method1]
+        """,
+        context: &context
+    ).trimmingCharacters(in: .whitespacesAndNewlines)
+    #expect(output == "sentinel")
 }
 
 @Test func associationOperatorFoldsACaptureLiteralAsATrailingArgumentOnABareIdentifierCall() async throws {

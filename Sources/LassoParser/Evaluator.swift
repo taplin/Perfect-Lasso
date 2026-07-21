@@ -16,10 +16,15 @@ struct Evaluator {
         case .null: return .null
         case .void: return .void
         case let .captureLiteral(body, autoCollect):
-            // Stage 1 (snapshot closure semantics only — see
-            // `Captures.swift`'s own doc comment): the capture's body
-            // executes later against a COPY of the locals as they exist
-            // right now, not a live reference back to this scope.
+            // Stage 3 (live-reference closures — see `Captures.swift`'s
+            // own doc comment): `context.snapshotLocals()` returns a
+            // dictionary COPY, but its VALUES are `LassoLocalBox` object
+            // references, not plain `LassoValue`s — so this shares the
+            // SAME storage cells the live scope's locals use, not a
+            // frozen value-type copy. A later write to one of those
+            // names (via `LassoContext.set`, which mutates an existing
+            // box in place) is visible through THIS capture's own
+            // `capturedLocals` too, since it's the identical box object.
             // Stage 2: `homeDepth` records the call-stack depth active
             // right now (this capture's creating frame's own depth) —
             // a later `return`/`yield` inside this capture's body
@@ -417,7 +422,7 @@ struct Evaluator {
     }
 
     /// `capture->invoke(...)` / `#cap(...)` shorthand — see
-    /// `Captures.swift`'s own doc comment for Stage 1's scope. Mirrors
+    /// `Captures.swift`'s own doc comment for the full design. Mirrors
     /// `invokeCustomTag` above almost exactly (same snapshot/restore
     /// discipline, same per-call return-signal reuse, same fresh
     /// `loopDepth`/recursion-depth-guarded call-stack push) — the one
@@ -443,7 +448,12 @@ struct Evaluator {
         if skipIfNonLocalReturnAlreadyPending() { return .void }
         var boundLocals = capture.capturedLocals
         for (offset, argument) in arguments.filter({ $0.label == nil }).enumerated() {
-            boundLocals[String(offset + 1)] = argument.value
+            // Stage 3 (Captures): a FRESH box per invocation, not a
+            // mutation of whatever box (if any) already occupied this
+            // slot — `#1`/`#2`/... are this call's own arguments, never
+            // shared with the creating scope or persisted across separate
+            // invocations of the same capture.
+            boundLocals[String(offset + 1)] = LassoLocalBox(argument.value)
         }
 
         let savedLocals = context.snapshotLocals()
@@ -527,13 +537,19 @@ struct Evaluator {
         return (givenBlock, remaining)
     }
 
+    /// Every bound parameter gets its OWN fresh box — a tag/method call
+    /// always starts an entirely new, isolated local scope (see
+    /// `invokeCustomTag`'s own doc comment: "a fresh, isolated local scope
+    /// so the tag body's #locals can't leak into or clobber the caller's"),
+    /// so nothing here should ever share a box with the caller's own
+    /// scope, matching `invokeCapture`'s identical treatment of `#1`/`#2`.
     private mutating func bindParameters(
         _ parameters: [LassoArgument],
         to callArguments: [EvaluatedArgument]
-    ) async throws -> [String: LassoValue] {
+    ) async throws -> [String: LassoLocalBox] {
         let positional = callArguments.filter { $0.label == nil }
         var positionalIndex = 0
-        var bound: [String: LassoValue] = [:]
+        var bound: [String: LassoLocalBox] = [:]
 
         for parameter in parameters {
             let (name, defaultExpression) = Self.parameterNameAndDefault(parameter.value)
@@ -542,14 +558,14 @@ struct Evaluator {
             if let labeled = callArguments.first(where: {
                 $0.label?.caseInsensitiveCompare(name) == .orderedSame
             }) {
-                bound[name.lowercased()] = labeled.value
+                bound[name.lowercased()] = LassoLocalBox(labeled.value)
             } else if positionalIndex < positional.count {
-                bound[name.lowercased()] = positional[positionalIndex].value
+                bound[name.lowercased()] = LassoLocalBox(positional[positionalIndex].value)
                 positionalIndex += 1
             } else if let defaultExpression {
-                bound[name.lowercased()] = try await evaluate(defaultExpression)
+                bound[name.lowercased()] = LassoLocalBox(try await evaluate(defaultExpression))
             } else {
-                bound[name.lowercased()] = .null
+                bound[name.lowercased()] = LassoLocalBox(.null)
             }
         }
         return bound
@@ -574,9 +590,31 @@ struct Evaluator {
         // params" note. Bound as an ordinary local (not passed through
         // invokeMemberMethod's own parameter binding) so it's visible here
         // and restored to whatever it was before once construction ends.
+        //
+        // Stage 3 (Captures) found a real, capture-unrelated bug in how
+        // this "restore" used to work: `context.set(...)` MUTATES an
+        // EXISTING box in place when one already exists for that name —
+        // exactly what makes closures see later same-slot writes — so if
+        // the CALLING scope already had its own local literally named
+        // "params", the old `context.set(...)` here permanently
+        // overwrote THAT box's value with the constructor's own argument
+        // array, and `context.replaceLocals(savedLocals)` afterward
+        // didn't undo it (it restores the name→box MAPPING, not a
+        // mutated box's contents, and it's the identical box either
+        // way). Fixed by inserting a FRESH box for "params" into a COPY
+        // of the ambient scope instead of mutating whatever box (if any)
+        // already occupied that name — every OTHER name in the ambient
+        // scope still resolves to the SAME shared boxes as before (data
+        // member defaults/`onCreate` keep seeing the calling scope's own
+        // other locals, unchanged), but "params" specifically points at
+        // a brand-new box this constructor call owns exclusively, so the
+        // caller's own pre-existing "params" (if any) is never touched
+        // at all and needs no real "restoring."
         let evaluatedCallArguments = try await evaluate(callArguments)
         let savedLocals = context.snapshotLocals()
-        context.set(.array(evaluatedCallArguments.map(\.value)), for: "params", scope: .local)
+        var scopedLocals = savedLocals
+        scopedLocals["params"] = LassoLocalBox(.array(evaluatedCallArguments.map(\.value)))
+        context.replaceLocals(scopedLocals)
         defer { context.replaceLocals(savedLocals) }
         for member in type.dataMembers {
             if let defaultValue = member.defaultValue {
@@ -803,6 +841,24 @@ struct Evaluator {
                 try await assign(evaluated, to: target, defaultScope: scope)
             } else if let name = Self.assignmentLabel(argument.value) {
                 readValue = context.value(for: name, scope: scope)
+                // Stage 3 (Captures): a bare `local(name)` declaration (no
+                // `=` value) must bring `name` into existence as a real,
+                // addressable storage cell RIGHT NOW — not defer creation
+                // until first assignment — so a capture literal evaluated
+                // between this declaration and a LATER `#name = value`
+                // assignment still closes over the SAME cell that
+                // assignment mutates (Ch. "Captures" §1.5's own worked
+                // example does exactly this shape). This same branch also
+                // covers the legacy read-only `(Local: 'name')` form, but
+                // that's harmless: `local_defined`/`var_defined` already
+                // check for `.null`, not box existence (see
+                // `LassoContext.trueGlobalDefined`'s own established
+                // precedent for this exact simplification), so creating an
+                // empty box here changes nothing observable for either
+                // form.
+                if scope == .local {
+                    context.ensureLocalExists(name)
+                }
             }
         }
         return readValue ?? .void

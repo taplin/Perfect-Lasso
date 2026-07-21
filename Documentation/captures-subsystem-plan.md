@@ -656,8 +656,126 @@ existed). Stage 2 doesn't change this, and doing so would be a materially
 different, out-of-scope change to `abort()`'s own long-standing semantics,
 not a Captures fix.
 
-**Stage 3 — live-reference closure semantics.** Pick and implement §4.2(a)
-or (b). By far the largest and riskiest single stage — see §7.
+**Stage 3 — live-reference closure semantics** ✅ done (2026-07-21) — chose
+§4.2(a), per-variable boxing, over §4.2(b)'s scope-chain redesign. A new
+`final class LassoLocalBox: @unchecked Sendable { var value: LassoValue }`
+(Runtime.swift, mirroring `LassoCaptureValue`/`LassoObjectInstance`'s own
+established pattern) replaces `LassoContext.locals`'s value type
+(`[String: LassoValue]` → `[String: LassoLocalBox]`) — `.local` scope only;
+`.global`/`.trueGlobal` need no change, since there's only ever one shared
+dictionary for the whole render, no snapshot/restore ever happens on them.
+`set(_:for:scope:.local)` now MUTATES an existing box in place when one
+exists (creating a fresh one only if not) — this in-place mutation through a
+shared reference IS the entire closure mechanism. `snapshotLocals()`/
+`replaceLocals(_:)` (15 call sites total, only in Evaluator.swift/
+Renderer.swift — every invocation boundary's own save-caller's-locals/
+start-fresh-scope/restore bookkeeping) keep identical logic, just a plain
+dictionary copy — which now shares box references for free, since a
+dictionary copy of class values shares the underlying objects. This is
+smaller-blast-radius than §4.2(b) would have been: it keeps the codebase's
+existing flat-dictionary-per-call-frame scoping model entirely intact (no
+lexical nesting/parent-chain lookup introduced), just changes what each
+dictionary VALUE is under the hood. `LassoCaptureValue.capturedLocals`
+(Captures.swift) changed type to match — `.captureLiteral`'s own evaluation
+(Evaluator.swift) needed NO code change at all, since `context
+.snapshotLocals()` already returns the right thing. Every place that binds
+FRESH names into a new scope (`invokeCapture`'s `#1`/`#2` positional
+binding, `bindParameters`, `RendererTagInvocationService.invoke`'s own
+parameter binding) constructs brand-new boxes, never sharing/mutating a
+pre-existing one — a tag/method call (and each capture invocation's own
+positional args) always starts an entirely new, isolated scope, unaffected
+by this stage. 552/552 tests passing (548 existing + 4 new, one existing
+Stage-1 test rewritten — see below).
+
+**Real gap found and fixed while implementing**: `Evaluator.declare(_:scope:)`'s
+bare-declaration branch (`local(name)`, NO `=` value) was a pure read-and-
+discard no-op — harmless under Stage 1's snapshot semantics, but breaks live-
+reference closures: the Guide's own worked example declares `local(my_local)`
+bare, THEN creates a capture closing over it, THEN assigns it — if the bare
+declaration never actually created a storage cell, the capture would have
+captured a dictionary with no "my_local" entry at all, and the later
+assignment would silently create a brand-new, disconnected box. Fixed with a
+new `LassoContext.ensureLocalExists(_:)`, wired in for `.local` scope only.
+Verified decisive by reverting box-sharing at the capture-literal-evaluation
+site (copying values into fresh boxes instead) and confirming the regression
+tests fail exactly as predicted — one with a wrong value, one by THROWING
+(a frozen `.null` copy of `my_local` can't dispatch `->append`).
+
+**One existing Stage 1 test superseded, not just patched**:
+`captureLiteralUsesSnapshotSemanticsNotLiveReferenceClosure` explicitly
+asserted the OLD, narrower snapshot behavior ("first", not "second") as its
+own documented limitation — Stage 3 makes that assertion genuinely WRONG,
+so it was rewritten (renamed to `...LiveReferenceClosureSemanticsNotASnapshot`)
+to assert the real, now-correct live-reference outcome ("second") instead of
+just being deleted or loosened.
+
+Deliberately unchanged: no lexical scope-chain/nested-block-scope
+introduction (§4.2(b)); `if`/`while`/`loop` bodies still share their
+enclosing call frame's single flat local dictionary exactly as before.
+
+**Three real findings from architect + code-reviewer + swift-concurrency-pro
+review, all resolved before merge:**
+
+1. **`Evaluator.instantiate`'s constructor-params shadow silently corrupted
+   an unrelated ambient local, capture-unrelated.** `instantiate` shadows
+   the constructor call's own arguments as a local named `params` while
+   evaluating data-member defaults/`onCreate` (Documentation
+   /legacy-define-tag-type-plan.md's own "Constructor params" note),
+   previously via `context.set(...)` on the live ambient scope, restored
+   afterward via `context.replaceLocals(savedLocals)`. Boxing broke this
+   specific pattern: `set(...)` MUTATES an existing box in place when one
+   already exists for that name — so if the CALLING scope already had its
+   own local literally named `params` (a plausible name — it's the
+   built-in pseudo-var for a method's own arguments), the old code
+   permanently overwrote that box's value with the constructor's own
+   argument array, and `replaceLocals` afterward did NOT undo it (same box
+   object either way — restoring the name→box mapping doesn't restore a
+   mutated box's contents). No captures involved in triggering this at
+   all. Fixed by inserting a FRESH box for `params` into a copy of the
+   ambient scope, rather than mutating whatever box (if any) already
+   occupied that name — every other ambient name still resolves to the
+   same shared boxes as before. Verified decisive by reverting and
+   confirming the regression test fails exactly as predicted (`"42"`
+   instead of `"sentinel"`).
+2. **Stale Stage-1-era doc comments contradicted the shipped Stage 3
+   behavior.** Three spots (the `.captureLiteral` evaluation case and
+   `invokeCapture`'s own doc comment in Evaluator.swift, `LassoValue
+   .capture`'s doc comment in Runtime.swift) still said "Stage 1: snapshot
+   closure semantics only" — exactly backwards from what Stage 3 ships,
+   sitting directly on/next to the very code that changed. Updated to
+   describe the real live-reference behavior.
+3. **`LassoLocalBox`'s doc comment overclaimed a locking precedent it
+   doesn't follow.** Said it "mirrors `LassoCaptureValue`/
+   `LassoObjectInstance`'s own established pattern" — both of which
+   protect their mutable state with an `NSLock`; `LassoLocalBox` has no
+   lock at all. Chose NOT to add one (it sits in the hot path of every
+   single local-variable read/write in the whole evaluator — a lock there
+   taxes all of it, not just capture-adjacent code) and instead rewrote
+   the comment to state the ACTUAL safety argument: a fresh `LassoContext`
+   per request, a fully sequential (no task groups/unstructured `Task`s)
+   render pipeline, and captures degrading to `NSNull` before ever
+   surviving a session round-trip — verified true across the codebase by
+   the concurrency review, not merely assumed.
+
+**One question raised by review, investigated and resolved as NOT a bug**:
+does a capture created and STORED (not invoked) during one loop iteration,
+then invoked after the loop ends, see its OWN iteration's value or the
+loop's FINAL value, for a loop-bound variable like `loop_value`? Checked
+directly against lassoguide.com/language/captures.html: "A capture with a
+home will always take the following environment values from its home:
+self, locals, params, and current call name" — `locals` comes from the
+home as ONE shared, mutable bag; there is no per-iteration/block-scope
+concept anywhere in the docs. So every capture created across every
+iteration of a loop within the same home correctly shares that home's SAME
+`loop_value` storage cell, and sees its FINAL value once invoked after the
+loop ends — exactly matching this stage's actual (unmodified) behavior.
+Pinned with a dedicated regression test rather than "fixed" into giving
+loop bodies their own per-iteration scope, which the docs don't describe
+and which this codebase's existing single-flat-dictionary-per-call-frame
+model doesn't have anywhere else either.
+
+554/554 tests passing after all review fixes (was 552; +2 from the
+`instantiate` regression test and the loop-scoping pinning test).
 
 **Stage 4 — `->forEach` (array/list/set/etc.) + `Set->ForEach`/
 `->InsertFrom`.** Once Stage 1 exists, wire to invoke the associated capture

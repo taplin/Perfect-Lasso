@@ -3,20 +3,23 @@ import Foundation
 /// A Lasso 9 Capture value (`https://lassoguide.com/language/captures.html`)
 /// — a stored block of Lasso code that can be invoked later. See
 /// `Documentation/captures-subsystem-plan.md` for the full scoping pass this
-/// implements Stages 1-2 of.
+/// implements Stages 1-3 of.
 ///
-/// **Snapshot closure semantics only** (Stage 1, unchanged) — a capture's
-/// body executes against the local variables as they existed at the MOMENT
-/// the capture literal was evaluated, not a live reference back to its
-/// creation scope. Real Lasso's own documented semantics are live-reference
-/// (the Guide's own worked example: a capture created in one method mutates
+/// **Live-reference closure semantics** (Stage 3, see the plan doc's §4.2(a)
+/// design decision) — a capture's body executes against the SAME storage
+/// cells (`LassoLocalBox`, `Runtime.swift`) the enclosing scope's local
+/// variables live in, not a value-type snapshot. Matches the Guide's own
+/// canonical worked example (§1.5): a capture created in one method mutates
 /// a local that method later reads back, after the capture is invoked from
-/// a completely different method) — this codebase's `LassoContext.locals`
-/// has no per-variable storage indirection anywhere (the identical
-/// structural wall the `@`/`[Reference]` aliasing gap hit), so providing
-/// real live-reference closures is a separate, materially larger piece of
-/// work, deliberately deferred to a later stage (see the plan doc's own
-/// architecture section, §4.2).
+/// a completely different method — this only works because
+/// `capturedLocals` below holds REFERENCES to the same boxes the creating
+/// scope's own `LassoContext.locals` holds, not copies of their values.
+/// Stage 1's original cut used a plain value-type snapshot instead
+/// (disclosed then as a deliberately narrower substitute); see
+/// `LassoLocalBox`'s own doc comment for why boxing every local (not just
+/// capture-adjacent ones) was the chosen fix over a scope-chain redesign
+/// (§4.2(b)) — smaller blast radius, no change to this codebase's existing
+/// flat-dictionary-per-call-frame scoping model.
 ///
 /// **Stage 2 adds**: non-local `return`/`yield` through a capture's home
 /// (see `Evaluator.invokeCapture`/`invokeCustomTag`/`invokeMemberMethod` for
@@ -63,11 +66,14 @@ public final class LassoCaptureValue: @unchecked Sendable, Equatable {
     /// capture produces when it falls off the end without an explicit
     /// `return`.
     public let autoCollect: Bool
-    /// A snapshot of the enclosing scope's local variables at the exact
-    /// moment this capture literal was evaluated — Stage 1's
-    /// intentionally narrower substitute for real Lasso's live-reference
-    /// closure semantics (see this type's own top-level doc comment).
-    public let capturedLocals: [String: LassoValue]
+    /// A dictionary COPY of the enclosing scope's `LassoContext.locals` at
+    /// the exact moment this capture literal was evaluated — but since the
+    /// dictionary's VALUES are `LassoLocalBox` object references (not
+    /// plain `LassoValue`s), this shares the same live storage cells the
+    /// creating scope's own locals use, giving real live-reference closure
+    /// semantics "for free" from a plain dictionary copy (see this type's
+    /// own top-level doc comment, and `LassoLocalBox`'s in `Runtime.swift`).
+    public let capturedLocals: [String: LassoLocalBox]
     /// The call-stack depth (`LassoContext.tagCallStack.count`) active
     /// WHILE the capture's creating frame was rendering its own body, at
     /// the exact moment this capture literal was evaluated — i.e. "the
@@ -80,7 +86,7 @@ public final class LassoCaptureValue: @unchecked Sendable, Equatable {
     /// to escape from this [non-local] behavior."
     private var _homeDepth: Int?
 
-    public init(body: [LassoNode], autoCollect: Bool, capturedLocals: [String: LassoValue], homeDepth: Int?) {
+    public init(body: [LassoNode], autoCollect: Bool, capturedLocals: [String: LassoLocalBox], homeDepth: Int?) {
         self.body = body
         self.autoCollect = autoCollect
         self.capturedLocals = capturedLocals

@@ -27,7 +27,7 @@ public indirect enum LassoValue: Equatable, Sendable {
     /// back via `->second` (includes/detail_by_color.lasso).
     case pair(LassoValue, LassoValue)
     /// A Lasso 9 Capture — see `Captures.swift`'s own doc comment for the
-    /// full design (Stage 1: snapshot closure semantics only).
+    /// full design (real live-reference closure semantics as of Stage 3).
     case capture(LassoCaptureValue)
 
     public var isTruthy: Bool {
@@ -1759,9 +1759,54 @@ enum LoopControlSignal: Sendable, Equatable {
     case continueIteration
 }
 
+/// A single mutable local-variable storage cell — Stage 3 (Captures, see
+/// `Documentation/captures-subsystem-plan.md` §4.2/§4.2(a)): real Lasso's
+/// captures need genuine LIVE-REFERENCE closures (Ch. "Captures" §1.5's own
+/// worked example: a capture created in one method mutates a local that
+/// method later reads back, after the capture is invoked from a completely
+/// different method) — a plain `[String: LassoValue]` dictionary (the
+/// pre-Stage-3 storage) can't provide this, since copying/snapshotting the
+/// dictionary copies the VALUES, not a live link back to the original slot.
+/// Boxing every local's storage cell (not just capture-adjacent ones) gives
+/// every local variable a stable, referenceable identity: two dictionaries
+/// that both hold the SAME box for a given name see each other's writes to
+/// it, because the write mutates the shared box object, not the dictionary
+/// entry. `LassoCaptureValue.capturedLocals` (`Captures.swift`) stores a
+/// snapshot of `LassoContext.locals` taken at the exact moment a capture
+/// literal is evaluated — since that snapshot is just a dictionary COPY
+/// (cheap, COW) whose VALUES are box references, it shares boxes with the
+/// live creating scope for free, with no additional plumbing needed at the
+/// capture-literal-evaluation site itself.
+///
+/// `@unchecked Sendable` with NO internal locking — unlike
+/// `LassoCaptureValue`/`LassoObjectInstance`, which both guard their own
+/// mutable state with an `NSLock` — because this type sits in the hot path
+/// of every single local-variable read/write in the entire evaluator, and a
+/// lock there would tax all of it, not just capture-adjacent code. Safety
+/// instead rests on a verified structural invariant, not synchronization:
+/// every HTTP request builds a brand-new `LassoContext` (never a copy of
+/// another in-flight one), the whole render/evaluate pipeline is a single
+/// sequential chain of `await`s with no task groups or unstructured `Task`s
+/// touching `LassoContext` anywhere, and a `.capture` value (so also its
+/// `capturedLocals` boxes) can never survive a session round-trip — session
+/// persistence degrades it to `NSNull` (see `jsonObject` below) before it
+/// could ever leak a box reference across requests. If a future change ever
+/// introduces real concurrency into the render path (parallel `forEach`,
+/// background prefetch, a diagnostic `Task` reading `context` mid-render),
+/// this box would race silently with no compiler or runtime signal — revisit
+/// this design (an `NSLock`, matching its two siblings, is the natural fix)
+/// before that happens, not after.
+public final class LassoLocalBox: @unchecked Sendable {
+    public var value: LassoValue
+
+    public init(_ value: LassoValue) {
+        self.value = value
+    }
+}
+
 public struct LassoContext: Sendable {
     private var globals: [String: LassoValue]
-    private var locals: [String: LassoValue]
+    private var locals: [String: LassoLocalBox]
     // Genuinely separate namespace from `globals` above — see
     // `VariableScope.trueGlobal`'s own doc comment for why.
     private var trueGlobals: [String: LassoValue] = [:]
@@ -1925,7 +1970,9 @@ public struct LassoContext: Sendable {
         tagRegistry: LassoTagRegistry = LassoTagRegistry()
     ) {
         self.globals = Dictionary(uniqueKeysWithValues: globals.map { ($0.key.lowercased(), $0.value) })
-        self.locals = Dictionary(uniqueKeysWithValues: locals.map { ($0.key.lowercased(), $0.value) })
+        // Public init keeps accepting plain `LassoValue`s (external callers,
+        // tests) — each gets its own fresh box on the way in.
+        self.locals = Dictionary(uniqueKeysWithValues: locals.map { ($0.key.lowercased(), LassoLocalBox($0.value)) })
         inlineFrames = []
         self.natives = natives
         self.nativeTypes = nativeTypes
@@ -2001,15 +2048,47 @@ public struct LassoContext: Sendable {
     }
 
     public subscript(_ name: String) -> LassoValue {
-        get { locals[name.lowercased()] ?? globals[name.lowercased()] ?? .null }
+        get { locals[name.lowercased()]?.value ?? globals[name.lowercased()] ?? .null }
         set { globals[name.lowercased()] = newValue }
     }
 
+    /// Stage 3 (Captures): a `.local` write MUTATES an existing box in
+    /// place when one already exists for `name`, rather than replacing the
+    /// dictionary entry outright — this is exactly what makes live-
+    /// reference closures work. Any capture (or any other scope) that
+    /// captured a reference to THIS box earlier sees the new value
+    /// immediately, because it's the same object, not a stale copy. Only
+    /// when no box exists yet does this create a fresh one.
     public mutating func set(_ value: LassoValue, for name: String, scope: VariableScope) {
         switch scope {
-        case .local: locals[name.lowercased()] = value
+        case .local:
+            let key = name.lowercased()
+            if let box = locals[key] {
+                box.value = value
+            } else {
+                locals[key] = LassoLocalBox(value)
+            }
         case .global, .unscoped: globals[name.lowercased()] = value
         case .trueGlobal: trueGlobals[name.lowercased()] = value
+        }
+    }
+
+    /// Ch. "Captures" §1.5's own worked example declares `local(my_local)`
+    /// (NO initial value) before creating a capture that closes over it,
+    /// then assigns it afterward from a completely different method — for
+    /// that later assignment to be visible through the ALREADY-CREATED
+    /// capture's own captured reference, `my_local`'s box must exist
+    /// (holding `.null`) at DECLARATION time, not be deferred until first
+    /// assignment. `Evaluator.declare(_:scope:)`'s bare-name (no `=`)
+    /// branch calls this for `.local` scope specifically — a plain read
+    /// like `(Local: 'name')` doesn't, and normal `local(x) = value`/
+    /// `set(_:for:scope:)` already creates a box as a side effect of
+    /// writing. A no-op if a box already exists (preserves whatever value
+    /// it currently holds).
+    mutating func ensureLocalExists(_ name: String) {
+        let key = name.lowercased()
+        if locals[key] == nil {
+            locals[key] = LassoLocalBox(.null)
         }
     }
 
@@ -2033,10 +2112,10 @@ public struct LassoContext: Sendable {
     // (caught by architect review, no test previously exercised this).
     public func value(for name: String, scope: VariableScope = .unscoped) -> LassoValue {
         switch scope {
-        case .local: locals[name.lowercased()] ?? .null
+        case .local: locals[name.lowercased()]?.value ?? .null
         case .global: globals[name.lowercased()] ?? trueGlobals[name.lowercased()] ?? .null
         case .trueGlobal: trueGlobals[name.lowercased()] ?? .null
-        case .unscoped: locals[name.lowercased()] ?? globals[name.lowercased()] ?? .null
+        case .unscoped: locals[name.lowercased()]?.value ?? globals[name.lowercased()] ?? .null
         }
     }
 
@@ -2226,11 +2305,21 @@ public struct LassoContext: Sendable {
         return false
     }
 
-    func snapshotLocals() -> [String: LassoValue] {
+    /// A shallow dictionary copy — cheap (Swift COW) — whose VALUES are
+    /// still the same `LassoLocalBox` object references the live scope
+    /// holds. Used for two genuinely different purposes that happen to
+    /// need the exact same thing: (1) every invocation boundary's own
+    /// save-then-restore-my-caller's-locals-across-this-call bookkeeping
+    /// (box identity is irrelevant there — the caller's dictionary gets
+    /// restored verbatim either way), and (2) `Evaluator`'s `.captureLiteral`
+    /// evaluation, which needs the SHARED box references for Stage 3's
+    /// live-reference closure semantics (Ch. "Captures" §1.5) — see
+    /// `LassoCaptureValue.capturedLocals`'s own doc comment.
+    func snapshotLocals() -> [String: LassoLocalBox] {
         locals
     }
 
-    mutating func replaceLocals(_ newLocals: [String: LassoValue]) {
+    mutating func replaceLocals(_ newLocals: [String: LassoLocalBox]) {
         locals = newLocals
     }
 

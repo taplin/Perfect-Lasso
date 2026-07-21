@@ -646,14 +646,17 @@ struct RendererTagInvocationService: LassoTagInvocationService {
         // silently shift every SUBSEQUENT parameter's binding one
         // position off, a wrong-value bug that wouldn't throw. Found by
         // code review during Stage 7a.
-        var bound: [String: LassoValue] = [:]
+        // Stage 3 (Captures): a fresh box per bound parameter, matching
+        // `Evaluator.bindParameters`'s identical treatment — a tag call
+        // always starts an entirely new, isolated local scope.
+        var bound: [String: LassoLocalBox] = [:]
         var positionalIndex = 0
         for parameter in definition.parameters {
             guard let name = LassoMethodDispatcher.parameterMetadata(parameter.value).name else { continue }
             guard positionalIndex < positionalArguments.count else {
                 throw LassoRuntimeError.tagInvocationArityMismatch(definition.name)
             }
-            bound[name.lowercased()] = positionalArguments[positionalIndex]
+            bound[name.lowercased()] = LassoLocalBox(positionalArguments[positionalIndex])
             positionalIndex += 1
         }
 
