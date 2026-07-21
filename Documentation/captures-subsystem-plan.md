@@ -968,7 +968,45 @@ own test with a doubled backslash (`'(\\d+)-(\\d+)'`), which produces
 the correct pattern under BOTH the current and any corrected future
 escape rule.
 
-**Stage 6 — predicate-taking `->find(matching)`.** Needs Stage 1 only.
+**Stage 6 — predicate-taking `->find(matching)`.** ✅ closed, no new code
+(2026-07-21) — this stage's original premise doesn't correspond to a real,
+missing Lasso 9.3 feature, the same outcome Stage 4 reached for
+`->forEachPair`. Real-doc research (lassoguide.com/operations/collections.html
+via `curl`) found `array->find(matching)`'s exact documented text: "Searches
+the array for elements matching the parameter... returns a new array
+containing all of the matched objects" — purely comparison/matcher-based,
+with no mention of a capture-block/predicate form anywhere on the page
+(checked specifically for "capture"/"onCompare"/"match_comparator"/
+"custom" — none relevant). No dedicated matchers.html doc page exists either
+(404 on both `/language/matchers.html` and `/operations/matchers.html`).
+`Matchers.swift`'s own top-of-file comment states it was "verified directly
+against the PDF... including every worked example" and lists exactly five
+real matcher kinds — `Match_Range`/`Match_NotRange`/`Match_RegExp`/
+`Match_NotRegExp`/`Match_Comparator` — with no capture-based custom-predicate
+kind among them.
+
+More importantly, `->find(matching)` is not missing at all: it's already
+fully implemented, Matcher-aware, and correct per-type, predating Captures
+entirely (built during the earlier, separately-numbered Collections
+subsystem work) — confirmed by reading every `register("find")` site in
+`Collections.swift` plus the `.array`/`.map`/TreeMap cases in
+`Evaluator.swift`. Array/List return a plain array of matches (Table 5);
+Set returns a Set (Table 16); Map/TreeMap follow the same pattern for their
+own element shape. All route through the shared
+`LassoMatcherValue.filterMatching`/`anyMatches`, so a `Match_Comparator`
+argument already supports an arbitrary custom comparator (per the earlier
+Collections plan's own "Stage 7b/7c" — a different numbering scheme than
+this Captures plan, not to be confused with this doc's own Stage 7 below).
+
+Considered, and rejected, building a new capture-based custom Matcher kind
+(e.g. a hypothetical `Match_Predicate` wrapping a boolean-returning capture)
+as a disclosed extension in the same spirit as Stage 4's built-in
+`->forEach` — but unlike `->forEach` (which had a real documented trait,
+`trait_queriable`, and real corpus usage motivating it), no real Lasso 9.3
+doc page, PDF table, or corpus file references anything like a
+capture-based matcher, so building one here would be speculative feature
+invention with no grounding and no demand. No code or test changes; this
+doc update is the only change for this stage.
 
 **Stage 7 — `currentCapture()`/`givenBlock`/introspection family.** Low
 corpus need; bookkeeping once Stage 1-2 exist.
