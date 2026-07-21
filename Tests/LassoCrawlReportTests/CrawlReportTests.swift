@@ -68,6 +68,113 @@ private func write(_ text: String, to root: URL, relativePath: String) throws {
     #expect(CrawlReport.pathMatchesExclude("assets/vendor/gmaps/demo.html", excludePaths: []) == false)
 }
 
+// MARK: - candidateIsEligible (shared by discoverPaths and Sitemap-derived
+// paths — see CrawlReport.swift's own doc comment on why this was
+// extracted rather than reimplemented a second time for sitemap discovery)
+
+@Test func candidateIsEligibleAcceptsAMatchingExtensionWithNoExcludes() {
+    #expect(CrawlReport.candidateIsEligible(relativePath: "pages/home.lasso", extensions: ["lasso"], excludePaths: []))
+}
+
+@Test func candidateIsEligibleRejectsNonMatchingExtension() {
+    #expect(CrawlReport.candidateIsEligible(relativePath: "image.jpg", extensions: ["lasso"], excludePaths: []) == false)
+}
+
+@Test func candidateIsEligibleRejectsUnderscorePrefixedFiles() {
+    #expect(CrawlReport.candidateIsEligible(relativePath: "_header.lasso", extensions: ["lasso"], excludePaths: []) == false)
+}
+
+@Test func candidateIsEligibleRejectsHiddenSegments() {
+    #expect(CrawlReport.candidateIsEligible(relativePath: ".hidden/page.lasso", extensions: ["lasso"], excludePaths: []) == false)
+}
+
+@Test func candidateIsEligibleRejectsExcludedPaths() {
+    #expect(CrawlReport.candidateIsEligible(relativePath: "assets/vendor/demo.lasso", extensions: ["lasso"], excludePaths: ["vendor"]) == false)
+}
+
+@Test func candidateIsEligibleAppliesEveryCheckToThePathPortionOnlyIgnoringAnyQueryString() {
+    // Sitemap-derived paths are exactly the query-parameterized case this
+    // feature exists for — every check must look at the path portion only.
+    #expect(CrawlReport.candidateIsEligible(relativePath: "product.lasso?id=42", extensions: ["lasso"], excludePaths: []))
+    #expect(CrawlReport.candidateIsEligible(relativePath: "_header.lasso?x=1", extensions: ["lasso"], excludePaths: []) == false)
+    #expect(CrawlReport.candidateIsEligible(relativePath: "assets/vendor/demo.lasso?x=1", extensions: ["lasso"], excludePaths: ["vendor"]) == false)
+    #expect(CrawlReport.candidateIsEligible(relativePath: "page.html?x=1", extensions: ["lasso"], excludePaths: []) == false)
+}
+
+// MARK: - encodedRequestPath (the requestPage query-encoding fix)
+
+@Test func encodedRequestPathWithNoQueryMatchesThePriorWholeStringEncodingExactly() {
+    // Regression: every caller before this feature never had a query
+    // string — this must produce byte-for-byte the same result as the
+    // single `.urlPathAllowed`-encoding call this replaced.
+    for raw in ["pages/home.lasso", "Caf\u{E9} menu/index.lasso", "a/b/c.inc"] {
+        #expect(CrawlReport.encodedRequestPath(raw) == raw.addingPercentEncoding(withAllowedCharacters: .urlPathAllowed))
+    }
+}
+
+@Test func encodedRequestPathSplitsPathAndQueryWithTheCorrectAllowedCharacterSets() throws {
+    let raw = "product.lasso?id=42&name=A B"
+    let encoded = try #require(CrawlReport.encodedRequestPath(raw))
+    let url = try #require(URL(string: "http://example.com/\(encoded)"))
+    let components = try #require(URLComponents(url: url, resolvingAgainstBaseURL: false))
+    #expect(components.path == "/product.lasso")
+    #expect(components.percentEncodedQuery?.removingPercentEncoding == "id=42&name=A B")
+}
+
+// MARK: - path-internal percent-encoded `?` (review finding: query-string
+// path/query confusion via an embedded percent-encoded `?`)
+
+@Test func candidateIsEligibleAndSitemapExtensionCheckAgreeOnAPathInternalPercentEncodedQuestionMark() {
+    // Before the `Sitemap.relativePath` fix, `Sitemap.discoverPaths`'s own
+    // extension check (against the FULL decoded string) and
+    // `candidateIsEligible`'s extension check (against only the pre-`?`
+    // prefix) disagreed on exactly this input shape — a path could pass
+    // `discoverPaths`'s own filtering but then get silently dropped here at
+    // merge time. Once `Sitemap.relativePath` re-escapes the path-internal
+    // `?` back to `%3F`, there is no longer any unescaped `?` for this
+    // function's own pre-`?` split to find in the path portion, so it
+    // agrees with `Sitemap.relativePath`'s full-string extension check
+    // (see `relativePathReEscapesAPathInternalPercentEncodedQuestionMark`
+    // in `SitemapTests.swift`, which proves what `Sitemap.relativePath`
+    // itself now returns for this exact input).
+    let sitemapDerivedPath = "foo.lasso%3Fbar.lasso"
+    #expect(CrawlReport.candidateIsEligible(relativePath: sitemapDerivedPath, extensions: ["lasso"], excludePaths: []))
+}
+
+@Test func encodedRequestPathBuildsARequestForTheSingleLiteralPathSegmentNotAWrongQuerySplit() throws {
+    // The reviewer's exact scenario: `Sitemap.relativePath` (once fixed)
+    // returns "foo.lasso%3Fbar.lasso" for a same-origin `<loc>` whose path
+    // contains a percent-encoded `?` and has no real query string at all.
+    // `encodedRequestPath` must build a request whose `.path` is the full
+    // literal segment and whose `.query` is `nil` — i.e. the ONE resource
+    // the sitemap declared — not a wrong split into path "/foo.lasso" and
+    // a spurious query "bar.lasso".
+    let sitemapDerivedPath = "foo.lasso%3Fbar.lasso"
+    let encoded = try #require(CrawlReport.encodedRequestPath(sitemapDerivedPath))
+    // The marker must survive as a SINGLE escape on the wire, not a
+    // double-escaped `%253F` — confirmed via a live local HTTP capture
+    // during review that a naive `addingPercentEncoding` re-escape of the
+    // re-inserted `%3F` corrupts it into `%253F`, which a real server
+    // (decoding once) would see as literal `%3F` text, a different,
+    // non-existent resource.
+    #expect(encoded == "foo.lasso%3Fbar.lasso")
+    let url = try #require(URL(string: "http://example.com/\(encoded)"))
+    #expect(url.path == "/foo.lasso?bar.lasso")
+    #expect(url.query == nil)
+}
+
+@Test func encodedRequestPathKeepsAPathInternalPercentEncodedQuestionMarkDistinctFromARealTrailingQuery() throws {
+    // Companion case: a path-internal percent-encoded `?` AND a genuine
+    // trailing real query string must remain distinguishable — proving the
+    // fix doesn't just make every `?` inert, only the re-escaped one.
+    let sitemapDerivedPath = "foo.lasso%3Fbar.lasso?real=1"
+    let encoded = try #require(CrawlReport.encodedRequestPath(sitemapDerivedPath))
+    #expect(encoded == "foo.lasso%3Fbar.lasso?real=1")
+    let url = try #require(URL(string: "http://example.com/\(encoded)"))
+    #expect(url.path == "/foo.lasso?bar.lasso")
+    #expect(url.query == "real=1")
+}
+
 @Test func discoverPathsSkipsStaticHTMLButKeepsLassoBearingHTML() throws {
     let root = try makeTempSiteRoot()
     defer { try? FileManager.default.removeItem(at: root) }
@@ -134,9 +241,27 @@ private func writeBaseline(_ records: [[String: String]]) throws -> URL {
 
     let loaded = try #require(CrawlReport.loadBaseline(file.path))
     #expect(loaded.count == 2)
+    // Neither record has a `"source"` key (an old-format baseline, written
+    // before this feature existed) — both must still load, defaulting to
+    // `.filesystem`. `CrawlPageResult`'s `Equatable` conformance covers
+    // `source` too, so this literal (built with its default `.filesystem`)
+    // only matches if the old-format fallback actually fired.
     #expect(loaded[0] == CrawlPageResult(path: "a.lasso", statusCode: 200, errorType: nil, errorDescription: nil, elapsedMS: 12))
+    #expect(loaded[0].source == .filesystem)
     #expect(loaded[1].errorDescription == "unknownFunction(\"X\")")
     #expect(loaded[1].isClean == false)
+}
+
+@Test func loadBaselineParsesAnExplicitSourceFieldFromANewFormatBaseline() throws {
+    let file = try writeBaseline([
+        ["path": "b.lasso", "statusCode": "200", "errorType": "", "errorDescription": "", "elapsedMS": "3", "source": "sitemapOnly"],
+        ["path": "a.lasso", "statusCode": "200", "errorType": "", "errorDescription": "", "elapsedMS": "3", "source": "filesystem"],
+    ])
+    defer { try? FileManager.default.removeItem(at: file) }
+
+    let loaded = try #require(CrawlReport.loadBaseline(file.path))
+    #expect(loaded.first { $0.path == "b.lasso" }?.source == .sitemapOnly)
+    #expect(loaded.first { $0.path == "a.lasso" }?.source == .filesystem)
 }
 
 @Test func pathsMatchingFailureFiltersCaseInsensitivelyAndOnlyFailingPages() throws {
@@ -215,6 +340,12 @@ private final class CrawlMockURLProtocol: URLProtocol {
     // real distress signal `isBackendDistressSignal` recognizes.
     nonisolated(unsafe) static var failingPaths: Set<String> = []
     nonisolated(unsafe) static var requestedPaths: [String] = []
+    // Per-path response bodies — defaults to the existing hardcoded `"{}"`
+    // (an ordinary crawled page's JSON error payload shape) when unset, so
+    // every pre-existing test using this mock is unaffected. Sitemap-merge
+    // tests below set this to real sitemap XML for `"sitemap.xml"`, since
+    // `Sitemap.discoverPaths` needs actual XML bytes, not `"{}"`.
+    nonisolated(unsafe) static var bodiesByPath: [String: Data] = [:]
 
     override class func canInit(with request: URLRequest) -> Bool { true }
     override class func canonicalRequest(for request: URLRequest) -> URLRequest { request }
@@ -229,7 +360,7 @@ private final class CrawlMockURLProtocol: URLProtocol {
         let statusCode = Self.statusCodesByPath[path] ?? 200
         let response = HTTPURLResponse(url: request.url!, statusCode: statusCode, httpVersion: nil, headerFields: nil)!
         client?.urlProtocol(self, didReceive: response, cacheStoragePolicy: .notAllowed)
-        client?.urlProtocol(self, didLoad: Data("{}".utf8))
+        client?.urlProtocol(self, didLoad: Self.bodiesByPath[path] ?? Data("{}".utf8))
         client?.urlProtocolDidFinishLoading(self)
     }
 
@@ -263,8 +394,9 @@ struct CrawlReportRunTests {
     // that distinction matters).
     CrawlMockURLProtocol.failingPaths = ["c.lasso", "d.lasso", "e.lasso"]
     CrawlMockURLProtocol.requestedPaths = []
+    CrawlMockURLProtocol.bodiesByPath = [:]
 
-    let (results, _, abortedByCircuitBreaker) = await CrawlReport.run(
+    let (results, _, abortedByCircuitBreaker, _) = await CrawlReport.run(
         baseURL: "http://mock.example",
         siteRoot: root,
         extensions: ["lasso"],
@@ -291,8 +423,9 @@ struct CrawlReportRunTests {
     CrawlMockURLProtocol.statusCodesByPath = ["a.lasso": 200, "c.lasso": 200]
     CrawlMockURLProtocol.failingPaths = ["b.lasso", "d.lasso"]
     CrawlMockURLProtocol.requestedPaths = []
+    CrawlMockURLProtocol.bodiesByPath = [:]
 
-    let (results, _, abortedByCircuitBreaker) = await CrawlReport.run(
+    let (results, _, abortedByCircuitBreaker, _) = await CrawlReport.run(
         baseURL: "http://mock.example",
         siteRoot: root,
         extensions: ["lasso"],
@@ -319,8 +452,9 @@ struct CrawlReportRunTests {
     CrawlMockURLProtocol.statusCodesByPath = ["a.lasso": 404, "b.lasso": 500, "c.lasso": 500, "d.lasso": 404]
     CrawlMockURLProtocol.failingPaths = []
     CrawlMockURLProtocol.requestedPaths = []
+    CrawlMockURLProtocol.bodiesByPath = [:]
 
-    let (results, _, abortedByCircuitBreaker) = await CrawlReport.run(
+    let (results, _, abortedByCircuitBreaker, _) = await CrawlReport.run(
         baseURL: "http://mock.example",
         siteRoot: root,
         extensions: ["lasso"],
@@ -340,8 +474,9 @@ struct CrawlReportRunTests {
     }
     CrawlMockURLProtocol.failingPaths = ["a.lasso", "b.lasso", "c.lasso"]
     CrawlMockURLProtocol.requestedPaths = []
+    CrawlMockURLProtocol.bodiesByPath = [:]
 
-    let (results, _, abortedByCircuitBreaker) = await CrawlReport.run(
+    let (results, _, abortedByCircuitBreaker, _) = await CrawlReport.run(
         baseURL: "http://mock.example",
         siteRoot: root,
         extensions: ["lasso"],
@@ -362,6 +497,7 @@ struct CrawlReportRunTests {
     CrawlMockURLProtocol.statusCodesByPath = ["a.lasso": 200, "b.lasso": 200, "c.lasso": 200]
     CrawlMockURLProtocol.failingPaths = []
     CrawlMockURLProtocol.requestedPaths = []
+    CrawlMockURLProtocol.bodiesByPath = [:]
 
     let start = Date()
     _ = await CrawlReport.run(
@@ -388,6 +524,7 @@ struct CrawlReportRunTests {
     CrawlMockURLProtocol.statusCodesByPath = ["a.lasso": 200, "b.lasso": 200, "c.lasso": 200]
     CrawlMockURLProtocol.failingPaths = []
     CrawlMockURLProtocol.requestedPaths = []
+    CrawlMockURLProtocol.bodiesByPath = [:]
 
     let start = Date()
     _ = await CrawlReport.run(
@@ -420,13 +557,14 @@ struct CrawlReportRunTests {
     ]
     CrawlMockURLProtocol.failingPaths = []
     CrawlMockURLProtocol.requestedPaths = []
+    CrawlMockURLProtocol.bodiesByPath = [:]
 
     final class CounterBox: @unchecked Sendable {
         var count = 0
     }
     let box = CounterBox()
 
-    let (results, _, abortedByCircuitBreaker) = await CrawlReport.run(
+    let (results, _, abortedByCircuitBreaker, _) = await CrawlReport.run(
         baseURL: "http://mock.example",
         siteRoot: root,
         extensions: ["lasso"],
@@ -454,8 +592,9 @@ struct CrawlReportRunTests {
     CrawlMockURLProtocol.statusCodesByPath = ["a.lasso": 200, "b.lasso": 200]
     CrawlMockURLProtocol.failingPaths = []
     CrawlMockURLProtocol.requestedPaths = []
+    CrawlMockURLProtocol.bodiesByPath = [:]
 
-    let (results, _, abortedByCircuitBreaker) = await CrawlReport.run(
+    let (results, _, abortedByCircuitBreaker, _) = await CrawlReport.run(
         baseURL: "http://mock.example",
         siteRoot: root,
         extensions: ["lasso"],
@@ -467,6 +606,97 @@ struct CrawlReportRunTests {
 
     #expect(abortedByCircuitBreaker == false)
     #expect(results.count == 2)
+}
+
+// MARK: - run(...) sitemap-discovery merge (Sitemap.swift)
+
+@Test func runMergesSitemapOnlyPathsWithFilesystemResultsAndTagsSourceCorrectly() async throws {
+    let root = try makeTempSiteRoot()
+    defer { try? FileManager.default.removeItem(at: root) }
+    try write("page", to: root, relativePath: "a.lasso")
+
+    CrawlMockURLProtocol.statusCodesByPath = ["a.lasso": 200, "b.lasso": 200]
+    CrawlMockURLProtocol.failingPaths = []
+    CrawlMockURLProtocol.requestedPaths = []
+    CrawlMockURLProtocol.bodiesByPath = [
+        "sitemap.xml": Data("""
+        <?xml version="1.0" encoding="UTF-8"?>
+        <urlset xmlns="http://www.sitemaps.org/schemas/sitemap/0.9">
+          <url><loc>https://origin.example/a.lasso</loc></url>
+          <url><loc>https://origin.example/b.lasso?id=1</loc></url>
+        </urlset>
+        """.utf8),
+    ]
+
+    let (results, _, _, sitemapSummary) = await CrawlReport.run(
+        baseURL: "http://mock.example",
+        siteRoot: root,
+        extensions: ["lasso"],
+        urlSession: mockSession(),
+        sitemapEnabled: true,
+        sitemapEntryPath: "sitemap.xml",
+        sitemapAllowedOrigin: "https://origin.example"
+    )
+
+    #expect(results.map(\.path).sorted() == ["a.lasso", "b.lasso?id=1"])
+    // Found by BOTH sources -> stays `.filesystem` (the pre-existing,
+    // better-understood source).
+    #expect(results.first { $0.path == "a.lasso" }?.source == .filesystem)
+    // Found ONLY via the sitemap -> `.sitemapOnly`.
+    #expect(results.first { $0.path == "b.lasso?id=1" }?.source == .sitemapOnly)
+    #expect(sitemapSummary != nil)
+    #expect(sitemapSummary?.sitemapURLsFetched == 2)
+}
+
+@Test func runWithSitemapDisabledNeverRequestsSitemapAndReturnsNilSummary() async throws {
+    let root = try makeTempSiteRoot()
+    defer { try? FileManager.default.removeItem(at: root) }
+    try write("page", to: root, relativePath: "a.lasso")
+
+    CrawlMockURLProtocol.statusCodesByPath = ["a.lasso": 200]
+    CrawlMockURLProtocol.failingPaths = []
+    CrawlMockURLProtocol.requestedPaths = []
+    CrawlMockURLProtocol.bodiesByPath = [:]
+
+    // sitemapEnabled defaults to false — every existing caller's behavior,
+    // before this feature existed, must be completely unaffected.
+    let (results, _, _, sitemapSummary) = await CrawlReport.run(
+        baseURL: "http://mock.example",
+        siteRoot: root,
+        extensions: ["lasso"],
+        urlSession: mockSession()
+    )
+
+    #expect(results.map(\.path) == ["a.lasso"])
+    #expect(sitemapSummary == nil)
+    #expect(CrawlMockURLProtocol.requestedPaths.contains("sitemap.xml") == false)
+}
+
+@Test func runSkipsSitemapDiscoveryWhenPathListIsSupplied() async throws {
+    let root = try makeTempSiteRoot()
+    defer { try? FileManager.default.removeItem(at: root) }
+
+    CrawlMockURLProtocol.statusCodesByPath = ["only.lasso": 200]
+    CrawlMockURLProtocol.failingPaths = []
+    CrawlMockURLProtocol.requestedPaths = []
+    CrawlMockURLProtocol.bodiesByPath = [:]
+
+    // Even with sitemapEnabled true, an explicit pathList means "the
+    // caller already chose exactly what to crawl" — matching pathList's
+    // pre-existing contract with the filesystem walk.
+    let (results, _, _, sitemapSummary) = await CrawlReport.run(
+        baseURL: "http://mock.example",
+        siteRoot: root,
+        extensions: ["lasso"],
+        pathList: ["only.lasso"],
+        urlSession: mockSession(),
+        sitemapEnabled: true,
+        sitemapAllowedOrigin: "https://origin.example"
+    )
+
+    #expect(results.map(\.path) == ["only.lasso"])
+    #expect(sitemapSummary == nil)
+    #expect(CrawlMockURLProtocol.requestedPaths.contains("sitemap.xml") == false)
 }
 
 }

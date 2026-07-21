@@ -152,6 +152,40 @@ struct ServerConfig: Sendable {
     /// datasource actions failing while every crawled page's HTTP status
     /// looked completely normal. Default 5. `nil`/unset-to-0 disables it.
     let crawlDatasourceFailureThreshold: Int?
+    /// `LASSO_CRAWL_SITEMAP_ENABLED=1` — adds `Sitemap.discoverPaths` as an
+    /// ADDITIONAL, merged-in source of crawl candidate paths, alongside
+    /// (never instead of) the existing filesystem walk — sees dynamic,
+    /// query-parameterized pages (`product.lasso?id=42`) the filesystem
+    /// walk can never discover on its own. Off by default: an extra fetch
+    /// of site-controlled content shouldn't activate silently for existing
+    /// users. See `Sitemap.swift`'s own doc comment for the full
+    /// same-origin/SSRF design.
+    let crawlSitemapEnabled: Bool
+    /// `LASSO_CRAWL_SITEMAP_PATH`, default `"sitemap.xml"` — fetched
+    /// relative to `baseURL` (the local server), exactly like every other
+    /// crawled page. Never a new arbitrary host.
+    let crawlSitemapPath: String
+    /// `LASSO_CRAWL_SITEMAP_ORIGIN` — the real, public origin (e.g.
+    /// `https://www.realclientsite.com`) the sitemap's `<loc>` entries are
+    /// declared to describe. Required (validated http(s)+host) when
+    /// `crawlSitemapEnabled` is true — `ServerConfig.load()` throws
+    /// `ServerConfigError.missingCrawlSitemapOrigin` otherwise, matching the
+    /// existing `missingCWPJanitorAdminAPIConfig` fail-fast-at-startup
+    /// convention. Deliberately NEVER inferred from `baseURL` or the
+    /// sitemap document itself — see `Sitemap.swift`'s doc comment.
+    let crawlSitemapOrigin: String?
+    /// `LASSO_CRAWL_SITEMAP_MAX_SUB_SITEMAPS`, default 50. Unlike
+    /// `crawlCircuitBreakerThreshold` above, `0`/negative does NOT disable
+    /// this — it falls back to the default. These three caps are
+    /// security-relevant bounds on content fetched from a site-controlled
+    /// source, not a legitimate "turn it off" knob.
+    let crawlSitemapMaxSubSitemaps: Int
+    /// `LASSO_CRAWL_SITEMAP_MAX_URLS`, default 20,000. See
+    /// `crawlSitemapMaxSubSitemaps`'s doc comment re: non-disableable.
+    let crawlSitemapMaxURLs: Int
+    /// `LASSO_CRAWL_SITEMAP_MAX_RESPONSE_BYTES`, default 10,000,000. See
+    /// `crawlSitemapMaxSubSitemaps`'s doc comment re: non-disableable.
+    let crawlSitemapMaxResponseBytes: Int
     /// `LASSO_IMAGE_PROXY_PREFIX`/`LASSO_IMAGE_PROXY_TARGET` — a temporary
     /// escape hatch for a local site-root copy that's missing a real image
     /// tree: any request whose resolved path starts with `imageProxyPrefix`
@@ -460,6 +494,18 @@ struct ServerConfig: Sendable {
             relayNames: Set(smtpRelays.keys)
         )
 
+        let crawlSitemapEnabled = Self.isTruthyEnv(env["LASSO_CRAWL_SITEMAP_ENABLED"])
+        let crawlSitemapOrigin = env["LASSO_CRAWL_SITEMAP_ORIGIN"]
+        if crawlSitemapEnabled {
+            guard let origin = crawlSitemapOrigin,
+                  let originURL = URL(string: origin),
+                  let originScheme = originURL.scheme?.lowercased(),
+                  originScheme == "http" || originScheme == "https",
+                  originURL.host != nil else {
+                throw ServerConfigError.missingCrawlSitemapOrigin
+            }
+        }
+
         return ServerConfig(
             siteRoot: root,
             port: env["LASSO_SERVER_PORT"].flatMap(Int.init) ?? 8181,
@@ -504,6 +550,25 @@ struct ServerConfig: Sendable {
             crawlDatasourceFailureThreshold: {
                 let configured = env["LASSO_CRAWL_DATASOURCE_FAILURE_THRESHOLD"].flatMap(Int.init) ?? 5
                 return configured > 0 ? configured : nil
+            }(),
+            crawlSitemapEnabled: crawlSitemapEnabled,
+            crawlSitemapPath: env["LASSO_CRAWL_SITEMAP_PATH"] ?? "sitemap.xml",
+            crawlSitemapOrigin: crawlSitemapOrigin,
+            // These three are security-relevant bounds on content fetched
+            // from a site-controlled source, not a legitimate "turn it
+            // off" knob — unlike the circuit-breaker thresholds above,
+            // 0/negative falls back to the default rather than disabling.
+            crawlSitemapMaxSubSitemaps: {
+                let configured = env["LASSO_CRAWL_SITEMAP_MAX_SUB_SITEMAPS"].flatMap(Int.init) ?? 50
+                return configured > 0 ? configured : 50
+            }(),
+            crawlSitemapMaxURLs: {
+                let configured = env["LASSO_CRAWL_SITEMAP_MAX_URLS"].flatMap(Int.init) ?? 20_000
+                return configured > 0 ? configured : 20_000
+            }(),
+            crawlSitemapMaxResponseBytes: {
+                let configured = env["LASSO_CRAWL_SITEMAP_MAX_RESPONSE_BYTES"].flatMap(Int.init) ?? 10_000_000
+                return configured > 0 ? configured : 10_000_000
             }(),
             imageProxyPrefix: env["LASSO_IMAGE_PROXY_PREFIX"]?.trimmingCharacters(in: CharacterSet(charactersIn: "/")),
             imageProxyTarget: env["LASSO_IMAGE_PROXY_TARGET"]?.trimmingCharacters(in: CharacterSet(charactersIn: "/")),
@@ -934,6 +999,10 @@ enum ServerConfigError: Error, Equatable, CustomStringConvertible {
     /// config-load time rather than silently shadowed by whichever entry
     /// wins the dictionary-construction race.
     case smtpReservedRelayName(String)
+    /// `LASSO_CRAWL_SITEMAP_ENABLED=1` requires `LASSO_CRAWL_SITEMAP_ORIGIN`
+    /// (a valid http(s) origin) — caught here at startup rather than
+    /// deferred to sitemap discovery silently no-op'ing on every crawl.
+    case missingCrawlSitemapOrigin
 
     var description: String {
         switch self {
@@ -960,6 +1029,8 @@ enum ServerConfigError: Error, Equatable, CustomStringConvertible {
             "smtp.mtaSTSEnforce requires smtp.allowDirectMX to also be true — MTA-STS enforcement has no effect on the named-relay-only delivery path."
         case .smtpReservedRelayName(let name):
             "smtp.relays must not define a relay named '\(name)' while smtp.allowDirectMX is true — that name is reserved for direct-MX delivery."
+        case .missingCrawlSitemapOrigin:
+            "LASSO_CRAWL_SITEMAP_ENABLED=1 requires LASSO_CRAWL_SITEMAP_ORIGIN — the real public origin (e.g. https://www.realclientsite.com) the sitemap's <loc> entries describe."
         }
     }
 }
@@ -2553,7 +2624,7 @@ if config.crawlReportMode {
         }
 
         await siteServer.datasourceFailureTracker.reset()
-        let (results, excludedCount, abortedByCircuitBreaker) = await CrawlReport.run(
+        let (results, excludedCount, abortedByCircuitBreaker, sitemapSummary) = await CrawlReport.run(
             baseURL: "http://localhost:\(config.port)",
             siteRoot: config.siteRoot,
             extensions: config.lassoExtensions,
@@ -2562,13 +2633,20 @@ if config.crawlReportMode {
             requestDelayMS: config.crawlRequestDelayMS,
             circuitBreakerThreshold: config.crawlCircuitBreakerThreshold,
             datasourceFailureThreshold: config.crawlDatasourceFailureThreshold,
-            currentDatasourceFailureCount: { await siteServer.datasourceFailureTracker.currentCount() }
+            currentDatasourceFailureCount: { await siteServer.datasourceFailureTracker.currentCount() },
+            sitemapEnabled: config.crawlSitemapEnabled,
+            sitemapEntryPath: config.crawlSitemapPath,
+            sitemapAllowedOrigin: config.crawlSitemapOrigin,
+            sitemapMaxSubSitemaps: config.crawlSitemapMaxSubSitemaps,
+            sitemapMaxURLs: config.crawlSitemapMaxURLs,
+            sitemapMaxResponseBytes: config.crawlSitemapMaxResponseBytes
         )
         CrawlReport.printAndWrite(
             results,
             outputPath: config.crawlReportOutputPath,
             excludedCount: excludedCount,
-            abortedByCircuitBreaker: abortedByCircuitBreaker
+            abortedByCircuitBreaker: abortedByCircuitBreaker,
+            sitemapSummary: sitemapSummary
         )
         exit(0)
     }

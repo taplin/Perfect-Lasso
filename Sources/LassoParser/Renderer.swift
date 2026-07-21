@@ -23,8 +23,22 @@ public struct LassoRenderer: Sendable {
             // value to the page's output — the same behavior
             // `<?lassoscript ... return json_serialize(...) ?>`-style API
             // pages already relied on before `return` gained real
-            // short-circuiting control flow.
-            if let returned = engine.evaluator.context.consumeReturnSignal() {
+            // short-circuiting control flow. Stage 2 (Captures): must use
+            // the depth-aware consume here too, not a bare
+            // `consumeReturnSignal()` — a capture invoked directly at THIS
+            // page's own top level (home == this exact level) leaves a
+            // still-live, correctly-targeted signal that only reaches this
+            // point because every invocation boundary in between declined
+            // to consume it (see `LassoContext
+            // .consumeReturnSignalRespectingNonLocalTarget`'s own doc
+            // comment); a bare unconditional consume here would also
+            // wrongly swallow a signal that's still non-locally targeting
+            // some OTHER, unrelated depth (impossible for a genuine
+            // top-level document render, whose own active depth this
+            // always is, but shared here for one uniform rule everywhere).
+            if let returned = engine.evaluator.context.consumeReturnSignalRespectingNonLocalTarget(
+                activeDepth: engine.evaluator.context.tagCallStack.count
+            ) {
                 output += returned.outputString
             }
             engine.evaluator.context.finalizeSessions()
@@ -170,6 +184,7 @@ private struct RendererEngine {
                     evaluator.context.set(.integer(iteration), for: "loop_count", scope: .local)
                     output += try await render(body)
                     if evaluator.context.consumeLoopControlSignal() { break }
+                    if evaluator.context.shouldStopRenderingCurrentBody() { break }
                 }
             }
             return output
@@ -189,6 +204,7 @@ private struct RendererEngine {
                 output += try await render(body)
                 iterations += 1
                 if evaluator.context.consumeLoopControlSignal() { break }
+                if evaluator.context.shouldStopRenderingCurrentBody() { break }
             }
             return output
         case "protect":
@@ -275,6 +291,7 @@ private struct RendererEngine {
                 evaluator.context.set(.integer(index + 1), for: "row_count", scope: .local)
                 output += try await render(body)
                 if evaluator.context.consumeLoopControlSignal() { break }
+                if evaluator.context.shouldStopRenderingCurrentBody() { break }
             }
             evaluator.context.setCurrentRow(nil)
             return output
@@ -324,6 +341,7 @@ private struct RendererEngine {
                 evaluator.context.set(mapKeys?[index] ?? .integer(index + 1), for: "loop_key", scope: .local)
                 output += try await render(body)
                 if evaluator.context.consumeLoopControlSignal() { break }
+                if evaluator.context.shouldStopRenderingCurrentBody() { break }
             }
             return output
         case "with":
@@ -348,6 +366,7 @@ private struct RendererEngine {
                 evaluator.context.set(value, for: variableName, scope: .local)
                 withOutput += try await render(body)
                 if evaluator.context.consumeLoopControlSignal() { break }
+                if evaluator.context.shouldStopRenderingCurrentBody() { break }
             }
             return withOutput
         case "output_none":
@@ -612,6 +631,15 @@ struct RendererTagInvocationService: LassoTagInvocationService {
         positionalArguments: [LassoValue],
         context: inout LassoContext
     ) async throws -> LassoValue {
+        // Stage 2 (Captures): mirrors `Evaluator
+        // .skipIfNonLocalReturnAlreadyPending()` — this call must not
+        // even start (bind parameters, push a new frame, render a body)
+        // if a return/yield is ALREADY mid-propagation from earlier in
+        // the same statement's expression evaluation. Without this, this
+        // boundary's own `context.clearReturnSignal()` below would
+        // silently clobber that still-live signal before the enclosing
+        // statement's poll ever gets a chance to see it.
+        if context.returnSignal != nil { return .void }
         // A separate `positionalIndex` counter, only advanced on an
         // actual bind — NOT the `enumerated()` loop index directly —
         // matching `Evaluator.bindParameters`'s own defensive shape
@@ -623,14 +651,17 @@ struct RendererTagInvocationService: LassoTagInvocationService {
         // silently shift every SUBSEQUENT parameter's binding one
         // position off, a wrong-value bug that wouldn't throw. Found by
         // code review during Stage 7a.
-        var bound: [String: LassoValue] = [:]
+        // Stage 3 (Captures): a fresh box per bound parameter, matching
+        // `Evaluator.bindParameters`'s identical treatment — a tag call
+        // always starts an entirely new, isolated local scope.
+        var bound: [String: LassoLocalBox] = [:]
         var positionalIndex = 0
         for parameter in definition.parameters {
             guard let name = LassoMethodDispatcher.parameterMetadata(parameter.value).name else { continue }
             guard positionalIndex < positionalArguments.count else {
                 throw LassoRuntimeError.tagInvocationArityMismatch(definition.name)
             }
-            bound[name.lowercased()] = positionalArguments[positionalIndex]
+            bound[name.lowercased()] = LassoLocalBox(positionalArguments[positionalIndex])
             positionalIndex += 1
         }
 
@@ -660,6 +691,15 @@ struct RendererTagInvocationService: LassoTagInvocationService {
             context = engine.evaluator.context
             throw error
         }
-        return context.consumeReturnSignal() ?? .void
+        // Stage 2 (Captures): same depth-aware consume as
+        // `Evaluator.invokeCustomTag`/`invokeMemberMethod`/`invokeCapture`
+        // (see `LassoContext.consumeReturnSignalRespectingNonLocalTarget`'s
+        // doc comment) — this boundary pushed `definition.name` via
+        // `pushTagCall` above and hasn't popped it yet (that's in the
+        // `defer`), so `context.tagCallStack.count` here is this
+        // invocation's own active depth, exactly like every other boundary.
+        return context.consumeReturnSignalRespectingNonLocalTarget(
+            activeDepth: context.tagCallStack.count
+        ) ?? .void
     }
 }

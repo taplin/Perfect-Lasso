@@ -5857,6 +5857,128 @@ private final class MapIncludeLoader: LassoIncludeLoader, @unchecked Sendable {
     #expect(falseOutput.contains("after"), "Content after a false guard must still render")
 }
 
+@Test func bareReturnAndYieldWorkAsATernaryActionClause() async throws {
+    // `ScriptBodyParser.normalizeReturn` rewrites a bare (paren-less)
+    // `return X`/`yield X` into `return(X)`/`yield(X)` -- but only by
+    // checking whether the WHOLE STATEMENT TEXT starts with "return "/
+    // "yield " (a `hasPrefix` check). When bare `return`/`yield` appears
+    // as a ternary short-form's action clause instead of the whole
+    // statement (`x == 1 ? return true`, no `|` else-branch), the
+    // rewrite never fires, and the bare keyword falls through to the
+    // generic juxtaposition/string-concatenation sugar (an unrelated
+    // undefined variable named "return", concatenated with "true")
+    // instead of ever invoking the real `register("return")` native
+    // function. Confirmed real via the Language Guide's own canonical
+    // `contains()` worked example -- see the `arrayForEach...` test
+    // below whose doc comment first flagged this, independent of
+    // Captures/forEach entirely (`x == 1 ? return true` alone
+    // reproduces it with a plain `define`).
+    var context = LassoContext()
+    let output = try await LassoRenderer().render(
+        """
+        <?lassoscript
+        define testit(x) => {
+            x == 1 ? return true
+            return false
+        }
+        ?>
+        [testit(1)]|[testit(2)]
+        """,
+        context: &context
+    ).trimmingCharacters(in: .whitespacesAndNewlines)
+    #expect(output == "true|false", "Bare `return` in a ternary's action clause must actually invoke return")
+
+    var yieldContext = LassoContext()
+    let yieldOutput = try await LassoRenderer().render(
+        """
+        <?lassoscript
+        define generator() => {
+            loop(-count=3) => {
+                loop_count == 2 ? yield 'two'
+            }
+        }
+        ?>
+        [generator()]
+        """,
+        context: &yieldContext
+    ).trimmingCharacters(in: .whitespacesAndNewlines)
+    #expect(yieldOutput == "two", "Bare `yield` in a ternary's action clause must actually invoke yield")
+
+    var elseBranchContext = LassoContext()
+    let elseBranchOutput = try await LassoRenderer().render(
+        """
+        <?lassoscript
+        define testit2(x) => {
+            x == 1 ? return true | return false
+        }
+        ?>
+        [testit2(1)]|[testit2(2)]
+        """,
+        context: &elseBranchContext
+    ).trimmingCharacters(in: .whitespacesAndNewlines)
+    #expect(elseBranchOutput == "true|false", "Bare `return` must work in both the `?` and `|` branches")
+
+    // Non-regression: the already-working parenthesized form must be untouched.
+    var parenContext = LassoContext()
+    let parenOutput = try await LassoRenderer().render(
+        """
+        <?lassoscript
+        define testit3(x) => {
+            x == 1 ? return(true)
+            return(false)
+        }
+        ?>
+        [testit3(1)]|[testit3(2)]
+        """,
+        context: &parenContext
+    ).trimmingCharacters(in: .whitespacesAndNewlines)
+    #expect(parenOutput == "true|false", "Parenthesized return(...) in a ternary action clause must keep working")
+}
+
+@Test func valuelessBareReturnAsATernaryActionStillReturnsVoidWithoutCorruptingParsing() async throws {
+    // `register("return")`/`register("yield")` (Runtime.swift) already
+    // default a MISSING argument to `.void` -- a bare `return`/`yield`
+    // with no value at all is a real, supported shape, not just the
+    // valued form `return X` this fix started from. Found by code
+    // review of the value-form fix above: naively assuming a value
+    // always follows a bare `return`/`yield` in ternary position either
+    // throws (nothing follows at all -- the parser tries to parse the
+    // statement's own end-of-input as a value) or, worse, silently eats
+    // the ternary's own `|` separator (single `|` isn't a registered
+    // binary operator, so it falls to the prefix parser's generic
+    // symbol catch-all as a bogus value), corrupting the whenFalse
+    // branch entirely. Both shapes below reproduce the two ways that
+    // went wrong.
+    var noElseContext = LassoContext()
+    let noElseOutput = try await LassoRenderer().render(
+        """
+        <?lassoscript
+        define testit5(x) => {
+            x == 1 ? return
+            return('not-returned')
+        }
+        ?>
+        [testit5(1)]|[testit5(2)]
+        """,
+        context: &noElseContext
+    ).trimmingCharacters(in: .whitespacesAndNewlines)
+    #expect(noElseOutput == "|not-returned", "A valueless bare return with nothing following it must halt with void, not throw")
+
+    var withElseContext = LassoContext()
+    let withElseOutput = try await LassoRenderer().render(
+        """
+        <?lassoscript
+        define testit6(x) => {
+            x == 1 ? return | return('fallback-branch-ran')
+        }
+        ?>
+        [testit6(1)]|[testit6(2)]
+        """,
+        context: &withElseContext
+    ).trimmingCharacters(in: .whitespacesAndNewlines)
+    #expect(withElseOutput == "|fallback-branch-ran", "A valueless bare return in the `?` branch must not swallow the `|` separator")
+}
+
 @Test func stringReplaceMutatesTheInvocantInPlaceAndProducesNoOutputAsABareStatement() async throws {
     // string->replace(find, replaceWith) mutates its invocant in place —
     // like array/map ->insert — rather than merely computing a new
@@ -7692,6 +7814,44 @@ struct IncludeURLTests {
     #expect(output.contains("count=1"))
 }
 
+@Test func returnInsideALoopBlockStopsIterationImmediatelyInsteadOfRunningToCompletion() async throws {
+    // Real pre-existing bug, unrelated to Captures: the "loop" case in
+    // `RendererEngine.renderBlock` only checked `consumeLoopControlSignal()`
+    // (the `Loop_Abort`/`Loop_Continue` mechanism) after each iteration's
+    // `render(body)` call, never `shouldStopRenderingCurrentBody()` (which
+    // is what actually goes true for a `return`/`yield`). `render(_:)`'s own
+    // per-node check only polls the flag AFTER a node runs, not before — so
+    // with no equivalent check in the "loop" case's own Swift `for` loop,
+    // iterations 4 and 5 still ran, and their `insert` call (the very FIRST
+    // node of each iteration's body, so nothing skips it) executed anyway.
+    // Must be a single line with no text/whitespace node between `[loop(5)]`
+    // and the `insert` call — an incidental leading text node would itself
+    // absorb the stale-signal check and mask the bug, making this
+    // non-decisive (caught by reverting the fix and confirming failure).
+    var context = LassoContext()
+    _ = try await LassoRenderer().render(
+        "[var(collected=array)][loop(5)][$collected->insert(loop_count)][if(loop_count==3)][return('done')][/if][/loop]",
+        context: &context
+    )
+    #expect(context.value(for: "collected", scope: .global) == .array([.integer(1), .integer(2), .integer(3)]))
+}
+
+@Test func returnInsideAnIterateBlockStopsIterationImmediatelyInsteadOfRunningToCompletion() async throws {
+    // Same bug shape as the `loop` case above, in `renderBlock`'s
+    // "iterate" case: `consumeLoopControlSignal()` alone can't see a
+    // `return`/`yield`'s `returnSignal`, so without also checking
+    // `shouldStopRenderingCurrentBody()`, `iterate` kept walking the rest
+    // of the source array after the matching element instead of stopping.
+    // Same single-line requirement as the `loop` test above, for the same
+    // reason.
+    var context = LassoContext()
+    _ = try await LassoRenderer().render(
+        "[var(collected=array)][iterate(array(10,20,30,40,50), var(x))][$collected->insert($x)][if($x==30)][return('done')][/if][/iterate]",
+        context: &context
+    )
+    #expect(context.value(for: "collected", scope: .global) == .array([.integer(10), .integer(20), .integer(30)]))
+}
+
 @Test func loopAbortWithNoEnclosingLoopIsATrueNoOpNotAPageTruncation() async throws {
     // Real bug caught by architect + code review of this stage's own
     // diff: `RendererEngine.render(_:)`'s two shared early-exit checks
@@ -9104,6 +9264,24 @@ struct IncludeURLTests {
     #expect(output == "0|0")
 }
 
+@Test func setConstructorWithPositionalArgumentsInsertsAndDedupsThemLikeListQueueStack() async throws {
+    // lassoguide.com/operations/collections.html: "set(key, ...) — A
+    // set is created with zero or more element parameters. The
+    // element values are inserted into the set." Matches List/Queue/
+    // Stack's own constructors, all of which insert their positional
+    // arguments — `set(...)` previously silently dropped them (only
+    // `set()`/bare `set` with zero elements worked). Repeated 'Three'
+    // exercises the same dedup-on-insert behavior as `->Insert` itself
+    // (see `setDeduplicatesRepeatedInsertsMatchingTheGuidesOneThreeWorkedExample`
+    // above) — the constructor must dedup too, not just insert raw.
+    var context = LassoContext()
+    let output = try await LassoRenderer().render(
+        "[string(set('One', 'Three', 'Three'))]|[(set(3, 4))->size]",
+        context: &context
+    )
+    #expect(output == "Set: (One), (Three)|2")
+}
+
 @Test func priorityQueueDefaultComparatorReturnsTheGreatestElementFirst() async throws {
     // Ch. 30 p.405-406: default comparator (`\Compare_LessThan`) —
     // insert 'One' then 'Two', `->First` is "Two" (greatest
@@ -9230,6 +9408,26 @@ struct IncludeURLTests {
         context: &context
     )
     #expect(output == "Two|1")
+}
+
+@Test func priorityQueueConstructorIgnoresPositionalArgumentsAndIsAlwaysCreatedEmpty() async throws {
+    // Unlike `set(...)` (fixed above to insert its positional
+    // arguments per lassoguide.com), PriorityQueue has no updated
+    // lassoguide.com page — reference.lassosoft.com's own
+    // `[PriorityQueue->Remove]` page explicitly defers to "the Lasso 8
+    // Language Guide" for this type, so the 8.5 PDF's Table 10
+    // ("Priority queues are always created empty... Accepts an
+    // optional parameter which specifies a comparator") is still the
+    // authoritative, current spec. `priorityqueue(2, 1)` must NOT
+    // insert 2/1 as elements — only `->Insert` populates a
+    // PriorityQueue. Regression guard against "fixing" this the same
+    // way Set was fixed, which would be wrong per the actual docs.
+    var context = LassoContext()
+    let output = try await LassoRenderer().render(
+        "[string(priorityqueue(2, 1))]|[(priorityqueue(2, 1))->size]",
+        context: &context
+    )
+    #expect(output == "PriorityQueue: |0")
 }
 
 @Test func comparatorDirectCallReturnsZeroForAValidComparisonAndNegativeOneOtherwise() async throws {
@@ -10520,5 +10718,1589 @@ struct IncludeURLTests {
     var context = LassoContext()
     let output = try await LassoRenderer().render("[123->asString]", context: &context)
     #expect(output == "123")
+}
+
+// MARK: - String method expansion (Ch. 25 Tables 3/5/11 members, Tables 4/6/10/12 free tags)
+
+@Test func stringRemoveDeletesACountedRangeStartingAtA1BasedOffset() async throws {
+    // Ch. 25 Table 3: "The first parameter is the offset at which to
+    // start removing characters. The second parameter is the number of
+    // characters to remove." No worked example in the Guide itself for
+    // the member form; hand-verified against "Alpha": removing 2
+    // characters starting at position 2 ('l','p') leaves "A" + "ha".
+    var context = LassoContext()
+    let output = try await LassoRenderer().render("['Alpha'->(Remove: 2, 2)]", context: &context)
+    #expect(output == "Aha")
+}
+
+@Test func stringRemoveWithNoCountRemovesToTheEndOfTheString() async throws {
+    // Ch. 25 Table 3: count "Defaults to removing to the end of the
+    // string." "Alpha" from position 3 onward ('p','h','a') removed
+    // leaves "Al".
+    var context = LassoContext()
+    let output = try await LassoRenderer().render("['Alpha'->(Remove: 3)]", context: &context)
+    #expect(output == "Al")
+}
+
+@Test func stringMergeInsertsAWholeMergeStringAtA1BasedLocation() async throws {
+    // Ch. 25 Table 3: "Inserts a merge string into the string...the
+    // location at which to insert the merge string and the string to
+    // insert." Hand-verified: inserting "XY" before position 3 of
+    // "Alpha" ('p') yields "Al" + "XY" + "pha".
+    var context = LassoContext()
+    let output = try await LassoRenderer().render("['Alpha'->(Merge: 3, 'XY')]", context: &context)
+    #expect(output == "AlXYpha")
+}
+
+@Test func stringMergeWithOffsetAndCountInsertsOnlyASliceOfTheMergeString() async throws {
+    // Ch. 25 Table 3: "Optional third and fourth parameters specify an
+    // offset into the merge string and number of characters of the
+    // merge string to insert." From "ABCDE", a 1-based offset of 2 with
+    // count 2 selects "BC" (skipping 'A', taking 'B','C').
+    var context = LassoContext()
+    let output = try await LassoRenderer().render("['Alpha'->(Merge: 3, 'ABCDE', 2, 2)]", context: &context)
+    #expect(output == "AlBCpha")
+}
+
+@Test func stringFoldcaseMutatesTheInvocantToACaseInsensitiveComparisonForm() async throws {
+    // Ch. 25 Table 5: "Converts all characters in the string for a
+    // case-insensitive comparison. Modifies the string and returns no
+    // value." Implemented as lowercasing (see `->foldcase`'s own doc
+    // comment for why this is the closest available approximation
+    // without a real ICU case-fold API).
+    var context = LassoContext()
+    let output = try await LassoRenderer().render(
+        "[var('s' = 'TEST')][$s->(Foldcase)][$s]", context: &context
+    )
+    #expect(output == "test")
+}
+
+@Test func stringToLowerToUpperToTitleMutateOnlyTheSingleCharacterAtTheGivenPosition() async throws {
+    // Ch. 25 Table 5: `->toLower`/`->toUpper`/`->toTitle` "Requires the
+    // position of the character to be modified" — distinct from the
+    // whole-string `->lowercase`/`->uppercase`/`->titlecase` already
+    // implemented. "TEST"->toLower(1) only lowercases the 'T'.
+    var context = LassoContext()
+    let output = try await LassoRenderer().render(
+        """
+        [var('a' = 'TEST')][$a->(toLower: 1)][$a]|\
+        [var('b' = 'test')][$b->(toUpper: 1)][$b]|\
+        [var('c' = 'test')][$c->(toTitle: 3)][$c]
+        """,
+        context: &context
+    )
+    #expect(output == "tEST|Test|teSt")
+}
+
+@Test func stringUnescapeDecodesHexadecimalURLEncoding() async throws {
+    // Ch. 25 Table 5: "Converts a string from the hexadecimal URL
+    // encoding" — the documented inverse of `->encodeUrl`.
+    var context = LassoContext()
+    let output = try await LassoRenderer().render(
+        "['A%20Short%20String'->(Unescape)]", context: &context
+    )
+    #expect(output == "A Short String")
+}
+
+@Test func stringCharacterInformationMemberTagsMatchTheLanguageGuidesOwnWorkedExampleOnTheLetterB() async throws {
+    // Ch. 25 Table 11, the Guide's own worked example verbatim:
+    // ['b'->(CharType: 1)] -> LOWERCASE_LETTER
+    // ['b'->(IsLower: 1)] -> True
+    // ['b'->(IsUpper: 1)] -> False
+    // ['b'->(IsWhiteSpace: 1)] -> False
+    // ['b'->(Digit: 1, 16)] -> 11
+    // `->CharName` (the sibling line in the same worked example,
+    // "LATIN SMALL LETTER B") is deliberately not implemented -- see
+    // `StringOperations.swift`'s own doc comment -- so it's not
+    // asserted here.
+    var context = LassoContext()
+    let output = try await LassoRenderer().render(
+        """
+        [(Array: 'b'->(CharType: 1), 'b'->(IsLower: 1), 'b'->(IsUpper: 1), \
+        'b'->(IsWhiteSpace: 1), 'b'->(Digit: 1, 16))->join('|')]
+        """,
+        context: &context
+    )
+    #expect(output == "LOWERCASE_LETTER|true|false|false|11")
+}
+
+@Test func stringCharDigitValueAndGetNumericValueReturnMinusOneForANonDigitCharacter() async throws {
+    // Ch. 25 Table 11: both return "-1" (worded as "if the character is
+    // alphabetic", read against `->Digit`'s own sibling entry and
+    // implemented via Swift's `wholeNumberValue`, nil for any
+    // non-digit -- see `StringOperations.swift`'s own doc comment).
+    var context = LassoContext()
+    let output = try await LassoRenderer().render(
+        "[(Array: '5'->(CharDigitValue: 1), 'a'->(CharDigitValue: 1), 'a'->(GetNumericValue: 1))->join('|')]",
+        context: &context
+    )
+    #expect(output == "5|-1|-1")
+}
+
+@Test func stringDigitCorrectlyRejectsACharacterThatIsNotAValidDigitInTheGivenRadix() async throws {
+    // Regression test for a real bug found by architect review: an
+    // earlier version only special-cased radix 16 and fell back to a
+    // plain-decimal `wholeNumberValue` for every other radix, so
+    // `Digit('5', 2)` returned 5 -- a value with no valid representation
+    // in binary -- instead of the documented -1-for-invalid sentinel.
+    // Decisive: '1' IS a valid binary digit (1), '5' is NOT (-1).
+    var context = LassoContext()
+    let output = try await LassoRenderer().render(
+        "[(Array: '1'->(Digit: 1, 2), '5'->(Digit: 1, 2))->join('|')]", context: &context
+    )
+    #expect(output == "1|-1")
+}
+
+@Test func stringGetNumericValueReturnsAFractionalValueForAVulgarFractionCharacterWhereCharDigitValueDoesNot() async throws {
+    // Regression test for a real, previously-collapsed distinction found
+    // by architect review: Ch. 25 Table 11 words `->GetNumericValue`
+    // ("the DECIMAL value... or A NEGATIVE NUMBER") more broadly than
+    // `->CharDigitValue` ("the INTEGER value... or -1"), matching ICU's
+    // own documented split between `u_getNumericValue` (any Unicode
+    // Numeric_Type, including fractions) and `u_charDigitValue`
+    // (decimal digits only). U+00BD "½" has a real Unicode numeric
+    // value (0.5) but is not a decimal digit -- decisive proof the two
+    // tags now genuinely differ, unlike an earlier version that
+    // collapsed both to the same `wholeNumberValue ?? -1`.
+    var context = LassoContext()
+    let output = try await LassoRenderer().render(
+        "[(Array: '\u{00BD}'->(GetNumericValue: 1), '\u{00BD}'->(CharDigitValue: 1))->join('|')]",
+        context: &context
+    )
+    #expect(output == "0.500000|-1")
+}
+
+@Test func stringIsalnumIsalphaIsdigitMemberTagsInspectASingleCharacterAtAPosition() async throws {
+    var context = LassoContext()
+    let output = try await LassoRenderer().render(
+        "[(Array: 'a1'->(IsAlnum: 1), 'a1'->(IsAlpha: 2), 'a1'->(IsDigit: 2), 'a1'->(IsDigit: 1))->join('|')]",
+        context: &context
+    )
+    #expect(output == "true|false|true|false")
+}
+
+@Test func stringConcatenateFreeTagConcatenatesEveryParameter() async throws {
+    // Ch. 25 Table 4, the Guide's own worked example:
+    // [String_Concatenate: 'Test', ' string.'] -> Test string.
+    var context = LassoContext()
+    let output = try await LassoRenderer().render(
+        "[String_Concatenate: 'Test', ' string.']", context: &context
+    )
+    #expect(output == "Test string.")
+}
+
+@Test func stringInsertFreeTagInsertsTextAtA1BasedPosition() async throws {
+    // Ch. 25 Table 4: string, `-Text`, `-Position`. No worked example in
+    // the Guide; hand-verified against its own prose -- inserting ' '
+    // before position 2 of "AShortString" yields "A ShortString".
+    var context = LassoContext()
+    let output = try await LassoRenderer().render(
+        "[String_Insert: 'AShortString', -Text=' ', -Position=2]", context: &context
+    )
+    #expect(output == "A ShortString")
+}
+
+@Test func stringRemoveFreeTagUsesStartAndEndPositionMatchingTheLanguageGuidesOwnWorkedExample() async throws {
+    // Ch. 25 Table 4/examples section, the Guide's own worked example
+    // verbatim -- a DIFFERENT signature from the member `->Remove`
+    // (offset+count): [String_Remove: 'A Short String', -StartPosition=3,
+    // -EndPosition=8] -> A String.
+    var context = LassoContext()
+    let output = try await LassoRenderer().render(
+        "[String_Remove: 'A Short String', -StartPosition=3, -EndPosition=8]", context: &context
+    )
+    #expect(output == "A String")
+}
+
+@Test func stringRemoveLeadingAndRemoveTrailingFreeTagsMatchTheLanguageGuidesOwnNestedWorkedExample() async throws {
+    // Ch. 25 examples section, the Guide's own worked example verbatim
+    // (nested calls): [String_RemoveLeading: -Pattern='*',
+    //   (String_RemoveTrailing: -Pattern='*', '*A Short String*')]
+    // -> A Short String
+    var context = LassoContext()
+    let output = try await LassoRenderer().render(
+        "[String_RemoveLeading: -Pattern='*', (String_RemoveTrailing: -Pattern='*', '*A Short String*')]",
+        context: &context
+    )
+    #expect(output == "A Short String")
+}
+
+@Test func stringReplaceFreeTagReplacesOnlyTheFirstInstanceMatchingTheLanguageGuidesOwnWorkedExample() async throws {
+    // Ch. 25 examples section, the Guide's own worked example verbatim:
+    // [String_Replace: 'A Short String', -Find='Short', -Replace='Long']
+    // -> A Long String. The free tag's own prose says "the FIRST
+    // instance" -- deliberately narrower than the member `->Replace`
+    // (every occurrence); a second, decisive assertion below proves
+    // that distinction with a repeated find-term the single worked
+    // example above can't discriminate.
+    var context = LassoContext()
+    let output = try await LassoRenderer().render(
+        "[String_Replace: 'A Short String', -Find='Short', -Replace='Long']", context: &context
+    )
+    #expect(output == "A Long String")
+    let repeated = try await LassoRenderer().render(
+        "[String_Replace: 'a a a', -Find='a', -Replace='b']", context: &context
+    )
+    #expect(repeated == "b a a")
+}
+
+@Test func stringUpperCaseAndLowerCaseFreeTagsMatchTheLanguageGuidesOwnWorkedExample() async throws {
+    // Ch. 25 examples section, the Guide's own worked example verbatim
+    // (also proves the correct case direction against the chapter's
+    // own self-contradictory Table 6 prose -- see the registration
+    // site's own doc comment).
+    var context = LassoContext()
+    let output = try await LassoRenderer().render(
+        "[String_UpperCase: 'A Short String']|[String_LowerCase: 'A Short String']", context: &context
+    )
+    #expect(output == "A SHORT STRING|a short string")
+}
+
+@Test func stringExtractFreeTagMatchesTheLanguageGuidesOwnWorkedExampleUpToATrailingSpace() async throws {
+    // Ch. 25 Table 10 examples section prints this worked example's
+    // result as "Short" (no trailing space), but the SAME chapter's own
+    // String_Remove worked example just above uses the IDENTICAL
+    // -StartPosition=3/-EndPosition=8 pair against the SAME source
+    // string and its result ("A String", verified by its own passing
+    // test above) is only self-consistent if that range is INCLUSIVE of
+    // position 8 -- position 8 is the space between "Short" and
+    // "String", so String_Remove(3,8) removing "Short " (6 chars,
+    // trailing space included) is what leaves "A" + "String" joined by
+    // exactly one remaining space. Extract and Remove share near-
+    // identical parameter wording with no documented distinction in
+    // range semantics, so implemented to extract the exact same 6-
+    // character range Remove deletes -- treating the Guide's printed
+    // "Short" as a trailing-space lost in PDF rendering (an invisible,
+    // easy-to-lose difference at the end of a line), not a genuine
+    // exclusive-vs-inclusive divergence between two otherwise-identical
+    // tag contracts.
+    var context = LassoContext()
+    let output = try await LassoRenderer().render(
+        "[String_Extract: 'A Short String', -StartPosition=3, -EndPosition=8]", context: &context
+    )
+    #expect(output == "Short ")
+}
+
+@Test func stringFindPositionFreeTagReturns1BasedPositionOrZeroOnMiss() async throws {
+    // Ch. 25 Table 10: string, `-Find` -> "the location of the -Find
+    // parameter in the string parameter." No worked example in the
+    // Guide; hand-verified: "Short" begins at position 3 of
+    // "A Short String".
+    var context = LassoContext()
+    let output = try await LassoRenderer().render(
+        "[String_FindPosition: 'A Short String', -Find='Short']|[String_FindPosition: 'A Short String', -Find='zzz']",
+        context: &context
+    )
+    #expect(output == "3|0")
+}
+
+@Test func stringFindBlocksFreeTagExtractsEverySubstringBetweenBeginAndEndDelimiters() async throws {
+    // Ch. 25 Table 10: "The result is an array of strings contained
+    // within the specified delimiters." No worked example exists
+    // anywhere in the Guide for this tag (confirmed via direct search
+    // of the whole document); implemented against its own prose only --
+    // see the registration site's own doc comment.
+    var context = LassoContext()
+    let output = try await LassoRenderer().render(
+        "[(String_FindBlocks: '<a>one</a><a>two</a>', -Begin='<a>', -End='</a>')->join(',')]",
+        context: &context
+    )
+    #expect(output == "one,two")
+}
+
+@Test func stringFindBlocksFreeTagIgnoreCommentsSkipsWholeSourceLinesStartingWithTheCommentCharacter() async throws {
+    var context = LassoContext()
+    let output = try await LassoRenderer().render(
+        """
+        [(String_FindBlocks: '<a>one</a>
+        # <a>two</a>
+        <a>three</a>', -Begin='<a>', -End='</a>', -IgnoreComments)->join(',')]
+        """,
+        context: &context
+    )
+    #expect(output == "one,three")
+}
+
+@Test func stringGetUnicodeVersionFreeTagReturnsANonEmptyVersionString() async throws {
+    var context = LassoContext()
+    let output = try await LassoRenderer().render("[String_GetUnicodeVersion]", context: &context)
+    #expect(output.isEmpty == false)
+}
+
+@Test func stringFreeTagsWithDocumentedRequiredKeywordParametersThrowWhenOneIsOmitted() async throws {
+    // Regression test for a real inconsistency found by code review:
+    // `String_Insert`/`String_Remove`/`String_Replace`/`String_Extract`/
+    // `String_FindBlocks` all document their keyword parameters as
+    // required, but an earlier version silently no-op'd (returned the
+    // unmodified input, an empty string, or an empty array) on an
+    // OMITTED one instead of throwing — inconsistent with this file's
+    // own `Encrypt_HMAC`/`File_ProcessUploads` precedent for exactly
+    // this situation. Each assertion below omits exactly one required
+    // keyword parameter.
+    var context = LassoContext()
+    let cases: [(String, String)] = [
+        ("[protect][String_Insert('x', -Position=1)][/protect][error_currenterror]", "String_Insert requires -Text."),
+        ("[protect][String_Insert('x', -Text='y')][/protect][error_currenterror]", "String_Insert requires -Position."),
+        ("[protect][String_Remove('x', -EndPosition=1)][/protect][error_currenterror]", "String_Remove requires -StartPosition."),
+        ("[protect][String_Remove('x', -StartPosition=1)][/protect][error_currenterror]", "String_Remove requires -EndPosition."),
+        ("[protect][String_Replace('x', -Replace='y')][/protect][error_currenterror]", "String_Replace requires -Find."),
+        ("[protect][String_Replace('x', -Find='x')][/protect][error_currenterror]", "String_Replace requires -Replace."),
+        ("[protect][String_Extract('x', -EndPosition=1)][/protect][error_currenterror]", "String_Extract requires -StartPosition."),
+        ("[protect][String_Extract('x', -StartPosition=1)][/protect][error_currenterror]", "String_Extract requires -EndPosition."),
+        ("[protect][String_FindBlocks('x', -End='y')][/protect][error_currenterror]", "String_FindBlocks requires -Begin."),
+        ("[protect][String_FindBlocks('x', -Begin='y')][/protect][error_currenterror]", "String_FindBlocks requires -End."),
+    ]
+    for (source, expectedMessage) in cases {
+        let output = try await LassoRenderer().render(source, context: &context)
+        #expect(output == expectedMessage)
+    }
+}
+
+// MARK: - Captures Stage 1 (capture literal + non-closure invoke)
+
+@Test func captureLiteralCanBeStoredAndInvokedViaTheInvokeMemberMethod() async throws {
+    // Ch. "Captures": "Captures are executed by calling their `invoke`
+    // method."
+    var context = LassoContext()
+    let output = try await LassoRenderer().render(
+        """
+        [local('cap' = { return 'hello' })]\
+        [#cap->invoke]
+        """,
+        context: &context
+    )
+    #expect(output == "hello")
+}
+
+@Test func captureLiteralCanBeInvokedViaTheShorthandCallSyntax() async throws {
+    // Ch. "Captures": "`#cap() // Shorthand invocation`"
+    var context = LassoContext()
+    let output = try await LassoRenderer().render(
+        """
+        [local('cap' = { return 'hello' })]\
+        [#cap()]
+        """,
+        context: &context
+    )
+    #expect(output == "hello")
+}
+
+@Test func captureBodyThatFallsOffTheEndWithoutAReturnProducesVoid() async throws {
+    // Regression test for a real gap found by code review: an earlier
+    // version of this test used a body (`local('unused' = 1)`) that
+    // produces no incidental rendered output either way, so it would
+    // have passed even with a plausible bug that made non-auto-collect
+    // captures also return their rendered body output as a string
+    // (`invokeCapture`'s own `capture.autoCollect ? .string(output) :
+    // .void` ternary, simplified to always take the `.string` branch).
+    // A literal string with no `return` produces real, visible
+    // incidental output that MUST be discarded (not returned) for a
+    // plain, non-auto-collect capture — decisive.
+    var context = LassoContext()
+    let output = try await LassoRenderer().render(
+        """
+        [local('cap' = { 'leaked' })]\
+        [#cap()]|after
+        """,
+        context: &context
+    )
+    #expect(output == "|after")
+}
+
+@Test func captureLiteralBindsPositionalArgumentsToNumberedLocals() async throws {
+    // Ch. "Captures": "Parameters arrive via positional special locals":
+    // `#1`, `#2`, etc.
+    var context = LassoContext()
+    let output = try await LassoRenderer().render(
+        """
+        [local('cap' = { return #1 + #2 })]\
+        [#cap(2, 3)]
+        """,
+        context: &context
+    )
+    #expect(output == "5")
+}
+
+@Test func autoCollectCaptureLiteralConcatenatesItsOwnRenderedOutputAsItsReturnValue() async throws {
+    // Ch. "Captures": "An auto-collect capture concatenates the result
+    // of calling the `asString` method on every value produced inside
+    // the capture when the capture is executed, and produces that
+    // value."
+    var context = LassoContext()
+    let output = try await LassoRenderer().render(
+        """
+        [local('cap' = {^ 'a' 'b' 'c' ^})]\
+        [#cap()]
+        """,
+        context: &context
+    )
+    #expect(output == "abc")
+}
+
+@Test func nestedCaptureLiteralsAndStringLiteralsContainingBracesParseCorrectly() async throws {
+    // The brace-balanced extraction (`ExpressionLexer.readCaptureBody`)
+    // must correctly skip over a `}` inside a string literal and
+    // correctly balance a capture literal nested inside another one --
+    // both real risks flagged by this stage's own scoping pass. Real
+    // newlines (not `;`) separate the two statements inside `outer`'s
+    // own body -- this parser's statement boundaries are newline-
+    // driven; `;` is skipped as lexer trivia, not treated as a
+    // statement separator (matches every other multi-statement tag/
+    // type-method body test in this file). `cap` uses an auto-collect
+    // body with no explicit `return` -- Stage 2 (Captures): a capture
+    // invoked directly at the SAME top-level sequence as its own
+    // creation, whose body DOES `return`, correctly (per Ch. "Captures":
+    // "exiting from the current home as well as itself") aborts the
+    // rest of that same top-level render once invoked -- exactly like a
+    // real `[Return]` at page scope. That's real, deliberate behavior,
+    // just not what THIS test is about (parsing, not non-local control
+    // flow), so it's avoided here by construction rather than worked
+    // around. `outer`/`inner` still use explicit `return`, since
+    // `inner`'s home is `outer`'s own ACTIVE invocation frame (created
+    // while `outer` itself is executing, not at top level) -- so its
+    // non-local unwind is fully absorbed by `outer`'s own invocation and
+    // never reaches top level at all, a good real exercise of nested
+    // non-local propagation resolving cleanly.
+    var context = LassoContext()
+    let output = try await LassoRenderer().render(
+        """
+        [local('cap' = {^ 'a}b' ^})]\
+        [#cap()]|\
+        [local('outer' = { local('inner' = { return 'nested' })
+        return #inner->invoke })]\
+        [#outer()]
+        """,
+        context: &context
+    )
+    #expect(output == "a}b|nested")
+}
+
+@Test func captureLiteralUsesLiveReferenceClosureSemanticsNotASnapshot() async throws {
+    // Superseded by Stage 3 (Captures, see `Documentation
+    // /captures-subsystem-plan.md` §4.2(a)): Stage 1 shipped a narrower
+    // value-type SNAPSHOT of the enclosing scope's locals (this test used
+    // to assert exactly that narrower behavior, expecting "first"). Real
+    // Lasso's own documented semantics are live-reference -- Ch.
+    // "Captures" §1.5: "it will have access to the surrounding local
+    // variables where the capture was created even when the capture is
+    // being executed in code that has a different scope" -- so a
+    // re-assignment of `#x` AFTER the capture literal was created, but
+    // BEFORE it's invoked, must be visible when the capture finally runs:
+    // "second", not "first".
+    var context = LassoContext()
+    let output = try await LassoRenderer().render(
+        """
+        [local('x' = 'first')]\
+        [local('cap' = { return #x })]\
+        [local('x' = 'second')]\
+        [#cap()]
+        """,
+        context: &context
+    )
+    #expect(output == "second")
+}
+
+// MARK: - Captures Stage 3 (live-reference closure semantics)
+
+@Test func theLanguageGuidesOwnCanonicalWorkedExampleForLiveReferenceClosures() async throws {
+    // Ch. "Captures" §1.5's own load-bearing citation, verbatim: "Stored
+    // captures can be executed at any point and the code contained
+    // within will operate as if it had been executed in the context in
+    // which it was created... it will have access to the surrounding
+    // local variables where the capture was created even when the
+    // capture is being executed in code that has a different scope."
+    // `method1` declares `my_local` (no value), creates a capture closing
+    // over it, THEN assigns 'Hello' to `my_local`, THEN hands the capture
+    // to `method2` -- a COMPLETELY DIFFERENT method -- which invokes it
+    // with ', world.'. The capture's own `#my_local->append(#1)`
+    // (self-mutating `String->append`) must reach back into `method1`'s
+    // own (already-assigned) `my_local` storage cell, so `method1`'s own
+    // trailing `return #my_local` sees the mutation: "Hello, world."
+    var context = LassoContext()
+    let output = try await LassoRenderer().render(
+        """
+        <?lassoscript
+        define method1() => {
+            local(my_local)
+            local(my_cap) = {
+                #my_local->append(#1)
+            }
+            #my_local = 'Hello'
+            method2(#my_cap)
+            return #my_local
+        }
+        define method2(cap) => {
+            #cap(', world.')
+        }
+        ?>
+        [method1]
+        """,
+        context: &context
+    ).trimmingCharacters(in: .whitespacesAndNewlines)
+    #expect(output == "Hello, world.")
+}
+
+@Test func aBareLocalDeclarationWithNoValueStillGetsARealStorageCellBeforeAssignment() async throws {
+    // Found while implementing Stage 3: `local(name)` (no `=` value) was
+    // previously a pure no-op READ (returns whatever's already there, or
+    // `.null`) that never actually created a storage cell -- harmless
+    // under Stage 1's snapshot semantics, but a real gap for live-
+    // reference closures: if the capture literal below were evaluated
+    // BEFORE `my_local`'s storage cell existed, it would capture a
+    // dictionary with no "my_local" entry at all, and the LATER `#my_local
+    // = 'Hello'` would create a BRAND NEW, entirely disconnected cell --
+    // silently breaking the exact mechanism this stage exists to provide.
+    // `LassoContext.ensureLocalExists`, wired into bare `local(name)`
+    // declarations, fixes this. This test is deliberately narrower than
+    // the Guide's own worked example above: it isolates JUST the bare-
+    // declaration-creates-a-cell requirement, independent of `method1`/
+    // `method2`'s own cross-method invocation shape.
+    var context = LassoContext()
+    let output = try await LassoRenderer().render(
+        """
+        [local('my_local')]\
+        [local('cap' = { return #my_local })]\
+        [local('my_local' = 'Hello')]\
+        [#cap()]
+        """,
+        context: &context
+    )
+    #expect(output == "Hello")
+}
+
+@Test func aCapturesOwnNewlyCreatedLocalDoesNotLeakBackIntoTheCallersScope() async throws {
+    // The other side of live-reference closures: sharing box REFERENCES
+    // for names the creating scope already had must NOT be confused with
+    // sharing the whole SCOPE going forward. A brand new local the
+    // capture body itself declares (never present in the creating
+    // scope's own locals at capture-literal-evaluation time) gets its own
+    // fresh, capture-invocation-local cell -- `Evaluator.invokeCapture`'s
+    // own `defer { context.replaceLocals(savedLocals) }` restores the
+    // CALLER's own dictionary wholesale afterward, discarding it. If this
+    // regressed (e.g. captures started sharing the live dictionary
+    // object itself, not just individual box references), `#leaked`
+    // would incorrectly read "leaked value" here instead of empty.
+    var context = LassoContext()
+    let output = try await LassoRenderer().render(
+        """
+        [local('cap' = { local('leaked' = 'leaked value') })]\
+        [#cap()]\
+        [string(#leaked)]
+        """,
+        context: &context
+    )
+    #expect(output == "")
+}
+
+@Test func twoInvocationsOfTheSameCaptureWithDifferentPositionalArgumentsDoNotInterfere() async throws {
+    // `#1`/`#2`/... get a FRESH box per invocation
+    // (`Evaluator.invokeCapture`'s `LassoLocalBox(argument.value)`, not a
+    // mutation of whatever box previously occupied that slot) --
+    // otherwise a capture that closes over an outer local AND reads its
+    // own positional argument could have one invocation's `#1` leak into
+    // a later invocation that didn't pass one, or two overlapping
+    // invocations (impossible in this single-threaded evaluator, but
+    // worth pinning down explicitly) could stomp on each other's
+    // arguments. Auto-collect, no explicit `return` -- an explicit
+    // `return` here would be a Stage 2 non-local exit whose home is THIS
+    // top level (the capture is invoked directly where it was created),
+    // which correctly aborts the rest of the page after the FIRST
+    // invocation -- real, unrelated Stage 2 behavior this test isn't
+    // about, sidestepped the same way Stage 2's own tests do.
+    var context = LassoContext()
+    let output = try await LassoRenderer().render(
+        """
+        [local('cap' = {^ #1 ^})]\
+        [#cap('first')]\
+        |\
+        [#cap('second')]\
+        |\
+        [#cap()]
+        """,
+        context: &context
+    )
+    #expect(output == "first|second|")
+}
+
+@Test func capturesCreatedAcrossLoopIterationsAllShareTheirHomesSingleLocalsBagNotAPerIterationCopy() async throws {
+    // Pinning test for a question raised by code review: does a capture
+    // created and STORED (not invoked) during one loop iteration, then
+    // invoked again after the loop finishes, see ITS OWN iteration's
+    // value for a loop-bound variable (`loop_value`), or the value the
+    // variable held by the time the loop ended? Checked directly against
+    // lassoguide.com/language/captures.html, which settles this
+    // explicitly: "A capture with a home will always take the following
+    // environment values from its home: self, locals, params, and
+    // current call name." -- a capture's `locals` come from its home as
+    // ONE shared, mutable bag (there is no per-iteration/block-scope
+    // concept anywhere in the docs), not a value frozen at the capture's
+    // own creation moment. So EVERY capture created across every
+    // iteration of a loop within the SAME home shares that home's SAME
+    // `loop_value` storage cell -- invoking any of them after the loop
+    // ends correctly reflects `loop_value`'s FINAL value, matching how
+    // an ordinary repeated `#x = ...` reassignment works elsewhere in
+    // that same scope. This is the CORRECT, doc-faithful behavior, not a
+    // bug -- deliberately NOT "fixed" to give loop bodies their own
+    // per-iteration scope, which real Lasso's own local-variable model
+    // (this codebase's existing single-flat-dictionary-per-call-frame
+    // design already matches it) simply doesn't have.
+    var context = LassoContext()
+    let output = try await LassoRenderer().render(
+        """
+        <?lassoscript
+        define collectCaptures() => {
+            local(caps) = array
+            iterate(array('a', 'b', 'c'), local(item))
+                #caps->insert({^ #item ^})
+            /iterate
+            local(results) = array
+            iterate(#caps, local(cap))
+                #results->insert(#cap->invoke)
+            /iterate
+            return #results->join('')
+        }
+        ?>
+        [collectCaptures]
+        """,
+        context: &context
+    ).trimmingCharacters(in: .whitespacesAndNewlines)
+    #expect(output == "ccc")
+}
+
+@Test func typeConstructorsDoNotPermanentlyCorruptACallingScopesOwnLocalNamedParams() async throws {
+    // Found by architect review: a real, capture-UNRELATED bug --
+    // `Evaluator.instantiate`'s "legacy constructor params" shadowing
+    // used to `context.set(...)` an ambient local named "params"
+    // (Documentation/legacy-define-tag-type-plan.md's own "Constructor
+    // params" note) and restore it afterward via `context
+    // .replaceLocals(savedLocals)`. Stage 3's boxed locals broke this:
+    // `set(...)` on an ALREADY-EXISTING name mutates that box in place
+    // (exactly what makes closures work) -- so if the CALLING scope
+    // already had its own local literally named "params" (a real,
+    // plausible name -- it's the built-in pseudo-var for a method's own
+    // arguments), the constructor call would silently overwrite that
+    // box's value with its own constructor argument array, and
+    // `replaceLocals` afterward would NOT undo it (same box object
+    // either way -- restoring the name→box mapping doesn't restore a
+    // mutated box's contents). No captures are involved in this
+    // reproduction at all.
+    var context = LassoContext()
+    let output = try await LassoRenderer().render(
+        """
+        <?lassoscript
+        define local_type => type {
+            data i
+            public onCreate(x) => { .i = #x }
+        }
+        define method1() => {
+            local(params) = 'sentinel'
+            local(obj) = local_type(42)
+            return #params
+        }
+        ?>
+        [method1]
+        """,
+        context: &context
+    ).trimmingCharacters(in: .whitespacesAndNewlines)
+    #expect(output == "sentinel")
+}
+
+@Test func associationOperatorFoldsACaptureLiteralAsATrailingArgumentOnABareIdentifierCall() async throws {
+    // Real corpus shape (bugcity9/StartUpTags/AuthorizeNet_AIM_9.inc,
+    // TS_lasso9/index.lasso): `someCall => { ... }` -- the general `=>`
+    // path (NOT one of the six already-hardcoded keyword forms
+    // if/while/loop/match/iterate/define), landing on a bare identifier
+    // with no call syntax of its own, which must be promoted to a real
+    // call so the capture has an argument slot to attach to. The tag
+    // reads the associated block back via the real, documented
+    // `givenBlock` keyword (Ch. "Captures") -- NOT a declared parameter
+    // -- matching `foldAssociatedCapture`'s corrected design (labels the
+    // capture "givenblock" and `Evaluator.extractGivenBlock` pulls it
+    // out before ordinary parameter binding ever sees it; see that
+    // function's own doc comment for the real bug this fixes). The
+    // associated block auto-collects rather than using an explicit
+    // `return` -- Stage 2 (Captures): `return`/`yield` inside a capture
+    // also exits its home (Ch. "Captures"), so a capture whose body
+    // returns AND whose value is meant to be used inline by the callee's
+    // OWN wrapping `return(...)` is a materially different (and much
+    // rarer) case than this test is actually about -- ordinary
+    // `givenBlock->invoke(...)` threading a ready-made value back to its
+    // caller, matching real corpus usage (`#AIMParams->forEachPair =>
+    // {...}`, `inline(...)=>{records=>{...}}}`), none of which use an
+    // explicit `return` inside the associated block at all.
+    var context = LassoContext()
+    let output = try await LassoRenderer().render(
+        """
+        [Define_Tag('UseWith')]\
+            [return(givenBlock->invoke('hi'))]\
+        [/Define_Tag]\
+        [UseWith => {^ 'got: ' + #1 ^}]
+        """,
+        context: &context
+    )
+    #expect(output == "got: hi")
+}
+
+@Test func associationOperatorFoldsACaptureLiteralOntoABareMemberAccessWithNoExistingArguments() async throws {
+    // Same mechanism as the free-tag case above, but folding onto
+    // `.member(base, name, arguments: nil)` (a BARE property-style
+    // member access, no parens at all) -- must be promoted to
+    // `arguments: [captureArg]`, matching real corpus's
+    // `#ary->forEachPair => {...}` shape (Stage 4's own eventual
+    // `->forEach` work reuses this identical parse path; this test
+    // exercises the parse+fold+invoke chain end-to-end using a plain
+    // custom-type method instead, since `->forEach` itself isn't
+    // implemented until Stage 4). `define`/`local` declaration
+    // statements need `<?lassoscript ?>` script-mode wrapping to be
+    // recognized at all (matching every other type-definition test in
+    // this file, e.g. `typeDefinitionsConstructObjectsAndDispatchMethods`
+    // just above) -- an ordinary bracket-tag `[...]` expects a single
+    // VALUE expression, not a declaration/block statement.
+    // Auto-collect associated block, no explicit `return` -- same reason
+    // as `associationOperatorFoldsACaptureLiteralAsATrailingArgumentOnABareIdentifierCall`
+    // just above.
+    var context = LassoContext()
+    let output = try await LassoRenderer().render(
+        """
+        <?lassoscript
+        define widget => type {
+            public usewith() => {
+                return givenBlock->invoke('hi')
+            }
+        }
+        local('w' = widget())
+        ?>
+        [#w->usewith => {^ 'got: ' + #1 ^}]
+        """,
+        context: &context
+    ).trimmingCharacters(in: .whitespacesAndNewlines)
+    #expect(output == "got: hi")
+}
+
+@Test func associationOperatorAppendsACaptureLiteralWithoutDisturbingExistingArguments() async throws {
+    // Real corpus shape (TS_lasso9's `inline(-host=..., -sql=...)=>{...}`):
+    // `=>` following a call that ALREADY has its own explicit `(...)`
+    // argument list -- the associated block must not disturb the
+    // existing argument's own binding. Auto-collect associated block, no
+    // explicit `return` -- same reason as
+    // `associationOperatorFoldsACaptureLiteralAsATrailingArgumentOnABareIdentifierCall`
+    // above.
+    var context = LassoContext()
+    let output = try await LassoRenderer().render(
+        """
+        [Define_Tag('UseWith', -Required='First')]\
+            [return(#First + ': ' + givenBlock->invoke('hi'))]\
+        [/Define_Tag]\
+        [UseWith('one') => {^ 'got: ' + #1 ^}]
+        """,
+        context: &context
+    )
+    #expect(output == "one: got: hi")
+}
+
+@Test func associationOperatorDoesNotCorruptATrailingOptionalParameterWhenFewerExplicitArgumentsAreGivenThanDeclared() async throws {
+    // Regression test for the real bug architect review found in an
+    // earlier version of `foldAssociatedCapture`: it appended the
+    // capture as an ORDINARY UNLABELED positional argument, so a call
+    // providing fewer explicit arguments than the callee declares
+    // parameters for (relying on the trailing one being unbound/
+    // defaulted, a completely normal shape) would have the capture
+    // silently misbound into that later parameter's slot instead of
+    // being kept separate -- e.g. `Wrap(5) => {...}` on a tag declaring
+    // `-Required='Value', -Optional='Times'` would bind `#Times` to the
+    // CAPTURE VALUE itself, not leave it unbound. Now that the capture
+    // is threaded via `givenBlock` instead of ordinary positional
+    // binding, `#Times` must still come through as its own genuinely
+    // unbound (`.null`, empty string output) self, not the capture.
+    var context = LassoContext()
+    let output = try await LassoRenderer().render(
+        """
+        [Define_Tag('Wrap', -Required='Value', -Optional='Times')]\
+            [return(string(#Value) + '|' + string(#Times))]\
+        [/Define_Tag]\
+        [Wrap(5) => { return 'unused' }]
+        """,
+        context: &context
+    )
+    #expect(output == "5|")
+}
+
+// MARK: - Captures Stage 2 (non-local return/yield, ->detach())
+
+@Test func returnInsideACaptureExitsBothTheInvokeCallAndItsHomeMethodSkippingBothTrailingStatements() async throws {
+    // Ch. "Captures": "Because captures are intended to execute as if
+    // they had been invoked directly within their home, return and
+    // yield will both behave by exiting from the current home as well
+    // as itself." This is the Guide's own canonical shape: a capture
+    // created inside one method (`method1`, its home) is handed to and
+    // invoked from a DIFFERENT, more deeply nested method (`method2`) --
+    // `return` inside the capture must unwind past `method2`'s own
+    // trailing statement AND back out of `method1` itself, past ITS
+    // trailing statement too, producing 'hello' as `method1`'s own
+    // return value. NOTE: this interpreter always discards a called
+    // tag/method's own internally-echoed bare-statement text (only its
+    // explicit `return` value, or `.void`, ever crosses a call boundary
+    // -- see `Evaluator.invokeCustomTag`'s `_ = try await
+    // renderNodes(...)`) -- so "not reached"/"also not reached" would
+    // never surface in `output` EITHER way, non-local or not. What
+    // actually discriminates Stage 2 here is `method1`'s own RETURN
+    // VALUE: under Stage 1's purely-local semantics `method1` would fall
+    // off the end with no explicit return of its own and produce
+    // `.void` (empty); Stage 2's non-local propagation instead makes
+    // 'hello' surface all the way out as `method1`'s own return value.
+    var context = LassoContext()
+    let output = try await LassoRenderer().render(
+        """
+        <?lassoscript
+        define method2(cap) => {
+            #cap->invoke
+            'not reached'
+        }
+        define method1() => {
+            local(cap) = { return 'hello' }
+            method2(#cap)
+            'also not reached'
+        }
+        ?>
+        [method1]
+        """,
+        context: &context
+    ).trimmingCharacters(in: .whitespacesAndNewlines)
+    #expect(output == "hello")
+}
+
+@Test func yieldBehavesLikeReturnForNonLocalExitButDoesNotResumeFromWhereItLeftOff() async throws {
+    // Ch. "Captures": `yield`, like `return`, halts the capture and
+    // exits its home non-locally -- exercised here via the SAME
+    // method1/method2 shape as the test above, just with `yield`
+    // instead of `return`. Also documents this stage's own explicitly
+    // narrower scope (see `Captures.swift`'s doc comment): a SECOND
+    // invocation of the same capture does NOT resume execution right
+    // after the `yield` (real Lasso's own documented behavior) -- it
+    // re-runs the body from the top and non-locally exits all over
+    // again, rather than continuing past the `yield`.
+    var context = LassoContext()
+    let output = try await LassoRenderer().render(
+        """
+        <?lassoscript
+        define method2(cap) => {
+            #cap->invoke
+            'not reached'
+        }
+        define method1() => {
+            local(cap) = { yield 'hello' }
+            method2(#cap)
+            'also not reached'
+        }
+        ?>
+        [method1]
+        """,
+        context: &context
+    ).trimmingCharacters(in: .whitespacesAndNewlines)
+    #expect(output == "hello")
+}
+
+@Test func nonLocalReturnFromACaptureInvokedThroughANestedCallSkipsSiblingStatementsAtTheHomeLevel() async throws {
+    // Real-shape analogue of the Guide's own `contains()`/`forEach`
+    // worked example (`->forEach` itself is Stage 4, not yet
+    // implemented; this simulates the same "check each item, stop on
+    // match" pattern via sequential `checkItem` calls instead of a
+    // native `loop`/`iterate` block -- see the found-but-out-of-scope
+    // bug noted just below). A capture created INSIDE `contains()`
+    // itself is invoked from a nested `checkItem` call for each
+    // candidate; `return true` on a match must unwind past `checkItem`'s
+    // own call AND skip every SUBSEQUENT sibling statement in
+    // `contains()`'s own body (the later `checkItem(#cap, 4)` calls and
+    // the trailing `'no match'` fallback), producing `true` as
+    // `contains()`'s own return value.
+    //
+    // Deliberately does NOT use `loop`/`iterate`/`while`/`with`/`records`
+    // here: found, while designing this test, that NONE of those five
+    // native block constructs check `shouldStopRenderingCurrentBody()`
+    // between their own internal iterations (`RendererEngine
+    // .renderBlock`, Renderer.swift) -- only the separate
+    // `consumeLoopControlSignal()`/`Loop_Abort` mechanism halts them
+    // early. This is a genuine, pre-existing gap (a bare `return` inside
+    // e.g. `loop(-from=1,-to=5) => { if(...) => { return x } }`, with NO
+    // capture involved at all, silently keeps iterating all 5 times
+    // instead of stopping at the match) -- entirely independent of
+    // Captures, unrelated to this stage's own scope, and left for
+    // separate follow-up rather than fixed here.
+    var context = LassoContext()
+    let output = try await LassoRenderer().render(
+        """
+        <?lassoscript
+        define checkItem(cap, value) => {
+            #cap->invoke(#value)
+        }
+        define contains(needle) => {
+            local(cap) = {
+                if(#1 == #needle) => { return true }
+            }
+            checkItem(#cap, 1)
+            checkItem(#cap, 2)
+            checkItem(#cap, 3)
+            checkItem(#cap, 4)
+            'no match'
+        }
+        ?>
+        [contains(3)]
+        """,
+        context: &context
+    ).trimmingCharacters(in: .whitespacesAndNewlines)
+    #expect(output == "true")
+}
+
+@Test func detachedCaptureReturnStaysPurelyLocalAndDoesNotExitItsFormerHome() async throws {
+    // Ch. "Captures": "A capture can be detached from its home in order
+    // to escape from this [non-local] behavior... detaches the capture
+    // so that it no longer has a home capture." Same method1/method2
+    // shape as the non-local tests above, but each method now has its
+    // OWN trailing explicit `return` (rather than falling off the end)
+    // so the difference is observable through the one channel that
+    // survives a call boundary in this interpreter -- return VALUES, not
+    // internally-echoed statement text (see the first test above's own
+    // note). Non-detached, `method2`'s own trailing `return` would never
+    // run (skipped by the still-propagating non-local signal) and
+    // `method1` would receive 'hello' directly, exactly like the first
+    // test above. Detached, `return 'hello'` inside the capture stops
+    // being non-local at all -- `#cap->detach->invoke` produces 'hello'
+    // as an perfectly ordinary LOCAL value, `method2`'s OWN trailing
+    // `return` then runs normally afterward, and `method1` sees THAT
+    // value, not the capture's.
+    var context = LassoContext()
+    let output = try await LassoRenderer().render(
+        """
+        <?lassoscript
+        define method2(cap) => {
+            #cap->detach->invoke
+            return 'method2 finished'
+        }
+        define method1() => {
+            local(cap) = { return 'hello' }
+            local(result) = method2(#cap)
+            return 'method1 got: ' + string(#result)
+        }
+        ?>
+        [method1]
+        """,
+        context: &context
+    ).trimmingCharacters(in: .whitespacesAndNewlines)
+    #expect(output == "method1 got: method2 finished")
+}
+
+@Test func nestedCaptureCreatedInsideAHomedCaptureInheritsThatCapturesHomeNotItsOwnRawDepth() async throws {
+    // Ch. "Captures": "A capture that is created within a capture that
+    // does have a home will have its home set to its parent capture's
+    // home. This means that nested captures will all have the same
+    // home." Found by code review: using the raw current call-stack
+    // depth for a capture literal evaluated WHILE ANOTHER capture's own
+    // body is executing (rather than inheriting THAT capture's home
+    // verbatim) silently catches the nested capture's non-local return
+    // one frame too early -- invisible when the outer capture is
+    // invoked immediately, in place (that shape can't distinguish
+    // correct from buggy), but wrong the moment the outer capture is
+    // invoked from a DIFFERENT depth than where it was created, exactly
+    // as here: `cap` is created inside `outerHome`, but not invoked
+    // until `invokeElsewhere` (one frame deeper) calls it. `inner`,
+    // created while `cap`'s own body runs, must inherit `cap`'s home
+    // (`outerHome`'s own frame) -- so `return 'from inner'` unwinds all
+    // the way past `cap`, past `invokeElsewhere`'s own trailing
+    // statement, AND past `outerHome`'s own trailing statement, landing
+    // as `outerHome()`'s own return value.
+    var context = LassoContext()
+    let output = try await LassoRenderer().render(
+        """
+        <?lassoscript
+        define invokeElsewhere(c) => {
+            #c->invoke
+            return 'invokeElsewhere fallback'
+        }
+        define outerHome() => {
+            local(cap) = {
+                local(inner) = { return 'from inner' }
+                #inner->invoke
+                return 'outer fallback'
+            }
+            invokeElsewhere(#cap)
+            return 'outerHome fallback'
+        }
+        ?>
+        [outerHome]
+        """,
+        context: &context
+    ).trimmingCharacters(in: .whitespacesAndNewlines)
+    #expect(output == "from inner")
+}
+
+@Test func aSecondCaptureInvokeInTheSameExpressionDoesNotReRunOrClobberAFirstStillPropagatingReturn() async throws {
+    // Found by architect review: `shouldStopRenderingCurrentBody()` is
+    // only ever polled between STATEMENTS, never mid-expression -- so
+    // without a guard, a SECOND `#cap->invoke` appearing later in the
+    // SAME expression as a first one whose `return` is still
+    // propagating (hasn't reached its target yet) would silently run to
+    // completion as if nothing were happening: re-executing the
+    // capture's body a second time, and its own invocation boundary's
+    // `clearReturnSignal()` (called right before rendering that second
+    // body) would wipe out the first invocation's still-live signal
+    // before `method1_helper`'s own statement-level poll ever saw it.
+    //
+    // `method1`'s own return value alone can't distinguish "ran once"
+    // from "ran twice" here -- BOTH invocations return the same 'X', and
+    // whichever one's signal ultimately survives to reach `method1`'s
+    // own home produces the identical value either way (a genuinely
+    // non-decisive shape, caught by tracing through what the buggy,
+    // unguarded behavior would ALSO produce before finalizing this
+    // test). `$checkedCount` is a GLOBAL-scope variable specifically
+    // because it survives independently of the discarded local-scope/
+    // return-value chain -- a real, observable side effect proving how
+    // many times the capture's body actually executed, unaffected by
+    // which invocation's propagating signal happens to win.
+    var context = LassoContext()
+    let output = try await LassoRenderer().render(
+        """
+        <?lassoscript
+        var(checkedCount) = 0
+        define method1_helper(cap) => {
+            local(combined) = #cap->invoke + '-' + #cap->invoke
+            return 'helper done: ' + #combined
+        }
+        define method1() => {
+            local(cap) = {
+                $checkedCount += 1
+                return 'X'
+            }
+            method1_helper(#cap)
+            return 'after'
+        }
+        ?>
+        [method1]|[$checkedCount]
+        """,
+        context: &context
+    ).trimmingCharacters(in: .whitespacesAndNewlines)
+    #expect(output == "X|1")
+}
+
+@Test func twoSiblingCapturesWithDifferentHomesInTheSameExpressionEachExitTheirOwnHomeCorrectly() async throws {
+    // Found by architect review: same mid-expression hazard as the test
+    // above, but with two SIBLING captures that have DIFFERENT homes --
+    // without the guard, the SECOND capture's own `clearReturnSignal()`
+    // would silently overwrite the FIRST capture's still-propagating
+    // signal (value AND target depth) with its own, so the WRONG home
+    // (`method3`, not `method1`) would "catch" the return, and
+    // `method1`'s own exit would be lost without a trace.
+    var context = LassoContext()
+    let output = try await LassoRenderer().render(
+        """
+        <?lassoscript
+        define method2(capA, capB) => {
+            local(combined) = #capA->invoke + '-' + #capB->invoke
+            return 'after2: ' + #combined
+        }
+        define method3(capA) => {
+            local(capB) = { return 'B' }
+            method2(#capA, #capB)
+            return 'after3'
+        }
+        define method1() => {
+            local(capA) = { return 'A' }
+            method3(#capA)
+            return 'after1'
+        }
+        ?>
+        [method1]
+        """,
+        context: &context
+    ).trimmingCharacters(in: .whitespacesAndNewlines)
+    #expect(output == "A")
+}
+
+@Test func detachReturnsTheCaptureItselfSoItChainsDirectlyIntoInvoke() async throws {
+    // Ch. "Captures": "...and then returns itself" -- `->detach` must
+    // hand back the SAME capture (not void, not a copy) so
+    // `#cap->detach->invoke(...)` chains in one expression, matching
+    // the test above's own usage.
+    var context = LassoContext()
+    let output = try await LassoRenderer().render(
+        """
+        [local('cap' = { return #1 + #2 })]\
+        [#cap->detach->invoke(2, 3)]
+        """,
+        context: &context
+    )
+    #expect(output == "5")
+}
+
+// MARK: - Captures Stage 4 (->forEach)
+
+@Test func theLanguageGuidesOwnContainsWorkedExampleUsingArrayForEach() async throws {
+    // Ch. "Captures", verbatim (used there to illustrate non-local
+    // return, but a real, working example of ->forEach in its own
+    // right): `#a->forEach => { #val == #1 ? return true }` -- checked
+    // directly against lassoguide.com/language/captures.html. Real
+    // Lasso 9.3 does NOT document `->forEach` as its own directly-
+    // callable array method (confirmed: no entry on operations
+    // /collections.html or in genindex.html) -- it's the method NAME a
+    // type must implement to conform to trait_queriable/trait_forEach
+    // (Ch. "Query Expressions", "Making an Object Queriable"). Providing
+    // it directly on the built-in collection types too is this
+    // interpreter's own disclosed extension (see the plan doc's Stage 4
+    // note), matching the DOCS' OWN worked example's assumption that it
+    // just works this way.
+    //
+    // Uses the Guide's own bare ternary shorthand verbatim
+    // (`#val == #1 ? return true`) -- a bare `return`/`yield` embedded as
+    // a ternary's action clause (not the WHOLE statement) used to not
+    // get `ScriptBodyParser.normalizeReturn`'s bare-return-to-real-call
+    // rewrite (that rewrite only ever sees the ternary's FULL statement
+    // text), silently mis-parsing the same way bare `yield` did before
+    // Stage 2 fixed IT for the whole-statement case. Real, reproducible
+    // with zero forEach/captures involved at all (`x == 1 ? return true`
+    // alone) -- fixed via `ExpressionParser.parseTernaryAction` (see
+    // `bareReturnAndYieldWorkAsATernaryActionClause` for the focused
+    // regression test).
+    var context = LassoContext()
+    let output = try await LassoRenderer().render(
+        """
+        <?lassoscript
+        define contains(a, val) => {
+            #a->forEach => { #val == #1 ? return true }
+            return false
+        }
+        ?>
+        [contains(array(1, 2, 3), 2)]|[contains(array(1, 2, 3), 9)]
+        """,
+        context: &context
+    ).trimmingCharacters(in: .whitespacesAndNewlines)
+    #expect(output == "true|false")
+}
+
+@Test func arrayForEachInvokesTheBlockOnceForEveryElementInOrder() async throws {
+    var context = LassoContext()
+    let output = try await LassoRenderer().render(
+        """
+        <?lassoscript
+        var(collected) = array
+        array(10, 20, 30)->forEach => { $collected->insert(#1 * 2) }
+        ?>
+        [$collected->join(',')]
+        """,
+        context: &context
+    ).trimmingCharacters(in: .whitespacesAndNewlines)
+    #expect(output == "20,40,60")
+}
+
+@Test func mapForEachYieldsPairsInSortedKeyOrderMatchingLassoIteratorValuesOwnConvention() async throws {
+    // Ch. "Query Expressions"'s own account of `forEach` never specifies
+    // what a MAP source should yield -- this interpreter has an
+    // existing, established convention for exactly this (`Pair(key,
+    // value)`, sorted by key), already used by `->Iterator`/
+    // `->ReverseIterator` (`LassoIteratorValue.build`, `Iterator.swift`)
+    // -- not a separate documented `->forEachPair` method (real Lasso
+    // 9.3 has no such method at all -- checked directly, "No Records
+    // Found" on reference.lassosoft.com, absent from lassoguide.com's
+    // search index). `->forEach` on a map reuses that SAME convention
+    // rather than inventing a new one. NOTE, found by review: `iterate`/
+    // `with` (`Renderer.swift`) do NOT follow this convention -- they
+    // iterate a map's raw, hash-order Swift `Dictionary` directly with
+    // no sorting, and `with` doesn't yield `Pair`s for a map source at
+    // all (bare values only) -- a real, pre-existing, benign
+    // inconsistency between constructs, not something this stage
+    // introduces or needs to reconcile.
+    var context = LassoContext()
+    let output = try await LassoRenderer().render(
+        """
+        <?lassoscript
+        var(collected) = array
+        map('b' = 2, 'a' = 1, 'c' = 3)->forEach => { $collected->insert(#1->first + '=' + #1->second) }
+        ?>
+        [$collected->join(',')]
+        """,
+        context: &context
+    ).trimmingCharacters(in: .whitespacesAndNewlines)
+    #expect(output == "a=1,b=2,c=3")
+}
+
+@Test func forEachWorksOnListSetQueueStackTreeMapAndPriorityQueue() async throws {
+    // One shared mechanism (`Evaluator.forEachElements(of:)`) serving
+    // every collection type this interpreter implements -- TreeMap
+    // yields Pairs (like Map), the rest yield plain values.
+    //
+    // Set/PriorityQueue built via `->insert` chains rather than bare
+    // constructor positional args (`set(3, 4)`, `priorityqueue(2, 1)`)
+    // -- found, independent of Captures/forEach entirely, that those
+    // two constructors' bare positional-argument form silently builds
+    // an EMPTY collection (confirmed: `string(set(3,4))` → "Set: ",
+    // `string(priorityqueue(2,1))` → "PriorityQueue: ", both empty)
+    // even though the identical shape works correctly for List/Queue/
+    // Stack. A real, pre-existing, separate gap, flagged for its own
+    // follow-up -- `->insert` chains are unaffected and confirmed
+    // working correctly for both types.
+    var context = LassoContext()
+    let output = try await LassoRenderer().render(
+        """
+        <?lassoscript
+        var(out) = array
+        list(1, 2)->forEach => { $out->insert('list:' + #1) }
+        local(s) = set
+        #s->insert(3)
+        #s->insert(4)
+        #s->forEach => { $out->insert('set:' + #1) }
+        queue(5, 6)->forEach => { $out->insert('queue:' + #1) }
+        stack(7, 8)->forEach => { $out->insert('stack:' + #1) }
+        local(pq) = priorityqueue
+        #pq->insert(2)
+        #pq->insert(1)
+        #pq->forEach => { $out->insert('pq:' + #1) }
+        treemap(1 = 'one', 2 = 'two')->forEach => { $out->insert('tree:' + #1->first + '=' + #1->second) }
+        ?>
+        [$out->join('|')]
+        """,
+        context: &context
+    ).trimmingCharacters(in: .whitespacesAndNewlines)
+    #expect(output == "list:1|list:2|set:3|set:4|queue:5|queue:6|stack:7|stack:8|pq:1|pq:2|tree:1=one|tree:2=two")
+}
+
+@Test func aCustomTypesOwnForEachMethodStillDispatchesCorrectlyNotInterceptedByTheBuiltInCase() async throws {
+    // The new generic `(_, "foreach")` case in `Evaluator.member` must
+    // NOT intercept a user-defined type's OWN `forEach` method --
+    // `Evaluator.forEachElements(of:)` returns `nil` for any `.object`
+    // whose `typeName` isn't one of the known built-in collection names,
+    // correctly falling through to the pre-existing (Stage 1)
+    // `invokeMemberMethod`/`givenBlock` dispatch this already used
+    // before Stage 4 ever existed.
+    var context = LassoContext()
+    let output = try await LassoRenderer().render(
+        """
+        <?lassoscript
+        define user_list => type {
+            data items
+            public onCreate() => { .items = array('a', 'b', 'c') }
+            public forEach() => {
+                local(gb) = givenBlock
+                iterate(.items, local('i'))
+                    #gb->invoke(#i)
+                /iterate
+            }
+        }
+        var(out) = ''
+        user_list()->forEach => { $out->append(#1) }
+        ?>
+        [$out]
+        """,
+        context: &context
+    ).trimmingCharacters(in: .whitespacesAndNewlines)
+    #expect(output == "abc")
+}
+
+@Test func queueInsertFromInsertsAnotherCollectionsElementsMatchingTheDocumentedTraitForEachSignature() async throws {
+    // Ch. 30 (operations/collections.html): "queue->insertFrom
+    // (value::trait_forEach) — Inserts new elements into the queue...
+    // by taking an object that implements trait_forEach." The ONE real,
+    // documented `->insertFrom` in Lasso 9.3 (List/Set/Array only have
+    // this under the legacy 8.x reference, a different iterator-based
+    // mechanism this interpreter doesn't implement).
+    //
+    // Verifies via `string(...)` (Ch. 30's own documented auto-
+    // stringification, "Queue: elem1, elem2, ...") rather than
+    // `->join(',')` -- found, independent of Captures/InsertFrom
+    // entirely, that `->join` is only registered for List (Table 5),
+    // not Queue/Stack/Set/PriorityQueue at all; a real, pre-existing,
+    // separate gap, flagged for its own follow-up.
+    var context = LassoContext()
+    let output = try await LassoRenderer().render(
+        """
+        [local('q' = queue(1, 2))]\
+        [#q->insertFrom(array(3, 4))]\
+        [string(#q)]
+        """,
+        context: &context
+    )
+    #expect(output == "Queue: 1, 2, 3, 4")
+}
+
+@Test func queueInsertFromUsedAsABareStatementWritesBackToTheReceiversOwnVariable() async throws {
+    // `->insertFrom` is registered in `selfMutatingMethods` (Ch. 30
+    // documents it as modifying the receiver) -- a bare top-level
+    // statement use must persist the mutation back into `#q`, exactly
+    // like `->Insert` already does for every other collection type.
+    var context = LassoContext()
+    let output = try await LassoRenderer().render(
+        """
+        [local('q' = queue(1, 2))]\
+        [#q->insertFrom(array(3, 4))]|\
+        [string(#q)]
+        """,
+        context: &context
+    )
+    #expect(output == "|Queue: 1, 2, 3, 4")
+}
+
+@Test func nonLocalReturnFromInsideArrayForEachCorrectlyAbortsRemainingElementsAndExitsToItsHome() async throws {
+    // Stage 2's non-local-return mechanism must correctly interact with
+    // Stage 4's new `->forEach` loop: `forEach` is NOT itself an
+    // invocation boundary (no `pushTagCall` of its own, mirroring
+    // `loop`/`iterate`) -- it must stop iterating the moment
+    // `context.shouldStopRenderingCurrentBody()` goes true, and the
+    // signal must keep propagating on up past `forEach`'s own call site
+    // to its real home. `$checkedCount` (a GLOBAL, visible outside the
+    // method) proves iteration genuinely stopped at the match -- NOT
+    // merely that the right value came back, which could also happen if
+    // `forEach` ran to completion and just happened to return the last
+    // qualifying value.
+    var context = LassoContext()
+    let output = try await LassoRenderer().render(
+        """
+        <?lassoscript
+        var(checkedCount) = 0
+        define findFirstOver(a, threshold) => {
+            #a->forEach => {
+                $checkedCount += 1
+                if(#1 > #threshold) => { return #1 }
+            }
+            return -1
+        }
+        ?>
+        [findFirstOver(array(1, 2, 3, 4, 5), 2)]|[$checkedCount]
+        """,
+        context: &context
+    ).trimmingCharacters(in: .whitespacesAndNewlines)
+    #expect(output == "3|3")
+}
+
+// MARK: - Captures Stage 5 (String iteration family)
+
+@Test func stringForEachCharacterInvokesTheBlockOncePerGraphemeCluster() async throws {
+    // Ch. "String Operations" (operations/strings.html): "Executes a
+    // given capture block once for every character in the base string.
+    // The character can be accessed in the capture block through the
+    // special local variable #1." Real, directly-callable String
+    // method -- confirmed against lassoguide.com before implementing
+    // (unlike Stage 4's collection `->forEach`, which isn't documented
+    // as a built-in method at all).
+    var context = LassoContext()
+    let output = try await LassoRenderer().render(
+        """
+        <?lassoscript
+        var(collected) = array
+        'abc'->forEachCharacter => { $collected->insert(#1) }
+        ?>
+        [$collected->join(',')]
+        """,
+        context: &context
+    ).trimmingCharacters(in: .whitespacesAndNewlines)
+    #expect(output == "a,b,c")
+}
+
+@Test func stringForEachWordBreakSplitsOnRealUnicodeWordBoundaries() async throws {
+    // "Executes a given capture block once for every word in the base
+    // string." The docs never define "word" further -- uses
+    // Foundation's own ICU-backed `.byWords` segmentation (Unicode
+    // UAX #29), matching this project's established "default to real
+    // ICU/Unicode behavior when ambiguous" convention. Punctuation is
+    // correctly excluded as its own token (not glued to the adjacent
+    // word), proving this isn't a naive whitespace split.
+    var context = LassoContext()
+    let output = try await LassoRenderer().render(
+        """
+        <?lassoscript
+        var(collected) = array
+        'Hello, world!'->forEachWordBreak => { $collected->insert(#1) }
+        ?>
+        [$collected->join('|')]
+        """,
+        context: &context
+    ).trimmingCharacters(in: .whitespacesAndNewlines)
+    #expect(output == "Hello|world")
+}
+
+@Test func stringForEachLineBreakRecognizesAllThreeDocumentedLineBreakForms() async throws {
+    // "Executes a given capture block once for every substring that
+    // would be generated by splitting the base string on a line break.
+    // Every line break character is recognized: \"\\r\", \"\\n\", and
+    // \"\\r\\n\"." Foundation's `.byLines` enumeration already treats
+    // \"\\r\\n\" as ONE break, not two -- verified here with a string
+    // containing all three forms.
+    var context = LassoContext()
+    let output = try await LassoRenderer().render(
+        """
+        <?lassoscript
+        var(collected) = array
+        ('one\\rtwo\\nthree\\r\\nfour')->forEachLineBreak => { $collected->insert(#1) }
+        ?>
+        [$collected->join('|')]
+        """,
+        context: &context
+    ).trimmingCharacters(in: .whitespacesAndNewlines)
+    #expect(output == "one|two|three|four")
+}
+
+@Test func stringForEachMatchAcceptsABarePatternStringMatchingRealCorpusMatchRegexpConvention() async throws {
+    // "string->forEachMatch(exp::string) — Executes a given capture
+    // block once for every match in the base string. Matches can be
+    // specified as either string or regexp objects." A bare string
+    // argument is used directly as a regex pattern, matching
+    // `Match_RegExp`'s own established convention.
+    var context = LassoContext()
+    let output = try await LassoRenderer().render(
+        """
+        <?lassoscript
+        var(collected) = array
+        'cat hat bat'->forEachMatch('[a-z]at') => { $collected->insert(#1) }
+        ?>
+        [$collected->join(',')]
+        """,
+        context: &context
+    ).trimmingCharacters(in: .whitespacesAndNewlines)
+    #expect(output == "cat,hat,bat")
+}
+
+@Test func stringForEachMatchAcceptsARealRegexpObjectArgument() async throws {
+    // The documented second overload: "string->forEachMatch(exp::regexp)".
+    var context = LassoContext()
+    let output = try await LassoRenderer().render(
+        """
+        <?lassoscript
+        var(collected) = array
+        'CAT hat BAT'->forEachMatch(regexp(-find='[a-z]+', -input='', -ignorecase=true)) => { $collected->insert(#1) }
+        ?>
+        [$collected->join(',')]
+        """,
+        context: &context
+    ).trimmingCharacters(in: .whitespacesAndNewlines)
+    #expect(output == "CAT,hat,BAT")
+}
+
+@Test func stringForEachMatchWithACapturingGroupInvokesOncePerMatchNotOncePerGroupFragment() async throws {
+    // Found by code review: an earlier version built `forEachMatch`
+    // directly on `LassoRegularExpressions.findAll`, which is Ch. 26
+    // Table 11's `String_FindRegExp` helper -- a genuinely DIFFERENT,
+    // incompatible documented contract ("a single FLAT array... full
+    // match text followed by each capture group's text"). `forEachMatch`
+    // itself documents ONE invocation per match, full-match text only
+    // -- reusing `findAll` unmodified meant any pattern with a capture
+    // group produced extra spurious invocations (the group text(s))
+    // interleaved with the real per-match ones. Neither of the two
+    // preceding `forEachMatch` tests catches this -- both use group-
+    // free patterns -- which is exactly what let the bug ship in the
+    // first place. Fixed via a new, dedicated
+    // `LassoRegularExpressions.findAllWholeMatches` that never touches
+    // `findAll`'s own flattened shape at all.
+    var context = LassoContext()
+    let output = try await LassoRenderer().render(
+        """
+        <?lassoscript
+        var(collected) = array
+        '12-34 56-78'->forEachMatch('(\\\\d+)-(\\\\d+)') => { $collected->insert(#1) }
+        ?>
+        [$collected->join(',')]
+        """,
+        context: &context
+    ).trimmingCharacters(in: .whitespacesAndNewlines)
+    #expect(output == "12-34,56-78")
+}
+
+@Test func stringForEachMatchEvaluatesItsPatternArgumentExactlyOnce() async throws {
+    // Found by architect review: an earlier version evaluated the `exp`
+    // argument twice -- once manually to extract the regex pattern,
+    // once again (unconditionally, as part of the whole `arguments`
+    // array) to build `invokeForEachCapture`'s own evaluated-argument
+    // list. Harmless for a plain literal pattern, but a real bug the
+    // moment `exp` is an arbitrary expression with a side effect --
+    // this codebase otherwise carefully evaluates every argument
+    // exactly once. `$sideEffects` proves `getPattern()` only actually
+    // runs once.
+    var context = LassoContext()
+    let output = try await LassoRenderer().render(
+        """
+        <?lassoscript
+        var(sideEffects) = 0
+        define getPattern() => {
+            $sideEffects += 1
+            return '[a-z]+'
+        }
+        var(collected) = array
+        'cat hat bat'->forEachMatch(getPattern()) => { $collected->insert(#1) }
+        ?>
+        [$collected->join(',')]|[$sideEffects]
+        """,
+        context: &context
+    ).trimmingCharacters(in: .whitespacesAndNewlines)
+    #expect(output == "cat,hat,bat|1")
+}
+
+@Test func stringForEachLineBreakHandlesTrailingLoneAndConsecutiveLineBreaksCorrectly() async throws {
+    // Found by architect review as untested edge-case coverage (not a
+    // bug -- Apple's own documented contract for the underlying
+    // primitive, "carriage return, newline, or carriage return and
+    // newline together," was independently confirmed correct): a
+    // trailing line break, a string that IS just a line break, and
+    // consecutive blank lines all need their own coverage beyond the
+    // single "all three forms in the middle of content" case above.
+    var context = LassoContext()
+    let trailingOutput = try await LassoRenderer().render(
+        """
+        <?lassoscript
+        var(collected) = array
+        ('abc\\n')->forEachLineBreak => { $collected->insert(#1) }
+        ?>
+        [$collected->join('|')]
+        """,
+        context: &context
+    ).trimmingCharacters(in: .whitespacesAndNewlines)
+    #expect(trailingOutput == "abc")
+
+    var context2 = LassoContext()
+    let blankLineOutput = try await LassoRenderer().render(
+        """
+        <?lassoscript
+        var(collected) = array
+        ('a\\n\\nb')->forEachLineBreak => { $collected->insert(#1) }
+        ?>
+        [$collected->join('|')]
+        """,
+        context: &context2
+    ).trimmingCharacters(in: .whitespacesAndNewlines)
+    #expect(blankLineOutput == "a||b")
+
+    // A string that IS just a line break produces one empty element,
+    // not zero.
+    var context3 = LassoContext()
+    let countOutput = try await LassoRenderer().render(
+        """
+        <?lassoscript
+        var(collected) = array
+        ('\\n')->forEachLineBreak => { $collected->insert(#1) }
+        ?>
+        [$collected->size]
+        """,
+        context: &context3
+    ).trimmingCharacters(in: .whitespacesAndNewlines)
+    #expect(countOutput == "1")
+}
+
+@Test func stringForEachFamilySkipsRemainingMatchesOnNonLocalReturnMatchingStage2Semantics() async throws {
+    // Same non-local-return interaction Stage 4 verified for collection
+    // ->forEach -- `invokeForEachCapture` is shared code, but this
+    // pins the behavior specifically for the NEW string call sites too
+    // (`$checkedCount` proves genuine early exit, not a coincidence).
+    var context = LassoContext()
+    let output = try await LassoRenderer().render(
+        """
+        <?lassoscript
+        var(checkedCount) = 0
+        define findFirstVowel(s) => {
+            #s->forEachCharacter => {
+                $checkedCount += 1
+                if(#1 == 'a' or #1 == 'e' or #1 == 'i' or #1 == 'o' or #1 == 'u') => { return #1 }
+            }
+            return 'none'
+        }
+        ?>
+        [findFirstVowel('xyzaeiou')]|[$checkedCount]
+        """,
+        context: &context
+    ).trimmingCharacters(in: .whitespacesAndNewlines)
+    #expect(output == "a|4")
 }
 

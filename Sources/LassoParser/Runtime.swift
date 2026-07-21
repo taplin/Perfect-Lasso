@@ -26,6 +26,9 @@ public indirect enum LassoValue: Equatable, Sendable {
     /// `$skuArrayItem->insert(field('scrubs_sku') = $temp_array)`, read
     /// back via `->second` (includes/detail_by_color.lasso).
     case pair(LassoValue, LassoValue)
+    /// A Lasso 9 Capture — see `Captures.swift`'s own doc comment for the
+    /// full design (real live-reference closure semantics as of Stage 3).
+    case capture(LassoCaptureValue)
 
     public var isTruthy: Bool {
         switch self {
@@ -38,6 +41,7 @@ public indirect enum LassoValue: Equatable, Sendable {
         case let .map(value): !value.isEmpty
         case .object: true
         case .pair: true
+        case .capture: true
         }
     }
 
@@ -107,6 +111,14 @@ public indirect enum LassoValue: Equatable, Sendable {
             // reading Ch. 30's Pair section for Stage 4's `->First=`/
             // `->Second=` work.
             "(\(key.outputString))=(\(value.outputString))"
+        case .capture:
+            // No documented bare-output contract found for a capture
+            // value (unlike `bytes`/List/Set/etc.'s own worked examples)
+            // — falls back to its type name, matching this codebase's
+            // existing convention for every other native type with no
+            // such contract (date/web_request/web_response, see the
+            // `.object` case's own doc comment just above).
+            "capture"
         }
     }
 
@@ -131,6 +143,7 @@ public indirect enum LassoValue: Equatable, Sendable {
         case .map: "map"
         case let .object(value): value.typeName
         case .pair: "pair"
+        case .capture: "capture"
         }
     }
 }
@@ -804,18 +817,33 @@ public struct LassoNativeRegistry: Sendable {
         register("stack") { arguments, _ in
             .object(LassoCollectionValue.makeObject(typeName: "stack", elements: arguments.map(\.value)))
         }
-        register("set") { _, _ in
-            // Table 15's own documented parameter is an optional
-            // comparator (Comparator values now exist as of Stage 2's
-            // `Comparators.swift`) — but wiring a per-instance
-            // comparator through Set's own Insert/Difference/
-            // Intersection/Union (which all currently hardcode
-            // `naturalSort`) is real additional work not in Stage 2's
-            // checklist (only PriorityQueue/TreeMap consume comparators
-            // this stage). Any argument given here is still ignored;
-            // Set always natural-sorts. Left as a disclosed gap, not
-            // silently dropped.
-            .object(LassoCollectionValue.makeObject(typeName: "set", elements: []))
+        register("set") { arguments, context in
+            // The 8.5 PDF's own Table 15 documents the constructor's
+            // one parameter as an optional comparator — but
+            // lassoguide.com/operations/collections.html (9.3, the
+            // newer/more complete source this project already prefers
+            // over 8.5 PDF gaps — see `queue`/`stack`'s own comment
+            // above) instead documents `set(key, ...)`: "A set is
+            // created with zero or more element parameters. The
+            // element values are inserted into the set." No comparator
+            // parameter is mentioned there at all. Following that
+            // newer source, matching List/Queue/Stack's own
+            // constructors, which all likewise insert their positional
+            // arguments. Dedup-then-sort mirrors `->Insert`'s own
+            // documented behavior (Table 15/16, "duplicate key value is
+            // replaced") — folding every argument through the same
+            // dedup check `->Insert` uses is equivalent to calling
+            // `->Insert` once per argument, since natural-sort is
+            // idempotent regardless of insertion order.
+            var elements: [LassoValue] = []
+            for argument in arguments.map(\.value) {
+                if !elements.contains(where: { LassoCollectionValue.equals($0, argument, context: context) }) {
+                    elements.append(argument)
+                }
+            }
+            return .object(LassoCollectionValue.makeObject(
+                typeName: "set", elements: LassoCollectionValue.naturalSort(elements)
+            ))
         }
         register("series") { arguments, _ in
             // "The start value is incremented until it equals the end
@@ -866,6 +894,15 @@ public struct LassoNativeRegistry: Sendable {
             // ONE optional parameter is a comparator, not initial
             // elements (unlike List/Queue/Stack). Defaults to
             // `\Compare_LessThan` per its own documented default.
+            // Re-verified directly against docs while investigating a
+            // report that `priorityqueue(2,1)` "silently drops"
+            // positional elements the same way `set(...)` did (fixed
+            // above): unlike Set, lassoguide.com has no updated
+            // PriorityQueue page — its own `[PriorityQueue->Remove]`
+            // reference page explicitly defers to "the Lasso 8 Language
+            // Guide" (i.e. this same 8.5 PDF) for this type. So this
+            // empty-plus-comparator-only behavior IS the documented
+            // behavior, not a gap; deliberately left unchanged.
             let comparatorArgument: LassoValue = arguments.first?.value ?? .null
             let kind = LassoComparatorValue.kind(of: comparatorArgument) ?? "lessthan"
             return .object(LassoPriorityQueueValue.makeObject(kind: kind, elements: []))
@@ -1026,6 +1063,221 @@ public struct LassoNativeRegistry: Sendable {
             let suffix = arguments.lastString(named: "find") ?? ""
             return .boolean(suffix.isEmpty || text.range(of: suffix, options: [.caseInsensitive, .backwards, .anchored]) != nil)
         }
+        register("string_concatenate") { arguments, _ in
+            // Ch. 25 Table 4: "Concatenates all of its parameters into a
+            // single string."
+            .string(arguments.map { $0.value.outputString }.joined())
+        }
+        register("string_insert") { arguments, _ in
+            // Ch. 25 Table 4: string, `-Text`, `-Position` — inserts
+            // `-Text` at the (1-based) `-Position` offset, returns the
+            // new string. Does not mutate — the free-tag family never
+            // does, only its member-tag siblings do. Both `-Text` and
+            // `-Position` are documented as required parameters; an
+            // OMITTED (not merely empty) one throws, matching this
+            // file's `encrypt_hmac`/`file_processuploads` precedent for
+            // a documented-required argument the caller simply forgot —
+            // found missing by code review.
+            let text = arguments.positionalValue(at: 0)?.outputString ?? ""
+            let characters = Array(text)
+            guard let insertText = arguments.lastString(named: "text") else {
+                throw LassoRecoverableError(LassoErrorState(
+                    code: 4001, message: "String_Insert requires -Text.", kind: "string"
+                ))
+            }
+            guard let position = arguments.lastInt(named: "position") else {
+                throw LassoRecoverableError(LassoErrorState(
+                    code: 4002, message: "String_Insert requires -Position.", kind: "string"
+                ))
+            }
+            let insertAt = min(max(position - 1, 0), characters.count)
+            return .string(String(characters[0..<insertAt]) + insertText + String(characters[insertAt...]))
+        }
+        register("string_remove") { arguments, _ in
+            // Ch. 25 Table 4: string, `-StartPosition`, `-EndPosition` —
+            // a DIFFERENT signature from the member `->Remove` (which
+            // takes offset+count): removes the substring from
+            // `-StartPosition` to `-EndPosition` (inclusive, per the
+            // Guide's own worked example: `String_Remove('A Short
+            // String', -StartPosition=3, -EndPosition=8)` → 'A String' —
+            // removing 6 characters, positions 3 through 8 inclusive)
+            // and returns the remainder. Both parameters are documented
+            // as required; an OMITTED one throws, matching this file's
+            // `encrypt_hmac`/`file_processuploads` precedent (found
+            // missing by code review — an earlier version silently
+            // returned the input unchanged instead).
+            let text = arguments.positionalValue(at: 0)?.outputString ?? ""
+            let characters = Array(text)
+            guard let start = arguments.lastInt(named: "startposition") else {
+                throw LassoRecoverableError(LassoErrorState(
+                    code: 4003, message: "String_Remove requires -StartPosition.", kind: "string"
+                ))
+            }
+            guard let end = arguments.lastInt(named: "endposition") else {
+                throw LassoRecoverableError(LassoErrorState(
+                    code: 4004, message: "String_Remove requires -EndPosition.", kind: "string"
+                ))
+            }
+            let startIndex = max(start - 1, 0)
+            let endIndex = min(end, characters.count)
+            guard startIndex < characters.count, endIndex > startIndex else { return .string(text) }
+            return .string(String(characters[0..<startIndex]) + String(characters[endIndex...]))
+        }
+        register("string_removeleading") { arguments, _ in
+            // Ch. 25 Table 4: string, `-Pattern` — "removed from the
+            // start", matching the member `->RemoveLeading`'s own
+            // documented repeated-removal semantics (worked example:
+            // stripping every leading `*` from `'*A Short String*'`).
+            let text = arguments.positionalValue(at: 0)?.outputString ?? ""
+            let pattern = arguments.lastString(named: "pattern") ?? ""
+            guard !pattern.isEmpty else { return .string(text) }
+            var remaining = Substring(text)
+            while remaining.hasPrefix(pattern) { remaining = remaining.dropFirst(pattern.count) }
+            return .string(String(remaining))
+        }
+        register("string_removetrailing") { arguments, _ in
+            let text = arguments.positionalValue(at: 0)?.outputString ?? ""
+            let pattern = arguments.lastString(named: "pattern") ?? ""
+            guard !pattern.isEmpty else { return .string(text) }
+            var remaining = Substring(text)
+            while remaining.hasSuffix(pattern) { remaining = remaining.dropLast(pattern.count) }
+            return .string(String(remaining))
+        }
+        register("string_replace") { arguments, _ in
+            // Ch. 25 Table 4: string, `-Find`, `-Replace` — "Returns the
+            // string with the FIRST INSTANCE of the -Find parameter
+            // replaced" — deliberately narrower than the member
+            // `->Replace` (which replaces every occurrence); this is the
+            // documented free-tag contract, not an oversight. Both
+            // `-Find` and `-Replace` are documented required parameters;
+            // an OMITTED one throws (found missing by code review),
+            // matching this file's `encrypt_hmac` precedent — an
+            // explicitly EMPTY `-Find` still just returns the input
+            // unchanged (nothing to find), same "omitted vs. present but
+            // empty" distinction `encrypt_hmac`'s own comment draws.
+            let text = arguments.positionalValue(at: 0)?.outputString ?? ""
+            guard let find = arguments.lastString(named: "find") else {
+                throw LassoRecoverableError(LassoErrorState(
+                    code: 4005, message: "String_Replace requires -Find.", kind: "string"
+                ))
+            }
+            guard let replacement = arguments.lastString(named: "replace") else {
+                throw LassoRecoverableError(LassoErrorState(
+                    code: 4006, message: "String_Replace requires -Replace.", kind: "string"
+                ))
+            }
+            guard !find.isEmpty, let range = text.range(of: find) else { return .string(text) }
+            var result = text
+            result.replaceSubrange(range, with: replacement)
+            return .string(result)
+        }
+        register("string_lowercase") { arguments, _ in
+            // Ch. 25 Table 6's own prose for BOTH `String_LowerCase` and
+            // `String_UpperCase` literally says "in lowercase" — a
+            // copy-paste artifact contradicted by the chapter's own worked
+            // example (`String_UpperCase: 'A Short String'` → 'A SHORT
+            // STRING'); implemented against the worked example, matching
+            // this project's established practice of preferring worked
+            // examples over inconsistent table prose (e.g. the earlier
+            // `Math_Div` documentation-defect precedent).
+            .string(arguments.map { $0.value.outputString }.joined().lowercased())
+        }
+        register("string_uppercase") { arguments, _ in
+            .string(arguments.map { $0.value.outputString }.joined().uppercased())
+        }
+        register("string_extract") { arguments, _ in
+            // Ch. 25 Table 10: string, `-StartPosition`, `-EndPosition` —
+            // "Returns a substring from -StartPosition to -EndPosition."
+            // worked example: `String_Extract('A Short String',
+            // -StartPosition=3, -EndPosition=8)` → 'Short' (inclusive
+            // range, same 1-based inclusive convention as
+            // `string_remove` above). Both parameters are documented
+            // required; an OMITTED one throws, matching this file's
+            // `encrypt_hmac`/`file_processuploads` precedent (found
+            // missing by code review — an earlier version silently
+            // returned an empty string instead).
+            let text = arguments.positionalValue(at: 0)?.outputString ?? ""
+            let characters = Array(text)
+            guard let start = arguments.lastInt(named: "startposition") else {
+                throw LassoRecoverableError(LassoErrorState(
+                    code: 4007, message: "String_Extract requires -StartPosition.", kind: "string"
+                ))
+            }
+            guard let end = arguments.lastInt(named: "endposition") else {
+                throw LassoRecoverableError(LassoErrorState(
+                    code: 4008, message: "String_Extract requires -EndPosition.", kind: "string"
+                ))
+            }
+            let startIndex = max(start - 1, 0)
+            let endIndex = min(end, characters.count)
+            guard startIndex < characters.count, endIndex > startIndex else { return .string("") }
+            return .string(String(characters[startIndex..<endIndex]))
+        }
+        register("string_findposition") { arguments, _ in
+            // Ch. 25 Table 10: string, `-Find` — "Returns the location
+            // of the -Find parameter in the string parameter." Same
+            // 1-based/0-miss convention as the member `->Find`.
+            let text = arguments.positionalValue(at: 0)?.outputString ?? ""
+            let needle = arguments.lastString(named: "find") ?? ""
+            guard !needle.isEmpty, let range = text.range(of: needle) else { return .integer(0) }
+            return .integer(text.distance(from: text.startIndex, to: range.lowerBound) + 1)
+        }
+        register("string_findblocks") { arguments, _ in
+            // Ch. 25 Table 10: string, `-Begin`, `-End`, optional
+            // `-IgnoreComments`/`-CommentChar` (default `#`) — returns an
+            // array of substrings found between each `-Begin`/`-End`
+            // delimiter pair. No worked example exists anywhere in the
+            // Language Guide for this specific tag (confirmed via direct
+            // search) — implemented against its own prose description
+            // only; `-IgnoreComments` skips any SOURCE LINE that begins
+            // with the comment character entirely, before block
+            // extraction, matching the documented "ignore comment lines"
+            // wording literally. `-Begin`/`-End` are documented required
+            // parameters; an OMITTED one throws, matching this file's
+            // `encrypt_hmac`/`file_processuploads` precedent (found
+            // missing by code review — an earlier version silently
+            // returned an empty array instead).
+            let text = arguments.positionalValue(at: 0)?.outputString ?? ""
+            guard let begin = arguments.lastString(named: "begin") else {
+                throw LassoRecoverableError(LassoErrorState(
+                    code: 4009, message: "String_FindBlocks requires -Begin.", kind: "string"
+                ))
+            }
+            guard let end = arguments.lastString(named: "end") else {
+                throw LassoRecoverableError(LassoErrorState(
+                    code: 4010, message: "String_FindBlocks requires -End.", kind: "string"
+                ))
+            }
+            guard !begin.isEmpty, !end.isEmpty else { return .array([]) }
+            let commentChar = arguments.lastString(named: "commentchar") ?? "#"
+            let ignoreComments = arguments.hasTruthyFlag("ignorecomments")
+            let source: String
+            if ignoreComments, !commentChar.isEmpty {
+                source = text.split(separator: "\n", omittingEmptySubsequences: false)
+                    .filter { !$0.hasPrefix(commentChar) }
+                    .joined(separator: "\n")
+            } else {
+                source = text
+            }
+            var blocks: [LassoValue] = []
+            var searchRange = source.startIndex..<source.endIndex
+            while let beginRange = source.range(of: begin, range: searchRange),
+                  let endRange = source.range(of: end, range: beginRange.upperBound..<source.endIndex) {
+                blocks.append(.string(String(source[beginRange.upperBound..<endRange.lowerBound])))
+                searchRange = endRange.upperBound..<source.endIndex
+            }
+            return .array(blocks)
+        }
+        register("string_getunicodeversion") { _, _ in
+            // Ch. 25 Table 12: "Returns the version of the Unicode
+            // standard which Lasso supports." Swift's stdlib exposes no
+            // runtime-queryable Unicode version constant, so this
+            // reports the Unicode Character Database version this
+            // toolchain is documented to ship (Swift 6's ICU/UCD data),
+            // matching the exact string format real Lasso itself uses
+            // for this tag (e.g. "5.1.0").
+            .string("15.0.0")
+        }
         register("valid_email") { arguments, _ in
             let email = arguments.positionalValue(at: 0)?.outputString ?? ""
             let domains: [String]?
@@ -1053,7 +1305,24 @@ public struct LassoNativeRegistry: Sendable {
             return .void
         }
         register("return") { arguments, context in
-            context.setReturnSignal(arguments.first?.value ?? .void)
+            context.setNonLocalReturnSignal(arguments.first?.value ?? .void)
+            return .void
+        }
+        // Ch. "Captures": "Captures can produce values by using `yield`
+        // or `return`. Both `yield` and `return` halt the execution of
+        // any of the capture's remaining code and produce the specified
+        // value." Implemented identically to `return` for now — see
+        // `Captures.swift`'s own doc comment for why the documented PC-
+        // preserving resume behavior (a subsequent invocation continuing
+        // right after the last `yield` instead of restarting) is NOT
+        // implemented: it needs genuinely resumable (coroutine-like)
+        // execution this tree-walking renderer has no capability for
+        // anywhere today, a materially larger, separate piece of work.
+        // The documented NON-LOCAL exit-through-home behavior IS real
+        // and shared with `return` here (see
+        // `LassoValue.setNonLocalReturnSignal`).
+        register("yield") { arguments, context in
+            context.setNonLocalReturnSignal(arguments.first?.value ?? .void)
             return .void
         }
         // Break/continue for the nearest enclosing loop/while/iterate/
@@ -1582,6 +1851,17 @@ extension LassoValue {
             value.snapshotData().mapValues(\.jsonObject)
         case let .pair(key, value):
             ["first": key.jsonObject, "second": value.jsonObject]
+        case .capture:
+            // A capture (stored code + a locals snapshot) has no
+            // meaningful JSON representation — this conversion exists for
+            // session-variable persistence (see this property's own doc
+            // comment), and storing a capture in a session isn't a real,
+            // documented use case. Falls back to `NSNull()`, matching the
+            // `.void`/`.null` case just above, rather than throwing —
+            // this property has no `throws` in its signature and every
+            // other case already degrades gracefully rather than
+            // crashing.
+            NSNull()
         }
     }
 
@@ -1658,9 +1938,54 @@ enum LoopControlSignal: Sendable, Equatable {
     case continueIteration
 }
 
+/// A single mutable local-variable storage cell — Stage 3 (Captures, see
+/// `Documentation/captures-subsystem-plan.md` §4.2/§4.2(a)): real Lasso's
+/// captures need genuine LIVE-REFERENCE closures (Ch. "Captures" §1.5's own
+/// worked example: a capture created in one method mutates a local that
+/// method later reads back, after the capture is invoked from a completely
+/// different method) — a plain `[String: LassoValue]` dictionary (the
+/// pre-Stage-3 storage) can't provide this, since copying/snapshotting the
+/// dictionary copies the VALUES, not a live link back to the original slot.
+/// Boxing every local's storage cell (not just capture-adjacent ones) gives
+/// every local variable a stable, referenceable identity: two dictionaries
+/// that both hold the SAME box for a given name see each other's writes to
+/// it, because the write mutates the shared box object, not the dictionary
+/// entry. `LassoCaptureValue.capturedLocals` (`Captures.swift`) stores a
+/// snapshot of `LassoContext.locals` taken at the exact moment a capture
+/// literal is evaluated — since that snapshot is just a dictionary COPY
+/// (cheap, COW) whose VALUES are box references, it shares boxes with the
+/// live creating scope for free, with no additional plumbing needed at the
+/// capture-literal-evaluation site itself.
+///
+/// `@unchecked Sendable` with NO internal locking — unlike
+/// `LassoCaptureValue`/`LassoObjectInstance`, which both guard their own
+/// mutable state with an `NSLock` — because this type sits in the hot path
+/// of every single local-variable read/write in the entire evaluator, and a
+/// lock there would tax all of it, not just capture-adjacent code. Safety
+/// instead rests on a verified structural invariant, not synchronization:
+/// every HTTP request builds a brand-new `LassoContext` (never a copy of
+/// another in-flight one), the whole render/evaluate pipeline is a single
+/// sequential chain of `await`s with no task groups or unstructured `Task`s
+/// touching `LassoContext` anywhere, and a `.capture` value (so also its
+/// `capturedLocals` boxes) can never survive a session round-trip — session
+/// persistence degrades it to `NSNull` (see `jsonObject` below) before it
+/// could ever leak a box reference across requests. If a future change ever
+/// introduces real concurrency into the render path (parallel `forEach`,
+/// background prefetch, a diagnostic `Task` reading `context` mid-render),
+/// this box would race silently with no compiler or runtime signal — revisit
+/// this design (an `NSLock`, matching its two siblings, is the natural fix)
+/// before that happens, not after.
+public final class LassoLocalBox: @unchecked Sendable {
+    public var value: LassoValue
+
+    public init(_ value: LassoValue) {
+        self.value = value
+    }
+}
+
 public struct LassoContext: Sendable {
     private var globals: [String: LassoValue]
-    private var locals: [String: LassoValue]
+    private var locals: [String: LassoLocalBox]
     // Genuinely separate namespace from `globals` above — see
     // `VariableScope.trueGlobal`'s own doc comment for why.
     private var trueGlobals: [String: LassoValue] = [:]
@@ -1795,6 +2120,8 @@ public struct LassoContext: Sendable {
     var loopDepth: Int
     var tagCallStack: [String]
     var selfStack: [LassoObjectInstance]
+    var givenBlockStack: [LassoValue] = []
+    var captureHomeDepthStack: [Int?] = []
     /// Real Lasso's request-local `error_currentError` state — reset to
     /// `.noError` on every fresh context, updated by `setError`/`clearError`.
     /// `lastError` preserves the previous error across a `clearError()` call,
@@ -1844,7 +2171,9 @@ public struct LassoContext: Sendable {
         tagRegistry: LassoTagRegistry = LassoTagRegistry()
     ) {
         self.globals = Dictionary(uniqueKeysWithValues: globals.map { ($0.key.lowercased(), $0.value) })
-        self.locals = Dictionary(uniqueKeysWithValues: locals.map { ($0.key.lowercased(), $0.value) })
+        // Public init keeps accepting plain `LassoValue`s (external callers,
+        // tests) — each gets its own fresh box on the way in.
+        self.locals = Dictionary(uniqueKeysWithValues: locals.map { ($0.key.lowercased(), LassoLocalBox($0.value)) })
         inlineFrames = []
         self.natives = natives
         self.nativeTypes = nativeTypes
@@ -1922,15 +2251,47 @@ public struct LassoContext: Sendable {
     }
 
     public subscript(_ name: String) -> LassoValue {
-        get { locals[name.lowercased()] ?? globals[name.lowercased()] ?? .null }
+        get { locals[name.lowercased()]?.value ?? globals[name.lowercased()] ?? .null }
         set { globals[name.lowercased()] = newValue }
     }
 
+    /// Stage 3 (Captures): a `.local` write MUTATES an existing box in
+    /// place when one already exists for `name`, rather than replacing the
+    /// dictionary entry outright — this is exactly what makes live-
+    /// reference closures work. Any capture (or any other scope) that
+    /// captured a reference to THIS box earlier sees the new value
+    /// immediately, because it's the same object, not a stale copy. Only
+    /// when no box exists yet does this create a fresh one.
     public mutating func set(_ value: LassoValue, for name: String, scope: VariableScope) {
         switch scope {
-        case .local: locals[name.lowercased()] = value
+        case .local:
+            let key = name.lowercased()
+            if let box = locals[key] {
+                box.value = value
+            } else {
+                locals[key] = LassoLocalBox(value)
+            }
         case .global, .unscoped: globals[name.lowercased()] = value
         case .trueGlobal: trueGlobals[name.lowercased()] = value
+        }
+    }
+
+    /// Ch. "Captures" §1.5's own worked example declares `local(my_local)`
+    /// (NO initial value) before creating a capture that closes over it,
+    /// then assigns it afterward from a completely different method — for
+    /// that later assignment to be visible through the ALREADY-CREATED
+    /// capture's own captured reference, `my_local`'s box must exist
+    /// (holding `.null`) at DECLARATION time, not be deferred until first
+    /// assignment. `Evaluator.declare(_:scope:)`'s bare-name (no `=`)
+    /// branch calls this for `.local` scope specifically — a plain read
+    /// like `(Local: 'name')` doesn't, and normal `local(x) = value`/
+    /// `set(_:for:scope:)` already creates a box as a side effect of
+    /// writing. A no-op if a box already exists (preserves whatever value
+    /// it currently holds).
+    mutating func ensureLocalExists(_ name: String) {
+        let key = name.lowercased()
+        if locals[key] == nil {
+            locals[key] = LassoLocalBox(.null)
         }
     }
 
@@ -1954,10 +2315,10 @@ public struct LassoContext: Sendable {
     // (caught by architect review, no test previously exercised this).
     public func value(for name: String, scope: VariableScope = .unscoped) -> LassoValue {
         switch scope {
-        case .local: locals[name.lowercased()] ?? .null
+        case .local: locals[name.lowercased()]?.value ?? .null
         case .global: globals[name.lowercased()] ?? trueGlobals[name.lowercased()] ?? .null
         case .trueGlobal: trueGlobals[name.lowercased()] ?? .null
-        case .unscoped: locals[name.lowercased()] ?? globals[name.lowercased()] ?? .null
+        case .unscoped: locals[name.lowercased()]?.value ?? globals[name.lowercased()] ?? .null
         }
     }
 
@@ -2028,9 +2389,79 @@ public struct LassoContext: Sendable {
         returnSignal = value
     }
 
+    /// Shared by `register("return")`/`register("yield")` — sets the
+    /// ordinary return signal exactly like `setReturnSignal(_:)` above,
+    /// but ALSO records the currently-executing capture's own home depth
+    /// (if any) as the target this signal must unwind back down to
+    /// before being consumed. Reading `currentCaptureHomeDepth` (a
+    /// double-optional: outer `nil` = not inside any capture invocation
+    /// at all right now, inner `nil` = inside one but it's detached) and
+    /// flattening both cases to a plain `nil` is exactly what preserves
+    /// ordinary, purely-local `return` behavior for every call site that
+    /// ISN'T inside a homed capture — the overwhelming majority of real
+    /// Lasso code, completely unaffected by this stage.
+    ///
+    /// No-ops entirely if a return signal is ALREADY live
+    /// (`returnSignal != nil`) — found via a real, reproducible hazard:
+    /// `[return(givenBlock->invoke(...))]`, where `givenBlock`'s own body
+    /// does an explicit `return`/`yield` targeting some ancestor's home.
+    /// Evaluating the argument to the OUTER `return(...)` call fires the
+    /// INNER capture's non-local return first, which (correctly) isn't
+    /// consumed yet because its target hasn't been reached — so the
+    /// still-propagating signal is live by the time the OUTER `return`
+    /// call itself runs. Without this guard, the outer call would
+    /// silently clobber the inner, still-unresolved signal with its own
+    /// (built from the inner's throwaway `.void` propagation value, since
+    /// expression evaluation has no mid-expression interruption point in
+    /// this tree-walking evaluator) — losing the real value entirely. A
+    /// signal only becomes live-and-unconsumed this way while a non-local
+    /// return is actively unwinding, so this guard never affects ordinary,
+    /// ONE-return-at-a-time code.
+    mutating func setNonLocalReturnSignal(_ value: LassoValue) {
+        guard returnSignal == nil else { return }
+        returnSignal = value
+        nonLocalReturnTargetDepth = currentCaptureHomeDepth.flatMap { $0 }
+    }
+
     mutating func consumeReturnSignal() -> LassoValue? {
         defer { returnSignal = nil }
         return returnSignal
+    }
+
+    /// Shared by every invocation boundary that can be a capture's home —
+    /// `Evaluator.invokeCustomTag`/`invokeMemberMethod`/`invokeCapture`,
+    /// `RendererTagInvocationService.invoke`, and the top-level
+    /// `LassoRenderer.render(_ document:)` page consume — consumes the
+    /// return signal produced by the just-finished render call, UNLESS a
+    /// non-local target depth is set (Ch. "Captures": `return`/`yield`
+    /// "exiting from the current home as well as itself") and doesn't
+    /// match THIS frame's own active depth — i.e. some capture's
+    /// `return`/`yield` is still unwinding past this frame toward an
+    /// ancestor's home. In that case this frame must NOT consume it:
+    /// `returnSignal` stays set and `nonLocalReturnTargetDepth` stays
+    /// untouched, so the render loop that called THIS frame sees
+    /// `shouldStopRenderingCurrentBody()` still true right after this call
+    /// returns and keeps unwinding too — propagation happens simply by
+    /// every frame in between declining to consume, reusing the EXISTING
+    /// poll-based `returnSignal` mechanism rather than any new exception-
+    /// based unwinding. `activeDepth` must be measured BEFORE this
+    /// frame's own `defer`-scheduled `popTagCall()` runs (i.e. while
+    /// `tagCallStack.count` still reflects this frame's own pushed
+    /// depth) — every call site does that naturally, since this is always
+    /// the last thing evaluated before the function returns. Originally a
+    /// private `Evaluator` helper; found (via the direct/non-nested
+    /// `#cap()`-at-top-level test regressions below) that TWO OTHER
+    /// consume boundaries outside `Evaluator` — the page-level consume in
+    /// `Renderer.swift` and `RendererTagInvocationService.invoke` — also
+    /// needed this exact same target-aware check, not the old
+    /// unconditional `consumeReturnSignal()`; moved here so both files
+    /// can share one implementation.
+    mutating func consumeReturnSignalRespectingNonLocalTarget(activeDepth: Int) -> LassoValue? {
+        if let target = nonLocalReturnTargetDepth, target != activeDepth {
+            return nil
+        }
+        nonLocalReturnTargetDepth = nil
+        return consumeReturnSignal()
     }
 
     mutating func clearReturnSignal() {
@@ -2077,11 +2508,21 @@ public struct LassoContext: Sendable {
         return false
     }
 
-    func snapshotLocals() -> [String: LassoValue] {
+    /// A shallow dictionary copy — cheap (Swift COW) — whose VALUES are
+    /// still the same `LassoLocalBox` object references the live scope
+    /// holds. Used for two genuinely different purposes that happen to
+    /// need the exact same thing: (1) every invocation boundary's own
+    /// save-then-restore-my-caller's-locals-across-this-call bookkeeping
+    /// (box identity is irrelevant there — the caller's dictionary gets
+    /// restored verbatim either way), and (2) `Evaluator`'s `.captureLiteral`
+    /// evaluation, which needs the SHARED box references for Stage 3's
+    /// live-reference closure semantics (Ch. "Captures" §1.5) — see
+    /// `LassoCaptureValue.capturedLocals`'s own doc comment.
+    func snapshotLocals() -> [String: LassoLocalBox] {
         locals
     }
 
-    mutating func replaceLocals(_ newLocals: [String: LassoValue]) {
+    mutating func replaceLocals(_ newLocals: [String: LassoLocalBox]) {
         locals = newLocals
     }
 
@@ -2096,6 +2537,66 @@ public struct LassoContext: Sendable {
     mutating func popSelf() {
         _ = selfStack.popLast()
     }
+
+    /// The capture (if any) associated with the CURRENT call via `=>`
+    /// (Ch. "Captures": "A method that receives an associated block
+    /// accesses it via the `givenBlock` keyword"). Stack-based like
+    /// `selfStack` just above — every call pushes its OWN given block
+    /// (`.void` if it wasn't invoked with one), so a nested call never
+    /// sees its caller's given block by accident, and popping restores
+    /// the caller's own on return. See `Evaluator.invokeCustomTag`/
+    /// `invokeMemberMethod` for where this is pushed/popped.
+    var currentGivenBlock: LassoValue {
+        givenBlockStack.last ?? .void
+    }
+
+    mutating func pushGivenBlock(_ value: LassoValue) {
+        givenBlockStack.append(value)
+    }
+
+    mutating func popGivenBlock() {
+        _ = givenBlockStack.popLast()
+    }
+
+    /// The home depth of whichever capture is CURRENTLY executing (top
+    /// of a stack, mirroring `givenBlockStack`'s own per-invocation push/
+    /// pop discipline — captures can nest, and a `return`/`yield` always
+    /// targets the INNERMOST active capture's own home, not some
+    /// enclosing one). `nil` at the top of the stack means "the
+    /// currently-executing capture is detached, or this isn't inside any
+    /// capture invocation at all" — either way, `return`/`yield` firing
+    /// right now is a genuinely ORDINARY, purely-local return, exactly
+    /// matching this codebase's pre-Stage-2 behavior. See
+    /// `Evaluator.invokeCapture` for where this is pushed/popped, and the
+    /// `register("return")`/`register("yield")` free functions
+    /// (`Runtime.swift`) for where it's read.
+    var currentCaptureHomeDepth: Int?? {
+        captureHomeDepthStack.last
+    }
+
+    mutating func pushCaptureHomeDepth(_ value: Int?) {
+        captureHomeDepthStack.append(value)
+    }
+
+    mutating func popCaptureHomeDepth() {
+        _ = captureHomeDepthStack.popLast()
+    }
+
+    /// Set by `return`/`yield` (Ch. "Captures": "return and yield will
+    /// both behave by exiting from the current home as well as itself")
+    /// alongside the pre-existing `returnSignal` whenever firing from
+    /// inside a HOMED (non-detached) capture invocation — the call-stack
+    /// depth (`tagCallStack.count`) that must be reached before the
+    /// return signal is actually consumed, rather than just left set so
+    /// the next frame up keeps unwinding. `nil` (the default/no-op case)
+    /// preserves this codebase's pre-Stage-2 behavior EXACTLY: an
+    /// ordinary `return` inside a plain custom tag/type method (never
+    /// touched by this field at all) is still always consumed by the
+    /// nearest enclosing call boundary, unaffected by anything below.
+    /// See `Evaluator.invokeCustomTag`/`invokeMemberMethod`/
+    /// `invokeCapture`'s shared "have I reached the target depth yet?"
+    /// check for how this is consulted and cleared.
+    var nonLocalReturnTargetDepth: Int?
 
     // Each level of Lasso-level tag recursion costs several real Swift
     // stack frames (the renderNodes closure, a fresh RendererEngine, the

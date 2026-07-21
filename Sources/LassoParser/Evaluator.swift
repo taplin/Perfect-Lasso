@@ -15,10 +15,60 @@ struct Evaluator {
         case let .boolean(value): return .boolean(value)
         case .null: return .null
         case .void: return .void
+        case let .captureLiteral(body, autoCollect):
+            // Stage 3 (live-reference closures — see `Captures.swift`'s
+            // own doc comment): `context.snapshotLocals()` returns a
+            // dictionary COPY, but its VALUES are `LassoLocalBox` object
+            // references, not plain `LassoValue`s — so this shares the
+            // SAME storage cells the live scope's locals use, not a
+            // frozen value-type copy. A later write to one of those
+            // names (via `LassoContext.set`, which mutates an existing
+            // box in place) is visible through THIS capture's own
+            // `capturedLocals` too, since it's the identical box object.
+            // Stage 2: `homeDepth` records the call-stack depth active
+            // right now (this capture's creating frame's own depth) —
+            // a later `return`/`yield` inside this capture's body
+            // unwinds back down to exactly this depth, no matter how
+            // many frames deep the capture is eventually invoked from.
+            //
+            // Ch. "Captures": "A capture that is created within a
+            // capture that does have a home will have its home set to
+            // its parent capture's home. This means that nested captures
+            // will all have the same home." — a capture literal
+            // evaluated WHILE another capture's own body is currently
+            // executing must inherit THAT capture's home verbatim
+            // (`context.currentCaptureHomeDepth`, itself `nil` if the
+            // enclosing capture is detached — nested captures inherit
+            // detachment too, per "will all have the same home"), not
+            // recompute its own from the raw current stack depth. Found
+            // by code review: using the raw depth here silently caught a
+            // nested capture's non-local return ONE FRAME TOO EARLY (at
+            // the enclosing capture's own invocation boundary) whenever
+            // the OUTER capture itself was invoked from a different
+            // depth than it was created at — invisible for the narrower
+            // "invoked immediately, in place" shape this file's own
+            // nested-capture test exercises, but a real, confirmed
+            // divergence from the documented rule.
+            return .capture(LassoCaptureValue(
+                body: body,
+                autoCollect: autoCollect,
+                capturedLocals: context.snapshotLocals(),
+                homeDepth: context.currentCaptureHomeDepth ?? context.tagCallStack.count
+            ))
         case let .variable(name, scope): return context.value(for: name, scope: scope)
         case let .identifier(name):
             if name.caseInsensitiveCompare("self") == .orderedSame, let object = context.currentSelf {
                 return .object(object)
+            }
+            // Ch. "Captures": "A method that receives an associated
+            // block accesses it via the `givenBlock` keyword" — a bare
+            // identifier, not `#givenBlock`/`$givenBlock`, matching the
+            // real docs' own worked example (`local(gb) = givenBlock`).
+            // `.void` (not an error) when the current call has no
+            // associated block, matching this codebase's established
+            // "no lookup-miss throws by default" convention elsewhere.
+            if name.caseInsensitiveCompare("givenblock") == .orderedSame {
+                return context.currentGivenBlock
             }
             // Checked before native functions: a couple of names (e.g.
             // "session") are registered as both a zero-arg-callable native
@@ -130,6 +180,16 @@ struct Evaluator {
                 return try await member(try await evaluate(base), name, arguments)
             }
             guard case let .identifier(name) = callee else {
+                // `#cap(...)` — Ch. "Captures": "`#cap() // Shorthand
+                // invocation`" — a capture value stored in a variable
+                // (or produced by any other non-identifier expression)
+                // called directly with `()`. Falls back to the existing
+                // "Dynamic call" error for every other callee shape,
+                // unchanged.
+                let calleeValue = try await evaluate(callee)
+                if case let .capture(capture) = calleeValue {
+                    return try await invokeCapture(capture, arguments: try await evaluate(arguments))
+                }
                 throw LassoRuntimeError.unsupportedExpression("Dynamic call")
             }
             if let scope = Self.declarationScope(for: name) {
@@ -284,13 +344,19 @@ struct Evaluator {
         _ definition: LassoCustomTagDefinition,
         callArguments: [LassoArgument]
     ) async throws -> LassoValue {
-        let evaluatedCallArguments = try await evaluate(callArguments)
+        // Stage 2 (Captures): must not even START this call if a
+        // return/yield is ALREADY mid-propagation — see this file's own
+        // `skipIfNonLocalReturnAlreadyPending()` doc comment for the
+        // real hazard this guards against (found by architect review).
+        if skipIfNonLocalReturnAlreadyPending() { return .void }
+        let (givenBlock, evaluatedCallArguments) = Self.extractGivenBlock(from: try await evaluate(callArguments))
         let boundLocals = try await bindParameters(definition.parameters, to: evaluatedCallArguments)
 
         let savedLocals = context.snapshotLocals()
         let savedLoopDepth = context.loopDepth
         try context.pushTagCall(definition.name)
         context.replaceLocals(boundLocals)
+        context.pushGivenBlock(givenBlock)
         // A tag call starts a fresh scope with no loop of its own yet —
         // without this, a stray Loop_Abort/Loop_Continue inside this
         // tag's own body (which has no loop) would be mistaken by
@@ -300,6 +366,7 @@ struct Evaluator {
         // iteration is calling this tag. See `LassoContext.loopDepth`.
         context.loopDepth = 0
         defer {
+            context.popGivenBlock()
             context.replaceLocals(savedLocals)
             context.popTagCall()
             context.loopDepth = savedLoopDepth
@@ -308,16 +375,266 @@ struct Evaluator {
         guard let renderNodes else { return .void }
         context.clearReturnSignal()
         _ = try await renderNodes(definition.body, &context)
-        return context.consumeReturnSignal() ?? .void
+        return consumeReturnValueRespectingNonLocalTarget(activeDepth: context.tagCallStack.count) ?? .void
     }
 
+    /// Thin wrapper around `LassoContext.consumeReturnSignalRespectingNonLocalTarget`
+    /// (see that method's own doc comment for the full propagation
+    /// mechanism) — shared by `invokeCustomTag`/`invokeMemberMethod`/
+    /// `invokeCapture`. `activeDepth` must be measured BEFORE this
+    /// frame's own `defer`-scheduled `popTagCall()` runs (i.e. while
+    /// `tagCallStack.count` still reflects this frame's own pushed
+    /// depth) — every call site here does that naturally, since this is
+    /// always the last thing evaluated before the function returns.
+    private mutating func consumeReturnValueRespectingNonLocalTarget(activeDepth: Int) -> LassoValue? {
+        context.consumeReturnSignalRespectingNonLocalTarget(activeDepth: activeDepth)
+    }
+
+    /// Guards every invocation boundary (`invokeCustomTag`/
+    /// `invokeMemberMethod`/`invokeCapture`) against a real hazard found
+    /// by architect review: `shouldStopRenderingCurrentBody()` is only
+    /// ever polled at STATEMENT granularity (between top-level nodes, or
+    /// between the pieces of one `.code` node) — never mid-expression.
+    /// So if a capture's non-local `return`/`yield` fires while it's
+    /// being invoked as a SUB-expression (a call argument, an operand of
+    /// `+`, an array element...) and something ELSE that goes through one
+    /// of these three boundaries runs afterward within that SAME
+    /// statement (another capture invocation, a plain tag call, a
+    /// member-method call), that later call would previously run to
+    /// completion as if nothing were happening — silently re-executing
+    /// side effects, and its own `context.clearReturnSignal()` (called
+    /// right before rendering ITS OWN body) would wipe out the still-
+    /// propagating signal before the enclosing statement's poll ever got
+    /// a chance to see it. Concretely: `#cap->invoke + '-' + #cap->invoke`
+    /// would silently invoke `cap`'s body TWICE instead of once once the
+    /// first invocation's `return` starts propagating; two SIBLING
+    /// captures with DIFFERENT homes in the same expression could have
+    /// the wrong one's value win entirely.
+    ///
+    /// The fix: a call that's about to start MUST NOT run at all — not
+    /// even evaluate its own arguments — if a return/yield is already
+    /// live and unconsumed. Real stack-unwinding semantics would never
+    /// even reach this call in the first place once an ancestor's
+    /// non-local exit is underway; this reproduces that by checking as
+    /// early as possible, before doing any of this boundary's own work.
+    private func skipIfNonLocalReturnAlreadyPending() -> Bool {
+        context.returnSignal != nil
+    }
+
+    /// `capture->invoke(...)` / `#cap(...)` shorthand — see
+    /// `Captures.swift`'s own doc comment for the full design. Mirrors
+    /// `invokeCustomTag` above almost exactly (same snapshot/restore
+    /// discipline, same per-call return-signal reuse, same fresh
+    /// `loopDepth`/recursion-depth-guarded call-stack push) — the one
+    /// real difference is WHICH locals a capture's invocation starts
+    /// from: `capturedLocals` (a snapshot of the scope the capture
+    /// literal was evaluated in), not a fresh empty dictionary the way a
+    /// custom tag call always starts from just its own bound parameters.
+    /// Positional arguments bind to `#1`/`#2`/... (Ch. "Captures":
+    /// "Parameters arrive via positional special locals"), OVERWRITING
+    /// any same-named entry already present in `capturedLocals` — the
+    /// call site's own arguments win over whatever the capture's
+    /// creation scope happened to have stored under the same numeric
+    /// name.
+    private mutating func invokeCapture(
+        _ capture: LassoCaptureValue,
+        arguments: [EvaluatedArgument]
+    ) async throws -> LassoValue {
+        // Stage 2 (Captures): see `skipIfNonLocalReturnAlreadyPending()`'s
+        // own doc comment — without this, a SECOND `#cap->invoke` in the
+        // same expression as a first one whose `return`/`yield` is still
+        // propagating would silently re-run this capture's body and
+        // clobber the still-live signal.
+        if skipIfNonLocalReturnAlreadyPending() { return .void }
+        var boundLocals = capture.capturedLocals
+        for (offset, argument) in arguments.filter({ $0.label == nil }).enumerated() {
+            // Stage 3 (Captures): a FRESH box per invocation, not a
+            // mutation of whatever box (if any) already occupied this
+            // slot — `#1`/`#2`/... are this call's own arguments, never
+            // shared with the creating scope or persisted across separate
+            // invocations of the same capture.
+            boundLocals[String(offset + 1)] = LassoLocalBox(argument.value)
+        }
+
+        let savedLocals = context.snapshotLocals()
+        let savedLoopDepth = context.loopDepth
+        try context.pushTagCall("capture")
+        context.replaceLocals(boundLocals)
+        context.loopDepth = 0
+        // Stage 2: this capture's OWN `homeDepth` (`nil` if `->detach()`ed)
+        // becomes the target a `return`/`yield` fired directly inside this
+        // body should unwind back down to — read via
+        // `context.currentCaptureHomeDepth` by `setNonLocalReturnSignal`.
+        context.pushCaptureHomeDepth(capture.homeDepth)
+        defer {
+            context.replaceLocals(savedLocals)
+            context.popTagCall()
+            context.loopDepth = savedLoopDepth
+            context.popCaptureHomeDepth()
+        }
+
+        guard let renderNodes else { return .void }
+        context.clearReturnSignal()
+        let output = try await renderNodes(capture.body, &context)
+        if let returned = consumeReturnValueRespectingNonLocalTarget(activeDepth: context.tagCallStack.count) {
+            return returned
+        }
+        // Ch. "Captures": a plain capture that falls off the end without
+        // an explicit `return`/`yield` produces `.void`; an auto-collect
+        // capture instead "concatenates the result of calling the
+        // `asString` method on every value produced inside the
+        // capture... and produces that value" — approximated here as the
+        // body's own rendered output string, matching every other value
+        // this codebase's `asString`-family conversions already reduce
+        // to a plain string representation. Also correctly covers the
+        // "still propagating to an outer target" case: if a nested
+        // return/yield hasn't reached ITS target yet, this capture's own
+        // invocation must not manufacture an auto-collect/void value of
+        // its own — it produces `.void` here and its caller's render loop
+        // keeps unwinding, exactly like `invokeCustomTag`/`invokeMemberMethod`.
+        return capture.autoCollect ? .string(output) : .void
+    }
+
+    /// Pulls a `=>`-associated capture block out of an already-evaluated
+    /// argument list, returning it separately from the REMAINING
+    /// arguments — used by every call site that can be invoked with an
+    /// associated block (`invokeCustomTag`/`invokeMemberMethod`) so the
+    /// block never participates in ordinary positional parameter
+    /// binding or multiple-dispatch arity/type resolution.
+    ///
+    /// `foldAssociatedCapture` (`ExpressionParser.swift`) labels the
+    /// capture argument `"givenblock"` specifically so it can be found
+    /// and removed HERE, before `bindParameters`/`LassoMethodDispatcher
+    /// .resolve` ever see it — architect review found a real bug in an
+    /// earlier version that instead appended the capture as an ordinary
+    /// UNLABELED positional argument: whenever a call provided fewer
+    /// explicit arguments than a tag/method declares parameters (a
+    /// completely normal shape, relying on trailing defaults), the
+    /// appended capture would silently land in and overwrite an
+    /// unrelated later parameter's default value instead of throwing or
+    /// being recognizable — and when the explicit argument count already
+    /// matched the parameter count exactly, the capture argument would
+    /// be silently dropped with no signal at all, since `bindParameters`'
+    /// own loop only ever binds up to `parameters.count`. Labeling it
+    /// removes it from `callArguments.filter { $0.label == nil }`
+    /// entirely, so neither failure mode can occur — the body reads it
+    /// back via the real, documented `givenBlock` keyword (see
+    /// `Evaluator.evaluate(_:)`'s own `.identifier` case) instead of an
+    /// ordinary declared parameter.
+    private static func extractGivenBlock(
+        from arguments: [EvaluatedArgument]
+    ) -> (givenBlock: LassoValue, remaining: [EvaluatedArgument]) {
+        var remaining: [EvaluatedArgument] = []
+        remaining.reserveCapacity(arguments.count)
+        var givenBlock: LassoValue = .void
+        for argument in arguments {
+            if argument.label?.caseInsensitiveCompare("givenblock") == .orderedSame {
+                givenBlock = argument.value
+            } else {
+                remaining.append(argument)
+            }
+        }
+        return (givenBlock, remaining)
+    }
+
+    /// Stage 4 (Captures): the real, shared `->forEach` mechanism —
+    /// invokes the call's associated `=>` block (its `givenBlock`) once
+    /// per element of `elements`, in order. NOT itself a genuine
+    /// invocation boundary the way `invokeCustomTag`/`invokeMemberMethod`/
+    /// `invokeCapture` are (no `pushTagCall`/depth tracking of its own):
+    /// it's sugar over a Swift-level loop of ordinary `invokeCapture`
+    /// calls, deliberately mirroring `loop`/`iterate`/`with`'s own
+    /// existing "native block construct, not a call boundary" shape
+    /// (`Renderer.swift`) — checking `context.shouldStopRenderingCurrentBody()`
+    /// after each invocation and stopping early is exactly what those
+    /// blocks do too (recently fixed to do so for `return`/`yield`, not
+    /// just `Loop_Abort`/`Loop_Continue`), so a non-local `return`/`yield`
+    /// fired from inside the block correctly aborts remaining iterations
+    /// and propagates on up to its real target — matching Ch. "Captures"'s
+    /// own `contains()` worked example (`#a->forEach => { #val == #1 ?
+    /// return true }`) exactly. Returns `.void` if no capture was
+    /// associated at all (real Lasso's own forEach has no meaningful
+    /// return value of its own; callers rely on side effects or a
+    /// non-local exit, never this function's own result).
+    private mutating func invokeForEachCapture(
+        over elements: [LassoValue],
+        evaluatedArguments: [EvaluatedArgument]
+    ) async throws -> LassoValue {
+        let (givenBlock, _) = Self.extractGivenBlock(from: evaluatedArguments)
+        guard case let .capture(capture) = givenBlock else { return .void }
+        for element in elements {
+            _ = try await invokeCapture(capture, arguments: [EvaluatedArgument(label: nil, value: element)])
+            if context.shouldStopRenderingCurrentBody() { break }
+        }
+        return .void
+    }
+
+    /// The real, documented Lasso 9.3 contract (Ch. "Query Expressions",
+    /// "Making an Object Queriable") ties `forEach`-style iteration to
+    /// `trait_forEach`/`trait_queriable` conformance in the abstract —
+    /// concretely, for the collection types this interpreter already
+    /// implements, that always cashes out to "produce this value's own
+    /// element sequence." Shared by `->forEach` (this file) and
+    /// `->insertFrom` (`Collections.swift`, Queue only — the one real,
+    /// documented Lasso 9.3 `trait_forEach`-typed parameter) so both
+    /// accept the SAME set of sources. A `.map` yields `Pair(key, value)`
+    /// per element, sorted by key — matching `LassoIteratorValue.build`'s
+    /// own already-established element-extraction shape
+    /// (`Iterator.swift`), not `iterate`/`with`'s (`Renderer.swift`):
+    /// found by review that those two iterate a `.map`'s raw, hash-order
+    /// Swift `Dictionary` directly, with NO sorting, and `with` doesn't
+    /// even yield `Pair`s for a map source (bare values only) — a real,
+    /// pre-existing, benign inconsistency between `->forEach` (this
+    /// stage, deterministic) and `iterate`/`with` (unspecified order)
+    /// over the identical Map value, worth a future look but out of
+    /// scope for this stage to fix. Not itself a separate documented
+    /// `->forEachPair` method (real Lasso 9.3 has no such method;
+    /// checked directly against lassoguide.com and
+    /// reference.lassosoft.com, see the plan doc's own Stage 4 note).
+    /// `nil` (not `.array([])`) for a value that doesn't conform at all,
+    /// so callers can distinguish "empty collection" from "not a
+    /// collection" if they need to. `static` (needs no `Evaluator`
+    /// instance/`LassoContext`) so `Collections.swift`'s native-type
+    /// method closures — which only ever receive `(receiver, arguments,
+    /// context)`, never a full `Evaluator` — can call it directly for
+    /// `->insertFrom`, exactly like this file's own `member(_:_:_:)` does
+    /// for `->forEach`.
+    static func forEachElements(of value: LassoValue) -> [LassoValue]? {
+        switch value {
+        case let .array(values): return values
+        case let .map(entries):
+            return entries.keys.sorted().map { .pair(.string($0), entries[$0] ?? .null) }
+        case let .object(object):
+            switch object.typeName.lowercased() {
+            case "list", "queue", "stack", "set":
+                return LassoCollectionValue.elements(from: object)
+            case "priorityqueue":
+                return LassoPriorityQueueValue.elements(from: object)
+            case "treemap":
+                // Already `.pair(key, value)` entries — matching the
+                // `.map` case above's own Pair-yielding convention.
+                return LassoTreeMapValue.entries(from: object)
+            default:
+                return nil
+            }
+        default:
+            return nil
+        }
+    }
+
+    /// Every bound parameter gets its OWN fresh box — a tag/method call
+    /// always starts an entirely new, isolated local scope (see
+    /// `invokeCustomTag`'s own doc comment: "a fresh, isolated local scope
+    /// so the tag body's #locals can't leak into or clobber the caller's"),
+    /// so nothing here should ever share a box with the caller's own
+    /// scope, matching `invokeCapture`'s identical treatment of `#1`/`#2`.
     private mutating func bindParameters(
         _ parameters: [LassoArgument],
         to callArguments: [EvaluatedArgument]
-    ) async throws -> [String: LassoValue] {
+    ) async throws -> [String: LassoLocalBox] {
         let positional = callArguments.filter { $0.label == nil }
         var positionalIndex = 0
-        var bound: [String: LassoValue] = [:]
+        var bound: [String: LassoLocalBox] = [:]
 
         for parameter in parameters {
             let (name, defaultExpression) = Self.parameterNameAndDefault(parameter.value)
@@ -326,14 +643,14 @@ struct Evaluator {
             if let labeled = callArguments.first(where: {
                 $0.label?.caseInsensitiveCompare(name) == .orderedSame
             }) {
-                bound[name.lowercased()] = labeled.value
+                bound[name.lowercased()] = LassoLocalBox(labeled.value)
             } else if positionalIndex < positional.count {
-                bound[name.lowercased()] = positional[positionalIndex].value
+                bound[name.lowercased()] = LassoLocalBox(positional[positionalIndex].value)
                 positionalIndex += 1
             } else if let defaultExpression {
-                bound[name.lowercased()] = try await evaluate(defaultExpression)
+                bound[name.lowercased()] = LassoLocalBox(try await evaluate(defaultExpression))
             } else {
-                bound[name.lowercased()] = .null
+                bound[name.lowercased()] = LassoLocalBox(.null)
             }
         }
         return bound
@@ -358,9 +675,31 @@ struct Evaluator {
         // params" note. Bound as an ordinary local (not passed through
         // invokeMemberMethod's own parameter binding) so it's visible here
         // and restored to whatever it was before once construction ends.
+        //
+        // Stage 3 (Captures) found a real, capture-unrelated bug in how
+        // this "restore" used to work: `context.set(...)` MUTATES an
+        // EXISTING box in place when one already exists for that name —
+        // exactly what makes closures see later same-slot writes — so if
+        // the CALLING scope already had its own local literally named
+        // "params", the old `context.set(...)` here permanently
+        // overwrote THAT box's value with the constructor's own argument
+        // array, and `context.replaceLocals(savedLocals)` afterward
+        // didn't undo it (it restores the name→box MAPPING, not a
+        // mutated box's contents, and it's the identical box either
+        // way). Fixed by inserting a FRESH box for "params" into a COPY
+        // of the ambient scope instead of mutating whatever box (if any)
+        // already occupied that name — every OTHER name in the ambient
+        // scope still resolves to the SAME shared boxes as before (data
+        // member defaults/`onCreate` keep seeing the calling scope's own
+        // other locals, unchanged), but "params" specifically points at
+        // a brand-new box this constructor call owns exclusively, so the
+        // caller's own pre-existing "params" (if any) is never touched
+        // at all and needs no real "restoring."
         let evaluatedCallArguments = try await evaluate(callArguments)
         let savedLocals = context.snapshotLocals()
-        context.set(.array(evaluatedCallArguments.map(\.value)), for: "params", scope: .local)
+        var scopedLocals = savedLocals
+        scopedLocals["params"] = LassoLocalBox(.array(evaluatedCallArguments.map(\.value)))
+        context.replaceLocals(scopedLocals)
         defer { context.replaceLocals(savedLocals) }
         for member in type.dataMembers {
             if let defaultValue = member.defaultValue {
@@ -496,7 +835,13 @@ struct Evaluator {
         arguments: [LassoArgument],
         missingIsVoid: Bool = false
     ) async throws -> LassoValue? {
-        let evaluatedCallArguments = try await evaluate(arguments)
+        // Stage 2 (Captures): see `skipIfNonLocalReturnAlreadyPending()`'s
+        // own doc comment. `.void` here (not `nil`) — `nil` specifically
+        // means "no such method", which would incorrectly redirect the
+        // caller to some other fallback dispatch path instead of just
+        // short-circuiting this already-resolved call.
+        if skipIfNonLocalReturnAlreadyPending() { return .void }
+        let (givenBlock, evaluatedCallArguments) = Self.extractGivenBlock(from: try await evaluate(arguments))
         guard let resolved = LassoMethodDispatcher.resolve(
             method: name,
             on: type,
@@ -508,12 +853,32 @@ struct Evaluator {
         let boundLocals = try await bindParameters(resolved.definition.parameters, to: resolved.evaluatedArguments)
         let savedLocals = context.snapshotLocals()
         let savedLoopDepth = context.loopDepth
+        // Found missing while wiring up Stage 2's depth-based non-local
+        // return propagation: unlike `invokeCustomTag`, this function
+        // never pushed onto `tagCallStack` at all — meaning every type-
+        // method call shared whatever depth was already active from any
+        // ENCLOSING free-tag call, with no depth increment of its own.
+        // Harmless before Stage 2 (nothing measured depth), but two
+        // real, independent problems once something does: (1) a capture
+        // created inside one method call's body would record the same
+        // `homeDepth` as an unrelated SIBLING or NESTED method call at
+        // the same free-tag nesting level, letting a non-local
+        // return/yield be consumed by the wrong frame; (2) type-method
+        // calls had no recursion-depth guard at all (only free-tag calls
+        // did, via this same `pushTagCall`'s built-in max-depth-20
+        // check) — a self-recursive method with no base case could
+        // recurse unboundedly. Fixed by pushing here too, matching
+        // `invokeCustomTag`'s own discipline exactly.
+        try context.pushTagCall(name)
         context.replaceLocals(boundLocals)
         context.pushSelf(object)
+        context.pushGivenBlock(givenBlock)
         // See the matching comment in `invokeCustomTag`.
         context.loopDepth = 0
         defer {
+            context.popGivenBlock()
             context.popSelf()
+            context.popTagCall()
             context.replaceLocals(savedLocals)
             context.loopDepth = savedLoopDepth
         }
@@ -521,7 +886,7 @@ struct Evaluator {
         guard let renderNodes else { return .void }
         context.clearReturnSignal()
         _ = try await renderNodes(resolved.definition.body, &context)
-        return context.consumeReturnSignal() ?? .void
+        return consumeReturnValueRespectingNonLocalTarget(activeDepth: context.tagCallStack.count) ?? .void
     }
 
     /// `Var`/`Variable` and `Global` are read/write tags (Ch. 15 Tables 1
@@ -561,6 +926,24 @@ struct Evaluator {
                 try await assign(evaluated, to: target, defaultScope: scope)
             } else if let name = Self.assignmentLabel(argument.value) {
                 readValue = context.value(for: name, scope: scope)
+                // Stage 3 (Captures): a bare `local(name)` declaration (no
+                // `=` value) must bring `name` into existence as a real,
+                // addressable storage cell RIGHT NOW — not defer creation
+                // until first assignment — so a capture literal evaluated
+                // between this declaration and a LATER `#name = value`
+                // assignment still closes over the SAME cell that
+                // assignment mutates (Ch. "Captures" §1.5's own worked
+                // example does exactly this shape). This same branch also
+                // covers the legacy read-only `(Local: 'name')` form, but
+                // that's harmless: `local_defined`/`var_defined` already
+                // check for `.null`, not box existence (see
+                // `LassoContext.trueGlobalDefined`'s own established
+                // precedent for this exact simplification), so creating an
+                // empty box here changes nothing observable for either
+                // form.
+                if scope == .local {
+                    context.ensureLocalExists(name)
+                }
             }
         }
         return readValue ?? .void
@@ -1017,6 +1400,94 @@ struct Evaluator {
             let index = position - 1
             guard characters.indices.contains(index) else { return .string("") }
             return .string(String(characters[index]))
+        case let (.string(value), "foreachcharacter"):
+            // Ch. "String Operations" (operations/strings.html, Lasso
+            // 9.3): "Executes a given capture block once for every
+            // character in the base string. The character can be
+            // accessed in the capture block through the special local
+            // variable #1." Real, directly-callable String method
+            // (unlike Stage 4's array/list/etc. `->forEach`, which isn't
+            // documented as callable at all) — checked directly against
+            // lassoguide.com before implementing. `Character` is already
+            // grapheme-cluster-aware (Unicode-correct), matching this
+            // project's established "default to real Unicode/ICU
+            // behavior" convention with no extra work needed.
+            return try await invokeForEachCapture(
+                over: value.map { .string(String($0)) },
+                evaluatedArguments: evaluate(arguments)
+            )
+        case let (.string(value), "foreachwordbreak"):
+            // "Executes a given capture block once for every word in
+            // the base string." Real Lasso docs never define "word"
+            // further — `String.enumerateSubstrings(options: .byWords)`
+            // is Foundation's own ICU-backed Unicode word-boundary
+            // segmentation (UAX #29), matching this project's
+            // established "default to real ICU/Unicode behavior when
+            // docs are ambiguous" convention (see memory:
+            // lasso-standards-culture) rather than a hand-rolled
+            // whitespace-split guess.
+            var words: [LassoValue] = []
+            value.enumerateSubstrings(in: value.startIndex..<value.endIndex, options: .byWords) { substring, _, _, _ in
+                if let substring { words.append(.string(substring)) }
+            }
+            return try await invokeForEachCapture(over: words, evaluatedArguments: evaluate(arguments))
+        case let (.string(value), "foreachlinebreak"):
+            // "Executes a given capture block once for every substring
+            // that would be generated by splitting the base string on a
+            // line break. Every line break character is recognized:
+            // \"\\r\", \"\\n\", and \"\\r\\n\"." Foundation's own
+            // `.byLines` enumeration already treats "\r\n" as ONE break
+            // (not two), matching this exact documented rule precisely
+            // — not a hand-rolled `components(separatedBy:)` split
+            // (which would need three separate passes to avoid
+            // double-splitting "\r\n").
+            var lines: [LassoValue] = []
+            value.enumerateSubstrings(in: value.startIndex..<value.endIndex, options: .byLines) { substring, _, _, _ in
+                if let substring { lines.append(.string(substring)) }
+            }
+            return try await invokeForEachCapture(over: lines, evaluatedArguments: evaluate(arguments))
+        case let (.string(value), "foreachmatch"):
+            // "string->forEachMatch(exp::string)" / "(exp::regexp) —
+            // Executes a given capture block once for every match in
+            // the base string. Matches can be specified as either
+            // string or regexp objects." A bare string argument is used
+            // directly AS a regex pattern (matching `Match_RegExp`'s own
+            // established convention, `Runtime.swift`'s
+            // `register("match_regexp")`, which stores whatever value
+            // it's given verbatim as the pattern) — a `regexp` object
+            // argument contributes its own pattern/`-IgnoreCase` fields
+            // instead (`NativeTypes.swift`'s `makeRegExpType`'s own
+            // `"find"`/`"ignorecase"` data keys).
+            //
+            // Found by architect review: an earlier version of this case
+            // evaluated `arguments[0].value` (the `exp` expression)
+            // manually to extract the pattern, THEN separately called
+            // `evaluate(arguments)` again to build `invokeForEachCapture`'s
+            // own evaluated-argument list — evaluating `exp` a SECOND,
+            // independent time. Harmless for a plain literal pattern, but
+            // a real bug the moment `exp` has any side effect (e.g.
+            // `'x'->forEachMatch(someMethodWithASideEffect())`, which
+            // would fire twice instead of once) — this codebase otherwise
+            // carefully evaluates each argument exactly once. Fixed by
+            // evaluating `arguments` ONCE and reading `exp` back out of
+            // that same evaluated list (the first non-`"givenblock"`-
+            // labeled entry — `exp` is always a plain positional
+            // argument, never itself labeled).
+            let evaluatedArguments = try await evaluate(arguments)
+            let matchArgument = evaluatedArguments.first {
+                $0.label?.caseInsensitiveCompare("givenblock") != .orderedSame
+            }?.value ?? .string("")
+            let pattern: String
+            let ignoreCase: Bool
+            if case let .object(regexpInstance) = matchArgument, regexpInstance.typeName == "regexp" {
+                pattern = regexpInstance.value(for: "find").outputString
+                ignoreCase = regexpInstance.value(for: "ignorecase").isTruthy
+            } else {
+                pattern = matchArgument.outputString
+                ignoreCase = false
+            }
+            let matches = LassoRegularExpressions.findAllWholeMatches(in: value, pattern: pattern, ignoreCase: ignoreCase)
+            return try await invokeForEachCapture(over: matches, evaluatedArguments: evaluatedArguments)
         case let (.string(value), "split"):
             let separator: String
             if let argument = arguments.first {
@@ -1156,6 +1627,104 @@ struct Evaluator {
             let end = min(start + length, characters.count)
             guard end > start else { return .string("") }
             return .string(String(characters[start..<end]))
+        case let (.string(value), "remove"):
+            // Ch. 25 Table 3: "Removes a substring from the string. The
+            // first parameter is the offset at which to start removing
+            // characters. The second parameter is the number of
+            // characters to remove. Defaults to removing to the end of
+            // the string." 1-based offset, matching `->substring`'s own
+            // established convention. Mutating (`"remove"` is already in
+            // `selfMutatingMethods`, shared with `Array->Remove`).
+            let characters = Array(value)
+            let evaluatedArguments = try await evaluate(arguments)
+            let offset = max(Int(evaluatedArguments.positionalValue(at: 0)?.number ?? 1) - 1, 0)
+            guard offset < characters.count else { return .string(value) }
+            let count = evaluatedArguments.positionalValue(at: 1).flatMap { $0.number.map(Int.init) } ?? (characters.count - offset)
+            let end = min(offset + max(count, 0), characters.count)
+            guard end > offset else { return .string(value) }
+            return .string(String(characters[0..<offset]) + String(characters[end...]))
+        case let (.string(value), "merge"):
+            // Ch. 25 Table 3: "Inserts a merge string into the string.
+            // Requires two parameters, the location at which to insert
+            // the merge string and the string to insert. Optional third
+            // and fourth parameters specify an offset into the merge
+            // string and number of characters of the merge string to
+            // insert." 1-based location, matching this file's other
+            // position-based string members. No worked example exists
+            // anywhere in the Guide for this specific tag (Table 3's own
+            // "Note" only points to the separate Lasso Reference) — the
+            // 1-based-offset assumption for the third/fourth parameters
+            // is inferred from this file's own established convention
+            // for every other position-based string member, not
+            // directly verified against a worked example (flagged by
+            // architect review).
+            let characters = Array(value)
+            let evaluatedArguments = try await evaluate(arguments)
+            let location = max(Int(evaluatedArguments.positionalValue(at: 0)?.number ?? 1) - 1, 0)
+            let mergeSource = Array(evaluatedArguments.positionalValue(at: 1)?.outputString ?? "")
+            let mergeOffset = min(max(evaluatedArguments.positionalValue(at: 2).flatMap { $0.number.map(Int.init) }.map { $0 - 1 } ?? 0, 0), mergeSource.count)
+            let mergeCount = evaluatedArguments.positionalValue(at: 3).flatMap { $0.number.map(Int.init) } ?? (mergeSource.count - mergeOffset)
+            let mergeEnd = min(mergeOffset + max(mergeCount, 0), mergeSource.count)
+            let mergeSlice = mergeEnd > mergeOffset ? String(mergeSource[mergeOffset..<mergeEnd]) : ""
+            let insertAt = min(location, characters.count)
+            return .string(String(characters[0..<insertAt]) + mergeSlice + String(characters[insertAt...]))
+        case let (.string(value), "foldcase"):
+            // Ch. 25 Table 5: "Converts all characters in the string for
+            // a case-insensitive comparison." Real Lasso backs this with
+            // ICU case folding; Swift/Foundation expose no direct case-
+            // fold API, so this uses `.folding(options: .caseInsensitive,
+            // locale: nil)` — Foundation's own closest equivalent, and a
+            // strictly closer match to real ICU case folding than plain
+            // `.lowercased()` for characters like German `ß` (which case-
+            // folds to `ss`, not just lowercases to itself) — still a
+            // disclosed approximation, not a full ICU case-fold
+            // implementation (flagged by architect review).
+            return .string(value.folding(options: .caseInsensitive, locale: nil))
+        case let (.string(value), "unescape"):
+            return .string(LassoEncoding.unescape(value))
+        case let (.string(value), member) where member == "tolower" || member == "toupper" || member == "totitle":
+            // Ch. 25 Table 5: `->toLower`/`->toUpper`/`->toTitle` convert
+            // a SINGLE character at a 1-based position, distinct from the
+            // whole-string `->lowercase`/`->uppercase`/`->titlecase`
+            // members above.
+            var characters = Array(value)
+            let position = arguments.first != nil ? Int(try await evaluate(arguments[0].value).number ?? 0) : 0
+            let index = position - 1
+            guard characters.indices.contains(index) else { return .string(value) }
+            let converted: String
+            switch member {
+            case "tolower": converted = String(characters[index]).lowercased()
+            case "toupper": converted = String(characters[index]).uppercased()
+            default:
+                // `->toTitle`: Swift/Foundation expose no per-character
+                // Unicode titlecase mapping, only whole-string
+                // `.capitalized`, so this uses plain uppercasing as the
+                // closest available approximation — identical to true
+                // titlecase for ASCII (everything this file's own tests
+                // exercise), but diverges for the small set of Unicode
+                // digraph characters with a distinct titlecase form
+                // (e.g. U+01C5 `ǅ`), matching this file's disclosed-
+                // narrower-scope convention elsewhere (flagged by
+                // architect review).
+                converted = String(characters[index]).uppercased()
+            }
+            characters.replaceSubrange(index..<(index + 1), with: Array(converted))
+            return .string(String(characters))
+        case let (.string(value), member) where LassoStringInformation.isCharacterMemberName(member):
+            // Ch. 25 Table 11: Character Information Member Tags — every
+            // one of these inspects a SINGLE character at a 1-based
+            // position. `->CharName` (full Unicode Character Database
+            // name lookup, e.g. "LATIN SMALL LETTER B") is deliberately
+            // NOT implemented here — Swift/Foundation expose no UCD name
+            // table, and guessing at one for only some code points would
+            // be worse than a clear, disclosed gap (see
+            // `StringOperations.swift`'s own doc comment).
+            let characters = Array(value)
+            let position = arguments.first != nil ? Int(try await evaluate(arguments[0].value).number ?? 0) : 0
+            let index = position - 1
+            guard characters.indices.contains(index) else { return .null }
+            let radix = arguments.count > 1 ? Int(try await evaluate(arguments[1].value).number ?? 10) : 10
+            return LassoStringInformation.characterMember(member, of: characters[index], radix: radix)
         case let (.integer(value), "asstring"):
             return .string(try await formattedNumber(Double(value), arguments, defaultPrecision: 0))
         case let (.decimal(value), "asstring"):
@@ -1169,6 +1738,15 @@ struct Evaluator {
             return .string(try await formattedNumber(value, arguments, defaultPrecision: 6))
         case let (.decimal(value), "ceil"): return .decimal(value.rounded(.up))
         case let (.integer(value), "ceil"): return .integer(value)
+        case let (.capture(capture), "invoke"):
+            return try await invokeCapture(capture, arguments: try await evaluate(arguments))
+        case let (.capture(capture), "detach"):
+            // Ch. "Captures": "detaches the capture so that it no longer
+            // has a home capture... After this, calling [capture->home]
+            // will return void" — and "returns itself", so `->detach()`
+            // chains naturally (e.g. `#cap->detach->invoke`).
+            capture.detach()
+            return .capture(capture)
         case let (.pair(key, _), "first"): return key
         case let (.pair(_, value), "second"): return value
         case (.pair, "size"):
@@ -1184,6 +1762,24 @@ struct Evaluator {
             case 2: return value
             default: return .null
             }
+        case (_, "foreach") where Self.forEachElements(of: base) != nil:
+            // Stage 4 (Captures): one shared case for every built-in
+            // collection this interpreter implements (array, map, list,
+            // queue, stack, set, priorityqueue, treemap) — see
+            // `forEachElements(of:)`/`invokeForEachCapture`'s own doc
+            // comments for the element-extraction and non-local-return
+            // mechanics (Ch. "Captures" `contains()` worked example).
+            // Placed ahead of the generic `.object` dispatch below so it
+            // wins for THESE known collection type names specifically —
+            // `forEachElements(of:)` returns `nil` for any OTHER
+            // `.object` (a user-defined type), correctly falling through
+            // to that type's OWN `forEach` method instead (already fully
+            // supported via ordinary `=>`-association + `givenBlock`,
+            // unchanged by this stage).
+            return try await invokeForEachCapture(
+                over: Self.forEachElements(of: base) ?? [],
+                evaluatedArguments: evaluate(arguments)
+            )
         case let (.array(values), "size"): return .integer(values.count)
         case let (.array(values), "first"): return values.first ?? .null
         case let (.array(values), "insert"):
@@ -1617,6 +2213,11 @@ struct Evaluator {
     /// recursive `evaluate(_:)` — see that method's doc for why.
     static let selfMutatingMethods: Set<String> = [
         "insert", "replace", "append", "trim",
+        // `Queue->InsertFrom` (Ch. 30, operations/collections.html) is
+        // documented the same "modifies the receiver" way `->Insert`
+        // already is — same write-back shape, just for Stage 4
+        // (Captures)'s new method.
+        "insertfrom",
         // `Array->Sort`/`->Reverse`/`->Remove`/`->RemoveAll` are documented
         // (Lasso 8.5 Language Guide Ch. 30) as invocant-mutating, exactly
         // like `->Insert` above — real corpus need: sorted product/category
@@ -1628,6 +2229,13 @@ struct Evaluator {
         // documented "Modifies the string and returns no value",
         // exactly like `->Trim`/`->Append` above.
         "padleading", "padtrailing", "removeleading", "removetrailing", "titlecase",
+        // `String->Merge`/`->Foldcase`/`->toLower`/`->toUpper`/`->toTitle`/
+        // `->Unescape` (Ch. 25 Tables 3/5) — same "modifies the string
+        // and returns no value" convention as the row above. `->Remove`
+        // is already covered by the pre-existing `"remove"` entry
+        // (shared with `Array->Remove`, purely name-based per this set's
+        // own top-level doc comment).
+        "merge", "foldcase", "tolower", "toupper", "totitle", "unescape",
         // `Date->Add`/`Date->Subtract` (Lasso 8.5 Language Guide Ch. 29
         // Table 7) — documented as changing "the values of variables
         // that contain date... data types" when called as a bare

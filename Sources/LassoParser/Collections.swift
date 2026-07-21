@@ -327,12 +327,15 @@ enum LassoTreeMapValue {
 extension LassoNativeTypeRegistry {
     // MARK: - list
     //
-    // Table 4/5 (pp. 397-399). `->ForEach`/`->InsertFrom`/`->Iterator`/
-    // `->ReverseIterator`/`->SortWith` are deliberately deferred
-    // (disclosed, not silently dropped): `->ForEach`/`->InsertFrom` need
+    // Table 4/5 (pp. 397-399). `->ForEach` is NOT registered here — it's
+    // implemented generically for every collection type this file
+    // defines via the shared Captures Stage 4 mechanism instead
+    // (`Evaluator.forEachElements(of:)`/`invokeForEachCapture`,
+    // `Evaluator.swift`), not as its own native method per type.
+    // `->InsertFrom`/`->SortWith` are deliberately deferred
+    // (disclosed, not silently dropped): `->InsertFrom` need
     // a passable tag-reference value (Stage 6's `\TagName` primitive);
-    // `->Iterator`/`->ReverseIterator` need the reference-typed Iterator
-    // mechanism (Stage 3); `->SortWith` needs Comparator values
+    // `->SortWith` needs Comparator values
     // (Stage 2). `->Insert`'s documented optional iterator-position
     // parameter (defaulting to the end) is also deferred — implemented
     // here as always-append, matching that documented default, since
@@ -527,6 +530,27 @@ extension LassoNativeTypeRegistry {
         type.register("insertlast") { receiver, arguments, _ in
             var elements = LassoCollectionValue.elements(from: receiver)
             if let value = arguments.first?.value { elements.append(value) }
+            return .object(LassoCollectionValue.makeObject(typeName: "queue", elements: elements))
+        }
+        // Ch. 30 (operations/collections.html, Lasso 9.3): "queue->insertFrom
+        // (value::trait_forEach) — Inserts new elements into the queue...
+        // by taking an object that implements trait_forEach." The ONE
+        // real, currently-documented `->insertFrom` in Lasso 9.3 — List/
+        // Set/Array only have this under the LEGACY (8.x, iterator-based)
+        // reference, a different mechanism this Lasso 9 interpreter
+        // doesn't implement; see this file's own top-level doc comment
+        // for the full citation trail. `Evaluator.forEachElements(of:)`
+        // is the shared "does this value even conform" extraction this
+        // interpreter uses for BOTH `->forEach` and this method, so a
+        // `value` that doesn't conform (an unrelated scalar, a custom
+        // type with no registered element sequence) contributes nothing
+        // rather than throwing — matching this codebase's established
+        // "unrecognized/inapplicable input is a no-op" convention.
+        type.register("insertfrom") { receiver, arguments, _ in
+            var elements = LassoCollectionValue.elements(from: receiver)
+            if let source = arguments.first?.value, let toInsert = Evaluator.forEachElements(of: source) {
+                elements.append(contentsOf: toInsert)
+            }
             return .object(LassoCollectionValue.makeObject(typeName: "queue", elements: elements))
         }
         type.register("remove") { receiver, _, _ in
