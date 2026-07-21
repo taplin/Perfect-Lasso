@@ -1,5 +1,19 @@
 # Captures Subsystem Scoping Pass
 
+## Status note (2026-07-21)
+
+**§8's "do not build now" recommendation below was made on corpus-evidence
+grounds alone — Tim overrode it explicitly: "Captures is important even if
+it's not used in the current corpus examples."** This project's corpus is
+known to skew Lasso 8.5-era code, and Captures is genuinely foundational
+Lasso 9 language machinery (not a rarely-hit convenience method) — corpus
+absence is the wrong signal for whether to build core language primitives,
+only for how to prioritize among many already-real gaps. Implementation is
+proceeding per the staged plan in §5, starting with Stage 1. The rest of this
+document (inventory, architecture, risk assessment, staged plan) remains
+accurate and is the active reference for that work — only §8's go/no-go
+verdict is superseded.
+
 ## Methodology
 
 Ground truth for this pass is lassoguide.com's Lasso 9.3 documentation, fetched
