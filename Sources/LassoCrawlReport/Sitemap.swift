@@ -96,19 +96,29 @@ public enum Sitemap {
 
     /// `sitemap.xml` never legitimately needs a DOCTYPE or a custom ENTITY
     /// declaration — checked case-insensitively against the raw response
-    /// BEFORE it's ever handed to `XMLParser`, since Foundation's
-    /// `XMLParser` has no libxml2-style flag to hard-disable entity
-    /// expansion (a "billion laughs" defense). This is defense in depth
-    /// beyond what was strictly needed to survive contact with real input:
-    /// the Linux-parity spike for this feature found that a small,
-    /// non-exponential entity payload didn't hang or crash `XMLParser` on
-    /// either Darwin or `swift-corelibs-foundation` — but that's not a
-    /// guarantee about a genuinely exponential payload, so this check stays
-    /// unconditional rather than being scoped down after the fact.
+    /// BEFORE it's ever handed to `XMLParser`, as a cheap, non-load-bearing
+    /// EARLY rejection for the common case.
+    ///
+    /// This is deliberately NOT the primary defense against a malicious
+    /// DOCTYPE/ENTITY payload — a real, valid, UTF-16-encoded XML document
+    /// (BOM + `encoding="UTF-16"` declaration, legal per the XML spec) can
+    /// carry a `<!DOCTYPE ...>`/`<!ENTITY ...>` declaration that this
+    /// substring scan never detects: `String(decoding:as: UTF8.self)` on
+    /// interleaved-null UTF-16 bytes never reproduces the literal ASCII
+    /// markers below, so an attacker who controls the encoding can bypass
+    /// this check entirely while still handing `XMLParser` a perfectly
+    /// parseable DOCTYPE-bearing document (confirmed empirically during
+    /// review). The real, documented, encoding-independent protection is
+    /// `parser.shouldResolveExternalEntities = false`, set explicitly at
+    /// every `XMLParser` construction site in `discoverPaths` below — this
+    /// scan is defense-in-depth on top of that, not a substitute for it.
     private static func containsDoctypeOrEntity(_ data: Data) -> Bool {
         // Lossy UTF-8 decode is fine here — this is a substring scan for a
         // literal ASCII marker, not a correctness-sensitive parse, and the
-        // caller has already bounded `data` to `maxResponseBytes`.
+        // caller has already bounded `data` to `maxResponseBytes`. It will
+        // miss non-UTF-8/UTF-16-family encodings (see the doc comment
+        // above) — that's expected and acceptable given this is only ever
+        // the secondary check.
         let text = String(decoding: data, as: UTF8.self).lowercased()
         return text.contains("<!doctype") || text.contains("<!entity")
     }
@@ -151,6 +161,25 @@ public enum Sitemap {
     /// a hidden segment (a component starting with `.` — the same
     /// filesystem-hidden-file convention `discoverPaths` already refuses to
     /// crawl), or an extension not in `extensions`.
+    ///
+    /// PATH-INTERNAL `?` DISAMBIGUATION: every downstream consumer of this
+    /// return value (`CrawlReport.candidateIsEligible`,
+    /// `CrawlReport.encodedRequestPath`) treats the FIRST unescaped `?` in
+    /// the flattened string as the query separator. A `<loc>` like
+    /// `.../foo.lasso%3Fbar.lasso` (a percent-encoded, literal `?` inside
+    /// what is really ONE path segment, no real query at all) percent-
+    /// decodes to `trimmedPath == "foo.lasso?bar.lasso"` — a literal,
+    /// decoded `?` that would collide with that separator convention and
+    /// get the path wrongly split (confirmed empirically during review).
+    /// Since a literal `?` can only ever appear in a decoded path component
+    /// if it was percent-encoded in the source URL to begin with (real URL
+    /// syntax has no other way to get a literal `?` into a path), it's
+    /// always correct — and never lossy — to re-escape it back to `%3F`
+    /// before this function hands the string off, restoring "the first
+    /// unescaped `?` is the true separator" for every downstream consumer.
+    /// `CrawlReport.encodedRequestPath` has a matching, narrowly-scoped fix
+    /// so this re-escaped `%3F` survives to the wire as a single escape
+    /// (not a double-escaped `%253F`) — see its own doc comment.
     static func relativePath(of url: URL, extensions: Set<String>) -> String? {
         guard let scheme = url.scheme?.lowercased(), scheme == "http" || scheme == "https" else { return nil }
         guard let components = URLComponents(url: url, resolvingAgainstBaseURL: false) else { return nil }
@@ -161,7 +190,12 @@ public enum Sitemap {
         let fileExtension = (trimmedPath as NSString).pathExtension.lowercased()
         guard extensions.contains(fileExtension) else { return nil }
 
-        var result = trimmedPath
+        // Extension/hidden-segment checks above ran against the fully
+        // human-readable decoded path, unchanged from before this fix.
+        // Only NOW, right before this becomes a flattened path+query
+        // string, do we re-escape any literal `?` that survived decoding —
+        // see this function's own doc comment above.
+        var result = trimmedPath.replacingOccurrences(of: "?", with: "%3F")
         if let encodedQuery = components.percentEncodedQuery,
            let decodedQuery = encodedQuery.removingPercentEncoding,
            decodedQuery.isEmpty == false {
@@ -345,6 +379,18 @@ public enum Sitemap {
             let parser = XMLParser(data: data)
             parser.delegate = delegate
             parser.shouldProcessNamespaces = false
+            // The real, documented, encoding-independent DOCTYPE/ENTITY
+            // defense (see `containsDoctypeOrEntity`'s doc comment for why
+            // that substring scan alone is bypassable via e.g. a
+            // UTF-16-encoded document). Explicitly disabling external
+            // entity resolution here doesn't depend on Foundation's
+            // undocumented per-platform default — this codebase already
+            // found a real Darwin-vs-Linux `XMLParser` behavioral
+            // divergence for this exact API elsewhere in this file (see
+            // the `FoundationXML` import comment above), so relying on an
+            // unstated default for a security-relevant setting is not
+            // acceptable here.
+            parser.shouldResolveExternalEntities = false
             // Deliberately ignore `parser.parse()`'s own return value — see
             // `LocCollectorDelegate`'s doc comment for why it isn't a
             // reliable cross-platform signal. Whatever `<loc>` entries the

@@ -65,6 +65,29 @@ import Testing
     #expect(Sitemap.relativePath(of: url, extensions: ["lasso"]) == nil)
 }
 
+@Test func relativePathReEscapesAPathInternalPercentEncodedQuestionMark() {
+    // Reproduces a real review finding: a `<loc>` whose PATH contains a
+    // percent-encoded, literal `?` (`%3F`) — one path segment, no real
+    // query string at all. Percent-decoding it naively (the pre-fix
+    // behavior) would produce the ambiguous flat string
+    // "foo.lasso?bar.lasso", indistinguishable from a real
+    // path+query split by every downstream consumer. The fix re-escapes
+    // that literal `?` back to `%3F` before returning, so the one true
+    // separator convention downstream depends on ("the first unescaped `?`
+    // is the query separator") stays true.
+    let url = URL(string: "https://example.com/foo.lasso%3Fbar.lasso")!
+    #expect(Sitemap.relativePath(of: url, extensions: ["lasso"]) == "foo.lasso%3Fbar.lasso")
+}
+
+@Test func relativePathDistinguishesAPathInternalPercentEncodedQuestionMarkFromARealTrailingQuery() {
+    // Companion case: a percent-encoded `?` INSIDE the path AND a genuine
+    // trailing real query string. The two must remain distinguishable
+    // after the fix — exactly one literal (real) `?` should appear in the
+    // result, separating the (re-escaped) path from the real query.
+    let url = URL(string: "https://example.com/foo.lasso%3Fbar.lasso?real=1")!
+    #expect(Sitemap.relativePath(of: url, extensions: ["lasso"]) == "foo.lasso%3Fbar.lasso?real=1")
+}
+
 // MARK: - discoverPaths (URLProtocol-mocked, keyed by full URL so
 // cross-origin hosts are genuinely distinguishable — the whole point of
 // several tests below is proving a cross-origin host is NEVER actually
@@ -341,6 +364,70 @@ private func setUp() {
     // WHOLE document is refused pre-parse, not selectively sanitized.
     #expect(paths.isEmpty)
     #expect(summary.fetchErrors.contains { $0.lowercased().contains("doctype") || $0.lowercased().contains("entity") })
+}
+
+@Test func utf16EncodedDoctypeAndEntityDocumentBypassesTheSubstringScanButIsStillSafe() async throws {
+    setUp()
+    // Reproduces a real review finding: a legal, UTF-16-encoded XML
+    // document (BOM + `encoding="UTF-16"` declaration) carrying a
+    // `<!DOCTYPE ...>` + external `<!ENTITY ...>` declaration. Confirmed
+    // empirically (outside this test) that `containsDoctypeOrEntity`'s
+    // `String(decoding:as: UTF8.self)` scan NEVER reproduces the literal
+    // ASCII "<!doctype"/"<!entity" markers against interleaved-null UTF-16
+    // bytes, so this document sails past that pre-check — unlike the
+    // ASCII-encoded `doctypeAndEntityDocumentsAreRejectedBeforeParsing`
+    // case above, which the scan does catch and rejects wholesale. The
+    // real, encoding-independent defense is `shouldResolveExternalEntities
+    // = false` at the `XMLParser` construction site, not this scan — this
+    // test must pass regardless of the scan's own (encoding-dependent)
+    // success or failure.
+    let xml = """
+    <?xml version="1.0" encoding="UTF-16"?>
+    <!DOCTYPE urlset [
+    <!ENTITY xxe SYSTEM "file:///etc/hostname">
+    ]>
+    <urlset xmlns="http://www.sitemaps.org/schemas/sitemap/0.9">
+      <url><loc>https://www.realclientsite.com/real.lasso</loc></url>
+      <url><loc>https://www.realclientsite.com/page.lasso?x=&xxe;</loc></url>
+    </urlset>
+    """
+    let utf16Data = try #require(xml.data(using: .utf16))
+    // Sanity check this really is UTF-16-with-BOM, not accidentally
+    // re-encoded as UTF-8 by the test itself — a `0xFF 0xFE` lead byte
+    // pair is the UTF-16LE byte-order mark.
+    #expect(utf16Data.prefix(2) == Data([0xFF, 0xFE]))
+
+    SitemapMockURLProtocol.responsesByURL = [
+        "\(Self.baseURL)/sitemap.xml": (200, utf16Data),
+    ]
+
+    let (paths, summary) = await Sitemap.discoverPaths(
+        baseURL: Self.baseURL,
+        entryPath: "sitemap.xml",
+        allowedOrigin: Self.defaultOrigin,
+        extensions: ["lasso"],
+        maxSubSitemaps: 50,
+        maxURLs: 20_000,
+        maxResponseBytes: 10_000_000,
+        urlSession: sitemapMockSession()
+    )
+
+    // The document was NOT rejected pre-parse (unlike the ASCII DOCTYPE
+    // test) — proving the substring scan really was bypassed by the
+    // encoding, exactly as the review found. It still parses safely and
+    // yields the real, declared `<loc>` entries.
+    #expect(Set(paths).isSuperset(of: ["real.lasso"]))
+    #expect(summary.sitemapURLsFetched == 2)
+    #expect(summary.malformedLocCount == 0)
+    // The whole point: with `shouldResolveExternalEntities = false` now
+    // explicit, the external entity was never fetched/expanded — the
+    // second `<loc>`'s `&xxe;` reference contributes no substituted text,
+    // so nothing beyond the literal `x=` prefix ever appears. If the
+    // external entity HAD been resolved, this would instead contain the
+    // contents of `/etc/hostname` appended after `x=`.
+    if let pageEntry = paths.first(where: { $0.hasPrefix("page.lasso") }) {
+        #expect(pageEntry == "page.lasso?x=")
+    }
 }
 
 @Test func maxURLsCapTruncatesCleanlyWithoutCrashing() async throws {

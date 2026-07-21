@@ -511,17 +511,62 @@ public enum CrawlReport {
     /// build its own (also potentially query-bearing) sitemap-document
     /// fetch URLs through this identical, tested logic instead of a second,
     /// independently-drifting copy.
+    ///
+    /// NECESSARY COMPANION TO `Sitemap.relativePath`'s path-internal-`?`
+    /// fix: that function now re-escapes a literal, decoded `?` inside a
+    /// path component back to `%3F` before it ever reaches this function,
+    /// so a value like `foo.lasso%3Fbar.lasso` (one path segment, no real
+    /// query) doesn't get wrongly split here. But `%` is not itself in
+    /// `.urlPathAllowed`/`.urlQueryAllowed` — a plain `pathPortion
+    /// .addingPercentEncoding(withAllowedCharacters:)` call blindly
+    /// re-escapes THAT `%` too, turning `%3F` into `%253F` on the wire (a
+    /// different, non-existent resource, confirmed empirically: a live
+    /// HTTP capture showed the raw request line carrying `%253F`, which a
+    /// server that itself decodes once would see as literal `%3F` text,
+    /// not the intended literal `?`). Splitting each portion around the
+    /// literal `%3F` marker and encoding only the pieces between it (never
+    /// the marker itself) keeps that one, deliberately reintroduced escape
+    /// intact through this second encoding pass while every other
+    /// character is still encoded exactly as before. `Sitemap.relativePath`
+    /// is the only caller that ever reintroduces a pre-escaped sequence,
+    /// and it only ever reintroduces this exact one — a decoded path
+    /// component that happens to already contain the literal text `%3F`
+    /// (only reachable via a doubly-percent-encoded sitemap `<loc>`, an
+    /// unusual, degenerate input) would, in that narrow case, also have its
+    /// `%` left unescaped rather than becoming `%25`; that's an accepted,
+    /// far rarer trade-off against the confirmed, common bug this fixes.
     static func encodedRequestPath(_ path: String) -> String? {
         guard let questionMarkIndex = path.firstIndex(of: "?") else {
-            return path.addingPercentEncoding(withAllowedCharacters: .urlPathAllowed)
+            return percentEncodedPreservingReEscapedQuestionMark(path, allowedCharacters: .urlPathAllowed)
         }
         let pathPortion = String(path[path.startIndex..<questionMarkIndex])
         let queryPortion = String(path[path.index(after: questionMarkIndex)...])
-        guard let encodedPath = pathPortion.addingPercentEncoding(withAllowedCharacters: .urlPathAllowed),
-              let encodedQuery = queryPortion.addingPercentEncoding(withAllowedCharacters: .urlQueryAllowed) else {
+        guard let encodedPath = percentEncodedPreservingReEscapedQuestionMark(pathPortion, allowedCharacters: .urlPathAllowed),
+              let encodedQuery = percentEncodedPreservingReEscapedQuestionMark(queryPortion, allowedCharacters: .urlQueryAllowed) else {
             return nil
         }
         return "\(encodedPath)?\(encodedQuery)"
+    }
+
+    /// Percent-encodes `string` with `allowedCharacters`, except that any
+    /// literal `%3F` substring — the exact marker `Sitemap.relativePath`
+    /// reintroduces for a path-internal, previously-percent-encoded `?` —
+    /// is left untouched instead of having its `%` re-escaped to `%25`. See
+    /// `encodedRequestPath`'s own doc comment for why a plain
+    /// `addingPercentEncoding` call here would otherwise double-escape that
+    /// marker.
+    private static func percentEncodedPreservingReEscapedQuestionMark(_ string: String, allowedCharacters: CharacterSet) -> String? {
+        let marker = "%3F"
+        let segments = string.components(separatedBy: marker)
+        var encodedSegments: [String] = []
+        encodedSegments.reserveCapacity(segments.count)
+        for segment in segments {
+            guard let encoded = segment.addingPercentEncoding(withAllowedCharacters: allowedCharacters) else {
+                return nil
+            }
+            encodedSegments.append(encoded)
+        }
+        return encodedSegments.joined(separator: marker)
     }
 
     private static func requestPage(baseURL: String, path: String, urlSession: URLSession, source: CrawlPathSource = .filesystem) async -> CrawlPageResult {

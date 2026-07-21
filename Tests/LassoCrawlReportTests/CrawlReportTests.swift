@@ -121,6 +121,60 @@ private func write(_ text: String, to root: URL, relativePath: String) throws {
     #expect(components.percentEncodedQuery?.removingPercentEncoding == "id=42&name=A B")
 }
 
+// MARK: - path-internal percent-encoded `?` (review finding: query-string
+// path/query confusion via an embedded percent-encoded `?`)
+
+@Test func candidateIsEligibleAndSitemapExtensionCheckAgreeOnAPathInternalPercentEncodedQuestionMark() {
+    // Before the `Sitemap.relativePath` fix, `Sitemap.discoverPaths`'s own
+    // extension check (against the FULL decoded string) and
+    // `candidateIsEligible`'s extension check (against only the pre-`?`
+    // prefix) disagreed on exactly this input shape — a path could pass
+    // `discoverPaths`'s own filtering but then get silently dropped here at
+    // merge time. Once `Sitemap.relativePath` re-escapes the path-internal
+    // `?` back to `%3F`, there is no longer any unescaped `?` for this
+    // function's own pre-`?` split to find in the path portion, so it
+    // agrees with `Sitemap.relativePath`'s full-string extension check
+    // (see `relativePathReEscapesAPathInternalPercentEncodedQuestionMark`
+    // in `SitemapTests.swift`, which proves what `Sitemap.relativePath`
+    // itself now returns for this exact input).
+    let sitemapDerivedPath = "foo.lasso%3Fbar.lasso"
+    #expect(CrawlReport.candidateIsEligible(relativePath: sitemapDerivedPath, extensions: ["lasso"], excludePaths: []))
+}
+
+@Test func encodedRequestPathBuildsARequestForTheSingleLiteralPathSegmentNotAWrongQuerySplit() throws {
+    // The reviewer's exact scenario: `Sitemap.relativePath` (once fixed)
+    // returns "foo.lasso%3Fbar.lasso" for a same-origin `<loc>` whose path
+    // contains a percent-encoded `?` and has no real query string at all.
+    // `encodedRequestPath` must build a request whose `.path` is the full
+    // literal segment and whose `.query` is `nil` — i.e. the ONE resource
+    // the sitemap declared — not a wrong split into path "/foo.lasso" and
+    // a spurious query "bar.lasso".
+    let sitemapDerivedPath = "foo.lasso%3Fbar.lasso"
+    let encoded = try #require(CrawlReport.encodedRequestPath(sitemapDerivedPath))
+    // The marker must survive as a SINGLE escape on the wire, not a
+    // double-escaped `%253F` — confirmed via a live local HTTP capture
+    // during review that a naive `addingPercentEncoding` re-escape of the
+    // re-inserted `%3F` corrupts it into `%253F`, which a real server
+    // (decoding once) would see as literal `%3F` text, a different,
+    // non-existent resource.
+    #expect(encoded == "foo.lasso%3Fbar.lasso")
+    let url = try #require(URL(string: "http://example.com/\(encoded)"))
+    #expect(url.path == "/foo.lasso?bar.lasso")
+    #expect(url.query == nil)
+}
+
+@Test func encodedRequestPathKeepsAPathInternalPercentEncodedQuestionMarkDistinctFromARealTrailingQuery() throws {
+    // Companion case: a path-internal percent-encoded `?` AND a genuine
+    // trailing real query string must remain distinguishable — proving the
+    // fix doesn't just make every `?` inert, only the re-escaped one.
+    let sitemapDerivedPath = "foo.lasso%3Fbar.lasso?real=1"
+    let encoded = try #require(CrawlReport.encodedRequestPath(sitemapDerivedPath))
+    #expect(encoded == "foo.lasso%3Fbar.lasso?real=1")
+    let url = try #require(URL(string: "http://example.com/\(encoded)"))
+    #expect(url.path == "/foo.lasso?bar.lasso")
+    #expect(url.query == "real=1")
+}
+
 @Test func discoverPathsSkipsStaticHTMLButKeepsLassoBearingHTML() throws {
     let root = try makeTempSiteRoot()
     defer { try? FileManager.default.removeItem(at: root) }
