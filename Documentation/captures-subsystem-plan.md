@@ -1,5 +1,70 @@
 # Captures Subsystem Scoping Pass
 
+## Additional corpus evidence (2026-07-21) — two more real Lasso 9 codebases
+
+Tim provided two more real, independent Lasso 9 codebases not covered by the
+original scoping pass:
+`.../DevWorkArchive/TS_lasso9` (61 `.lasso`/`.inc` files, a tennis-court
+booking/POS system) and `.../DevWorkArchive/bugcity9` (24 files, an
+e-commerce site). Direct grep + manual inspection of every `=>` occurrence in
+both (file-by-file, not sampled) found **real, uncommented, non-trivial
+capture-family usage the original two corpora (scrubsSite/scrubs9) showed
+zero evidence for**:
+
+- **`#AIMParams->forEachPair => { #AIMParamArray->insert(#1->first = #1->second) }`**
+  (`bugcity9/StartUpTags/AuthorizeNet_AIM_9.inc`) — genuine `forEach`-family
+  iteration over a map, with `#1` positional capture-parameter binding, in a
+  real payment-gateway (Authorize.net AIM) integration file — not a toy
+  example. **`forEach`/`forEachPair` do not exist anywhere in this codebase
+  today** (confirmed via grep — zero hits in `Evaluator.swift`/
+  `Collections.swift`/`Runtime.swift`). This single line is concrete,
+  real-world proof that Stage 4's `->forEach` work (§5) has an actual
+  consumer, contradicting the original pass's "zero corpus hits" finding —
+  the original corpora simply didn't happen to include this idiom.
+- **`inline(-host=..., -database=..., -sql=$sqlcode, -maxrows='all')=>{ records=>{ ... } }`**
+  (repeated across `TS_lasso9/index.lasso` and 4 near-duplicate siblings) —
+  `inline`/`records` invoked as an ORDINARY EXPRESSION with parens and an
+  associated capture block, not the bracket-tag `[Inline]...[/Inline]` form
+  this codebase implements as a hardcoded `.block(name: "inline")` parse
+  node. This is real evidence of the general "arbitrary call + `=>{...}`"
+  mechanism (§4.1) being used for tags beyond the six hardcoded keywords
+  (`define`/`if`/`while`/`loop`/`match`/`iterate`) already covered.
+- **`(-inlinename='menulist')=>{^	 ^}`** and **`loop(10)=>{^ ... ^}`**
+  (`TS_lasso9/index copy.lasso`, `courts/main.lasso`) — the auto-collect
+  `{^...^}` literal form, real (if the first example is a trivial/empty
+  body) — the original pass found zero live `{^...^}` usage anywhere.
+- **`with current_result in #AIMResultArray do => { #counter += 1 ... }`**
+  (`bugcity9/StartUpTags/AuthorizeNet_AIM_9.inc`) — a genuinely NEW,
+  currently-unparseable variant of the already-implemented `with...do`:
+  **confirmed by direct code inspection** (`ScriptBodyParser.swift:503-509`,
+  `parseWithOpening`) that the parser requires `do` followed directly by
+  `{` (via `skipTrivia()` then a hard `characters[index] == "{"` check) —
+  it never calls `consumeArrowBlockStartIfPresent()` the way `parseElseTag`
+  does, so an explicit `=>` between `do` and `{` fails to parse today. This
+  is a small, concrete, independently-fixable gap (accept an optional `=>`
+  in `parseWithOpening`, mirroring `parseElseTag`'s existing pattern) that
+  doesn't need to wait for the rest of the Captures subsystem.
+- **`select(found_count)=>{ case(0) ... }`** (`TS_lasso9/authenticate.lasso`,
+  `ccp/pos_tags.lasso`) — the legacy `Select`/`Case` construct (already
+  lowered to `if`/`else`, per `outstanding-compatibility-project-plans.md`
+  item 10) invoked via the arrow-association call form rather than the
+  bracket-tag form — not independently verified against the current
+  `select`/`case` parser support in this pass; worth checking when Stage 1's
+  general `=>`-as-expression-operator work lands, since it may already
+  self-resolve.
+- A commented-out (`/* ... */`, dead) example in `TS_lasso9/courts/main.lasso`
+  — `$atimes->foreach=>{$xset->insert(#1)};` — not live evidence on its own,
+  but shows the same developer reaching for this exact `->foreach`+`#1`
+  idiom independently in a second file, consistent with the AuthorizeNet
+  finding above rather than a one-off.
+
+**Net effect on the staged plan**: Stage 4 (`->forEach`) now has real,
+non-hypothetical corpus justification, not just "the docs say `Set->ForEach`
+needs it." The `with...do=>{...}` arrow-form gap is real but independent of
+the rest of this plan — worth fixing as a standalone quick patch whenever
+convenient, not gated on Stage 1-3. Everything else in the original pass's
+architecture/risk analysis (§§1-7) is unaffected by this new evidence.
+
 ## Status note (2026-07-21)
 
 **§8's "do not build now" recommendation below was made on corpus-evidence
