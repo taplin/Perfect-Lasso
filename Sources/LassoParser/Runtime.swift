@@ -817,18 +817,33 @@ public struct LassoNativeRegistry: Sendable {
         register("stack") { arguments, _ in
             .object(LassoCollectionValue.makeObject(typeName: "stack", elements: arguments.map(\.value)))
         }
-        register("set") { _, _ in
-            // Table 15's own documented parameter is an optional
-            // comparator (Comparator values now exist as of Stage 2's
-            // `Comparators.swift`) — but wiring a per-instance
-            // comparator through Set's own Insert/Difference/
-            // Intersection/Union (which all currently hardcode
-            // `naturalSort`) is real additional work not in Stage 2's
-            // checklist (only PriorityQueue/TreeMap consume comparators
-            // this stage). Any argument given here is still ignored;
-            // Set always natural-sorts. Left as a disclosed gap, not
-            // silently dropped.
-            .object(LassoCollectionValue.makeObject(typeName: "set", elements: []))
+        register("set") { arguments, context in
+            // The 8.5 PDF's own Table 15 documents the constructor's
+            // one parameter as an optional comparator — but
+            // lassoguide.com/operations/collections.html (9.3, the
+            // newer/more complete source this project already prefers
+            // over 8.5 PDF gaps — see `queue`/`stack`'s own comment
+            // above) instead documents `set(key, ...)`: "A set is
+            // created with zero or more element parameters. The
+            // element values are inserted into the set." No comparator
+            // parameter is mentioned there at all. Following that
+            // newer source, matching List/Queue/Stack's own
+            // constructors, which all likewise insert their positional
+            // arguments. Dedup-then-sort mirrors `->Insert`'s own
+            // documented behavior (Table 15/16, "duplicate key value is
+            // replaced") — folding every argument through the same
+            // dedup check `->Insert` uses is equivalent to calling
+            // `->Insert` once per argument, since natural-sort is
+            // idempotent regardless of insertion order.
+            var elements: [LassoValue] = []
+            for argument in arguments.map(\.value) {
+                if !elements.contains(where: { LassoCollectionValue.equals($0, argument, context: context) }) {
+                    elements.append(argument)
+                }
+            }
+            return .object(LassoCollectionValue.makeObject(
+                typeName: "set", elements: LassoCollectionValue.naturalSort(elements)
+            ))
         }
         register("series") { arguments, _ in
             // "The start value is incremented until it equals the end
@@ -879,6 +894,15 @@ public struct LassoNativeRegistry: Sendable {
             // ONE optional parameter is a comparator, not initial
             // elements (unlike List/Queue/Stack). Defaults to
             // `\Compare_LessThan` per its own documented default.
+            // Re-verified directly against docs while investigating a
+            // report that `priorityqueue(2,1)` "silently drops"
+            // positional elements the same way `set(...)` did (fixed
+            // above): unlike Set, lassoguide.com has no updated
+            // PriorityQueue page — its own `[PriorityQueue->Remove]`
+            // reference page explicitly defers to "the Lasso 8 Language
+            // Guide" (i.e. this same 8.5 PDF) for this type. So this
+            // empty-plus-comparator-only behavior IS the documented
+            // behavior, not a gap; deliberately left unchanged.
             let comparatorArgument: LassoValue = arguments.first?.value ?? .null
             let kind = LassoComparatorValue.kind(of: comparatorArgument) ?? "lessthan"
             return .object(LassoPriorityQueueValue.makeObject(kind: kind, elements: []))
