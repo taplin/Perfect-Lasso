@@ -1,5 +1,5 @@
 {
-  "originHash" : "6ea579fa1e75aaa91f40ee439aa867cd3982c6f2e4a99c4e5972f1cbeefc328a",
+  "originHash" : "2d0205681654e7669a30c80990df9e50be6ba499a8bbe7aac0d60bc62a95cfd7",
   "pins" : [
     {
       "identity" : "perfect-crud",
@@ -7,7 +7,7 @@
       "location" : "https://github.com/taplin/Perfect-CRUD.git",
       "state" : {
         "branch" : "main",
-        "revision" : "5174a753a671fa56adb113c7015169d55e7f5d4b"
+        "revision" : "80e7b1263980121abb316011046bfc3612f98065"
       }
     },
     {
@@ -16,7 +16,7 @@
       "location" : "https://github.com/taplin/Perfect-FileMaker.git",
       "state" : {
         "branch" : "main",
-        "revision" : "a120b2b83b415299b39371b8b699122a0b93f0d5"
+        "revision" : "7f7d6da0ac574789c3c7264b3fc54ef143cca5bc"
       }
     },
     {
@@ -25,7 +25,7 @@
       "location" : "https://github.com/taplin/Perfect-FileMaker-AdminAPI.git",
       "state" : {
         "branch" : "main",
-        "revision" : "bf72bd37d3632694b45aaa9f4a002787028b11a1"
+        "revision" : "6972003fe2e9d812dbc00acaf78ff4b053b81769"
       }
     },
     {
@@ -34,7 +34,7 @@
       "location" : "https://github.com/taplin/Perfect-MySQL.git",
       "state" : {
         "branch" : "main",
-        "revision" : "17cd91b8099390c22c3b09ba0d36ec713c731f61"
+        "revision" : "b81fbd477f09999d29b5c4d01104684696d6f54d"
       }
     },
     {
@@ -43,7 +43,7 @@
       "location" : "https://github.com/taplin/Perfect-NIO.git",
       "state" : {
         "branch" : "main",
-        "revision" : "a78cc44352ca3fc26d168cb94ad06dc9e8d0fc98"
+        "revision" : "91209560d0342850dba6ac073243313e700bfee0"
       }
     },
     {
@@ -52,7 +52,7 @@
       "location" : "https://github.com/taplin/Perfect-PostgreSQL.git",
       "state" : {
         "branch" : "main",
-        "revision" : "b86c20f93680cf9b7b3e156c5b596349d7e8f81f"
+        "revision" : "3b9b0f61e5503bab804616cf509f6e6075f35cfc"
       }
     },
     {
@@ -61,7 +61,7 @@
       "location" : "https://github.com/taplin/Perfect-Redis.git",
       "state" : {
         "branch" : "main",
-        "revision" : "edf051a8b79ae1f1599a001db228f1fcba09ade2"
+        "revision" : "0a08271d61f16bf08af7f43ce3a2ef63e85d6be6"
       }
     },
     {
@@ -70,7 +70,7 @@
       "location" : "https://github.com/taplin/Perfect-Session.git",
       "state" : {
         "branch" : "main",
-        "revision" : "6b0b6cfb39fb6a7e6119e7104f7735d4eee7ae69"
+        "revision" : "022e7b7a495b49964dd0a7d56073e80c17e3e071"
       }
     },
     {
@@ -79,7 +79,7 @@
       "location" : "https://github.com/taplin/Perfect-SMTP.git",
       "state" : {
         "branch" : "main",
-        "revision" : "94f40a44790aba28e4cf0a8d1f1c5fdcd7a3143f"
+        "revision" : "57b93b696ccbe078385a23e3afaabcb2f97c003b"
       }
     },
     {
@@ -88,7 +88,7 @@
       "location" : "https://github.com/taplin/Perfect-SQLite.git",
       "state" : {
         "branch" : "main",
-        "revision" : "3f8a22b89ee5b76b892bf14e6d79c7198712b6b7"
+        "revision" : "a52cdba88e15f15e1bbf996f0ed901d477be7322"
       }
     },
     {
@@ -97,7 +97,7 @@
       "location" : "https://github.com/taplin/Perfect-XML.git",
       "state" : {
         "branch" : "main",
-        "revision" : "87f06dd0ee3a9261a0c5ccbc10fc09fdd3ffcf32"
+        "revision" : "964bd9f2e0147787bdaa9982b076b60573169dee"
       }
     },
     {
@@ -231,8 +231,8 @@
       "kind" : "remoteSourceControl",
       "location" : "https://github.com/apple/swift-nio-http2.git",
       "state" : {
-        "revision" : "61d1b44f6e4e118792be1cff88ee2bc0267c6f9a",
-        "version" : "1.44.0"
+        "revision" : "45bdf670248be5f16ec0340e125dca285536f0fb",
+        "version" : "1.45.0"
       }
     },
     {
