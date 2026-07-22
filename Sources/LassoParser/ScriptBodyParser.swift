@@ -637,8 +637,53 @@ struct ScriptBodyParser {
         // by `TagCatalog.allowsBareOpen`), not name-specific.
         switch expressions[0] {
         case let .call(.identifier(name), arguments) where TagCatalog.allowsBareOpen(name, in: .scriptBody):
-            recordFire(name, .bareColonCall)
-            nodes.append(.tag(name: name, arguments: arguments, closing: false, dialect: .lasso8, range: statementRange))
+            // A bareword `name => { ... }` arrow-block (real corpus:
+            // zeroloop/ds's ds.lasso, `protect => { ... }`, used dozens
+            // of times) parses through `ExpressionParser`'s GENERIC
+            // association-operator folding (`foldAssociatedCapture`)
+            // into this exact same `.call(.identifier(name), [-
+            // givenblock: captureLiteral])` shape — INDISTINGUISHABLE,
+            // at this switch's level, from a genuine Lasso 8 bare
+            // COLON-CALL that genuinely needs `BlockBuilder` pairing
+            // with a LATER, separate explicit closer (`iterate: vars,
+            // local:'i' ... /iterate;`). Unlike that legacy shape, an
+            // arrow-block's body is ALREADY fully present, embedded
+            // right here in the givenblock capture — there is no later
+            // closer to pair with at all. Previously this branch always
+            // emitted an unclosed `.tag(..., closing: false, ...)`
+            // opener regardless, so `BlockBuilder`'s pairing pass
+            // silently (and wrongly) grabbed whatever statement
+            // happened to follow in the source as this block's own
+            // body — found live: `protect => { return X } return Y`
+            // executed ONLY `return Y`, having silently discarded
+            // `return X` (the protect block's REAL, intended body)
+            // entirely. `if`/`while`/`loop`/`match`/`iterate`/`define`
+            // never hit this at all — those six keywords have their own
+            // dedicated character-level arrow-block recognition
+            // (`consumeArrowBlockStartIfPresent`, called from each of
+            // their own `parse*Opening` functions) that intercepts them
+            // before this generic fallback ever runs; `protect` (and
+            // any other `TagCatalog`-registered bare-open name without
+            // such a dedicated parser) had no equivalent, so it fell
+            // all the way through to `ExpressionParser`'s fully generic
+            // handling instead. Detecting the givenblock argument here
+            // and emitting a real, SELF-CONTAINED `.block(...)` node
+            // directly (matching what every OTHER open form of these
+            // same names already produces, per `Renderer.swift`'s own
+            // `renderBlock` switch) fixes this in the one shared place
+            // every bare-open name funnels through, not just `protect`.
+            if let givenBlockIndex = arguments.firstIndex(where: { $0.label == "givenblock" }),
+               case let .captureLiteral(captureBody, _) = arguments[givenBlockIndex].value {
+                var remainingArguments = arguments
+                remainingArguments.remove(at: givenBlockIndex)
+                nodes.append(.block(
+                    name: name, arguments: remainingArguments, body: captureBody,
+                    alternate: nil, dialect: .lasso9, range: statementRange
+                ))
+            } else {
+                recordFire(name, .bareColonCall)
+                nodes.append(.tag(name: name, arguments: arguments, closing: false, dialect: .lasso8, range: statementRange))
+            }
         case let .identifier(name) where TagCatalog.allowsBareOpen(name, in: .scriptBody):
             recordFire(name, .bareIdentifier)
             nodes.append(.tag(name: name, arguments: [], closing: false, dialect: .lasso8, range: statementRange))
