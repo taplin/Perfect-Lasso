@@ -9442,6 +9442,59 @@ struct IncludeURLTests {
     #expect(output == "Boolean|true|true|Pair|true")
 }
 
+@Test func istypeReportsTrueForPrimitiveAndRegisteredTypesAndFalseForUnknownOnes() async throws {
+    // `tag->istype()` (`lassoguide.com/9.2/language/types.html`, "Check if
+    // a type with the same name as the given tag exists" -- the docs' own
+    // worked example: `::string->istype // => true`). `::name` tag
+    // literals desugar to plain strings, so `istype` checks the primitive
+    // type-name set, the native-type registry, and the user-type registry
+    // in turn.
+    var context = LassoContext()
+    let output = try await LassoRenderer().render(
+        "[::string->istype]|[::bytes->istype]|[::notarealtype->istype]",
+        context: &context
+    )
+    #expect(output == "true|true|false")
+}
+
+@Test func istypeMatchesRealCorpusDefensiveGuardShapeAgainstAnUnimplementedType() async throws {
+    // Real corpus shape (zeroloop/ds's activerow.lasso):
+    // `::json_encode->istype ? define json_encode->encodeValue(...) => ...`
+    // -- a defensive guard that only patches a type if it's actually
+    // loaded. This codebase never registers `json_encode`, so `istype`
+    // reporting `false` here is the correct, graceful outcome -- the
+    // guarded `define` should simply not run, not throw or crash.
+    let source = """
+    <?lassoscript
+    ::json_encode->istype ? 'patched' | 'skipped';
+    ?>
+    """
+    var context = LassoContext()
+    let output = try await LassoRenderer().render(source, context: &context)
+    #expect(output == "skipped")
+}
+
+@Test func istypeWorksOnAUserDefinedType() async throws {
+    var context = LassoContext()
+    let output = try await LassoRenderer().render(
+        """
+        [
+        define_type: 'Ex_Timer', 'integer', -prototype;
+        /define_type;
+        ]
+        [::Ex_Timer->istype]|[::NotDefined->istype]
+        """,
+        context: &context
+    ).trimmingCharacters(in: .whitespacesAndNewlines)
+    #expect(output == "true|false")
+}
+
+@Test func istypeIsReportedAvailableViaHasMethodOnAnyType() async throws {
+    var context = LassoContext()
+    let output = try await LassoRenderer().render("[(123)->hasMethod('istype')]", context: &context)
+    #expect(output == "true")
+}
+
 @Test func typeWorksOnAMapWithNoKeyCollidingWithTheTagName() async throws {
     // The other `.map` coverage above (`hasMethodReportsTrueForRealMemberMethodsAndFalseForUnknownOnes`
     // and the pre-existing `fileUploadsExposeMetadataUnderBothLasso9And8KeyNames`)
