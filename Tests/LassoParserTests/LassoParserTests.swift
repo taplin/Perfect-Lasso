@@ -12944,13 +12944,12 @@ struct IncludeURLTests {
 @Test func queryExpressionOverANonQueriableSourceThrowsRatherThanSilentlyProducingAnEmptyResult() async throws {
     // Real Lasso restricts the with-source to "any object whose type
     // supports the `trait_queriable` trait" -- a plain integer doesn't
-    // conform. Disclosed Stage 8.1 scope: this reuses
-    // `Evaluator.forEachElements(of:)`, which only recognizes this
-    // interpreter's own native collection types (array/map/list/queue/
-    // stack/set/priorityqueue/treemap) -- a custom user-defined
-    // `trait_queriable` type (via its own `forEach` method) is a
-    // disclosed, not-yet-supported source, and this test's plain integer
-    // pins the SAME rejection path a real non-queriable source hits.
+    // conform, and (unlike a custom user-defined type implementing its
+    // own `forEach` member -- supported since Stage 8.5, see
+    // `Evaluator.materializeCustomQueriableElements`) has no `forEach`
+    // method to fall back to either, so it correctly hits the same
+    // "not queriable" rejection path a real non-queriable source always
+    // has.
     var context = LassoContext()
     await #expect(throws: Error.self) {
         _ = try await LassoRenderer().render(
@@ -13360,5 +13359,174 @@ struct IncludeURLTests {
         context: &context
     )
     #expect(output == "a,b")
+}
+
+// MARK: - Captures Stage 8.5 (Query Expressions: multiple with clauses, generateSeries, Making an Object Queriable)
+
+@Test func multipleWithClausesNestIterationsAndTheCommaFormMatchesTheDocsOwnEquivalenceClaim() async throws {
+    // Ch. "Query Expressions", "The With Clause": "Multiple subsequent
+    // with clauses can follow the first. When this occurs, the second
+    // `with` word can optionally be replaced by a comma... Multiple with
+    // clauses define a nesting of iterations. The following two example
+    // snippets are equivalent: `with variable_name in source with
+    // another_name in #variable_name` / `with variable_name in source,
+    // another_name in #variable_name`." No concrete worked EXAMPLE with
+    // actual values is given for this specific claim, so this verifies
+    // the documented CROSS-PRODUCT nesting behavior directly (each outer
+    // element paired with every inner element, in order) and confirms
+    // both spellings produce the IDENTICAL result, per the docs' own
+    // equivalence claim.
+    var context = LassoContext()
+    let commaForm = try await LassoRenderer().render(
+        "[(with a in array(1, 2), b in array('x', 'y') select #a + #b)->join(',')]",
+        context: &context
+    )
+    var context2 = LassoContext()
+    let withKeywordForm = try await LassoRenderer().render(
+        "[(with a in array(1, 2) with b in array('x', 'y') select #a + #b)->join(',')]",
+        context: &context2
+    )
+    #expect(commaForm == "1x,1y,2x,2y")
+    #expect(withKeywordForm == commaForm)
+}
+
+@Test func laterWithClausesCanReferenceAnEarlierClausesVariable() async throws {
+    // "Multiple with clauses define a nesting of iterations" — the
+    // SECOND clause's own source expression (`array('a', 'b', 'c')`
+    // here, standing in for the docs' own "digging into nested
+    // sequences" framing) is evaluated freshly for EVERY outer row, with
+    // the outer variable already bound and readable via `#outer`.
+    var context = LassoContext()
+    let output = try await LassoRenderer().render(
+        "[(with outer in array(1, 2), inner in array('a', 'b', 'c') select #outer + ':' + #inner)->join(',')]",
+        context: &context
+    )
+    #expect(output == "1:a,1:b,1:c,2:a,2:b,2:c")
+}
+
+@Test func multipleWithClausesComposeCorrectlyWithAWhereOperation() async throws {
+    // Confirms the new multi-clause row-fanout (Stage 8.5) feeds
+    // correctly into the PRE-EXISTING operations pipeline (Stage 8.2) —
+    // `where` filters the already-cross-joined row set, not just the
+    // first clause's own elements.
+    var context = LassoContext()
+    let output = try await LassoRenderer().render(
+        "[(with a in array(1, 2), b in array(10, 20) where #a + #b > 15 select #a + '+' + #b)->join(',')]",
+        context: &context
+    )
+    #expect(output == "1+20,2+20")
+}
+
+@Test func generateSeriesFunctionAndLiteralFormsAreEquivalentMatchingTheDocsOwnSumExample() async throws {
+    // Ch. "Query Expressions", "GenerateSeries Type" worked example,
+    // verbatim: "with num in generateSeries(2, 11, 2) sum #num // => 30"
+    // — note 11 is NOT part of the generated series (2, 4, 6, 8, 10).
+    // "There is also a generateSeries literal syntax... with num in 2 to
+    // 11 by 2 sum #num // => 30" — the docs' own claimed equivalence,
+    // verified directly against the SAME result.
+    var context = LassoContext()
+    let functionForm = try await LassoRenderer().render(
+        "[with num in generateSeries(2, 11, 2) sum #num]",
+        context: &context
+    )
+    var context2 = LassoContext()
+    let literalForm = try await LassoRenderer().render(
+        "[with num in 2 to 11 by 2 sum #num]",
+        context: &context2
+    )
+    #expect(functionForm == "30")
+    #expect(literalForm == "30")
+}
+
+@Test func generateSeriesLiteralFormDefaultsToAStepOfOneWhenByIsOmitted() async throws {
+    // "an optional third parameter can specify the step to use for
+    // going through the series, defaulting to 1" — the `to`-only
+    // literal form (no trailing `by`) should default identically.
+    var context = LassoContext()
+    let output = try await LassoRenderer().render(
+        "[(with num in 1 to 5 select #num)->join(',')]",
+        context: &context
+    )
+    #expect(output == "1,2,3,4,5")
+}
+
+@Test func generateSeriesAsStaticArrayMatchesTheDocsOwnExampleVerbatim() async throws {
+    // Ch. "Query Expressions" worked example, verbatim: "generateSeries
+    // (2, 11, 2)->asStaticArray // => staticarray(2, 4, 6, 8, 10)". This
+    // codebase has no distinct StaticArray type (an already-tracked,
+    // pre-existing gap — see `NativeTypes.makeGenerateSeriesType`'s own
+    // doc comment), so the elements themselves are checked via ->join
+    // rather than a literal "staticarray(...)" string match.
+    var context = LassoContext()
+    let output = try await LassoRenderer().render(
+        "[generateSeries(2, 11, 2)->asStaticArray->join(',')]",
+        context: &context
+    )
+    #expect(output == "2,4,6,8,10")
+}
+
+@Test func aBareStringIsStillNotDirectlyQueriableOnlyEachCharacterIs() async throws {
+    // Ch. "Query Expressions", "Making an Object Queriable": "while a
+    // string CANNOT be iterated upon directly, it has an iterator
+    // string->forEachCharacter, which is implemented as an `eacher`."
+    // Confirms this codebase respects that exact distinction — a bare
+    // string source still throws (unchanged from every prior stage),
+    // while `->eachCharacter` (added this stage) works.
+    var context = LassoContext()
+    await #expect(throws: (any Error).self) {
+        _ = try await LassoRenderer().render(
+            "[(with i in 'abc' select #i)->join(',')]",
+            context: &context
+        )
+    }
+}
+
+@Test func eachCharacterMatchesTheDocsOwnWorkedExampleVerbatim() async throws {
+    // Ch. "Query Expressions" worked example, verbatim: `with i in
+    // 'Hammershaimb'->eachCharacter select #i // => H, a, m, m, e, r, s,
+    // h, a, i, m, b`.
+    var context = LassoContext()
+    let output = try await LassoRenderer().render(
+        "[(with i in 'Hammershaimb'->eachCharacter select #i)->join(',')]",
+        context: &context
+    )
+    #expect(output == "H,a,m,m,e,r,s,h,a,i,m,b")
+}
+
+@Test func aCustomTypesOwnForEachMemberMakesItAValidWithSourceMatchingTheDocsOwnUserListExample() async throws {
+    // Ch. "Query Expressions", "Making an Object Queriable" worked
+    // example, verbatim: a `user_list` type importing `trait_queriable`
+    // and implementing `forEach()` by reading the ordinary `givenBlock`
+    // keyword and invoking it once per element — then used directly as
+    // a with-source: `with user in #ul select #user->first // => Krinn,
+    // Ármarinn, Kjarni, Halbjörg, Björg, Hjörtur`. Confirms the Stage
+    // 8.5 `query_collector` given-block bridge (`Evaluator
+    // .materializeCustomQueriableElements`) correctly reconstructs each
+    // labeled `#gb->invoke('Krinn'='Jones')` call into a real Pair
+    // (mirroring `register("array")`'s own established label-to-Pair
+    // convention), not just the bare value half.
+    var context = LassoContext()
+    let output = try await LassoRenderer().render(
+        """
+        <?lassoscript
+        define user_list => type {
+            trait { import trait_queriable }
+            public forEach() => {
+                local(gb) = givenBlock
+                #gb->invoke('Krinn'='Jones')
+                #gb->invoke('Ármarinn'='Hammershaimb')
+                #gb->invoke('Kjarni'='Jones')
+                #gb->invoke('Halbjörg'='Skywalker')
+                #gb->invoke('Björg'='Riley')
+                #gb->invoke('Hjörtur'='Hammershaimb')
+            }
+        }
+        local(ul) = user_list()
+        ?>
+        [(with user in #ul select #user->first)->join(',')]
+        """,
+        context: &context
+    ).trimmingCharacters(in: .whitespacesAndNewlines)
+    #expect(output == "Krinn,Ármarinn,Kjarni,Halbjörg,Björg,Hjörtur")
 }
 

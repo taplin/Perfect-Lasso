@@ -55,8 +55,8 @@ struct Evaluator {
                 capturedLocals: context.snapshotLocals(),
                 homeDepth: context.currentCaptureHomeDepth ?? context.tagCallStack.count
             ))
-        case let .queryExpression(variable, source, operations, action):
-            return try await evaluateQueryExpression(variable: variable, source: source, operations: operations, action: action)
+        case let .queryExpression(withClauses, operations, action):
+            return try await evaluateQueryExpression(withClauses: withClauses, operations: operations, action: action)
         case let .variable(name, scope): return context.value(for: name, scope: scope)
         case let .identifier(name):
             if name.caseInsensitiveCompare("self") == .orderedSame, let object = context.currentSelf {
@@ -669,6 +669,18 @@ struct Evaluator {
                 // Already `.pair(key, value)` entries — matching the
                 // `.map` case above's own Pair-yielding convention.
                 return LassoTreeMapValue.entries(from: object)
+            case "generateseries":
+                // Ch. "Query Expressions", "GenerateSeries Type" — see
+                // `Runtime.swift`'s `generateSeries` free-function
+                // registration for how `_elements` is populated (Stage
+                // 8.5). Same `_elements` convention as every other
+                // collection-shaped native type here.
+                return LassoCollectionValue.elements(from: object)
+            case "eacher":
+                // Ch. "Query Expressions", "Making an Object Queriable"
+                // — see `member(_:_:_:)`'s `->eachCharacter` case for how
+                // this is populated (Stage 8.5).
+                return LassoCollectionValue.elements(from: object)
             default:
                 return nil
             }
@@ -677,25 +689,117 @@ struct Evaluator {
         }
     }
 
+    /// Materializes a with-clause source's element sequence, trying the
+    /// closed set of built-in collection types `forEachElements(of:)`
+    /// already recognizes FIRST, then falling back to the general,
+    /// documented "Making an Object Queriable" mechanism (Ch. "Query
+    /// Expressions") for a CUSTOM (user-defined) type: "An object can be
+    /// used as the source of a `with` clause... if its type has
+    /// implemented... the `forEach` member method." `nil` (not an empty
+    /// array) for a value that's neither — lets the caller distinguish
+    /// "genuinely not queriable" from "queriable but empty," matching
+    /// `forEachElements(of:)`'s own established `nil` convention.
+    private mutating func materializeQueriableElements(from value: LassoValue) async throws -> [LassoValue]? {
+        if let native = Self.forEachElements(of: value) { return native }
+        guard case let .object(object) = value else { return nil }
+        return try await materializeCustomQueriableElements(from: object)
+    }
+
+    /// Bridges a CUSTOM type's own `forEach` member method into this
+    /// interpreter's eager with-source materialization — see the docs'
+    /// own worked `user_list` example (Ch. "Query Expressions", "Making
+    /// an Object Queriable"): `public forEach() => { local(gb) =
+    /// givenBlock #gb->invoke('Krinn'='Jones') ... }`. There's no Lasso
+    /// SOURCE to parse a real `=>` capture literal from here (the given
+    /// block this needs is entirely a Swift-side bookkeeping device), so
+    /// this pushes a synthetic native `query_collector` object as the
+    /// given block instead of a real `LassoCaptureValue` — `#gb
+    /// ->invoke(element)` inside the user's `forEach` body dispatches
+    /// through the exact SAME native-method lookup every other `.object`
+    /// member call already uses (`context.nativeTypes.type(named:)?
+    /// .method(named:)`, `member(_:_:_:)`'s own `.object` case), so
+    /// `query_collector->invoke` (registered in `NativeTypes.swift`,
+    /// alongside every other native type) just appends its one argument
+    /// into the collector's own `_elements` array — reusing the SAME
+    /// storage-key convention `LassoCollectionValue`/`queriable_grouping`
+    /// already established, rather than inventing a new value shape or a
+    /// new `LassoValue` case just to hold a Swift closure. Previously (
+    /// Stages 8.1-8.4) this whole mechanism was a disclosed, out-of-scope
+    /// gap — see `materializeQueriableElements`'s own doc comment for
+    /// where that's now resolved.
+    private mutating func materializeCustomQueriableElements(from object: LassoObjectInstance) async throws -> [LassoValue]? {
+        guard let type = context.tagRegistry.type(named: object.typeName) else { return nil }
+        let collector = LassoObjectInstance(typeName: "query_collector", data: ["_elements": .array([])])
+        guard try await invokeMemberMethodWithNativeGivenBlock(
+            named: "forEach",
+            on: object,
+            type: type,
+            givenBlock: .object(collector)
+        ) != nil else { return nil }
+        return LassoCollectionValue.elements(from: collector)
+    }
+
+    /// Mirrors `invokeMemberMethod` (below) almost exactly — same
+    /// resolve/bind/push-frame/render/pop-frame shape — but pushes a
+    /// PRE-BUILT `LassoValue` given block directly instead of extracting
+    /// one from a parsed `=>` call argument, since
+    /// `materializeCustomQueriableElements` has no Lasso source to parse
+    /// one from at all. A separate function rather than threading an
+    /// optional pre-built given block through `invokeMemberMethod`
+    /// itself, so that function's existing, already-reviewed argument-
+    /// evaluation path stays untouched for its many other call sites.
+    /// Always called with zero arguments — real Lasso's own `forEach`
+    /// contract for this mechanism is nullary (`public forEach() => {...}`
+    /// in the docs' own worked example).
+    private mutating func invokeMemberMethodWithNativeGivenBlock(
+        named name: String,
+        on object: LassoObjectInstance,
+        type: LassoTypeDefinition,
+        givenBlock: LassoValue
+    ) async throws -> LassoValue? {
+        if skipIfNonLocalReturnAlreadyPending() { return .void }
+        guard let resolved = LassoMethodDispatcher.resolve(method: name, on: type, arguments: []) else {
+            return nil
+        }
+        let boundLocals = try await bindParameters(resolved.definition.parameters, to: resolved.evaluatedArguments)
+        let savedLocals = context.snapshotLocals()
+        let savedLoopDepth = context.loopDepth
+        try context.pushTagCall(name)
+        context.replaceLocals(boundLocals)
+        context.pushSelf(object)
+        context.pushGivenBlock(givenBlock)
+        context.loopDepth = 0
+        defer {
+            context.popGivenBlock()
+            context.popSelf()
+            context.popTagCall()
+            context.replaceLocals(savedLocals)
+            context.loopDepth = savedLoopDepth
+        }
+        guard let renderNodes else { return .void }
+        context.clearReturnSignal()
+        _ = try await renderNodes(resolved.definition.body, &context)
+        return consumeReturnValueRespectingNonLocalTarget(activeDepth: context.tagCallStack.count) ?? .void
+    }
+
     /// Ch. "Query Expressions" — see `LassoExpression.queryExpression`'s
-    /// own doc comment for this stage's scope (single with-clause,
-    /// `select`/`do` actions only).
+    /// own doc comment for this feature's overall scope across Stages
+    /// 8.1-8.5.
     ///
-    /// The with-source is materialized via the SAME `forEachElements(of:)`
-    /// used by `->forEach`/`->insertFrom` — real Lasso ties query-
-    /// expression sourcing to `trait_queriable` in the abstract, which for
-    /// every collection type this interpreter implements already cashes
-    /// out to exactly that same element sequence (Ch. "Query Expressions",
-    /// "Making an Object Queriable": "any object whose type supports the
-    /// `trait_queriable` trait, such as an array or a list"). A CUSTOM
-    /// user-defined type implementing its own `forEach` member (the
-    /// docs' own worked `user_list` example) is a disclosed, real gap —
-    /// `forEachElements` returns `nil` for those (by design, so
-    /// `->forEach`'s OWN dispatch can fall through to the user's method
-    /// instead), and materializing a with-source from one here would need
-    /// synthesizing a Swift-native capture to collect its elements, a
-    /// genuinely new mechanism with zero corpus evidence either way —
-    /// out of scope for this stage.
+    /// The with-source is materialized via `materializeQueriableElements`
+    /// — real Lasso ties query-expression sourcing to `trait_queriable`
+    /// in the abstract, which for every BUILT-IN collection type this
+    /// interpreter implements already cashes out to
+    /// `forEachElements(of:)`'s own existing element sequence (Ch. "Query
+    /// Expressions", "Making an Object Queriable": "any object whose type
+    /// supports the `trait_queriable` trait, such as an array or a
+    /// list"). Stage 8.5 additionally resolves a CUSTOM user-defined
+    /// type's own `forEach` member (the docs' own worked `user_list`
+    /// example) — previously (Stages 8.1-8.4) a disclosed, out-of-scope
+    /// gap — via `materializeCustomQueriableElements`'s synthetic
+    /// `query_collector` given-block bridge; see that function's own doc
+    /// comment for how it avoids needing a genuinely new `LassoValue`
+    /// case just to hold a Swift closure.
     ///
     /// Real Lasso evaluates query expressions LAZILY ("creating the query
     /// expression does not execute it... only when something else
@@ -707,9 +811,11 @@ struct Evaluator {
     /// reusable, re-drawable deferred object. A disclosed, deliberate
     /// simplification: laziness only differs OBSERVABLY from eager
     /// evaluation when the source/captured state mutates between
-    /// creation and consumption, or when short-circuiting (`take`, a
-    /// later stage) should skip upstream work entirely — neither shows
-    /// up in any of the real docs' own worked examples, all of which show
+    /// creation and consumption, or when short-circuiting (`take`, added
+    /// in Stage 8.2, but implemented eagerly here too — every upstream
+    /// operation still runs to completion before the row list is
+    /// trimmed) should skip upstream work entirely — neither shows up in
+    /// any of the real docs' own worked examples, all of which show
     /// only a query expression's PRODUCED VALUE, and building a genuine
     /// deferred-execution runtime would be a materially larger, separate
     /// undertaking disproportionate to this project's zero corpus
@@ -717,34 +823,29 @@ struct Evaluator {
     /// Lasso 9 completeness, not corpus need — see this project's own
     /// corpus-evidence-not-sole-bar convention).
     private mutating func evaluateQueryExpression(
-        variable: String,
-        source: LassoExpression,
+        withClauses: [QueryWithClause],
         operations: [QueryOperation],
         action: QueryAction
     ) async throws -> LassoValue {
-        let sourceValue = try await evaluate(source)
-        guard let elements = Self.forEachElements(of: sourceValue) else {
-            throw LassoRuntimeError.unsupportedExpression("with \(variable) in <non-queriable source>")
-        }
         // "New variables introduced by a query expression clause will
         // not be available outside of the query expression that
         // introduces them" — same save/restore discipline `invokeCapture`
-        // uses for its own `#1`/`#2` bindings. Covers BOTH the
-        // with-variable and every `let`-introduced name (Ch. "Query
-        // Expressions": "variables introduced with a `let` operation have
-        // the SAME SCOPE as those introduced in a `with` clause").
+        // uses for its own `#1`/`#2` bindings. Covers every with-variable
+        // AND every `let`-introduced name (Ch. "Query Expressions":
+        // "variables introduced with a `let` operation have the SAME
+        // SCOPE as those introduced in a `with` clause").
         let savedLocals = context.snapshotLocals()
         defer { context.replaceLocals(savedLocals) }
         // Every name this query expression can ever bind is known
-        // STATICALLY from its own AST (the with-variable, plus each
-        // `let` operation's own name) — collected up front so ONE box
-        // per name can be created ONCE, before any row is processed, and
-        // then MUTATED in place (`box.value = ...`) as rows/stages
-        // advance, rather than replaced with a fresh box each time.
-        // Real bug found live while implementing this: an earlier cut
-        // created a brand-new box PER ROW PER STAGE (the exact fix Stage
-        // 8.1 needed to stop corrupting a same-named OUTER local — see
-        // that box's own doc comment history) — but a `do` capture
+        // STATICALLY from its own AST (every with-clause's own variable,
+        // plus each `let`/`group by` operation's own name) — collected up
+        // front so ONE box per name can be created ONCE, before any row
+        // is processed, and then MUTATED in place (`box.value = ...`) as
+        // rows/stages advance, rather than replaced with a fresh box each
+        // time. Real bug found live while implementing this: an earlier
+        // cut created a brand-new box PER ROW PER STAGE (the exact fix
+        // Stage 8.1 needed to stop corrupting a same-named OUTER local —
+        // see that box's own doc comment history) — but a `do` capture
         // literal is constructed ONCE, BEFORE any row is bound, and
         // needs a LIVE REFERENCE to the with-variable's box that later
         // per-row binding steps go on to update; creating fresh boxes
@@ -767,7 +868,10 @@ struct Evaluator {
         // loop variable" effect. No real corpus/doc evidence for this
         // shape (every worked example reads row values immediately), so
         // disclosed here rather than built around.
-        var queryOwnedBoxes: [String: LassoLocalBox] = [variable.lowercased(): LassoLocalBox(.void)]
+        var queryOwnedBoxes: [String: LassoLocalBox] = [:]
+        for clause in withClauses {
+            queryOwnedBoxes[clause.variable.lowercased()] = LassoLocalBox(.void)
+        }
         for operation in operations {
             if case let .let(name, _) = operation {
                 queryOwnedBoxes[name.lowercased()] = LassoLocalBox(.void)
@@ -786,16 +890,35 @@ struct Evaluator {
             }
         }
 
-        // Stage 8.2: each surviving element is now a ROW — a dictionary
-        // of every variable name bound for it so far (starts with just
-        // the with-variable; `let` operations below ADD keys without
-        // changing row count; `where` FILTERS rows; `skip`/`take` trim
-        // the row list itself). Real Lasso's own worked examples show
-        // `skip`/`take`'s relative ORDER changing the result (`take 4
-        // skip 3` vs `skip 3 take 4`), confirming operations form a real
-        // SEQUENTIAL PIPELINE over the row list, not independent filters
-        // applied in some fixed order.
-        var rows: [[String: LassoValue]] = elements.map { [variable.lowercased(): $0] }
+        // Stage 8.5: "Multiple with clauses define a nesting of
+        // iterations" — the SECOND (and later) with-clause's own source
+        // expression can reference an EARLIER clause's variable (`with
+        // variable_name in source, another_name in #variable_name`), so
+        // clauses are materialized LEFT TO RIGHT, cross-joining: for
+        // every row surviving so far, bind it (making prior with-
+        // variables visible), evaluate the NEXT clause's source, and fan
+        // out one new row per element it produces. A single with-clause
+        // (the only shape Stages 8.1-8.4 ever had) is just this loop
+        // running once, starting from one empty seed row.
+        var rows: [[String: LassoValue]] = [[:]]
+        for clause in withClauses {
+            var expanded: [[String: LassoValue]] = []
+            expanded.reserveCapacity(rows.count)
+            for row in rows {
+                bind(row)
+                let sourceValue = try await evaluate(clause.source)
+                guard let elements = try await materializeQueriableElements(from: sourceValue) else {
+                    throw LassoRuntimeError.unsupportedExpression("with \(clause.variable) in <non-queriable source>")
+                }
+                for element in elements {
+                    var newRow = row
+                    newRow[clause.variable.lowercased()] = element
+                    expanded.append(newRow)
+                }
+                if context.shouldStopRenderingCurrentBody() { break }
+            }
+            rows = expanded
+        }
         for operation in operations {
             switch operation {
             case let .filter(expr):
@@ -1867,6 +1990,35 @@ struct Evaluator {
                 over: value.map { .string(String($0)) },
                 evaluatedArguments: evaluate(arguments)
             )
+        case let (.string(value), "eachcharacter"):
+            // Ch. "Query Expressions", "Making an Object Queriable":
+            // "while a string cannot be iterated upon directly, it has
+            // an iterator string->forEachCharacter, which is implemented
+            // as an `eacher`" -- the docs' own worked example:
+            // `with i in 'Hammershaimb'->eachCharacter select #i`. Real
+            // Lasso implements this via the general `eacher(...)` free
+            // function (an ESCAPED method reference + a generator
+            // adapter) applied to `->forEachCharacter` above; this
+            // codebase instead EAGERLY materializes the same character
+            // sequence directly into an "eacher"-typed native object
+            // (recognized by `forEachElements(of:)`), matching the
+            // SAME disclosed eager-evaluation simplification already
+            // established for the rest of Query Expressions (Stage 8.1's
+            // own doc comment) rather than building the fully general
+            // `eacher()` free function -- which would also need the
+            // MEMBER-POSITION form of Lasso's real "Method Escaping"
+            // operator (`object->\identifier`, producing a real
+            // `memberstream`; this codebase already has the BARE form,
+            // `\identifier`/`.tagReference` in `TagReference.swift`, but
+            // not this one) with no existing precedent anywhere in this
+            // parser and zero corpus evidence either way. Disclosed,
+            // narrower scope: this
+            // resolves the docs' own concrete worked example exactly,
+            // not the general "wrap ANY iterator method" mechanism.
+            return .object(LassoObjectInstance(
+                typeName: "eacher",
+                data: ["_elements": .array(value.map { .string(String($0)) })]
+            ))
         case let (.string(value), "foreachwordbreak"):
             // "Executes a given capture block once for every word in
             // the base string." Real Lasso docs never define "word"

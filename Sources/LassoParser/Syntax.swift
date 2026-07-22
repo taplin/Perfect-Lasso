@@ -195,12 +195,34 @@ public indirect enum LassoExpression: Equatable, Sendable {
     /// skip 3` vs `skip 3 take 4` — so this is a real sequential
     /// pipeline, not a set of independent filters). Stage 8.3 added the
     /// `order by` operation and the `sum`/`average`/`min`/`max` actions.
-    /// Stage 8.4 added `group by`. Still no comma-separated multi
-    /// with-clause nesting, `generateSeries`, or `eacher` — each a later
-    /// stage's own addition, per
-    /// `Documentation/captures-subsystem-plan.md`'s Stage 8 breakdown.
-    case queryExpression(variable: String, source: LassoExpression, operations: [QueryOperation], action: QueryAction)
+    /// Stage 8.4 added `group by`. Stage 8.5 (the last piece of the
+    /// Captures subsystem plan) generalizes `withClauses` from a single
+    /// `(variable, source)` pair to an ARRAY of them ("multiple with
+    /// clauses define a nesting of iterations" — a later clause's source
+    /// can reference an earlier clause's variable), and separately adds
+    /// the `to`/`by` `generateSeries` literal syntax (desugared at parse
+    /// time into an ordinary `generateSeries(...)` call — see
+    /// `ExpressionParser.tryParseQueryWithClause`) plus a narrow,
+    /// concrete `->eachCharacter` resolution of the docs' own
+    /// "Making an Object Queriable"/`eacher` worked example (see
+    /// `Evaluator.member(_:_:_:)`'s own `"eachcharacter"` case for why
+    /// the FULLY general `eacher()` free-function + escaped-method-
+    /// reference mechanism itself remains out of scope).
+    case queryExpression(withClauses: [QueryWithClause], operations: [QueryOperation], action: QueryAction)
     case unknown(String)
+}
+
+/// One `with NAME in SOURCE` clause (Ch. "Query Expressions", "The With
+/// Clause") — see `LassoExpression.queryExpression`'s own doc comment
+/// for how an array of these models "multiple with clauses" (Stage 8.5).
+public struct QueryWithClause: Equatable, Sendable {
+    public let variable: String
+    public let source: LassoExpression
+
+    public init(variable: String, source: LassoExpression) {
+        self.variable = variable
+        self.source = source
+    }
 }
 
 /// The action ending a Query Expression (Ch. "Query Expressions",

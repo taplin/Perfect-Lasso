@@ -707,14 +707,35 @@ struct ExpressionParser {
     /// needed to distinguish the two `do` payload shapes at parse time.
     mutating private func tryParseQueryExpression() -> LassoExpression? {
         let start = index
-        guard case let .identifier(variable) = peek else { return nil }
-        index += 1
-        guard case let .identifier(inKeyword) = peek, inKeyword.caseInsensitiveCompare("in") == .orderedSame else {
-            index = start
-            return nil
+        guard let firstClause = tryParseQueryWithClause() else { return nil }
+        var withClauses = [firstClause]
+        // Ch. "Query Expressions", "The With Clause": "Multiple
+        // subsequent with clauses can follow the first. When this
+        // occurs, the second `with` word can optionally be replaced by a
+        // comma" — `with a in x with b in #a` and `with a in x, b in #a`
+        // are documented as equivalent (Stage 8.5). Each additional
+        // clause is itself fully speculative: if what follows a
+        // consumed `with`/`,` introducer doesn't parse as a well-formed
+        // `NAME in SOURCE` clause, the introducer token is un-consumed
+        // too (`index = beforeClause`, not just `tryParseQueryWithClause`'s
+        // own internal reset) so a malformed trailing `with`/`,` doesn't
+        // get silently swallowed before this function's own final
+        // backtrack further below.
+        while true {
+            let beforeClause = index
+            var consumedIntroducer = false
+            if case let .identifier(withKeyword) = peek, withKeyword.caseInsensitiveCompare("with") == .orderedSame {
+                index += 1
+                consumedIntroducer = true
+            } else if consume(",") {
+                consumedIntroducer = true
+            }
+            guard consumedIntroducer, let clause = tryParseQueryWithClause() else {
+                index = beforeClause
+                break
+            }
+            withClauses.append(clause)
         }
-        index += 1
-        let source = parseExpression()
         // Ch. "Query Expressions", "Operations": zero or more `where`/
         // `let`/`skip`/`take`/`order by`/`group ... by ... into` clauses
         // (Stage 8.2 added the first four, Stage 8.3 added `order by`,
@@ -741,29 +762,81 @@ struct ExpressionParser {
             case "select":
                 index += 1
                 let transform = parseExpression()
-                return .queryExpression(variable: variable, source: source, operations: operations, action: .select(transform))
+                return .queryExpression(withClauses: withClauses, operations: operations, action: .select(transform))
             case "do":
                 index += 1
                 let payload = parseExpression()
-                return .queryExpression(variable: variable, source: source, operations: operations, action: .perform(payload))
+                return .queryExpression(withClauses: withClauses, operations: operations, action: .perform(payload))
             case "sum":
                 index += 1
-                return .queryExpression(variable: variable, source: source, operations: operations, action: .sum(parseExpression()))
+                return .queryExpression(withClauses: withClauses, operations: operations, action: .sum(parseExpression()))
             case "average":
                 index += 1
-                return .queryExpression(variable: variable, source: source, operations: operations, action: .average(parseExpression()))
+                return .queryExpression(withClauses: withClauses, operations: operations, action: .average(parseExpression()))
             case "min":
                 index += 1
-                return .queryExpression(variable: variable, source: source, operations: operations, action: .min(parseExpression()))
+                return .queryExpression(withClauses: withClauses, operations: operations, action: .min(parseExpression()))
             case "max":
                 index += 1
-                return .queryExpression(variable: variable, source: source, operations: operations, action: .max(parseExpression()))
+                return .queryExpression(withClauses: withClauses, operations: operations, action: .max(parseExpression()))
             default:
                 break
             }
         }
         index = start
         return nil
+    }
+
+    /// One `NAME in SOURCE [to EXPR [by EXPR]]` with-clause (Ch. "Query
+    /// Expressions", "The With Clause" + "GenerateSeries Type") — `nil`,
+    /// with NO index mutation, on any mismatch (used both for a query
+    /// expression's required FIRST clause and each optional subsequent
+    /// one; the caller is responsible for consuming the leading `with`/
+    /// `,` introducer before calling this).
+    ///
+    /// The trailing `to EXPR [by EXPR]` (Stage 8.5) is real Lasso's
+    /// documented `generateSeries` LITERAL syntax — "with num in 2 to 11
+    /// by 2" is, per the docs, exactly equivalent to "with num in
+    /// generateSeries(2, 11, 2)". Rather than a new AST shape, this is
+    /// DESUGARED at parse time into an ordinary `.call` to the already-
+    /// registered `generateSeries` free function (`Runtime.swift`),
+    /// reusing that one implementation for both spellings with zero new
+    /// Evaluator code. `to`/`by` are recognized ONLY in this narrow
+    /// structural position (immediately after a with-clause's source
+    /// expression), not as general-purpose infix operators anywhere else
+    /// in the grammar — neither word is used elsewhere in this parser,
+    /// but scoping the check this tightly (matching `order`/`group`'s
+    /// own narrow, position-specific keyword recognition) avoids any
+    /// risk of shadowing a legitimately-named `to`/`by` identifier used
+    /// as an ordinary bareword somewhere unrelated.
+    mutating private func tryParseQueryWithClause() -> QueryWithClause? {
+        let start = index
+        guard case let .identifier(variable) = peek else { return nil }
+        index += 1
+        guard case let .identifier(inKeyword) = peek, inKeyword.caseInsensitiveCompare("in") == .orderedSame else {
+            index = start
+            return nil
+        }
+        index += 1
+        var source = parseExpression()
+        if case let .identifier(toKeyword) = peek, toKeyword.caseInsensitiveCompare("to") == .orderedSame {
+            index += 1
+            let toExpression = parseExpression()
+            var byExpression: LassoExpression = .integer(1)
+            if case let .identifier(byKeyword) = peek, byKeyword.caseInsensitiveCompare("by") == .orderedSame {
+                index += 1
+                byExpression = parseExpression()
+            }
+            source = .call(
+                callee: .identifier("generateSeries"),
+                arguments: [
+                    LassoArgument(value: source),
+                    LassoArgument(value: toExpression),
+                    LassoArgument(value: byExpression),
+                ]
+            )
+        }
+        return QueryWithClause(variable: variable, source: source)
     }
 
     /// One `where`/`let`/`skip`/`take`/`order by` operation — `nil`,

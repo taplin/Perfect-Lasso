@@ -1838,6 +1838,44 @@ public struct LassoNativeRegistry: Sendable {
             )
             return .void
         }
+        register("generateSeries") { arguments, _ in
+            // Ch. "Query Expressions", "GenerateSeries Type":
+            // "generateSeries(from, to, by=1) — Creates an integer
+            // series. The first parameter specifies the first number in
+            // the series. The second parameter specifies the maximum
+            // value of the last number in the series... an optional
+            // third parameter can specify the step... Note that the
+            // second parameter will not be included in the series if
+            // the step value causes it to be skipped" — verified
+            // against the docs' own worked example: `generateSeries(2,
+            // 11, 2) // => 2, 4, 6, 8, 10` (11 excluded). Only positional
+            // calling is verified (the docs' own examples never show a
+            // labeled `-from=`/`-to=`/`-by=` form). Eagerly materialized
+            // into `_elements`, matching the same disclosed eager-
+            // evaluation simplification the rest of Query Expressions
+            // already uses (`Evaluator.evaluateQueryExpression`'s own
+            // doc comment) — a `by` of 0 produces an empty series rather
+            // than looping forever, a defensive choice with no doc
+            // guidance either way.
+            guard let from = arguments.positionalValue(at: 0)?.number.map(Int.init) else { return .void }
+            guard let to = arguments.positionalValue(at: 1)?.number.map(Int.init) else { return .void }
+            let by = arguments.positionalValue(at: 2)?.number.map(Int.init) ?? 1
+            var elements: [LassoValue] = []
+            if by > 0 {
+                var current = from
+                while current <= to {
+                    elements.append(.integer(current))
+                    current += by
+                }
+            } else if by < 0 {
+                var current = from
+                while current >= to {
+                    elements.append(.integer(current))
+                    current += by
+                }
+            }
+            return .object(LassoObjectInstance(typeName: "generateseries", data: ["_elements": .array(elements)]))
+        }
         LassoFileOperations.registerDefaultFunctions(into: &self)
         LassoErrorHandling.registerDefaultFunctions(into: &self)
     }

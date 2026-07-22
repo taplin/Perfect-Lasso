@@ -77,6 +77,58 @@ public struct LassoNativeTypeRegistry: Sendable {
         register(Self.makeTreeMapType())
         register(Self.makeIteratorType())
         register(Self.makeQueriableGroupingType())
+        register(Self.makeGenerateSeriesType())
+        register(Self.makeQueryCollectorType())
+    }
+}
+
+extension LassoNativeTypeRegistry {
+    /// Ch. "Query Expressions", "GenerateSeries Type" — see
+    /// `Runtime.swift`'s `generateSeries` free-function registration for
+    /// how `_elements` is populated (Stage 8.5).
+    static func makeGenerateSeriesType() -> LassoNativeType {
+        var type = LassoNativeType(name: "generateseries")
+        type.register("asstaticarray") { receiver, _, _ in
+            // "A generateSeries object can also be converted to a
+            // staticarray for later use... generateSeries(2, 11, 2)->
+            // asStaticArray // => staticarray(2, 4, 6, 8, 10)". This
+            // codebase has no distinct StaticArray type (an already-
+            // tracked, pre-existing gap — see `Runtime.swift`'s
+            // `cipher_list` free function for the same established
+            // precedent), so an ordinary `.array` stands in for it here
+            // too, matching that precedent rather than introducing a new
+            // one just for this one call site.
+            .array(LassoCollectionValue.elements(from: receiver))
+        }
+        return type
+    }
+
+    /// Internal-only bridge type (Stage 8.5, "Making an Object
+    /// Queriable") — not a real, named Lasso type. Exists purely so a
+    /// custom type's own `forEach` member method (invoked with an
+    /// instance of this as its synthetic given block — see
+    /// `Evaluator.materializeCustomQueriableElements`) can hand elements
+    /// back to this interpreter's eager with-source materialization via
+    /// the SAME `#gb->invoke(element)` call shape the docs' own worked
+    /// example uses.
+    static func makeQueryCollectorType() -> LassoNativeType {
+        var type = LassoNativeType(name: "query_collector")
+        type.register("invoke") { receiver, arguments, _ in
+            guard let argument = arguments.first else { return .void }
+            // The docs' own worked example invokes with a labeled
+            // argument shape (`#gb->invoke('Krinn'='Jones')`) — this
+            // parses as an ordinary LABELED call argument (label:
+            // "Krinn", value: "Jones"), the exact same shape
+            // `register("array")` above already reconstructs into a
+            // real `.pair(...)` rather than silently discarding the
+            // label. Mirrors that established convention here too,
+            // rather than losing the key half of each element.
+            let value: LassoValue = argument.label.map { .pair(.string($0), argument.value) } ?? argument.value
+            let existing = LassoCollectionValue.elements(from: receiver)
+            receiver.set(.array(existing + [value]), for: "_elements")
+            return .void
+        }
+        return type
     }
 }
 

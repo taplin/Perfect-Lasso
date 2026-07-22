@@ -67,6 +67,18 @@ architecture/risk analysis (§§1-7) is unaffected by this new evidence.
 
 ## Status note (2026-07-21)
 
+**Update (2026-07-21, later same day): the Captures subsystem is now
+COMPLETE.** Every stage in §5's plan — Stages 1-7 (capture literals,
+non-local return/yield/detach, live-reference closure semantics,
+`->forEach`, string iteration, predicate-taking `->find`,
+`currentCapture()`/`givenBlock`/introspection) and Stage 8's five
+sub-stages (Query Expressions: core `with`/`select`/`do`,
+`where`/`let`/`skip`/`take`, `order by` + aggregates, `group by`,
+multiple with-clauses/`generateSeries`/"Making an Object Queriable") —
+has landed, been reviewed, and merged to `main`. See each stage's own
+status writeup inline in §5 below for what was built, what review found,
+and what was deliberately deferred (with reasoning — §6).
+
 **§8's "do not build now" recommendation below was made on corpus-evidence
 grounds alone — Tim overrode it explicitly: "Captures is important even if
 it's not used in the current corpus examples."** This project's corpus is
@@ -1431,6 +1443,95 @@ keywords.
 (not yet started): 8.5 (multiple with-clauses/nesting, `generateSeries`
 type + literal syntax, `eacher`) — the last piece of the entire Captures
 subsystem plan.
+
+**Stage 8.5 — multiple with-clauses, `generateSeries`, "Making an Object
+Queriable"** ✅ done (2026-07-21). The FINAL sub-stage of Stage 8, and
+the last piece of the entire Captures subsystem plan. Bundles three
+distinct, self-contained additions.
+
+*Multiple with-clauses*: real Lasso: "Multiple subsequent with clauses
+can follow the first. When this occurs, the second `with` word can
+optionally be replaced by a comma... Multiple with clauses define a
+nesting of iterations." `LassoExpression.queryExpression`'s single
+`variable`/`source` pair generalizes to `withClauses: [QueryWithClause]`
+(a new struct, mirroring `QueryOrderKey`'s own precedent).
+`Evaluator.evaluateQueryExpression` builds the initial row set via a
+left-to-right cross-join: starting from one empty seed row, each
+with-clause expands every existing row by binding it (making EARLIER
+clauses' variables visible) before evaluating its OWN source expression
+and fanning out one new row per element — exactly the mechanism a later
+clause referencing an earlier one (`with a in x, b in #a`) needs.
+`ExpressionParser` gained `tryParseQueryWithClause()` (parsing one
+`NAME in SOURCE` clause, used for both the required first clause and
+each optional subsequent one) and a loop in `tryParseQueryExpression()`
+recognizing a `with`/`,`-introduced next clause, backtracking fully (un-
+consuming the introducer too) if what follows isn't well-formed.
+
+*`generateSeries`*: `generateSeries(from, to, by=1)` (Ch. "Query
+Expressions", "GenerateSeries Type") eagerly builds an integer sequence
+into a `generateseries`-typed native object, verified against the docs'
+own `generateSeries(2, 11, 2) // => 2, 4, 6, 8, 10` example (11 excluded
+via natural loop-overshoot, not a special case). `->asStaticArray`
+returns a plain `.array` — this codebase has no distinct StaticArray
+type (an already-tracked, pre-existing gap, same precedent as
+`Runtime.swift`'s own `cipher_list`). The documented LITERAL syntax
+(`2 to 11 by 2`, claimed exactly equivalent) is recognized ONLY inside
+with-clause source parsing and DESUGARED at parse time into an ordinary
+`generateSeries(...)` call — reusing that one implementation for both
+spellings with zero new Evaluator code, and verified identical via a
+dedicated equivalence test.
+
+*"Making an Object Queriable"*: real Lasso lets a custom type become a
+valid with-source by implementing its own `forEach()` member, which
+reads the ordinary `givenBlock` keyword and invokes it once per element
+— previously (Stages 8.1-8.4) a disclosed, out-of-scope gap. Bridged via
+a new `materializeCustomQueriableElements`: constructs a synthetic
+native `query_collector` object and invokes the type's `forEach` method
+with it pushed as the given block, through a new
+`invokeMemberMethodWithNativeGivenBlock` — a deliberate small duplicate
+of the pre-existing `invokeMemberMethod` (same resolve/push-frame/
+render/pop-frame shape) rather than a refactor of that heavily-used,
+already-reviewed function, since there's no real Lasso SOURCE to parse a
+`=>` capture argument from here at all. `query_collector->invoke`
+reconstructs each labeled `#gb->invoke('Krinn'='Jones')` call into a
+real `.pair(...)`, mirroring the exact same label-to-Pair convention the
+pre-existing `register("array")` free function already established.
+Verified end-to-end against the docs' own full six-user `user_list`
+worked example. Separately, `->eachCharacter` (a narrower, concrete
+resolution of the docs' own `'Hammershaimb'->eachCharacter` example, via
+the same eager-materialization philosophy already established
+throughout Stage 8) was added WITHOUT building the fully general,
+doc-described `eacher()` free-function + escaped-method-reference
+(`->\identifier`, real Lasso's documented "Method Escaping" operator —
+see §1.8 above) mechanism — that broader mechanism remains deliberately
+out of scope: this codebase already has the BARE form (`\identifier`,
+`TagReference.swift`'s `.tagReference`), but not the MEMBER-POSITION
+form (`object->\identifier`, producing a `memberstream` real Lasso can
+pass around and later invoke) `eacher()` itself would need to accept a
+reference to an arbitrary iterator method — a genuinely separate parser
+addition with zero corpus evidence either way. A bare
+string is still correctly NOT directly queriable (real Lasso: "a string
+CANNOT be iterated upon directly") — only `->eachCharacter`'s own result
+is, confirmed by a dedicated negative test.
+
+**Architect + code-reviewer review (parallel) found the multi-with
+fanout, `generateSeries` loop/desugaring, given-block bridge, label-to-
+Pair reconstruction, parser backtracking, and all 9 new tests fully
+correct** — both independently hand-traced the row cross-join against 2-
+and 3-clause cases and empty/single-element sources, compared
+`invokeMemberMethodWithNativeGivenBlock` line-by-line against
+`invokeMemberMethod` for frame-leak risk on throw/non-local-return
+(none found), and confirmed all 6 `.queryExpression(...)` construction
+call sites were updated consistently. **One real, low-severity finding,
+fixed**: architect caught a stale rationale comment on a PRE-EXISTING
+Stage 8.1 test (`queryExpressionOverANonQueriableSourceThrowsRather
+ThanSilentlyProducingAnEmptyResult`) still describing a custom type's
+own `forEach` as "not-yet-supported" — now false as of this same diff.
+Fixed by updating the comment; the test itself was already unaffected
+(it exercises a plain integer, still genuinely non-queriable).
+
+656/656 tests passing (9 new). **This closes Stage 8 and the entire
+Captures subsystem plan** — no further sub-stages remain.
 
 ## 6. Deferred, With Reasoning
 
