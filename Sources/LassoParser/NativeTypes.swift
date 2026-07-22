@@ -79,10 +79,55 @@ public struct LassoNativeTypeRegistry: Sendable {
         register(Self.makeQueriableGroupingType())
         register(Self.makeGenerateSeriesType())
         register(Self.makeQueryCollectorType())
+        register(Self.makeTagReferenceType())
     }
 }
 
 extension LassoNativeTypeRegistry {
+    /// Ch. "Operators" > escape method operators: "the [tagreference]
+    /// object... manages the finding of the desired method... and the
+    /// execution of the method when the [tagreference] is invoked" — the
+    /// dispatch half of `\identifier`/`\ #variable` (`TagReference.swift`/
+    /// `Syntax.swift`'s `.tagReference`/`.dynamicTagReference`), which
+    /// previously had NO native-type registration at all (a bare
+    /// `LassoObjectInstance` with zero members). Real corpus (zeroloop/ds's
+    /// ds.lasso): `.'capi' = \#datasource`, later `.'capi'->invoke(#dsinfo)`.
+    ///
+    /// Checks a registered CUSTOM tag first (via `context.tagInvocationService`
+    /// — see that protocol's own doc comment for why it's deliberately
+    /// narrower than `Evaluator.invokeCustomTag`: positional-only, no
+    /// default-parameter-expression evaluation), then falls back to a
+    /// built-in native FUNCTION (`context.natives`) — the same two
+    /// categories `.tagReference`'s own evaluation-time validation already
+    /// checks against (`Evaluator.swift`'s `.tagReference`/
+    /// `.dynamicTagReference` cases), just actually dispatched here instead
+    /// of merely validated. A tagreference naming a custom TYPE or built-in
+    /// native TYPE (the other two categories that validation accepts) has
+    /// no sensible `->invoke` meaning — "invoking" a type isn't a real
+    /// operation any real corpus site exercises — so those fall through to
+    /// the same `unknownFunction` error an unresolvable name gets.
+    static func makeTagReferenceType() -> LassoNativeType {
+        var type = LassoNativeType(name: LassoTagReferenceValue.typeName)
+        type.register("invoke") { receiver, arguments, context in
+            guard let name = LassoTagReferenceValue.name(of: .object(receiver)) else {
+                throw LassoRuntimeError.unknownFunction("<tagreference>")
+            }
+            if let definition = context.tagRegistry.tag(named: name) {
+                guard let tagInvocationService = context.tagInvocationService else {
+                    throw LassoRuntimeError.unknownFunction(name)
+                }
+                return try await tagInvocationService.invoke(
+                    definition, positionalArguments: arguments.map(\.value), context: &context
+                )
+            }
+            if let function = context.natives.function(named: name) {
+                return try await function(arguments, &context)
+            }
+            throw LassoRuntimeError.unknownFunction(name)
+        }
+        return type
+    }
+
     /// Ch. "Query Expressions", "GenerateSeries Type" — see
     /// `Runtime.swift`'s `generateSeries` free-function registration for
     /// how `_elements` is populated (Stage 8.5).

@@ -318,6 +318,90 @@ import PerfectSessionCore
     #expect(output == "hi")
 }
 
+// MARK: - Dynamic tag-reference operator (\#var) and ->invoke dispatch
+
+@Test func dynamicTagReferenceWithBareVariableResolvesAndInvokesANativeFunction() async throws {
+    // Ch. "Operators" > escape method operators, DYNAMIC-name form --
+    // `\ #variable` (real corpus: zeroloop/ds's ds.lasso, `.'capi' =
+    // \#datasource`). The name comes from evaluating the variable at
+    // runtime, unlike the pre-existing `\identifier` bareword form,
+    // which bakes a parse-time-fixed name straight into the AST.
+    var context = LassoContext()
+    let output = try await LassoRenderer().render(
+        """
+        <?lassoscript
+        local(fname) = 'string'
+        local(ref) = \\#fname
+        ?>
+        [#ref->invoke(42)]
+        """,
+        context: &context
+    ).trimmingCharacters(in: .whitespacesAndNewlines)
+    #expect(output == "42")
+}
+
+@Test func dynamicTagReferenceToACustomTagInvokesItViaTheSharedTagInvocationService() async throws {
+    // The other half of real corpus's need: `\#var` naming a CUSTOM
+    // (user-`define`d) tag, not just a built-in native function --
+    // dispatched via `context.tagInvocationService`
+    // (`LassoTagInvocationService`, `Providers.swift`), the same
+    // narrower positional-only invocation path the pre-existing static
+    // `\identifier` form already relies on for custom comparators.
+    var context = LassoContext()
+    let output = try await LassoRenderer().render(
+        """
+        <?lassoscript
+        define greet(name::string) => {
+            return 'Hello, ' + #name
+        }
+        local(tagname) = 'greet'
+        local(ref) = \\#tagname
+        ?>
+        [#ref->invoke('Tim')]
+        """,
+        context: &context
+    ).trimmingCharacters(in: .whitespacesAndNewlines)
+    #expect(output == "Hello, Tim")
+}
+
+@Test func dynamicTagReferenceAcceptsAParenthesizedCompoundNameExpression() async throws {
+    // The general, documented `\ (expr)` form for a compound dynamic
+    // name expression -- no real corpus evidence for this exact shape
+    // (only the bare-variable form above), but it's directly documented
+    // and this parser accepts it alongside the bare form at no extra
+    // cost.
+    var context = LassoContext()
+    let output = try await LassoRenderer().render(
+        """
+        <?lassoscript
+        local(ref) = \\('str' + 'ing')
+        ?>
+        [#ref->invoke(7)]
+        """,
+        context: &context
+    ).trimmingCharacters(in: .whitespacesAndNewlines)
+    #expect(output == "7")
+}
+
+@Test func dynamicTagReferenceToAnUnresolvableNameThrowsUnknownFunction() async throws {
+    // Same "fails loudly at the reference site" validation the
+    // pre-existing static `\identifier` form already applies --
+    // confirms the dynamic form isn't silently more permissive just
+    // because its name comes from a runtime expression.
+    var context = LassoContext()
+    await #expect(throws: LassoRuntimeError.unknownFunction("nosuchtagoranything")) {
+        _ = try await LassoRenderer().render(
+            """
+            <?lassoscript
+            local(fname) = 'nosuchtagoranything'
+            local(ref) = \\#fname
+            ?>
+            """,
+            context: &context
+        )
+    }
+}
+
 // MARK: - Comment apostrophes desyncing readBalanced's brace/paren tracking
 
 @Test func lineCommentApostropheInATypeMethodBodyDoesNotSwallowTheNextMethod() async throws {

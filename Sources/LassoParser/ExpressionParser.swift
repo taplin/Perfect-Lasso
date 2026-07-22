@@ -645,6 +645,33 @@ struct ExpressionParser {
         case let .decimal(value): expression = .decimal(value)
         case let .variable(name, scope): expression = .variable(name, scope)
         case let .tagReference(name): expression = .tagReference(name)
+        case .symbol("\\"):
+            // Ch. "Operators" > escape method operators: the DYNAMIC-name
+            // form of the unary escape operator, `\ #variable` / `\
+            // (expr)`. The raw lexer only special-cases `\` immediately
+            // followed by a letter/underscore as `.tagReference` (a
+            // literal bareword name, handled above); `\` followed by
+            // anything else -- `#`/`$` variable sigils, `(` -- reaches
+            // here as a bare `.symbol("\\")`. Real corpus (zeroloop/ds's
+            // ds.lasso): `\#datasource`, written BARE (no parens) --
+            // LassoGuide's own wording ("the right-hand operand...
+            // must be surrounded in parentheses to disambiguate") is
+            // about compound expressions; a single variable token is
+            // already unambiguous, matching real corpus usage exactly.
+            // A genuinely invalid use (`\` followed by neither) falls
+            // through to the same `.unknown("\\")` this produced before
+            // this case existed, preserving prior error behavior.
+            if case let .variable(varName, scope) = peek {
+                index += 1
+                expression = .dynamicTagReference(.variable(varName, scope))
+            } else if peek == .symbol("(") {
+                index += 1
+                let nameExpression = parseExpression()
+                _ = consume(")")
+                expression = .dynamicTagReference(nameExpression)
+            } else {
+                expression = .unknown("\\")
+            }
         case let .identifier(name):
             switch name.lowercased() {
             case "true": expression = .boolean(true)
