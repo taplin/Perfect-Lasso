@@ -11,6 +11,7 @@ If you have an existing Lasso site and are curious how much of it this server al
 ## Requirements
 
 - **Xcode 27 or later** (Swift 6.4 toolchain, confirmed working). `Package.swift` declares a `swift-tools-version: 6.2` minimum, but only Xcode 27 has been verified.
+- **macOS 14.0 (Sonoma) or later at runtime**, on either Apple Silicon or Intel. `Package.swift` declares this as the deployment target across the whole dependency graph; Intel support has been verified via real cross-compilation (`swift build --triple x86_64-apple-macosx14.0`), not just assumed from the code. See [`Documentation/macos-deployment-targets.md`](Documentation/macos-deployment-targets.md) for the full findings, including what a lower target (13.0/12.0) would additionally require.
 - **[Homebrew](https://brew.sh)**, with one formula installed:
 
   ```bash
