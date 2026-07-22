@@ -1265,13 +1265,35 @@ struct LassoSiteServer: Sendable {
             // supplies `-Host=$host_array` itself.
             let knownDatabases = Set(config.datasourceMap.values)
             @Sendable func makeDatabase(_ database: String, hostOverride: LassoInlineHostOverride?) throws -> Database<MySQLDatabaseConfiguration> {
-                try Database(configuration: MySQLDatabaseConfiguration(
-                    database: database,
-                    host: hostOverride?.name ?? config.mysqlHost,
-                    port: hostOverride?.port ?? config.mysqlPort,
-                    username: hostOverride?.username ?? config.mysqlUser,
-                    password: hostOverride?.password ?? config.mysqlPassword
-                ))
+                guard let hostOverride else {
+                    return try Database(configuration: MySQLDatabaseConfiguration(
+                        database: database,
+                        host: config.mysqlHost,
+                        port: config.mysqlPort,
+                        username: config.mysqlUser,
+                        password: config.mysqlPassword
+                    ))
+                }
+                // An ad-hoc -Host connection reaches whatever address the
+                // site's own code supplies at the call site, never vetted
+                // at deployment time the way a pre-configured datasource
+                // is -- bound how long one unreachable/misconfigured
+                // ad-hoc host can stall a request, rather than the
+                // library's unbounded OS-default connect timeout.
+                let connection = MySQL()
+                _ = connection.setOption(.MYSQL_OPT_CONNECT_TIMEOUT, 5)
+                guard connection.connect(
+                    host: hostOverride.name,
+                    user: hostOverride.username,
+                    password: hostOverride.password,
+                    db: database,
+                    port: UInt32(hostOverride.port ?? 0),
+                    socket: nil,
+                    flag: 0
+                ) else {
+                    throw MySQLCRUDError("Could not connect. \(connection.errorMessage())")
+                }
+                return Database(configuration: MySQLDatabaseConfiguration(connection: connection))
             }
             let executor = PerfectCRUDLassoExecutor(
                 capabilities: { datasource, hostOverride in
