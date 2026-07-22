@@ -731,6 +731,70 @@ import PerfectSessionCore
     #expect(capture.messages == ["something happened"])
 }
 
+// `stdout`/`stdoutnl` (`lassoguide.com/9.2/operations/command-line-tools.html`)
+// -- write to the process's real STDOUT stream, a genuinely separate
+// destination from `log_critical`'s `diagnosticLogSink`, so these get
+// their own `stdoutSink` hook (`LassoContext.stdoutSink`) rather than
+// reusing that one. Same no-op-when-unwired convention.
+@Test func stdoutIsANoOpWhenNoStdoutSinkIsWired() async throws {
+    var context = LassoContext()
+    let output = try await LassoRenderer().render(
+        "BEFORE[stdout('something happened')]AFTER",
+        context: &context
+    )
+    #expect(output == "BEFOREAFTER")
+}
+
+@Test func stdoutForwardsItsMessageToTheWiredStdoutSinkWithNoTrailingNewline() async throws {
+    final class Capture: @unchecked Sendable {
+        var messages: [String] = []
+    }
+    let capture = Capture()
+    var context = LassoContext(stdoutSink: { message in
+        capture.messages.append(message)
+    })
+    let output = try await LassoRenderer().render(
+        "BEFORE[stdout('something happened')]AFTER",
+        context: &context
+    )
+    #expect(output == "BEFOREAFTER")
+    #expect(capture.messages == ["something happened"])
+}
+
+@Test func stdoutnlAppendsATrailingNewlineToTheForwardedMessage() async throws {
+    final class Capture: @unchecked Sendable {
+        var messages: [String] = []
+    }
+    let capture = Capture()
+    var context = LassoContext(stdoutSink: { message in
+        capture.messages.append(message)
+    })
+    let output = try await LassoRenderer().render(
+        "BEFORE[stdoutnl('something happened')]AFTER",
+        context: &context
+    )
+    #expect(output == "BEFOREAFTER")
+    #expect(capture.messages == ["something happened\n"])
+}
+
+@Test func stdoutAndStdoutnlRunInRegistrationOrderMatchingRealCorpusLoopShape() async throws {
+    // Real corpus shape (zeroloop/ds's own `_init.lasso`): a loop calling
+    // `stdout` once per file being loaded, as a progress indicator.
+    final class Capture: @unchecked Sendable {
+        var messages: [String] = []
+    }
+    let capture = Capture()
+    var context = LassoContext(stdoutSink: { message in
+        capture.messages.append(message)
+    })
+    let output = try await LassoRenderer().render(
+        "[with file in array('a.lasso', 'b.lasso') do { stdoutnl('loading ' + #file) }]",
+        context: &context
+    )
+    #expect(output == "")
+    #expect(capture.messages == ["loading a.lasso\n", "loading b.lasso\n"])
+}
+
 // Confirmed against reference.lassosoft.com (LassoSoft's own canonical tag
 // reference) and lassoguide.com, not just the local 8.5 PDF -- confirmed
 // live 2026-07-18 that no Lasso 9 dot-notation equivalent exists (real

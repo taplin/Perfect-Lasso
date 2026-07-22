@@ -2007,6 +2007,9 @@ struct LassoSiteServer: Sendable {
                 guard let logCapture else { return }
                 await logCapture.capture("[log_critical] " + message)
             },
+            stdoutSink: { (message: String) async -> Void in
+                FileHandle.standardOutput.write(Data(message.utf8))
+            },
             tagRegistry: tagRegistry
         )
         // The render pipeline (`LassoRenderer`, `LassoInlineProvider`,

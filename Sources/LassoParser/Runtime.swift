@@ -1304,6 +1304,25 @@ public struct LassoNativeRegistry: Sendable {
             }
             return .void
         }
+        // `stdout`/`stdoutnl` (`lassoguide.com/9.2/operations/command-line-tools.html`,
+        // e.g. `stdoutnl($argc)`) -- write directly to the process's real
+        // STDOUT stream, not to the page's own rendered output (see
+        // `LassoContext.stdoutSink`'s doc comment for why this is a
+        // separate hook from `log_critical`'s `diagnosticLogSink`). Real
+        // corpus (zeroloop/ds's `_init.lasso`) only ever calls these with
+        // a single already-stringifiable expression.
+        register("stdout") { arguments, context in
+            if let sink = context.stdoutSink {
+                await sink(arguments.first?.value.outputString ?? "")
+            }
+            return .void
+        }
+        register("stdoutnl") { arguments, context in
+            if let sink = context.stdoutSink {
+                await sink((arguments.first?.value.outputString ?? "") + "\n")
+            }
+            return .void
+        }
         register("return") { arguments, context in
             context.setNonLocalReturnSignal(arguments.first?.value ?? .void)
             return .void
@@ -2135,6 +2154,19 @@ public struct LassoContext: Sendable {
     /// `log_critical` a no-op, matching its behavior before this hook
     /// existed, for callers that don't wire anything.
     public var diagnosticLogSink: (@Sendable (String) async -> Void)?
+    /// Called by `stdout`/`stdoutnl` with their already-`asString`-converted
+    /// message text (newline already appended for `stdoutnl`) -- real
+    /// Lasso's `stdout`/`stdoutnl` (`lassoguide.com/9.2/operations/command-line-tools.html`)
+    /// write directly to the process's actual STDOUT stream, a genuinely
+    /// different destination from `log_critical`'s `diagnosticLogSink`
+    /// (a log facility, not the raw console stream) -- so this is its own
+    /// field rather than a reuse. Same "no direct I/O in `LassoParser`
+    /// itself" convention as `diagnosticLogSink`/`requestProvider`/
+    /// `responseSink`: `nil` (the default) makes `stdout`/`stdoutnl` a
+    /// no-op for callers that don't wire anything; the host application
+    /// (`LassoPerfectServer`'s `main.swift`) wires this to the real
+    /// process stdout.
+    public var stdoutSink: (@Sendable (String) async -> Void)?
     public var tagRegistry: LassoTagRegistry
     /// Paths already processed by `library()` for THIS request's render —
     /// deliberately per-`LassoContext`, not on the shared `tagRegistry`.
@@ -2271,6 +2303,7 @@ public struct LassoContext: Sendable {
         inlineProvider: (any LassoInlineProvider)? = nil,
         emailProvider: (any LassoEmailProvider)? = nil,
         diagnosticLogSink: (@Sendable (String) async -> Void)? = nil,
+        stdoutSink: (@Sendable (String) async -> Void)? = nil,
         tagRegistry: LassoTagRegistry = LassoTagRegistry()
     ) {
         self.globals = Dictionary(uniqueKeysWithValues: globals.map { ($0.key.lowercased(), $0.value) })
@@ -2296,6 +2329,7 @@ public struct LassoContext: Sendable {
         self.emailProvider = emailProvider
         lastEmailJobID = nil
         self.diagnosticLogSink = diagnosticLogSink
+        self.stdoutSink = stdoutSink
         self.tagRegistry = tagRegistry
         loadedLibraries = []
         libraryStack = []
