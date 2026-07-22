@@ -4488,6 +4488,81 @@ func perfectCRUDConnectorFailuresBecomeInlineErrorFrames(source: String, expecte
     #expect(output == "42")
 }
 
+// MARK: - Tag literals `::name`
+
+@Test func tagLiteralDesugarsToItsNameAsAPlainString() async throws {
+    // Ch. "Literals" > "Tag Literals": "A tag literal consists of two
+    // colons followed by the tag's characters" -- `::name`. This codebase
+    // has no dedicated `tag` runtime type (`->Type` already collapses type
+    // identity to a plain string as a disclosed simplification), so a tag
+    // literal desugars straight into an ordinary string literal of its
+    // name.
+    var context = LassoContext()
+    let output = try await LassoRenderer().render("[::hello]", context: &context)
+    #expect(output == "hello")
+}
+
+@Test func tagLiteralWorksAsAnIsaArgumentMatchingRealCorpusShape() async throws {
+    // Real corpus shape (zeroloop/ds's activerow.lasso: `.'ds'->isa(::ds)`)
+    // -- previously failed entirely with unsupportedExpression("::") since
+    // the parser only recognized `::` as a binary type-constraint operator
+    // (needing a left-hand operand already parsed), never as a standalone
+    // prefix expression.
+    var context = LassoContext(globals: ["x": .string("hello")])
+    let output = try await LassoRenderer().render(
+        "[$x->isa(::string)]/[$x->isa(::integer)]",
+        context: &context
+    )
+    #expect(output == "true/false")
+}
+
+@Test func tagLiteralWorksAsASwitchCaseValueMatchingRealCorpusShape() async throws {
+    // Real corpus shape (zeroloop/ds's ds.lasso: `case(::add) ... case(::update) ...`)
+    // -- tag literals used as plain symbolic constants, compared for
+    // equality against another tag-literal-derived string.
+    let source = """
+    <?lassoscript
+    Select($action);
+    Case(::add);
+    'adding';
+    Case(::update);
+    'updating';
+    Case(::delete);
+    'deleting';
+    /Select;
+    ?>
+    """
+    var context = LassoContext(globals: ["action": .string("update")])
+    let output = try await LassoRenderer().render(source, context: &context)
+    #expect(output == "updating")
+}
+
+@Test func tagLiteralNamedVoidDoesNotCollideWithTheVoidLiteralKeyword() async throws {
+    // Real corpus shape (zeroloop/ds's sequential.lasso: `#1->isnota(::void)`)
+    // -- a regression guard that `::void` produces the STRING "void", not
+    // the bare `.void` value the identifier `void` alone would produce.
+    var context = LassoContext()
+    let output = try await LassoRenderer().render("[::void]", context: &context)
+    #expect(output == "void")
+}
+
+@Test func typeConstraintDoubleColonStillWorksAlongsideTheTagLiteralFix() async throws {
+    // Regression guard: the pre-existing BINARY `::` type-constraint
+    // operator (a left-hand operand already parsed, e.g. inside a define
+    // signature) must be unaffected by the new PREFIX `::name` case.
+    var context = LassoContext()
+    let output = try await LassoRenderer().render(
+        """
+        <?lassoscript
+        define typedEcho(n::integer) => { return(#n + 1) }
+        ?>
+        [typedEcho(41)]
+        """,
+        context: &context
+    ).trimmingCharacters(in: .whitespacesAndNewlines)
+    #expect(output == "42")
+}
+
 @Test func bareIdentifierCallsZeroArgCustomTag() async throws {
     var context = LassoContext()
     let output = try await LassoRenderer().render(
