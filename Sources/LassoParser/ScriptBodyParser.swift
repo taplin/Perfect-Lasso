@@ -542,8 +542,19 @@ struct ScriptBodyParser {
     }
 
     private mutating func parseIgnoredBrace() -> Bool {
-        guard characters[index] == "}" else { return false }
-        index += 1
+        // `^}` closes an auto-collect capture literal (`{^ ... ^}`) — see
+        // `consumeArrowBlockStartIfPresent`'s matching comment. Checked
+        // before the plain `}` case since `^` alone is never a valid
+        // statement start here and would otherwise fall through to
+        // `emitStatement`/the expression parser and fail as an
+        // unsupported bare `^` token.
+        if characters[index] == "^", index + 1 < characters.count, characters[index + 1] == "}" {
+            index += 2
+        } else if characters[index] == "}" {
+            index += 1
+        } else {
+            return false
+        }
         // A brace-style if's own closing brace, when immediately followed
         // by `else`, does not close the if/else construct yet — only "if"
         // can have a following else in this language, so this check is
@@ -1063,6 +1074,22 @@ struct ScriptBodyParser {
         }
         if index < characters.count, characters[index] == "{" {
             index += 1
+            // `{^ ... ^}` (Ch. "Captures": an auto-collect capture literal)
+            // is real, documented Lasso 9 syntax real corpus attaches to
+            // these same TagCatalog block keywords (`inline(...)=>{^ ... ^}`
+            // is TS_lasso9's near-universal shape for an inline's content
+            // block). For a TagCatalog block tag, the body is always
+            // rendered as template content via `Renderer.render(body)` —
+            // there is no separate capture object whose auto-collected
+            // return value could ever be consumed — so auto-collect vs.
+            // plain is not a real distinction here; the `^` marker just
+            // needs to be tolerated (consumed, not treated as the start of
+            // an ordinary statement) rather than given new runtime
+            // semantics. The matching closer's own `^` (before `}`) is
+            // handled symmetrically by `parseIgnoredBrace`.
+            if index < characters.count, characters[index] == "^" {
+                index += 1
+            }
             return true
         }
         return false
