@@ -1071,6 +1071,26 @@ struct ScriptBodyParser {
                 continue
             }
 
+            // Real corpus (zeroloop/ds's ds.lasso): `// Don't store
+            // connections...` -- see `TypeBodyParser.readBalanced`'s
+            // identical fix/comment for the full failure mode (an
+            // apostrophe inside a `//`/`/* */` comment was previously
+            // mistaken for an opening string quote, desyncing balance-
+            // tracking and silently swallowing everything up to the next
+            // apostrophe anywhere later in the source).
+            if character == "/", index + 1 < characters.count, characters[index + 1] == "/" {
+                while index < characters.count, characters[index] != "\n" { index += 1 }
+                continue
+            }
+            if character == "/", index + 1 < characters.count, characters[index + 1] == "*" {
+                index += 2
+                while index + 1 < characters.count, !(characters[index] == "*" && characters[index + 1] == "/") {
+                    index += 1
+                }
+                index = min(index + 2, characters.count)
+                continue
+            }
+
             if character == "'" || character == "\"" || character == "`" {
                 quote = character
             } else if character == open {

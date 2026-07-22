@@ -310,6 +310,35 @@ struct TypeBodyParser {
                 continue
             }
 
+            // Real corpus (zeroloop/ds's ds.lasso): `// Don't store
+            // connections...` -- a `//` comment containing an
+            // apostrophe. Without this check, the quote-tracking below
+            // treats that apostrophe as an OPENING string quote (comments
+            // aren't string literals and don't need balancing, but this
+            // scanner had no notion of comments at all), then scans for
+            // the next apostrophe ANYWHERE in the remaining source to
+            // "close" it -- silently swallowing everything in between,
+            // including entire subsequent method definitions, into the
+            // current method's own body text. An extremely common trigger
+            // ("don't"/"it's"/"won't"/"can't" in ordinary English prose
+            // comments), found via a real failing case where a type's
+            // SECOND `store` overload vanished entirely, its own source
+            // absorbed into the FIRST `store` method's body -- and then,
+            // once inside there, misparsed as an ordinary unbound
+            // `store(...)` call, surfacing as `unknownFunction("store")`.
+            if character == "/", index + 1 < characters.count, characters[index + 1] == "/" {
+                while index < characters.count, characters[index] != "\n" { index += 1 }
+                continue
+            }
+            if character == "/", index + 1 < characters.count, characters[index + 1] == "*" {
+                index += 2
+                while index + 1 < characters.count, !(characters[index] == "*" && characters[index + 1] == "/") {
+                    index += 1
+                }
+                index = min(index + 2, characters.count)
+                continue
+            }
+
             if character == "'" || character == "\"" || character == "`" {
                 quote = character
             } else if character == open {
