@@ -94,25 +94,33 @@ struct LassoMethodDispatcher {
 
     private static func score(method: LassoMethodDefinition, arguments: [EvaluatedArgument]) -> Int? {
         let positional = arguments.filter { $0.label == nil }
-        let requiredCount = method.parameters.filter { parameter in
+        // Ch. "Defining Methods" > "Rest Parameters": a rest parameter
+        // (`consumeRestParameterMarker`'s `"..."`-labeled argument,
+        // guaranteed last per the documented signature grammar) accepts
+        // "any number of additional parameters" beyond the fixed ones —
+        // it must not count toward `requiredCount`, and the caller's
+        // positional count must not be capped at the fixed count.
+        let hasRestParameter = method.parameters.last?.label == "..."
+        let fixedParameters = hasRestParameter ? Array(method.parameters.dropLast()) : method.parameters
+        let requiredCount = fixedParameters.filter { parameter in
             let (_, defaultExpression, _) = parameterMetadata(parameter.value)
             return defaultExpression == nil
         }.count
 
         guard positional.count >= requiredCount,
-              positional.count <= method.parameters.count else {
+              hasRestParameter || positional.count <= fixedParameters.count else {
             return nil
         }
 
         var score = 0
-        for (index, parameter) in method.parameters.enumerated() {
+        for (index, parameter) in fixedParameters.enumerated() {
             let (_, defaultExpression, typeConstraint) = parameterMetadata(parameter.value)
             if index < positional.count {
                 if let typeConstraint {
                     guard matches(typeConstraint: typeConstraint, value: positional[index].value) else {
                         return nil
                     }
-                    score += (method.parameters.count - index) * 10
+                    score += (fixedParameters.count - index) * 10
                 }
                 if defaultExpression == nil {
                     score += 1

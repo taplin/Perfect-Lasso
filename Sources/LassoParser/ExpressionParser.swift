@@ -324,6 +324,29 @@ private struct ExpressionLexer {
                 }
                 continue
             }
+            // Real corpus (zeroloop/ds's ds.lasso): a `//` comment
+            // containing an apostrophe (e.g. "Clean up legacy
+            // '-string' support") -- see `TypeBodyParser.readBalanced`'s
+            // identical fix/comment for the full failure mode. Without
+            // this, the quote-tracking below mistakes a stray comment
+            // apostrophe for an opening string quote and scans for the
+            // next apostrophe ANYWHERE LATER in the source to "close"
+            // it, silently swallowing everything in between -- found via
+            // a real case where a large method body's own closing `}`
+            // was never found at all, consuming all the way to
+            // end-of-file.
+            if character == "/", index + 1 < characters.count, characters[index + 1] == "/" {
+                while index < characters.count, characters[index] != "\n" { index += 1 }
+                continue
+            }
+            if character == "/", index + 1 < characters.count, characters[index + 1] == "*" {
+                index += 2
+                while index + 1 < characters.count, !(characters[index] == "*" && characters[index + 1] == "/") {
+                    index += 1
+                }
+                index = min(index + 2, characters.count)
+                continue
+            }
             if character == "'" || character == "\"" || character == "`" {
                 quote = character
                 index += 1
@@ -1314,6 +1337,14 @@ struct ExpressionParser {
             // `consume(")")` (already established for `(Array: ...)`-style
             // wraps) claim it instead.
             if closing == nil, peek == .symbol(")") { break }
+            if let restArgument = consumeRestParameterMarker() {
+                arguments.append(restArgument)
+                if !consume(",") {
+                    if let closing { _ = consume(closing) }
+                    break
+                }
+                continue
+            }
             var label: String?
             if case let .named(name) = peek {
                 index += 1
@@ -1449,7 +1480,44 @@ struct ExpressionParser {
         }
     }
 
+    /// Ch. "Defining Methods" > "Rest Parameters": a parameter list may
+    /// end with three literal periods (`...`), optionally immediately
+    /// followed by a name (`...other`) renaming the local variable rest
+    /// arguments are collected into (default `rest`). Recognized as its
+    /// own atomic unit BEFORE falling into ordinary expression parsing —
+    /// the generic prefix-expression parser's `.symbol(".")` case treats
+    /// a lone `.` as self-member-access shorthand and unconditionally
+    /// reads the NEXT token as the member name (`readMemberName()`
+    /// always calls `advance()`), which desyncs badly on three
+    /// consecutive bare `.` tokens with nothing valid between them: the
+    /// second dot gets misread as the first "member name" (producing
+    /// `<unknown>`), then the third dot's own attempt does the same
+    /// again — this time swallowing whatever real token follows it,
+    /// e.g. this very call's own closing `)`, cascading into the rest
+    /// of the enclosing statement being misparsed. Represented as a
+    /// `LassoArgument` with the sentinel label `"..."` (never a real
+    /// label — labeled/keyword arguments come from `.named` tokens,
+    /// which are lexed as `-Name=`, not a bare word) so
+    /// `bindParameters`/`LassoMethodDispatcher.score` can recognize it
+    /// without a new `LassoExpression` case. Real corpus: zeroloop/ds's
+    /// `ds.lasso` — `define dsinfo->extend(...) => { ... with p in
+    /// delve(#rest) do {...} ... }`.
+    mutating private func consumeRestParameterMarker() -> LassoArgument? {
+        guard peek == .symbol("."), peek(ahead: 1) == .symbol("."), peek(ahead: 2) == .symbol(".") else {
+            return nil
+        }
+        index += 3
+        var name = "rest"
+        if case let .identifier(renamed) = peek {
+            name = renamed
+            index += 1
+        }
+        return LassoArgument(label: "...", value: .identifier(name))
+    }
+
     private var peek: Token { tokens[min(index, tokens.count - 1)] }
+
+    private func peek(ahead offset: Int) -> Token { tokens[min(index + offset, tokens.count - 1)] }
 
     mutating private func advance() -> Token {
         defer { index = min(index + 1, tokens.count) }

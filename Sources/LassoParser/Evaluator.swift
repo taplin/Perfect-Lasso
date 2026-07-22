@@ -1352,6 +1352,22 @@ struct Evaluator {
         var bound: [String: LassoLocalBox] = [:]
 
         for parameter in parameters {
+            // Ch. "Defining Methods" > "Rest Parameters": "any additional
+            // parameters are placed into a predefined local variable
+            // named 'rest' ... it will be a staticarray holding the
+            // remaining parameter values ... If no rest parameters, the
+            // 'rest' local will be 'void'." See `consumeRestParameterMarker`
+            // (ExpressionParser.swift) for how this `"..."`-labeled
+            // argument gets produced.
+            if parameter.label == "..." {
+                let name = Self.parameterNameAndDefault(parameter.value).0 ?? "rest"
+                let remaining = Array(positional[positionalIndex...])
+                positionalIndex = positional.count
+                bound[name.lowercased()] = remaining.isEmpty
+                    ? LassoLocalBox(.void)
+                    : LassoLocalBox(.array(remaining.map(\.value)))
+                continue
+            }
             let (name, defaultExpression) = Self.parameterNameAndDefault(parameter.value)
             guard let name else { continue }
 

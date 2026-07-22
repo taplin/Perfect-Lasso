@@ -4777,6 +4777,167 @@ func perfectCRUDConnectorFailuresBecomeInlineErrorFrames(source: String, expecte
     #expect(output == "60")
 }
 
+@Test func restOnlyBoundMethodDefineParsesAndBindsRestParameterMatchingRealCorpusShape() async throws {
+    // Real corpus shape (zeroloop/ds's ds.lasso): `define dsinfo->extend(...)
+    // => { ... with p in delve(#rest) do {...} ... }` -- a top-level BOUND
+    // method (`Type->method`) whose ENTIRE parameter list is the bare
+    // rest-only signature (Ch. "Defining Methods" > "Rest Parameters": "A
+    // signature whose parameter list is just three periods ( ... )
+    // indicates that the method will accept any number and type of
+    // parameters ... the parameters that were passed in can be accessed
+    // through a local variable named 'rest'"). This previously threw
+    // unsupportedExpression("Member extend"): `ScriptBodyParser.parseDefineOpening`
+    // has no support for the bound `Type->method` form at all (only a bare
+    // `name`), so the statement fell through to `tryParseDefineExpression`
+    // (expression position) -- whose own `parseArguments(closing: ")")`
+    // desynced on the bare `...`, since the generic prefix-expression
+    // parser's `.symbol(".")` case unconditionally reads the NEXT token as
+    // a member name, misreading the second and third dots and ultimately
+    // swallowing the call's own closing `)`. `tryParseDefineExpression`
+    // then backtracked entirely, leaving `dsinfo->extend` to be parsed as
+    // an ordinary (unsupported) member-access read.
+    var context = LassoContext()
+    let output = try await LassoRenderer().render(
+        """
+        [
+        define_type: 'Ex_Extend', 'integer', -prototype;
+        /define_type;
+        ]
+        [define Ex_Extend->sumRest(...) => {
+            local(total) = 0
+            with n in #rest do { #total += #n }
+            return #total
+        }]
+        [Local(t = Ex_Extend())][#t->sumRest(1, 2, 3)]
+        """,
+        context: &context
+    ).trimmingCharacters(in: .whitespacesAndNewlines)
+    #expect(output == "6")
+}
+
+@Test func restOnlyUnboundTagDefineBindsRestParameterMatchingRealCorpusShape() async throws {
+    // Real corpus shape (zeroloop/ds's ds.lasso): `define datasource(...)
+    // => ds(:#rest || staticarray)` -- an UNBOUND top-level tag with a
+    // rest-only signature, reached via `ScriptBodyParser.parseDefineOpening`'s
+    // OWN character-level `(...)`  reconstruction
+    // (`parseCallArguments`/`readBalanced`), a separate code path from the
+    // bound-method case above but sharing the same underlying
+    // `parseArguments` fix.
+    var context = LassoContext()
+    let output = try await LassoRenderer().render(
+        """
+        <?lassoscript
+        define sumAll(...) => {
+            local(total) = 0
+            with n in #rest do { #total += #n }
+            return #total
+        }
+        ?>
+        [sumAll(1, 2, 3)]
+        """,
+        context: &context
+    ).trimmingCharacters(in: .whitespacesAndNewlines)
+    #expect(output == "6")
+}
+
+@Test func fixedParameterFollowedByRestParameterBindsBothMatchingDocumentedShape() async throws {
+    // Ch. "Defining Methods" > "Rest Parameters": `string_concatenate
+    // (value, ...)` -- fixed parameters may precede the rest marker;
+    // the fixed ones bind normally and only the LEFTOVER positional
+    // arguments land in `rest`.
+    var context = LassoContext()
+    let output = try await LassoRenderer().render(
+        """
+        <?lassoscript
+        define combine(prefix, ...) => {
+            local(total) = #prefix
+            with n in #rest do { #total += #n }
+            return #total
+        }
+        ?>
+        [combine('x', 'y', 'z')]
+        """,
+        context: &context
+    ).trimmingCharacters(in: .whitespacesAndNewlines)
+    #expect(output == "xyz")
+}
+
+@Test func renamedRestParameterUsesTheGivenLocalNameMatchingDocumentedSyntax() async throws {
+    // Ch. "Defining Methods" > "Rest Parameters": "an alternate variable
+    // name can be specified in the signature by placing the desired name
+    // immediately after the three periods" -- `...other` renames the
+    // predefined `rest` local to `other`.
+    var context = LassoContext()
+    let output = try await LassoRenderer().render(
+        """
+        <?lassoscript
+        define sumOther(...other) => {
+            local(total) = 0
+            with n in #other do { #total += #n }
+            return #total
+        }
+        ?>
+        [sumOther(4, 5, 6)]
+        """,
+        context: &context
+    ).trimmingCharacters(in: .whitespacesAndNewlines)
+    #expect(output == "15")
+}
+
+@Test func restParameterIsVoidWhenNoExtraArgumentsAreGivenMatchingDocumentedBehavior() async throws {
+    // Ch. "Defining Methods" > "Rest Parameters": "If no parameters are
+    // given, it will remain 'void'." This codebase's own `.void` member
+    // dispatch (Evaluator.swift's `case (.void, _):`, an existing,
+    // deliberate design choice confirmed by prior architect review, not
+    // something this fix introduces or should special-case around)
+    // redirects EVERY member access on `.void` to `.string("")`'s own
+    // behavior for graceful degradation -- so `->type` on a genuinely
+    // void `rest` reports "String" (an empty string's introspection type
+    // name), while `rest` bound to real extra arguments reports "Array".
+    // This still directly distinguishes `bindParameters`' two outcomes
+    // (`.void` vs `.array(...)`) even though `->isa(::void)` itself can
+    // never observe void-ness through this same redirect.
+    var context = LassoContext()
+    let output = try await LassoRenderer().render(
+        """
+        <?lassoscript
+        define checkRest(...) => (#rest->type)
+        ?>
+        [checkRest()]/[checkRest(1)]
+        """,
+        context: &context
+    ).trimmingCharacters(in: .whitespacesAndNewlines)
+    #expect(output == "String/Array")
+}
+
+@Test func typeBodyMethodWithRestOnlySignatureBindsRestParameterMatchingRealCorpusShape() async throws {
+    // Real corpus shape (zeroloop/ds's ds.lasso, inside `dsinfo`'s own
+    // type body): `public updaterows(...) => .updaterow(: #rest ||
+    // staticarray)` / `public select(...) => ...` / `public where(...) =>
+    // ...` -- a method declared INSIDE a `type { ... }` body
+    // (TypeBodyParser.parseMethod), a separate character-level code path
+    // from the top-level `define` cases above but sharing the same
+    // `parseCallArguments`/`readBalanced`/`parseArguments` machinery.
+    var context = LassoContext()
+    let output = try await LassoRenderer().render(
+        """
+        <?lassoscript
+        define Ex_Bag => type {
+            public sumRest(...) => {
+                local(total) = 0
+                with n in #rest do { #total += #n }
+                return #total
+            }
+        }
+        local(b::Ex_Bag = Ex_Bag())
+        ?>
+        [#b->sumRest(7, 8, 9)]
+        """,
+        context: &context
+    ).trimmingCharacters(in: .whitespacesAndNewlines)
+    #expect(output == "24")
+}
+
 // MARK: - Staticarray literals `(: ... )`
 
 @Test func staticarrayLiteralParsesAsAnOrdinaryArrayValue() async throws {
