@@ -660,6 +660,30 @@ struct ExpressionParser {
             expression = .unary(operator: op, value: parseExpression(minimumPrecedence: 8))
         case .symbol("."):
             expression = .member(base: .identifier("self"), name: readMemberName(), arguments: nil)
+        case .symbol("(") where peek == .symbol(":"):
+            // Ch. "Literals" > "Staticarray Literals": "an open
+            // parenthesis immediately followed by a colon, then zero or
+            // more comma-delimited expressions, ending with the closing
+            // parenthesis" — `(: 1, 2, 'hello')`. Real corpus: zeroloop/ds
+            // LassoApp's own _init.lasso (`with file in (: 'a.lasso',
+            // 'b.lasso', ...) do { ... }`), previously unsupported (a bare
+            // `:` right after `(` fell through to `.unknown(":")`,
+            // surfacing as `unsupportedExpression(":")`).
+            //
+            // This codebase already treats real Lasso's distinct,
+            // non-resizable `staticarray` type as equivalent to its own
+            // `.array` runtime value everywhere else (no separate
+            // immutable-array runtime type) — see the `->asstring`
+            // formatting comment in `Evaluator.swift` citing this exact
+            // corpus file. Desugaring straight into the same
+            // `.call(.identifier("array"), ...)` shape the `array(...)`
+            // constructor already produces reuses that evaluation path
+            // entirely rather than adding a new runtime case just for a
+            // literal spelling of the same value.
+            _ = consume(":")
+            let elements = parseArguments(closing: ")")
+            expression = .call(callee: .identifier("array"), arguments: elements)
+            eligibleForGiveback = false
         case .symbol("("):
             expression = parseExpression()
             _ = consume(")")
