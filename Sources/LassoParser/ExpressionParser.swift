@@ -654,6 +654,19 @@ struct ExpressionParser {
                 } else {
                     expression = .identifier(name)
                 }
+            case "define":
+                // See `LassoExpression.definition`'s own doc comment --
+                // `define` reached from EXPRESSION position (previously
+                // only recognized as its own top-level statement via
+                // `ScriptBodyParser.parseDefineOpening`). Fully
+                // speculative with backtrack-to-nil, same precedent as
+                // `with`/`tryParseQueryExpression` just above.
+                if let definitionExpression = tryParseDefineExpression() {
+                    expression = definitionExpression
+                    eligibleForGiveback = false
+                } else {
+                    expression = .identifier(name)
+                }
             default: expression = .identifier(name)
             }
         case let .symbol(op) where ["!", "-", "+"].contains(op):
@@ -1010,6 +1023,79 @@ struct ExpressionParser {
         var nestedBuilder = BlockBuilder(nodes: flatBody, diagnostics: [], openFormFires: [:])
         let nestedResult = nestedBuilder.build()
         return .captureLiteral(body: nestedResult.nodes, autoCollect: autoCollect)
+    }
+
+    /// `define [TypeName->]name(params)[::ReturnType] => body` reached
+    /// from EXPRESSION position — see `LassoExpression.definition`'s own
+    /// doc comment for the real corpus need (a ternary-guarded
+    /// monkey-patch). Fully speculative with backtrack-to-`nil` on any
+    /// mismatch, restoring `index` to right after the already-consumed
+    /// `define` token — so a bare `define` used as an ordinary
+    /// identifier (however unlikely) is left completely untouched,
+    /// matching `tryParseQueryExpression`'s own precedent.
+    ///
+    /// The brace-bodied form (`=> { ... }`) reuses the exact same
+    /// nested-parse steps `parseCaptureLiteral` just above uses — the
+    /// RAW LEXER already isolated the `{...}` span into a single
+    /// `.captureBody` token during tokenization, regardless of context.
+    /// The bare-expression form (`=> expr`, no braces) wraps the parsed
+    /// expression in a synthetic `return(...)` call, matching
+    /// `ScriptBodyParser.parseDefineOpening`'s own "constant-style"
+    /// define body exactly (`.code([...], ...)` wrapping a `return(...)`
+    /// call) — a method with no explicit `return` needs its evaluated
+    /// body value to actually come back to the caller.
+    mutating private func tryParseDefineExpression() -> LassoExpression? {
+        let start = index
+        guard case let .identifier(firstName) = peek else {
+            index = start
+            return nil
+        }
+        _ = advance()
+
+        var boundType: String?
+        var methodName = firstName
+        if consume("->") {
+            guard case let .identifier(secondName) = peek else {
+                index = start
+                return nil
+            }
+            _ = advance()
+            boundType = firstName
+            methodName = secondName
+        }
+
+        var parameters: [LassoArgument] = []
+        if consume("(") {
+            parameters = parseArguments(closing: ")")
+        }
+        if consume("::") {
+            _ = readIdentifier()
+        }
+        guard consume("=>") else {
+            index = start
+            return nil
+        }
+
+        let placeholderRange = SourceRange(
+            start: SourcePosition(offset: 0, line: 0, column: 0),
+            end: SourcePosition(offset: 0, line: 0, column: 0)
+        )
+        let body: [LassoNode]
+        if case let .captureBody(source, _) = peek {
+            _ = advance()
+            var nestedParser = ScriptBodyParser(source: source, range: placeholderRange)
+            let flatBody = nestedParser.parse()
+            var nestedBuilder = BlockBuilder(nodes: flatBody, diagnostics: [], openFormFires: [:])
+            body = nestedBuilder.build().nodes
+        } else {
+            let bodyExpression = parseExpression()
+            let returnCall = LassoExpression.call(
+                callee: .identifier("return"),
+                arguments: [LassoArgument(label: nil, value: bodyExpression)]
+            )
+            body = [.code([returnCall], .lasso9, .lassoscript, placeholderRange)]
+        }
+        return .definition(boundType: boundType, name: methodName, parameters: parameters, body: body)
     }
 
     /// Parses `initial`'s own postfix chain (`(...)`/`:...`/`->member`),
