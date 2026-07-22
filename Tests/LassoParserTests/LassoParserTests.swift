@@ -164,6 +164,160 @@ import PerfectSessionCore
     #expect(output == "3")
 }
 
+// MARK: - Keyword parameters in method signatures (-name::type=default)
+
+@Test func keywordParameterWithTypeConstraintAndDefaultParsesAndBindsInATypeMethodMatchingRealCorpusShape() async throws {
+    // Ch. "Methods" > "Keyword Parameters": `-name::type=default`. Real
+    // corpus (zeroloop/ds's ds.lasso): `public oncreate(
+    // -datasource::string='mysqlds', ...)` -- previously the ENTIRE
+    // parameter list silently parsed as empty (confirmed via a dispatch-
+    // resolution debug print showing only one zero-parameter candidate),
+    // because `TypeBodyParser.parseCallArguments`'s throwaway
+    // reconstruction reuses the ordinary CALL-ARGUMENT grammar
+    // (`ExpressionParser.parseArguments`'s `.named` handling, built for
+    // real call-site `-name=value` syntax) to extract SIGNATURE
+    // parameter names -- that grammar expects the value to follow `=`
+    // DIRECTLY, and desyncs badly on the `::type` sitting in between.
+    var context = LassoContext()
+    let output = try await LassoRenderer().render(
+        """
+        <?lassoscript
+        define Widget => type {
+            public oncreate(-datasource::string='mysqlds') => {
+                return #datasource
+            }
+        }
+        local(w) = Widget
+        ?>
+        [#w->oncreate(-datasource='postgres')]/[#w->oncreate]
+        """,
+        context: &context
+    ).trimmingCharacters(in: .whitespacesAndNewlines)
+    #expect(output == "postgres/mysqlds")
+}
+
+@Test func multipleKeywordParametersWithMixedTypesAndDefaultsAllBindCorrectlyMatchingRealCorpusShape() async throws {
+    // Real corpus shape: ds.lasso's actual `oncreate` overload has 14 of
+    // these in one signature, several separated by blank lines and `//`
+    // comments -- both confirmed NOT to be the cause on their own (the
+    // raw lexer's `skipTrivia()` already handles them), but included
+    // here anyway since real corpus signatures always have them.
+    var context = LassoContext()
+    let output = try await LassoRenderer().render(
+        """
+        <?lassoscript
+        define Widget2 => type {
+            public oncreate(
+                -datasource::string='mysqlds',
+                -database::string='',
+
+                // Host params
+                -port::integer=3306,
+                -useinfo::boolean=false
+            ) => {
+                return #datasource + '|' + #database + '|' + #port + '|' + #useinfo
+            }
+        }
+        local(w) = Widget2
+        ?>
+        [#w->oncreate(-datasource='pg', -database='mydb', -port=5432, -useinfo=true)]
+        """,
+        context: &context
+    ).trimmingCharacters(in: .whitespacesAndNewlines)
+    #expect(output == "pg|mydb|5432|true")
+}
+
+@Test func keywordParameterWithoutATypeConstraintStillBindsCorrectly() async throws {
+    // Ch. "Methods" > "Keyword Parameters": the plain `-name=expression`
+    // form (no `::type`). Confirmed as a SEPARATE, ALSO-broken shape
+    // while investigating the `::type` case: even without a type
+    // constraint, `parameterMetadata` reads a parameter's NAME from its
+    // `.value` (never `.label`), so the pre-fix `.named`-token path
+    // (which set `label` but left `.value` as a bare `.boolean`/literal
+    // with no identifier) silently lost the parameter's name too.
+    var context = LassoContext()
+    let output = try await LassoRenderer().render(
+        """
+        <?lassoscript
+        define Widget3 => type {
+            public oncreate(-greeting='hi') => {
+                return #greeting
+            }
+        }
+        local(w) = Widget3
+        ?>
+        [#w->oncreate(-greeting='hello')]/[#w->oncreate]
+        """,
+        context: &context
+    ).trimmingCharacters(in: .whitespacesAndNewlines)
+    #expect(output == "hello/hi")
+}
+
+@Test func keywordParameterInATopLevelUnboundDefineAlsoBindsCorrectly() async throws {
+    // The `ScriptBodyParser` sibling of the `TypeBodyParser` fix above --
+    // top-level (unbound) `define name(-kw::type=default) => ...`.
+    var context = LassoContext()
+    let output = try await LassoRenderer().render(
+        """
+        <?lassoscript
+        define greet(-name::string='World') => {
+            return 'Hello, ' + #name
+        }
+        ?>
+        [greet(-name='Tim')]/[greet]
+        """,
+        context: &context
+    ).trimmingCharacters(in: .whitespacesAndNewlines)
+    #expect(output == "Hello, Tim/Hello, World")
+}
+
+@Test func plainPositionalParametersStillWorkAlongsideTheKeywordParameterFix() async throws {
+    // Regression guard: ordinary positional parameters (no `-` prefix,
+    // with or without a type constraint/default) must be completely
+    // unaffected by the dash-stripping fix. `oncreate`'s own return
+    // value is discarded at construction time (`instantiate`'s `_ =
+    // onCreate`), so this calls `oncreate` explicitly afterward instead
+    // of relying on construction-time binding to be independently
+    // observable.
+    var context = LassoContext()
+    let output = try await LassoRenderer().render(
+        """
+        <?lassoscript
+        define Widget4 => type {
+            public oncreate(a::integer, b::string = 'x') => {
+                return #a->asstring + #b
+            }
+        }
+        local(w) = Widget4
+        ?>
+        [#w->oncreate(1)]/[#w->oncreate(2, 'y')]
+        """,
+        context: &context
+    ).trimmingCharacters(in: .whitespacesAndNewlines)
+    #expect(output == "1x/2y")
+}
+
+@Test func realCallSiteNamedArgumentsStillWorkAlongsideTheSignatureFix() async throws {
+    // Regression guard: real CALL-SITE `-name=value` arguments (an
+    // entirely different grammar position from a method SIGNATURE'S
+    // parameter declaration, both reachable via the shared `.named`
+    // token but through DIFFERENT code paths -- this fix only touches
+    // `TypeBodyParser`/`ScriptBodyParser`'s signature-extraction
+    // reconstruction, never `ExpressionParser.parseArguments`'s own
+    // `.named` handling used for actual calls) must be completely
+    // unaffected.
+    var natives = LassoNativeRegistry()
+    natives.register("realcall") { arguments, _ in
+        .string(arguments.first(where: { $0.label == "greeting" })?.value.outputString ?? "MISSING")
+    }
+    var context = LassoContext(natives: natives)
+    let output = try await LassoRenderer().render(
+        "[realcall(-greeting='hi')]",
+        context: &context
+    ).trimmingCharacters(in: .whitespacesAndNewlines)
+    #expect(output == "hi")
+}
+
 // MARK: - Comment apostrophes desyncing readBalanced's brace/paren tracking
 
 @Test func lineCommentApostropheInATypeMethodBodyDoesNotSwallowTheNextMethod() async throws {

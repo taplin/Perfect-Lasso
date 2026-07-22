@@ -109,7 +109,7 @@ struct TypeBodyParser {
         var parameters: [LassoArgument] = []
         if index < characters.count, characters[index] == "(" {
             let body = readBalanced(open: "(", close: ")")
-            parameters = parseCallArguments(name: name, body: body)
+            parameters = parseSignatureParameters(name: name, body: body)
         }
 
         skipHorizontalWhitespace()
@@ -187,10 +187,156 @@ struct TypeBodyParser {
         // call, silently producing zero parameters instead of the
         // intended one. Only `body`'s own content (the parameter list
         // text) is actually needed here; `name` plays no other role.
+        //
+        // ORDINARY call-argument lists only -- deliberately NOT used for
+        // method SIGNATURES, which need `parseSignatureParameters`
+        // below instead. A real, once-shipped bug: sharing this one
+        // function for both broke `loop(-count=3) => {...}` in
+        // ScriptBodyParser (a real CALL, whose `-count` label must
+        // survive intact) the moment dash-stripping was added here
+        // directly -- confirmed via a full-suite regression
+        // (`bareReturnAndYieldWorkAsATernaryActionClause` et al.) before
+        // being split back out.
         var parser = ExpressionParser("__typeBodyParserParams__(\(body))")
         let expression = parser.parseExpression()
         guard case let .call(_, arguments) = expression else { return [] }
         return arguments
+    }
+
+    /// SIGNATURE-only sibling of `parseCallArguments` just above -- used
+    /// exclusively for a method's own parameter-list declaration
+    /// (`parseMethod`), never for an ordinary call's arguments. See
+    /// `stripKeywordParameterDashes`'s own doc comment for why keyword
+    /// (`-name[::type][=default]`) SIGNATURE parameters need this
+    /// separate handling.
+    private func parseSignatureParameters(name: String, body: String) -> [LassoArgument] {
+        var parser = ExpressionParser("__typeBodyParserParams__(\(stripKeywordParameterDashes(body)))")
+        let expression = parser.parseExpression()
+        guard case let .call(_, arguments) = expression else { return [] }
+        return arguments
+    }
+
+    /// Ch. "Methods" > "Keyword Parameters": a SIGNATURE parameter may be
+    /// declared `-name[::type][=default]` (e.g. `-find::string`,
+    /// `-ignoreCase::boolean=false`) -- the leading `-` marks it as
+    /// keyword-only (must be called via `-name=value`), but carries no
+    /// meaning for this codebase's simpler binding model once bound (see
+    /// `Evaluator.bindParameters`'s own label-then-positional fallback,
+    /// which already treats every parameter uniformly regardless of how
+    /// it was declared). Left alone, this reconstruction's throwaway
+    /// `ExpressionParser` sub-parse tokenizes `-name` as a `.named`
+    /// token -- the SAME token a real CALL SITE's `-name=value` produces
+    /// -- and `parseArguments`'s `.named` handling expects the value to
+    /// follow `=` DIRECTLY; a signature's `::type` sitting in between
+    /// desyncs it badly enough that the whole reconstructed parse stops
+    /// matching `.call(...)`, silently discarding EVERY parameter (found
+    /// live: zeroloop/ds's `ds.lasso`, `oncreate`'s 14-parameter "core
+    /// inline params" overload -- confirmed via a minimal repro that
+    /// even a SINGLE `-datasource::string='mysqlds'` parameter alone
+    /// reproduces it). Fixed here rather than in the shared
+    /// `ExpressionParser.parseArguments`/`.named` handling itself, which
+    /// stays completely unchanged and correct for its real job (real
+    /// call-site `-name=value` arguments, used constantly throughout
+    /// this codebase) -- this strips the leading `-` from each
+    /// TOP-LEVEL parameter's name BEFORE reconstruction, so
+    /// `-name::type=default` becomes plain `name::type=default`, which
+    /// already parses correctly via the ordinary (non-`.named`)
+    /// `::`/`=` expression grammar, exactly like a non-keyword parameter
+    /// with the same shape.
+    ///
+    /// Comment/quote/nesting-aware (learned from this same session's
+    /// `readBalanced` comment-desync bug) so a `-` inside a string
+    /// literal default, a comment between parameters, or a negative-
+    /// number default nested inside a parenthesized/bracketed
+    /// sub-expression is never mistaken for a new parameter's own
+    /// leading dash -- only a `-` immediately at a top-level parameter
+    /// boundary (the very start of `body`, or right after a top-level
+    /// `,`) followed by a letter qualifies.
+    private func stripKeywordParameterDashes(_ body: String) -> String {
+        let characters = Array(body)
+        var result = ""
+        result.reserveCapacity(characters.count)
+        var index = 0
+        var quote: Character?
+        var depth = 0
+        var atParameterStart = true
+
+        while index < characters.count {
+            let character = characters[index]
+
+            if let activeQuote = quote {
+                result.append(character)
+                if character == activeQuote { quote = nil }
+                index += 1
+                continue
+            }
+            if character == "'" || character == "\"" || character == "`" {
+                quote = character
+                result.append(character)
+                index += 1
+                atParameterStart = false
+                continue
+            }
+            if character == "/", index + 1 < characters.count, characters[index + 1] == "/" {
+                while index < characters.count, characters[index] != "\n" {
+                    result.append(characters[index])
+                    index += 1
+                }
+                continue
+            }
+            if character == "/", index + 1 < characters.count, characters[index + 1] == "*" {
+                result.append(characters[index])
+                result.append(characters[index + 1])
+                index += 2
+                while index + 1 < characters.count, !(characters[index] == "*" && characters[index + 1] == "/") {
+                    result.append(characters[index])
+                    index += 1
+                }
+                if index + 1 < characters.count {
+                    result.append(characters[index])
+                    result.append(characters[index + 1])
+                    index += 2
+                } else {
+                    index = characters.count
+                }
+                continue
+            }
+            if character == "(" || character == "[" || character == "{" {
+                depth += 1
+                result.append(character)
+                index += 1
+                atParameterStart = false
+                continue
+            }
+            if character == ")" || character == "]" || character == "}" {
+                depth = max(depth - 1, 0)
+                result.append(character)
+                index += 1
+                atParameterStart = false
+                continue
+            }
+            if character == ",", depth == 0 {
+                result.append(character)
+                index += 1
+                atParameterStart = true
+                continue
+            }
+            if character.isWhitespace {
+                result.append(character)
+                index += 1
+                continue
+            }
+            if atParameterStart, depth == 0, character == "-",
+               index + 1 < characters.count, characters[index + 1].isLetter {
+                index += 1
+                atParameterStart = false
+                continue
+            }
+            result.append(character)
+            index += 1
+            atParameterStart = false
+        }
+        return result
     }
 
     private mutating func skipTrivia() {

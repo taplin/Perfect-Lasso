@@ -386,7 +386,7 @@ struct ScriptBodyParser {
         var parameters: [LassoArgument] = []
         if index < characters.count, characters[index] == "(" {
             let body = readBalanced(open: "(", close: ")")
-            parameters = parseCallArguments(name: name, body: body)
+            parameters = parseSignatureParameters(name: name, body: body)
             skipHorizontalWhitespace()
         }
 
@@ -1156,10 +1156,124 @@ struct ScriptBodyParser {
         // `TypeBodyParser.parseCallArguments`'s identical fix/comment: a
         // setter-style name ending in `=` would otherwise reconstruct as
         // an ASSIGNMENT (`name = (body)`) rather than a call.
+        //
+        // ORDINARY call-argument lists only (`else(...)`/`case(...)`/
+        // every `parseBlockOpening`/`parseIfOpening` tag call, e.g.
+        // `loop(-count=3)`) -- deliberately NOT used for the top-level
+        // `define name(-kw::type=default) => ...` SIGNATURE case, which
+        // needs `parseSignatureParameters` below instead. See
+        // `TypeBodyParser.parseCallArguments`'s identical split and its
+        // own doc comment for the real regression this avoids
+        // (`loop(-count=3)`'s `-count` label getting silently stripped).
         var parser = ExpressionParser("__scriptBodyParserParams__(\(body))")
         let expression = parser.parseExpression()
         guard case let .call(_, arguments) = expression else { return [] }
         return arguments
+    }
+
+    /// SIGNATURE-only sibling of `parseCallArguments` just above -- used
+    /// exclusively for `parseDefineOpening`'s own top-level (unbound)
+    /// parameter-list declaration, never for an ordinary call's
+    /// arguments. See `stripKeywordParameterDashes`'s own doc comment.
+    private func parseSignatureParameters(name: String, body: String) -> [LassoArgument] {
+        var parser = ExpressionParser("__scriptBodyParserParams__(\(stripKeywordParameterDashes(body)))")
+        let expression = parser.parseExpression()
+        guard case let .call(_, arguments) = expression else { return [] }
+        return arguments
+    }
+
+    /// See `TypeBodyParser.stripKeywordParameterDashes`'s own doc
+    /// comment for the full rationale -- identical fix, duplicated here
+    /// rather than shared, matching this codebase's existing
+    /// `readBalanced`-style per-parser duplication convention. Fixes
+    /// top-level (unbound) `define name(-kw::type=default) => ...`
+    /// signatures the same way its type-body sibling fixes bound method
+    /// signatures.
+    private func stripKeywordParameterDashes(_ body: String) -> String {
+        let characters = Array(body)
+        var result = ""
+        result.reserveCapacity(characters.count)
+        var index = 0
+        var quote: Character?
+        var depth = 0
+        var atParameterStart = true
+
+        while index < characters.count {
+            let character = characters[index]
+
+            if let activeQuote = quote {
+                result.append(character)
+                if character == activeQuote { quote = nil }
+                index += 1
+                continue
+            }
+            if character == "'" || character == "\"" || character == "`" {
+                quote = character
+                result.append(character)
+                index += 1
+                atParameterStart = false
+                continue
+            }
+            if character == "/", index + 1 < characters.count, characters[index + 1] == "/" {
+                while index < characters.count, characters[index] != "\n" {
+                    result.append(characters[index])
+                    index += 1
+                }
+                continue
+            }
+            if character == "/", index + 1 < characters.count, characters[index + 1] == "*" {
+                result.append(characters[index])
+                result.append(characters[index + 1])
+                index += 2
+                while index + 1 < characters.count, !(characters[index] == "*" && characters[index + 1] == "/") {
+                    result.append(characters[index])
+                    index += 1
+                }
+                if index + 1 < characters.count {
+                    result.append(characters[index])
+                    result.append(characters[index + 1])
+                    index += 2
+                } else {
+                    index = characters.count
+                }
+                continue
+            }
+            if character == "(" || character == "[" || character == "{" {
+                depth += 1
+                result.append(character)
+                index += 1
+                atParameterStart = false
+                continue
+            }
+            if character == ")" || character == "]" || character == "}" {
+                depth = max(depth - 1, 0)
+                result.append(character)
+                index += 1
+                atParameterStart = false
+                continue
+            }
+            if character == ",", depth == 0 {
+                result.append(character)
+                index += 1
+                atParameterStart = true
+                continue
+            }
+            if character.isWhitespace {
+                result.append(character)
+                index += 1
+                continue
+            }
+            if atParameterStart, depth == 0, character == "-",
+               index + 1 < characters.count, characters[index + 1].isLetter {
+                index += 1
+                atParameterStart = false
+                continue
+            }
+            result.append(character)
+            index += 1
+            atParameterStart = false
+        }
+        return result
     }
 
     private mutating func readIdentifier() -> String {
