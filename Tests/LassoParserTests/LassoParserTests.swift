@@ -1982,6 +1982,53 @@ import PerfectSessionCore
     #expect(output.trimmingCharacters(in: .whitespacesAndNewlines) == "SQL")
 }
 
+@Test func ternaryConditionAndLeadingQuestionMarkCanSpanSeparateLinesMatchingRealCorpusShape() async throws {
+    // Real corpus shape (zeroloop/ds's activerow.lasso):
+    // `::json_encode->istype` / `? define json_encode->encodeValue(...) => ...`
+    // -- an "operator-led continuation" style where the ternary's `?` opens
+    // the NEXT physical line rather than trailing the condition's own
+    // line. A fourth continuation case, looking FORWARD past the newline
+    // for a bare `?` (unlike the three trailing-character cases just above,
+    // which all look backward at the current line's own end).
+    var context = LassoContext()
+    let output = try await LassoRenderer().render(
+        """
+        <?lassoscript
+        1 == 1
+        ? 'matched'
+        ?>
+        """,
+        context: &context
+    ).trimmingCharacters(in: .whitespacesAndNewlines)
+    #expect(output == "matched")
+}
+
+@Test func ternaryConditionAndLeadingQuestionMarkWithElseBranchAlsoSpansSeparateLines() async throws {
+    var context = LassoContext()
+    let output = try await LassoRenderer().render(
+        """
+        <?lassoscript
+        1 == 2
+        ? 'matched'
+        | 'unmatched'
+        ?>
+        """,
+        context: &context
+    ).trimmingCharacters(in: .whitespacesAndNewlines)
+    #expect(output == "unmatched")
+}
+
+@Test func sameLineTernaryStillWorksAlongsideTheMultiLineTernaryFix() async throws {
+    // Regression guard: the ordinary same-line ternary form (the vast
+    // majority of real corpus usage) must be completely unaffected.
+    var context = LassoContext()
+    let output = try await LassoRenderer().render(
+        "[1 == 1 ? 'matched' | 'unmatched']",
+        context: &context
+    )
+    #expect(output == "matched")
+}
+
 @Test func inlineColonWithParensStillWorksAlongsideTheBareColonCallFix() async throws {
     // Regression guard: `inline:(...)` (colon immediately followed by
     // parens, matching the already-fixed `if:(condition)` shape) is a
