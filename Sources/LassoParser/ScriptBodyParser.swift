@@ -361,13 +361,27 @@ struct ScriptBodyParser {
         guard readKeyword("define") else { return false }
         skipHorizontalWhitespace()
 
-        let name = readIdentifier()
+        var name = readIdentifier()
         guard !name.isEmpty else {
             diagnostics.append(Diagnostic(message: "Malformed 'define': expected a tag name", range: range))
             index = start
             return false
         }
         skipHorizontalWhitespace()
+        // Ch. "Types" > "Custom Getters and Setters": `public firstName=
+        // (value) => {...}` -- a method NAME ending in `=`, called via
+        // `#someone->firstName = "Bob"`. Real corpus (zeroloop/ds's
+        // ds.lasso): `define ds_connections_closed = (p::integer) => ...`
+        // (an UNBOUND, top-level setter-style tag, not a type member).
+        // `!matches("==")`/`!matches("=>")` rule out equality and the
+        // association operator -- a plain `define name => expr` never
+        // reaches here with a bare trailing `=` otherwise, since ordinary
+        // defines always use `=>`, never a lone `=`.
+        if index < characters.count, characters[index] == "=", !matches("=="), !matches("=>") {
+            index += 1
+            name += "="
+            skipHorizontalWhitespace()
+        }
 
         var parameters: [LassoArgument] = []
         if index < characters.count, characters[index] == "(" {
@@ -1118,7 +1132,11 @@ struct ScriptBodyParser {
     }
 
     private func parseCallArguments(name: String, body: String) -> [LassoArgument] {
-        var parser = ExpressionParser("\(name)(\(body))")
+        // A fixed placeholder callee, not `name` itself -- see
+        // `TypeBodyParser.parseCallArguments`'s identical fix/comment: a
+        // setter-style name ending in `=` would otherwise reconstruct as
+        // an ASSIGNMENT (`name = (body)`) rather than a call.
+        var parser = ExpressionParser("__scriptBodyParserParams__(\(body))")
         let expression = parser.parseExpression()
         guard case let .call(_, arguments) = expression else { return [] }
         return arguments

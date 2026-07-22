@@ -84,7 +84,7 @@ struct TypeBodyParser {
 
     private mutating func parseMethod(visibility: LassoMemberVisibility) {
         skipHorizontalWhitespace()
-        let name = readIdentifier()
+        var name = readIdentifier()
         guard name.isEmpty == false else {
             diagnostics.append(Diagnostic(message: "Malformed type method: expected method name", range: range))
             skipLineRemainder()
@@ -92,6 +92,20 @@ struct TypeBodyParser {
         }
 
         skipHorizontalWhitespace()
+        // Ch. "Types" > "Custom Getters and Setters": `public firstName=
+        // (value) => {...}` -- a member method NAME ending in `=`, called
+        // via `#someone->firstName = "Bob"`. Real corpus (zeroloop/ds's
+        // activerow.lasso): `public set=(val,col::tag) => ...`,
+        // `public table=(p::tag) => {...}`, etc. `!matches("==")`/
+        // `!matches("=>")` rule out equality and the association operator
+        // -- an ordinary method signature always reaches its own `=>`
+        // right after the parameter list (or return-type constraint),
+        // never a bare `=` immediately after the name.
+        if index < characters.count, characters[index] == "=", !matches("=="), !matches("=>") {
+            index += 1
+            name += "="
+            skipHorizontalWhitespace()
+        }
         var parameters: [LassoArgument] = []
         if index < characters.count, characters[index] == "(" {
             let body = readBalanced(open: "(", close: ")")
@@ -119,11 +133,21 @@ struct TypeBodyParser {
         if index < characters.count, characters[index] == "{" {
             let bodySource = readBalanced(open: "{", close: "}")
             bodyNodes = parseMethodBody(bodySource)
+            skipLineRemainder()
         } else {
+            // `readStatement()` already consumes through its own
+            // trailing newline (real corpus: a bare-expression-bodied
+            // method, e.g. `public firstName => .'firstName'`, is
+            // usually followed immediately by another method on the
+            // very next line) -- an unconditional `skipLineRemainder()`
+            // here would silently swallow that ENTIRE next line/method,
+            // never reaching `methods.append` for it at all. Found via
+            // a real failing case: a getter/setter pair where the bare-
+            // expression getter's own line-consumption ate the setter
+            // right below it.
             let expressionSource = readStatement()
             bodyNodes = parseExpressionMethodBody(expressionSource)
         }
-        skipLineRemainder()
 
         methods.append(LassoMethodDefinition(
             name: name,
@@ -155,7 +179,15 @@ struct TypeBodyParser {
     }
 
     private func parseCallArguments(name: String, body: String) -> [LassoArgument] {
-        var parser = ExpressionParser("\(name)(\(body))")
+        // A fixed placeholder callee, not `name` itself -- a setter-style
+        // name ending in `=` (`firstName=`) would otherwise reconstruct
+        // as `firstName=(value)`, which `ExpressionParser` reads as an
+        // ASSIGNMENT (`firstName = (value)`, `=` being a real, low-
+        // precedence binary operator in this grammar) rather than a
+        // call, silently producing zero parameters instead of the
+        // intended one. Only `body`'s own content (the parameter list
+        // text) is actually needed here; `name` plays no other role.
+        var parser = ExpressionParser("__typeBodyParserParams__(\(body))")
         let expression = parser.parseExpression()
         guard case let .call(_, arguments) = expression else { return [] }
         return arguments

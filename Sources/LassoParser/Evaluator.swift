@@ -206,8 +206,8 @@ struct Evaluator {
             // second, separate call on its result. Real corpus:
             // includes/detail_by_color.lasso's
             // `#skuItem->second->get:1`.
-            if case let .member(base, name, nil) = callee {
-                return try await member(try await evaluate(base), name, arguments)
+            if case let .member(base, name, nil, isQuoted) = callee {
+                return try await member(try await evaluate(base), name, arguments, isQuoted: isQuoted)
             }
             guard case let .identifier(name) = callee else {
                 // `#cap(...)` — Ch. "Captures": "`#cap() // Shorthand
@@ -267,7 +267,7 @@ struct Evaluator {
                 return try await invokeCustomTag(definition, callArguments: arguments)
             }
             throw LassoRuntimeError.unknownFunction(name)
-        case let .member(base, name, arguments):
+        case let .member(base, name, arguments, isQuoted):
             // Self-mutating methods (`->insert`, `->replace`, etc.) are
             // handled here as *plain, value-returning* calls — real Lasso
             // only suppresses their return value and treats the mutation
@@ -279,7 +279,7 @@ struct Evaluator {
             // `#out = '-' + #out->replace('-','')` reads `->replace`'s
             // result as part of a larger expression, which would silently
             // collapse to `'-' + ''` if this case voided it unconditionally.
-            return try await member(try await evaluate(base), name, arguments ?? [])
+            return try await member(try await evaluate(base), name, arguments ?? [], isQuoted: isQuoted)
         case let .unknown(value):
             if value == "@" {
                 // Lasso 8.5 Language Guide Ch. 15 pp.230-232: `@` is the
@@ -417,7 +417,23 @@ struct Evaluator {
         // `skipIfNonLocalReturnAlreadyPending()` doc comment for the
         // real hazard this guards against (found by architect review).
         if skipIfNonLocalReturnAlreadyPending() { return .void }
-        let (givenBlock, evaluatedCallArguments) = Self.extractGivenBlock(from: try await evaluate(callArguments))
+        return try await invokeCustomTag(definition, evaluatedCallArguments: try await evaluate(callArguments))
+    }
+
+    /// Same dispatch/bind/run pipeline as the raw-`[LassoArgument]`
+    /// overload just above, starting from ALREADY-EVALUATED arguments —
+    /// lets `assignToBarewordOrSetterTag` inject the already-evaluated
+    /// assigned value as an unbound setter-style tag's sole argument
+    /// without a synthetic `LassoExpression` wrapper, the identical
+    /// need `invokeMemberMethod`'s own evaluated-arguments overload
+    /// serves for bound (member) setters — see that overload's own doc
+    /// comment.
+    private mutating func invokeCustomTag(
+        _ definition: LassoCustomTagDefinition,
+        evaluatedCallArguments rawEvaluatedArguments: [EvaluatedArgument]
+    ) async throws -> LassoValue {
+        if skipIfNonLocalReturnAlreadyPending() { return .void }
+        let (givenBlock, evaluatedCallArguments) = Self.extractGivenBlock(from: rawEvaluatedArguments)
         let boundLocals = try await bindParameters(definition.parameters, to: evaluatedCallArguments)
 
         let savedLocals = context.snapshotLocals()
@@ -1572,9 +1588,36 @@ struct Evaluator {
         // own doc comment. `.void` here (not `nil`) — `nil` specifically
         // means "no such method", which would incorrectly redirect the
         // caller to some other fallback dispatch path instead of just
-        // short-circuiting this already-resolved call.
+        // short-circuiting this already-resolved call. Checked BEFORE
+        // evaluating `arguments` (which may have side effects that
+        // shouldn't run mid-unwind) — the `evaluatedArguments` overload
+        // below repeats this same check for its own direct callers,
+        // since it skips this raw-argument evaluation step entirely.
         if skipIfNonLocalReturnAlreadyPending() { return .void }
-        let (givenBlock, evaluatedCallArguments) = Self.extractGivenBlock(from: try await evaluate(arguments))
+        return try await invokeMemberMethod(
+            named: name, on: object, type: type,
+            evaluatedArguments: try await evaluate(arguments), missingIsVoid: missingIsVoid
+        )
+    }
+
+    /// Same dispatch/bind/run pipeline as the raw-`[LassoArgument]`
+    /// overload just above, starting from ALREADY-EVALUATED arguments —
+    /// lets `assign(_:to:defaultScope:)`'s custom-setter dispatch
+    /// (`#obj->name = value`) inject the already-evaluated `value` as
+    /// the setter's first argument without needing a synthetic
+    /// `LassoExpression` wrapper for an arbitrary `LassoValue` (no such
+    /// generic literal-expression case exists in this codebase, since
+    /// every existing caller either has raw source syntax to parse or an
+    /// already-evaluated value in hand, never the reverse).
+    private mutating func invokeMemberMethod(
+        named name: String,
+        on object: LassoObjectInstance,
+        type: LassoTypeDefinition,
+        evaluatedArguments: [EvaluatedArgument],
+        missingIsVoid: Bool = false
+    ) async throws -> LassoValue? {
+        if skipIfNonLocalReturnAlreadyPending() { return .void }
+        let (givenBlock, evaluatedCallArguments) = Self.extractGivenBlock(from: evaluatedArguments)
         guard let resolved = LassoMethodDispatcher.resolve(
             method: name,
             on: type,
@@ -1687,6 +1730,30 @@ struct Evaluator {
         return readValue ?? .void
     }
 
+    /// `name = value` (a bare, unbound target — no `#`/`$` sigil, no
+    /// `->`) checks for a registered custom TAG named `"\(name)="`
+    /// before falling back to an ordinary variable assignment — the
+    /// UNBOUND analog of a member-access setter, for a plain top-level
+    /// `define`d setter-style tag (Ch. "Types" > "Custom Getters and
+    /// Setters" describes the member form; real corpus — zeroloop/ds's
+    /// ds.lasso — applies the identical convention to an UNBOUND tag:
+    /// `define ds_connections_closed = (p::integer) => ...` is called as
+    /// a bare `ds_connections_closed = 1`, not `ds_connections_closed(1)`).
+    /// `context.tagRegistry.tag(named:)` is a single dictionary lookup
+    /// (no arity/overload resolution the way `LassoMethodDispatcher`
+    /// does for member methods) — a custom tag is either registered
+    /// under that exact name or it isn't, so existence alone decides
+    /// whether to call it or fall through to `context.set`.
+    private mutating func assignToBarewordOrSetterTag(
+        _ name: String, value: LassoValue, defaultScope: VariableScope
+    ) async throws {
+        if let definition = context.tagRegistry.tag(named: "\(name)=") {
+            _ = try await invokeCustomTag(definition, evaluatedCallArguments: [EvaluatedArgument(label: nil, value: value)])
+            return
+        }
+        context.set(value, for: name, scope: defaultScope)
+    }
+
     private mutating func assign(
         _ value: LassoValue,
         to target: LassoExpression,
@@ -1713,10 +1780,10 @@ struct Evaluator {
         case let .variable(name, scope):
             context.set(value, for: name, scope: scope == .unscoped ? defaultScope : scope)
         case let .identifier(name):
-            context.set(value, for: name, scope: defaultScope)
+            try await assignToBarewordOrSetterTag(name, value: value, defaultScope: defaultScope)
         case let .string(name):
-            context.set(value, for: name, scope: defaultScope)
-        case let .member(base, name, memberArguments):
+            try await assignToBarewordOrSetterTag(name, value: value, defaultScope: defaultScope)
+        case let .member(base, name, memberArguments, isQuoted):
             let normalizedName = name.lowercased()
             let baseValue: LassoValue
             if case let .identifier(baseName) = base,
@@ -1866,6 +1933,36 @@ struct Evaluator {
             // BLOCKING FIX #1).
             if context.nativeTypes.type(named: object.typeName) != nil {
                 throw LassoRuntimeError.nativeTypeFieldAssignmentNotSupported(typeName: object.typeName, field: name)
+            }
+            // Custom setter methods (Ch. "Types" > "Custom Getters and
+            // Setters": `public firstName=(value) => {...}`, called via
+            // `#someone->firstName = "Bob"`) take priority over a raw
+            // field write, mirroring how a custom GETTER already wins
+            // over raw field reads in the read-dispatch `.object` case
+            // above (`invokeMemberMethod`, checked before `object.value(for:)`).
+            // The assigned `value` becomes the setter's first argument;
+            // any extra arguments already present on the member access
+            // itself (`#someone->firstName("nick") = "Bob"`, the
+            // documented multi-parameter setter calling convention)
+            // follow it, in the order written. `invokeMemberMethod`
+            // returning `nil` means "no such method" (as opposed to a
+            // real call that happened to return `.void`), so THAT specific
+            // case still falls through to the plain field write below —
+            // not every type defines a setter for every property.
+            // `isQuoted` (`.'name' = value`, not `.name = value`) skips
+            // this check entirely and writes the raw field directly —
+            // the write-side half of the documented "use single-quoted
+            // names inside a manual getter/setter" convention (a setter
+            // named "firstName=" writing `.'firstName' = #value`
+            // internally must NOT re-invoke itself).
+            if !isQuoted, let type = context.tagRegistry.type(named: object.typeName) {
+                let evaluatedExtraArguments = try await evaluate(memberArguments ?? [])
+                let setterArguments = [EvaluatedArgument(label: nil, value: value)] + evaluatedExtraArguments
+                if try await invokeMemberMethod(
+                    named: "\(name)=", on: object, type: type, evaluatedArguments: setterArguments
+                ) != nil {
+                    return
+                }
             }
             object.set(value, for: name)
         default:
@@ -2044,7 +2141,8 @@ struct Evaluator {
     private mutating func member(
         _ base: LassoValue,
         _ name: String,
-        _ arguments: [LassoArgument]
+        _ arguments: [LassoArgument],
+        isQuoted: Bool = false
     ) async throws -> LassoValue {
         let normalized = name.lowercased()
         switch (base, normalized) {
@@ -2918,13 +3016,23 @@ struct Evaluator {
             if let introspected = try await introspectionResult(normalized, base, arguments) { return introspected }
             return .null
         case let (.object(object), _):
-            if let nativeMethod = context.nativeTypes.type(named: object.typeName)?.method(named: name) {
-                let evaluatedArguments = try await evaluate(arguments)
-                return try await nativeMethod(object, evaluatedArguments, &context)
-            }
-            if let type = context.tagRegistry.type(named: object.typeName),
-               let value = try await invokeMemberMethod(named: name, on: object, type: type, arguments: arguments) {
-                return value
+            // `isQuoted` (`.'name'`, not `.name`) bypasses BOTH method
+            // checks below entirely, going straight to the raw stored
+            // field — see `LassoExpression.member`'s own doc comment.
+            // This is the read-side half of the documented "use the
+            // single-quoted name syntax inside a manual getter/setter to
+            // avoid infinite recursion" convention (a getter named
+            // "firstName" reading `.'firstName'` internally must NOT
+            // re-invoke itself).
+            if !isQuoted {
+                if let nativeMethod = context.nativeTypes.type(named: object.typeName)?.method(named: name) {
+                    let evaluatedArguments = try await evaluate(arguments)
+                    return try await nativeMethod(object, evaluatedArguments, &context)
+                }
+                if let type = context.tagRegistry.type(named: object.typeName),
+                   let value = try await invokeMemberMethod(named: name, on: object, type: type, arguments: arguments) {
+                    return value
+                }
             }
             // A real native/custom-defined method (checked above) wins
             // over the synthetic introspection tags, which in turn win
@@ -3171,10 +3279,10 @@ struct Evaluator {
         // `('no!smoking!allowed')->(Replace('!','<br>'))`-shaped literal
         // base must still just return its computed value, not attempt a
         // write-back.
-        if case let .member(base, name, arguments) = expression,
+        if case let .member(base, name, arguments, isQuoted) = expression,
            Self.selfMutatingMethods.contains(name.lowercased()),
            case .variable = base {
-            let result = try await member(try await evaluate(base), name, arguments ?? [])
+            let result = try await member(try await evaluate(base), name, arguments ?? [], isQuoted: isQuoted)
             try await assign(result, to: base, defaultScope: .unscoped)
             return .void
         }
