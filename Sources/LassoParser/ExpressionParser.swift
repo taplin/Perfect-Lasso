@@ -660,6 +660,27 @@ struct ExpressionParser {
             expression = .unary(operator: op, value: parseExpression(minimumPrecedence: 8))
         case .symbol("."):
             expression = .member(base: .identifier("self"), name: readMemberName(), arguments: nil)
+        case .symbol("::") where isIdentifierToken(peek):
+            // Ch. "Literals" > "Tag Literals": "A tag is an object that
+            // uniquely represents a particular string of characters...
+            // A tag literal consists of two colons followed by the tag's
+            // characters" (`::name`) -- used throughout real corpus
+            // (zeroloop/ds's `ds.lasso`/`statement.lasso`/`activerow.lasso`)
+            // both as a type reference (`->isa(::ds)`) and as a plain
+            // symbolic constant (`case(::add)`, `thread_var_get(::__ds_results)`).
+            // This codebase has no dedicated `tag` runtime type (see
+            // `Evaluator.introspectionTypeName`'s own doc comment: `->Type`
+            // already collapses type identity down to a plain string as a
+            // disclosed simplification), so a tag literal desugars straight
+            // into an ordinary string literal of its name -- reusing every
+            // existing string-equality code path (`->isa`, `case()`,
+            // `thread_var_get`, `var()`) with no new runtime plumbing,
+            // matching the staticarray-literal fix's precedent immediately
+            // below. Real corpus only ever uses simple identifiers here
+            // (no dotted names), so a following `.` after the identifier is
+            // left to ordinary member-access parsing rather than treated
+            // as part of the tag's own name.
+            expression = .string(readIdentifier())
         case .symbol("(") where peek == .symbol(":"):
             // Ch. "Literals" > "Staticarray Literals": "an open
             // parenthesis immediately followed by a colon, then zero or
@@ -1309,6 +1330,11 @@ struct ExpressionParser {
     mutating private func readIdentifier() -> String {
         guard case let .identifier(name) = advance() else { return "<unknown>" }
         return name
+    }
+
+    private func isIdentifierToken(_ token: Token) -> Bool {
+        if case .identifier = token { return true }
+        return false
     }
 
     mutating private func readMemberName() -> String {
