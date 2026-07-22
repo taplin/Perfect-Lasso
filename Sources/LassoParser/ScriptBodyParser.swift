@@ -788,7 +788,8 @@ struct ScriptBodyParser {
                 // exactly these three cases (and no others) fixes the
                 // multi-line shape without weakening the newline
                 // terminator for ordinary one-statement-per-line code.
-                if !Self.lineContinuesPastNewline(characters, start: start, upTo: index) {
+                if !Self.lineContinuesPastNewline(characters, start: start, upTo: index),
+                   !Self.nextLineStartsWithTernaryOperator(characters, from: index) {
                     break
                 }
             }
@@ -812,6 +813,27 @@ struct ScriptBodyParser {
         }
         guard i >= start else { return false }
         return characters[i] == "," || characters[i] == "+" || characters[i] == ":"
+    }
+
+    /// Real corpus (zeroloop/ds's activerow.lasso): a ternary's condition
+    /// and its leading `?` sometimes sit on SEPARATE physical lines --
+    /// `::json_encode->istype` / `? define json_encode->encodeValue(...) => ...`
+    /// -- an "operator-led continuation" style distinct from the three
+    /// trailing-character cases `lineContinuesPastNewline` above covers
+    /// (which all look BACKWARD at the current line's own end). This looks
+    /// FORWARD instead: a bare `?` or `|` (the ternary's condition/else
+    /// separators -- `cond ? whenTrue | whenElse`) as the first
+    /// non-whitespace character on the very next line means the PREVIOUS
+    /// line's statement isn't actually finished yet. Neither token is
+    /// otherwise a valid statement-starter in this language, so this is
+    /// unambiguous regardless of whether a lone `|` happens to be the
+    /// first half of a `||` compound token.
+    private static func nextLineStartsWithTernaryOperator(_ characters: [Character], from newlineIndex: Int) -> Bool {
+        var i = newlineIndex + 1
+        while i < characters.count, characters[i] == " " || characters[i] == "\t" || characters[i] == "\r" {
+            i += 1
+        }
+        return i < characters.count && (characters[i] == "?" || characters[i] == "|")
     }
 
     /// Reads up to (not including) a case-insensitive, word-boundary match
