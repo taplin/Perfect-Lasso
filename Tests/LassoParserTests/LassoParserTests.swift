@@ -1942,6 +1942,60 @@ import PerfectSessionCore
     #expect(output.trimmingCharacters(in: .whitespacesAndNewlines) == "SQL")
 }
 
+@Test func inlineArrowBlockToleratesAutoCollectCaretMarkers() async throws {
+    // Real corpus shape (TS_lasso9, near-universal across the site):
+    // `inline(...)=>{^ ... ^}` -- `{^ ... ^}` is real, documented Lasso 9
+    // syntax for an "auto-collect capture" (Ch. "Captures"), but for a
+    // TagCatalog block tag like `inline` the body is always rendered as
+    // template content via `Renderer.render(body)` -- there's no separate
+    // capture object whose auto-collected value could ever be consumed,
+    // so the `^` markers just need to be tolerated (consumed), not given
+    // new semantics. Previously `consumeArrowBlockStartIfPresent` only
+    // consumed the opening `{` (leaving a bare `^` to be parsed as the
+    // start of the next statement, failing as unsupportedExpression("^")),
+    // and `parseIgnoredBrace` only recognized a plain `}` (not `^}`).
+    let scriptInline = """
+    <?LassoScript
+    inline(-database='catalog_mysql', -table='skus', -sql='SELECT 1;')=>{^
+        action_statement;
+    ^}
+    ?>
+    """
+
+    struct InlineProvider: LassoInlineProvider {
+        func executeInline(arguments: [EvaluatedArgument], context: LassoContext) async throws -> LassoInlineFrame {
+            LassoInlineFrame(rows: [], actionStatement: "SQL")
+        }
+    }
+
+    var context = LassoContext(inlineProvider: InlineProvider())
+    let output = try await LassoRenderer().render(scriptInline, context: &context)
+    #expect(output.trimmingCharacters(in: .whitespacesAndNewlines) == "SQL")
+}
+
+@Test func inlineArrowBlockAutoCollectMarkersWorkOnAnEmptyBody() async throws {
+    // Real corpus shape (TS_lasso9's courts/main.lasso, index.lasso, and
+    // others): `inline(...)=>{^\n^}` -- a genuinely empty auto-collect
+    // body, nothing but whitespace between the two markers.
+    let scriptInline = """
+    <?LassoScript
+    inline(-database='catalog_mysql', -table='skus', -sql='SELECT 1;')=>{^
+    ^}
+    'after'
+    ?>
+    """
+
+    struct InlineProvider: LassoInlineProvider {
+        func executeInline(arguments: [EvaluatedArgument], context: LassoContext) async throws -> LassoInlineFrame {
+            LassoInlineFrame(rows: [])
+        }
+    }
+
+    var context = LassoContext(inlineProvider: InlineProvider())
+    let output = try await LassoRenderer().render(scriptInline, context: &context)
+    #expect(output.trimmingCharacters(in: .whitespacesAndNewlines) == "after")
+}
+
 @Test func inlineBareColonCallArgumentFoldsJuxtaposedStringConcatenation() async throws {
     // Was a deliberately-deferred gap (found live-verifying the
     // bareBlockNames/line-continuation fixes above against the real corpus
