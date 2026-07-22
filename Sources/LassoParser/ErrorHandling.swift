@@ -10,28 +10,23 @@ import Foundation
 /// unreadably) and, for the handful only documented on the Lasso 9
 /// side, lassoguide.com's own "Lasso Error Codes and Messages" table.
 ///
-/// Deliberately NOT implemented this stage, disclosed rather than
-/// silently dropped: `Handle`/`Handle_Error` container-tag blocks and
-/// `Protect`'s own queued-callback-at-block-end execution of them.
-/// Real Lasso's `Handle` blocks are collected as the enclosing
-/// container/page executes and run — each independently, conditionally,
-/// in registration order — only once that container finishes OR a
-/// `Fail` is triggered inside it; `Fail` itself halts the REST of the
-/// current container's statements and jumps straight to those handlers.
-/// That's a materially different mechanism from `protect`'s existing
-/// simple try/catch (`Renderer.swift`'s own `"protect"` case) — it
-/// needs new per-container deferred-callback-queue state in the
-/// renderer plus a new control-flow signal for `Fail`'s "halt and jump"
-/// behavior, distinct from both `LassoRecoverableError` (a plain thrown
-/// Swift error, which is what `fail`/`fail_if` below actually throw)
-/// and the existing `returnSignal` short-circuit. `fail`/`fail_if`
-/// still provide real, working value without it: thrown inside an
-/// existing `[Protect]...[/Protect]` block, they're already caught and
-/// halt just that block, matching a real (if incomplete) subset of the
-/// documented behavior — a `Fail` with no enclosing `Protect` and no
-/// `Handle` propagates as an unhandled `LassoRecoverableError`, which
-/// is the correct "unrecoverable" outcome for that case per the Guide's
-/// own first documented use ("To report an unrecoverable error").
+/// `handle`/`handle_failure` (Ch. "Error Handling") are now implemented
+/// too — see `Evaluator.registerHandle`/`drainPendingHandlers` and
+/// `Renderer.render(_:)`'s own doc comment. Deliberately narrower than
+/// the full documented mechanism: each `Renderer.render(_:)` call is its
+/// own "container" (registration scope), drained (handlers invoked in
+/// registration order, `handle_failure` only on an actual failure) once
+/// that call finishes — whether normally or via a thrown error — and the
+/// original error, if any, always propagates unchanged afterward. What's
+/// still NOT implemented: `Fail`'s documented "halt the rest of the
+/// current container's statements and jump straight to its handlers"
+/// control-flow signal — `fail`/`fail_if` still just throw the existing
+/// `LassoRecoverableError` (a plain thrown Swift error), which this
+/// codebase's ordinary error propagation already carries up through
+/// enclosing `render(_:)` calls (now draining `handle` along the way)
+/// to `protect` or an unhandled failure exactly as before. No corpus
+/// evidence has needed the distinction between that and a genuine
+/// "jump directly to the handlers, skip everything in between" signal.
 enum LassoErrorHandling {
     /// Verified against Appendix A Table 1 (pp. 822-824) unless noted.
     enum Code {

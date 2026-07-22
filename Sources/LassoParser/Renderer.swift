@@ -89,7 +89,41 @@ private struct RendererEngine {
         }
     }
 
+    /// Ch. "Error Handling" > "handle and handle_failure": pushes a fresh
+    /// `LassoContext.pendingHandlerFrames` frame before rendering `nodes`
+    /// and drains it (running any `handle`/`handle_failure` blocks
+    /// registered during this exact call, in registration order) once
+    /// `nodes` finishes — whether that's a normal return or a thrown
+    /// error unwinding through it. This makes every nested body this
+    /// codebase renders (a loop iteration, an invoked capture, the
+    /// top-level page — `render(_:)` is the single choke point all of
+    /// them go through) its own independent "handle" registration scope,
+    /// matching the Guide's own "container" wording with no separate
+    /// per-construct logic needed.
+    ///
+    /// On the error path, handlers still run (so side-effecting cleanup —
+    /// e.g. `error_msg`-based logging — still gets a chance to execute,
+    /// per the Guide's own examples) but their own rendered text output
+    /// is deliberately discarded rather than threaded onto the eventual
+    /// thrown-error path: real Lasso replaces an unprotected failing
+    /// page's output with an error message rather than appending to it,
+    /// and this codebase's existing render()/protect() plumbing has no
+    /// channel for a thrown call to also return a partial string. The
+    /// original error always propagates unchanged afterward — `handle`
+    /// observes a failure, it never swallows one (that stays `protect`'s
+    /// job, unaffected by this).
     mutating func render(_ nodes: [LassoNode]) async throws -> String {
+        evaluator.context.pushHandlerFrame()
+        do {
+            let output = try await renderBody(nodes)
+            return output + (try await evaluator.drainPendingHandlers(afterError: nil))
+        } catch {
+            _ = try? await evaluator.drainPendingHandlers(afterError: error)
+            throw error
+        }
+    }
+
+    private mutating func renderBody(_ nodes: [LassoNode]) async throws -> String {
         var output = ""
         for node in nodes {
             do {

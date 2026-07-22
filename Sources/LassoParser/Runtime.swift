@@ -2198,6 +2198,33 @@ public struct LassoContext: Sendable {
     /// invocation implicitly runs inside its own capture (this codebase
     /// never materializes a `LassoCaptureValue` for a plain method call).
     var currentCaptureStack: [LassoCaptureValue] = []
+    /// Ch. "Error Handling" > "handle and handle_failure" — one frame per
+    /// active `Renderer.render(_:)` call (pushed/drained there), matching
+    /// the Guide's own "container" wording: "When used within any Lasso
+    /// capture block, the code inside the handle methods will be
+    /// conditionally executed after the capture block is executed" —
+    /// since `render(_:)` is the single choke point every capture/block/
+    /// page body in this codebase renders through, one frame per call
+    /// naturally gives each nested body (a loop iteration, an invoked
+    /// capture, the top-level page) its own independent registration
+    /// scope, with no separate "what kind of container is this" logic
+    /// needed. See `LassoPendingHandler`'s own doc comment for what gets
+    /// stored and `Renderer.render(_:)` for where frames are drained.
+    var pendingHandlerFrames: [[LassoPendingHandler]] = []
+
+    mutating func pushHandlerFrame() {
+        pendingHandlerFrames.append([])
+    }
+
+    mutating func registerHandler(_ handler: LassoPendingHandler) {
+        guard !pendingHandlerFrames.isEmpty else { return }
+        pendingHandlerFrames[pendingHandlerFrames.count - 1].append(handler)
+    }
+
+    @discardableResult
+    mutating func popHandlerFrame() -> [LassoPendingHandler] {
+        pendingHandlerFrames.popLast() ?? []
+    }
     /// Real Lasso's request-local `error_currentError` state — reset to
     /// `.noError` on every fresh context, updated by `setError`/`clearError`.
     /// `lastError` preserves the previous error across a `clearError()` call,

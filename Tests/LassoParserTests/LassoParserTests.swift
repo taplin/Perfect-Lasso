@@ -5614,6 +5614,112 @@ final class FullyRecordingResponseSink: LassoResponseSink, @unchecked Sendable {
     }
 }
 
+// MARK: - handle / handle_failure
+
+@Test func handleRunsAfterNormalCompletionOfItsEnclosingBlock() async throws {
+    // Ch. "Error Handling" > "handle and handle_failure": "the code
+    // inside the handle methods will be conditionally executed after the
+    // capture block is executed" -- registered inside an `if` block here
+    // (any block, per the Guide's own wording, not just a page), runs
+    // once that block finishes, its own output appended normally since
+    // nothing failed.
+    // Registering handle produces no output of its own at the point it's
+    // written -- its capture's text only appears once the ENCLOSING
+    // block (`if`, here) finishes rendering, appended after everything
+    // else that block already produced.
+    var context = LassoContext()
+    let output = try await LassoRenderer().render(
+        "before-[if(true)]during-mid[handle => {'-H'}][/if]-after",
+        context: &context
+    )
+    #expect(output == "before-during-mid-H-after")
+}
+
+@Test func handleRunsOnAThrownErrorAndObservesItViaErrorMsgWithoutSwallowingIt() async throws {
+    // The real evidenced corpus need (zeroloop/ds's own _init.lasso,
+    // Task #178): handle registered before a call that fails, using
+    // error_msg to describe what happened -- handle must NOT swallow the
+    // failure (`protect` stays the only thing that does that); the same
+    // error still propagates afterward.
+    var natives = LassoNativeRegistry()
+    natives.register("fail_with_db_error") { _, _ in
+        throw LassoRecoverableError(LassoErrorState(code: 42, message: "Add failed", kind: "add"))
+    }
+    var context = LassoContext(natives: natives)
+    await #expect(throws: LassoRecoverableError(LassoErrorState(code: 42, message: "Add failed", kind: "add"))) {
+        _ = try await LassoRenderer().render(
+            "[handle => {var(sawError) = error_msg}][fail_with_db_error]",
+            context: &context
+        )
+    }
+    #expect(context.value(for: "sawError", scope: .global) == .string("Add failed"))
+}
+
+@Test func handleConditionSkipsExecutionWhenFalse() async throws {
+    // "can take a single parameter that is a conditional expression,
+    // defaulting to true. If the conditional expression evaluates as
+    // true, the code in the given capture block is executed."
+    var context = LassoContext()
+    let output = try await LassoRenderer().render(
+        "[handle(false) => {'H'}]visible",
+        context: &context
+    )
+    #expect(output == "visible")
+}
+
+@Test func handleFailureOnlyRunsWhenItsEnclosingBlockActuallyFailed() async throws {
+    var natives = LassoNativeRegistry()
+    natives.register("fail_with_db_error") { _, _ in
+        throw LassoRecoverableError(LassoErrorState(code: 1, message: "boom", kind: "custom"))
+    }
+    var cleanContext = LassoContext()
+    let cleanOutput = try await LassoRenderer().render(
+        "[handle_failure => {'H'}]clean",
+        context: &cleanContext
+    )
+    #expect(cleanOutput == "clean")
+
+    var failingContext = LassoContext(natives: natives)
+    await #expect(throws: LassoRecoverableError(LassoErrorState(code: 1, message: "boom", kind: "custom"))) {
+        _ = try await LassoRenderer().render(
+            "[handle_failure => {var(ranHandleFailure) = true}][fail_with_db_error]",
+            context: &failingContext
+        )
+    }
+    #expect(failingContext.value(for: "ranHandleFailure", scope: .global) == .boolean(true))
+}
+
+@Test func multipleHandlesRunInRegistrationOrder() async throws {
+    var context = LassoContext()
+    let output = try await LassoRenderer().render(
+        "[handle => {'first;'}][handle => {'second;'}]body-",
+        context: &context
+    )
+    #expect(output == "body-first;second;")
+}
+
+@Test func handleRegisteredInsideAWithDoLoopIterationRunsOncePerIterationMatchingRealCorpusShape() async throws {
+    // Real corpus shape (zeroloop/ds LassoApp's own _init.lasso): handle
+    // registered fresh each loop iteration, only observing/logging that
+    // ONE iteration's own outcome -- not accumulating across iterations,
+    // and not leaking into a later iteration's own handle registration.
+    var context = LassoContext()
+    let output = try await LassoRenderer().render(
+        """
+        <?lassoscript
+        with file in array('a.lasso', 'b.lasso') do {
+            handle => {
+                ' [handled ' + #file + ']'
+            }
+            #file + ';'
+        }
+        ?>
+        """,
+        context: &context
+    )
+    #expect(output == "a.lasso; [handled a.lasso]b.lasso; [handled b.lasso]")
+}
+
 @Test func errorCurrentErrorDefaultsToNoErrorAndInlineFramesUpdateIt() async throws {
     // Milestone 3/4: a fresh context starts at real Lasso's "No Error"
     // state, and pushing an inline frame (the mechanism every inline
