@@ -1947,6 +1947,8 @@ public struct LassoNativeRegistry: Sendable {
         }
         LassoFileOperations.registerDefaultFunctions(into: &self)
         LassoErrorHandling.registerDefaultFunctions(into: &self)
+        LassoLcapiDatasourceConstants.registerDefaultFunctions(into: &self)
+        LassoMysqldsConnector.registerDefaultFunctions(into: &self)
     }
 }
 
@@ -2973,6 +2975,28 @@ public enum LassoRuntimeError: Error, Equatable {
     /// overrode it. Same "adapter-configuration gap, not an ordinary
     /// expected runtime failure" rationale as `emailSMTPNotSupportedByProvider`.
     case emailResultNotSupportedByProvider
+    /// Thrown by the `mysqlds` connector tag's low-level bridge (real
+    /// corpus: zeroloop/ds's `.'capi'->invoke(#dsinfo)`) when
+    /// `dsinfo->action` names an LCAPI action this first pass doesn't
+    /// implement yet (only `lcapi_datasourcesearch`/`lcapi_datasourcefindall`
+    /// are — see `MysqldsConnector.swift`'s own doc comment for the full
+    /// scope decision). Carries the action's registered constant name
+    /// (e.g. `"lcapi_datasourceadd"`) reverse-looked-up from its integer
+    /// value, so the error names what was actually requested.
+    case datasourceUnsupportedAction(String)
+    /// Same shape as `.datasourceUnsupportedAction`, for an
+    /// `lcapi_datasourceop*` operator constant in a `dsinfo->keycolumns`
+    /// tuple that `PerfectCRUDLassoExecutor`'s own recognized `-Op` alias
+    /// set has no equivalent for (`opft`/`oprx`/`opnrx` — full-text/regex
+    /// matching, not supported by the underlying SQL executor at all).
+    case datasourceUnsupportedOperator(String)
+    /// `dsinfo->keycolumns`' tuple shape wasn't the `(fieldName::string,
+    /// operator::integer, value)` form the `mysqlds` connector's first
+    /// pass supports — see `MysqldsConnector.swift`'s own doc comment for
+    /// why the alternate "value-only, no field name" shape real corpus's
+    /// `keyvalue(p::string)`/`keyvalue(p::tag)` helpers can produce is a
+    /// disclosed, deliberate gap rather than a guessed-at mapping.
+    case datasourceMalformedKeyColumn
     /// Thrown by `LassoEmailProvider`'s default `status` implementation
     /// (`Providers.swift`) — same rationale as `emailResultNotSupportedByProvider`.
     case emailStatusNotSupportedByProvider

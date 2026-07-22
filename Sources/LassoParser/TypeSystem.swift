@@ -149,6 +149,34 @@ struct LassoMethodDispatcher {
     static func matches(typeConstraint: String, value: LassoValue) -> Bool {
         let normalized = typeConstraint.lowercased()
         if normalized == "any" { return true }
+        // Trait constraints (Ch. "Traits" — `trait_searchable`,
+        // `trait_positionallykeyed`, etc.) describe an INTERFACE a value
+        // must satisfy, not a concrete type name — this codebase has no
+        // trait/protocol-conformance system to check structurally
+        // against, so (matching the established "type constraints are
+        // parsed and discarded where they can't be meaningfully
+        // enforced" precedent used elsewhere in this codebase) any
+        // `trait_*` constraint is accepted permissively rather than
+        // rejecting a real value that would satisfy it. Found live: real
+        // corpus (zeroloop/ds's `ds_result.lasso`) declares its own
+        // 8-parameter constructor as `index::trait_searchable,
+        // cols::trait_positionallykeyed, ...` — rejecting these silently
+        // dropped the WHOLE `oncreate` candidate from dispatch (`resolve`
+        // filters out any `score(...) == nil` candidate entirely), so
+        // `instantiate` found no matching overload and simply never ran
+        // it, leaving every data member at its bare `.null` default with
+        // no error at all — exactly the kind of silent-wrong-result this
+        // project's own conventions try hard to avoid.
+        if normalized.hasPrefix("trait_") { return true }
+        // `staticarray` is aliased to this codebase's ordinary `.array`
+        // runtime representation everywhere else a `staticarray`-typed
+        // VALUE is constructed/assigned (see
+        // `[[lasso-staticarray-future-enhancement]]`) — a PARAMETER
+        // constrained to `::staticarray` must accept the exact same
+        // `.array` values that alias already produces, or (same finding
+        // as `trait_*` above, same real corpus source) every method
+        // declaring one silently never matches.
+        if normalized == "staticarray" { return value.typeName == "array" }
         return value.typeName.caseInsensitiveCompare(normalized) == .orderedSame
     }
 
