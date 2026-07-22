@@ -1690,9 +1690,16 @@ struct LassoSiteServer: Sendable {
             }
             let fileURL = try fileURL(for: path)
             resolvedFileURL = fileURL
-            if shouldRender(fileURL, path: path) {
+            // path is empty (or directory-shaped) exactly when directory-
+            // index resolution picked the actual file -- recover its real
+            // relative path so shouldRender's exclude-match and render's
+            // includePath reflect what was actually served, not the empty
+            // string that located it.
+            let effectivePath = (path.isEmpty || path.hasSuffix("/")) ? relativePath(of: fileURL) : path
+            resolvedPath = effectivePath
+            if shouldRender(fileURL, path: effectivePath) {
                 let postBody = try await readPostBody(request: request)
-                return try await render(fileURL: fileURL, request: request, includePath: path, postBody: postBody)
+                return try await render(fileURL: fileURL, request: request, includePath: effectivePath, postBody: postBody)
             }
             return try FileOutput(localPath: fileURL.path)
         } catch let error as ErrorOutput {
@@ -1802,17 +1809,42 @@ struct LassoSiteServer: Sendable {
         }
     }
 
-    private func resolveRequestPath(_ trailingPath: String) throws -> String {
-        let raw = trailingPath.isEmpty ? "index.lasso" : trailingPath
-        let decoded = raw.removingPercentEncoding ?? raw
-        let normalized = decoded.split(separator: "/").reduce(into: [String]()) { parts, component in
+    func resolveRequestPath(_ trailingPath: String) throws -> String {
+        // Deliberately does NOT hardcode "index.lasso" for an empty/root
+        // path -- that used to short-circuit fileURL(for:)'s own directory-
+        // index fallback (directoryIndexURL(for:), which already tries
+        // index.html/index.htm/etc.) by handing it a literal "index.lasso"
+        // relative path that doesn't exist, throwing notFound before the
+        // fallback list was ever consulted. Real corpus: a site with only
+        // index.html (no .lasso files at all) got "File not found:
+        // index.lasso" for every request to "/", even though the exact
+        // same fallback search already succeeds for any OTHER directory
+        // request (e.g. "/sub/") because those correctly pass an empty
+        // relativePath into fileURL(for:) today. Returning the normalized
+        // (possibly empty) path here, unconditionally, makes the root case
+        // go through the identical, already-correct directory-index path.
+        let decoded = trailingPath.removingPercentEncoding ?? trailingPath
+        return decoded.split(separator: "/").reduce(into: [String]()) { parts, component in
             switch component {
             case "", ".": break
             case "..": _ = parts.popLast()
             default: parts.append(String(component))
             }
         }.joined(separator: "/")
-        return normalized.isEmpty ? "index.lasso" : normalized
+    }
+
+    /// The site-root-relative path of an already-resolved file URL, in the
+    /// same slash-joined, no-leading-slash shape `resolveRequestPath`
+    /// produces (matches `CrawlReport.discoverPaths`' `relativePath` shape,
+    /// per `shouldRender`'s own doc comment below). Used to recover a real,
+    /// reportable path after directory-index resolution has picked an
+    /// actual file for an originally empty/directory request -- so
+    /// `render`'s `includePath` and error reporting still show the file
+    /// that was actually served, not the empty string that located it.
+    func relativePath(of url: URL) -> String {
+        let rootPath = config.siteRoot.path.hasSuffix("/") ? config.siteRoot.path : config.siteRoot.path + "/"
+        guard url.path.hasPrefix(rootPath) else { return url.path }
+        return String(url.path.dropFirst(rootPath.count))
     }
 
     /// A non-throwing existence check mirroring `fileURL(for:)`'s own
@@ -1829,7 +1861,7 @@ struct LassoSiteServer: Sendable {
         return FileManager.default.fileExists(atPath: candidate.path, isDirectory: &isDirectory) && isDirectory.boolValue == false
     }
 
-    private func fileURL(for relativePath: String) throws -> URL {
+    func fileURL(for relativePath: String) throws -> URL {
         let candidate = config.siteRoot
             .appendingPathComponent(relativePath)
             .standardizedFileURL
@@ -1850,8 +1882,8 @@ struct LassoSiteServer: Sendable {
         throw ErrorOutput(status: .notFound, description: "File not found: \(relativePath)")
     }
 
-    private func directoryIndexURL(for directory: URL) throws -> URL {
-        for name in ["index.lasso", "index.html", "default.lasso", "default.html"] {
+    func directoryIndexURL(for directory: URL) throws -> URL {
+        for name in ["index.lasso", "index.html", "index.htm", "default.lasso", "default.html", "default.htm"] {
             let candidate = directory.appendingPathComponent(name)
             if FileManager.default.fileExists(atPath: candidate.path) {
                 return candidate
