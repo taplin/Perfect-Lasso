@@ -2,16 +2,9 @@
 
 Maintainer runbook for tagging a `lasso-perfect-server` release and publishing its source tarball, per `Documentation/release-target-plan.md`'s build-from-source distribution model. Not needed by anyone just building/running this project — see the root [`README.md`](../README.md) for that.
 
-## Prerequisite — has this repo actually been pushed to GitHub yet?
+## Prerequisite — pushed to GitHub
 
-**As of this writing, it has not.** Unlike every sibling Perfect-Resurrection library (`Perfect-SMTP`, `Perfect-MySQL`, etc., all already at `github.com/taplin/*`), `Perfect-Lasso` itself has no `origin` remote configured and no repository exists yet at `github.com/taplin/Perfect-Lasso`. Nothing below works until that's done. When ready (a separate, explicit decision — creating a new public repo is its own visible action, not something to do as a side effect of following this runbook):
-
-```bash
-gh repo create taplin/Perfect-Lasso --public --source=. --remote=origin
-git push -u origin main
-```
-
-(Use `--private` instead of `--public` if a private repo is wanted — confirm which before running either way.)
+`taplin/Perfect-Lasso` is public and live, matching every sibling Perfect-Resurrection library. `origin` is already configured; `main` is pushed and tracked.
 
 ## Version scheme
 

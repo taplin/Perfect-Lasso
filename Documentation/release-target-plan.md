@@ -49,7 +49,7 @@ GitHub already auto-generates and attaches "Source code (zip)"/"Source code (tar
 
 **Full step-by-step runbook (pre-flight checks, the actual tag/release commands, post-release verification, and rollback): [`Documentation/releasing.md`](releasing.md).**
 
-**Real, previously-unknown blocker found while writing that runbook**: `Perfect-Lasso` itself has never been pushed to GitHub at all. Confirmed directly — `git remote -v` in the canonical repo returns nothing, and `gh repo view taplin/Perfect-Lasso` fails with "Could not resolve to a Repository." This is unlike every sibling Perfect-Resurrection library (`Perfect-SMTP`, `Perfect-MySQL`, etc.), all of which already have a real `origin` at `github.com/taplin/*`. The README's `git clone https://github.com/taplin/Perfect-Lasso.git` instruction describes the intended eventual state, not something that works today. Pushing this repo to GitHub for the first time is its own separate, explicitly-confirmed decision (asked and explicitly deferred — "hold off on pushing anything" — as of this writing) — `releasing.md` documents it as an explicit prerequisite step, not something bundled into the release process itself.
+**Resolved**: `Perfect-Lasso` is now pushed to GitHub — `taplin/Perfect-Lasso`, public, matching every sibling Perfect-Resurrection library. Verified end-to-end against the real live URL, not just asserted: a fresh `git clone https://github.com/taplin/Perfect-Lasso.git` in a scratch directory built (`swift build -c release --product lasso-perfect-server`) and ran (served a real request correctly) with no local shortcuts of any kind.
 
 ### 5.3 Versioning
 
