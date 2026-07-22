@@ -159,6 +159,17 @@ public indirect enum LassoExpression: Equatable, Sendable {
     /// rather than invoked. See `Evaluator.evaluate(_:)`'s own case for
     /// how this resolves.
     case tagReference(String)
+    /// Ch. "Operators" > escape method operators: `\ (expr)` /
+    /// `\ #variable` — the unary escape operator with a DYNAMIC name (as
+    /// opposed to `.tagReference`'s literal bareword name), where the
+    /// tag name comes from evaluating `expr` at runtime rather than
+    /// being fixed at parse time. Resolves to the SAME `tagreference`
+    /// object shape `.tagReference` produces (see
+    /// `Evaluator.evaluate(_:)`'s own case) once `expr`'s value is
+    /// stringified into a name — downstream consumers (e.g. `->invoke`)
+    /// don't need to know which form produced it. Real corpus
+    /// (zeroloop/ds's ds.lasso): `.'capi' = \#datasource`.
+    case dynamicTagReference(LassoExpression)
     case call(callee: LassoExpression, arguments: [LassoArgument])
     /// `isQuoted` distinguishes `.name`/`->name` (bareword) from
     /// `.'name'`/`->'name'` (single-quoted) member access — a REAL,

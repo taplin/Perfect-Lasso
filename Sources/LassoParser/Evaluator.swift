@@ -162,6 +162,23 @@ struct Evaluator {
                 throw LassoRuntimeError.unknownFunction(name)
             }
             return .object(LassoTagReferenceValue.makeObject(name: name))
+        case let .dynamicTagReference(nameExpression):
+            // Ch. "Operators" > escape method operators, DYNAMIC-name
+            // form -- `\ #variable` / `\ (expr)`. Same validation as the
+            // static `.tagReference` case just above (a genuinely
+            // unresolvable name fails loudly here, at the reference
+            // site), just with the name coming from evaluating
+            // `nameExpression` first instead of being a fixed parse-time
+            // string. Real corpus (zeroloop/ds's ds.lasso):
+            // `.'capi' = \#datasource`.
+            let name = try await evaluate(nameExpression).outputString
+            guard context.natives.contains(name)
+                || context.tagRegistry.containsTag(named: name)
+                || context.tagRegistry.containsType(named: name)
+                || context.nativeTypes.containsType(named: name) else {
+                throw LassoRuntimeError.unknownFunction(name)
+            }
+            return .object(LassoTagReferenceValue.makeObject(name: name))
         case let .assignment(target, value):
             let evaluated = try await evaluate(value)
             try await assign(evaluated, to: target, defaultScope: .unscoped)
