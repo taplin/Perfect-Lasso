@@ -40,6 +40,12 @@ struct ServerConfig: Sendable {
     /// source on a real, non-crawler request too).
     let renderExcludePaths: [String]
     let startupPath: URL?
+    /// `LASSO_APPS_PATH` — the "LassoApps" directory conventionally
+    /// holding one subdirectory per installed LassoApp; see
+    /// `loadLassoApps`'s doc comment for exactly what subset of real
+    /// Lasso 9's LassoApp system this loads (library-style `_init*.lasso`
+    /// auto-load only, no HTTP-servable node tree).
+    let appsPath: URL?
     /// Lasso-side datasource alias (e.g. `-database='catalog_mysql'`) ->
     /// real MySQL schema name, one entry per configured datasource.
     /// Empty means no live MySQL datasource is configured (inline()
@@ -373,6 +379,9 @@ struct ServerConfig: Sendable {
         let startupPathValue = env["LASSO_STARTUP_PATH"].map {
             URL(fileURLWithPath: $0).standardizedFileURL.resolvingSymlinksInPath()
         }
+        let appsPathValue = env["LASSO_APPS_PATH"].map {
+            URL(fileURLWithPath: $0).standardizedFileURL.resolvingSymlinksInPath()
+        }
 
         // LASSO_DATASOURCE_CONFIG_PATH takes priority when set — a JSON
         // file so real credentials never land on a command line or in
@@ -512,6 +521,7 @@ struct ServerConfig: Sendable {
             lassoExtensions: Set(extensions),
             renderExcludePaths: renderExcludePaths,
             startupPath: startupPathValue,
+            appsPath: appsPathValue,
             datasourceMap: datasourceMap,
             mysqlHost: datasourceFile?.mysql?.host ?? env["LASSO_MYSQL_HOST"] ?? "localhost",
             mysqlPort: datasourceFile?.mysql?.port ?? env["LASSO_MYSQL_PORT"].flatMap(Int.init),
@@ -2677,6 +2687,15 @@ if let startupPath = config.startupPath {
     }
 } else {
     print("Startup folder: none")
+}
+if let appsPath = config.appsPath {
+    let result = await loadLassoApps(at: appsPath, tagRegistry: siteServer.tagRegistry)
+    print("LassoApps: \(appsPath.path) (\(result.loadedFiles.count) loaded, \(result.failedFiles.count) failed)")
+    for failure in result.failedFiles {
+        fputs("LassoApp load failed: \(failure.file): \(failure.error)\n", stderr)
+    }
+} else {
+    print("LassoApps: none")
 }
 // "Listening: ..." now prints from inside siteServerTask's withServer callback (above),
 // only once the server has genuinely bound and started accepting — not unconditionally

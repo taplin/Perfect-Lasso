@@ -47,6 +47,24 @@ Environment variables:
   to parse or render is logged to stderr and skipped; it does not prevent
   the server from starting or the rest of the folder from loading. See
   "Verified" below for what this surfaced against a real startup folder.
+- `LASSO_APPS_PATH`: filesystem path to a "LassoApps" directory (real Lasso
+  convention: one subdirectory per installed LassoApp). No default —
+  opt-in only. Supports only the "library" use of LassoApps real Lasso 9
+  code commonly relies on (e.g. the zeroloop/ds datasource-abstraction
+  package) — NOT the full LassoApp system (LassoGuide "Operations >
+  LassoApps": a `/lasso9/AppName/...`-routed node/resource tree with
+  content-type representation objects), which has no evidenced need in any
+  corpus seen so far. If set, every immediate subdirectory of the given
+  path is treated as one installed app (hidden/dot-prefixed entries
+  skipped); every `_init*.lasso` file directly inside an app's own folder
+  (non-recursive, matching real Lasso's "only initialization files at the
+  root of the LassoApp are executed") is loaded once, in filename order,
+  sharing the same tag registry `LASSO_STARTUP_PATH` uses. `lassoapp_include`
+  is supported as an alias of `include()`, resolving relative to that same
+  app's own folder (never another app's, never the site's own root) —
+  matching how the real `_init.lasso` convention typically loops over its
+  own sibling files. A file that fails to parse or render is logged to
+  stderr and skipped, matching `LASSO_STARTUP_PATH`'s own resilience.
 - `LASSO_DATASOURCE_ALIAS`: MySQL-only, legacy single-alias form; datasource
   name used by Lasso pages, for example `catalog_mysql`. Supports exactly
   one alias, and only MySQL — see `LASSO_DATASOURCE_CONFIG_PATH` below for
