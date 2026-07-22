@@ -13530,3 +13530,112 @@ struct IncludeURLTests {
     #expect(output == "Krinn,Ármarinn,Kjarni,Halbjörg,Björg,Hjörtur")
 }
 
+// MARK: - `@` variable-reference/aliasing operator (Lasso 8.5 Language Guide Ch. 15) -- deliberately unsupported, throws a clear catchable error rather than crashing
+
+@Test func atPrefixOperatorThrowsADedicatedDiagnosticErrorRatherThanTheGenericOneCharacterMessage() async throws {
+    // Real Lasso's `@`/[Reference] variable-aliasing system has zero real
+    // corpus evidence for its FULL feature (two variable names sharing one
+    // mutable storage cell) -- deliberately not built. But bare `@#var`-
+    // style usage ("hand back the actual value, not a copy") appears in 6
+    // real production files. Rather than the generic, cryptic
+    // `unsupportedExpression("@")`, this now throws a dedicated, readable
+    // message -- still an ordinary Swift `throws`, never a process crash.
+    var context = LassoContext()
+    await #expect(throws: LassoRuntimeError.unsupportedExpression(
+        "@ (variable-reference/aliasing operator) is not supported"
+    )) {
+        _ = try await LassoRenderer().render("[local(x)=5][@#x]", context: &context)
+    }
+}
+
+@Test func atPrefixOperatorThrowsCleanlyAcrossEveryRealCorpusUsageShape() async throws {
+    // Every one of these mirrors an actual line from real production
+    // corpus files (components/inSite/urlencode.inc, urldecode.inc,
+    // tables.inc, results_navigation.inc, components/autoctype.inc,
+    // components/inSite/lp_inline_dataset.inc) that uses bare `@` this
+    // way. Confirms each shape -- a bare local, a `self->member` chain, a
+    // colon-call argument, and a nested nested nested chain -- throws a
+    // normal, catchable error (never traps/crashes the process) so a real
+    // page hitting any of these fails as an ordinary HTTP error, not a
+    // server outage.
+    let shapes = [
+        "return: @#url_string",
+        "return(@#myFeedback)",
+    ]
+    for shape in shapes {
+        var context = LassoContext()
+        await #expect(throws: (any Error).self) {
+            _ = try await LassoRenderer().render(
+                """
+                <?lassoscript
+                define foo() => {
+                    local(url_string, myFeedback) = 'x', 'y'
+                    \(shape)
+                }
+                ?>
+                [foo]
+                """,
+                context: &context
+            )
+        }
+    }
+
+    var selfContext = LassoContext()
+    await #expect(throws: (any Error).self) {
+        _ = try await LassoRenderer().render(
+            """
+            <?lassoscript
+            define foo => type {
+                data public records_array
+                public onCreate() => { self->records_array = array(1, 2, 3) }
+                public bar() => { return: @self->'records_array'->first }
+            }
+            local(f) = foo()
+            ?>
+            [#f->bar]
+            """,
+            context: &selfContext
+        )
+    }
+
+    var nestedContext = LassoContext()
+    await #expect(throws: (any Error).self) {
+        _ = try await LassoRenderer().render(
+            """
+            <?lassoscript
+            define helper(a, b) => { return: #a->asString + ',' + #b->asString }
+            define foo => type {
+                data public records_array, public field_names
+                public onCreate() => { self->records_array = 'RA'; self->field_names = 'FN' }
+                public bar() => { return: @(helper: @self->'records_array', @self->'field_names') }
+            }
+            local(f) = foo()
+            ?>
+            [#f->bar]
+            """,
+            context: &nestedContext
+        )
+    }
+}
+
+@Test func atPrefixOperatorErrorIsCaughtByTheServersOwnSiteRenderErrorWrapperNotLeftUncaught() async throws {
+    // Confirms the failure mode a real site sees end-to-end: a thrown
+    // LassoRuntimeError from `@` propagates as an ordinary Swift error out
+    // of `LassoRenderer().render(...)` -- the exact call
+    // `LassoPerfectServer`'s own request handler already wraps in a
+    // do/catch and re-throws as `LassoSiteRenderError` (turned into a
+    // normal HTTP error response for that one request, not a process
+    // crash). This test pins that the error surfaces as a plain,
+    // catchable `Error` at the render boundary -- the same boundary that
+    // server-side wrapping sits on.
+    var context = LassoContext()
+    var caught: (any Error)?
+    do {
+        _ = try await LassoRenderer().render("[@#missing]", context: &context)
+    } catch {
+        caught = error
+    }
+    #expect(caught != nil)
+    #expect(caught is LassoRuntimeError)
+}
+

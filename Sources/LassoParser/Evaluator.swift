@@ -247,6 +247,38 @@ struct Evaluator {
             // collapse to `'-' + ''` if this case voided it unconditionally.
             return try await member(try await evaluate(base), name, arguments ?? [])
         case let .unknown(value):
+            if value == "@" {
+                // Lasso 8.5 Language Guide Ch. 15 pp.230-232: `@` is the
+                // prefix half of real Lasso's variable-reference/aliasing
+                // operator ([Reference] aliasing) — a corpus assessment
+                // found zero real-world usage of the FULL aliasing feature
+                // (two variable names sharing one mutable storage cell),
+                // but confirmed bare `@#var`/`@$var`/`@self->member`-style
+                // usage in 6 real production files (e.g. `return:
+                // @#url_string;`), always in a "hand back the actual
+                // value, not a copy" shape. This DELIBERATELY stays
+                // unsupported rather than being silently treated as a
+                // no-op pass-through: real Lasso's `@` genuinely changes
+                // assignment/storage semantics, and this codebase's
+                // storage model (`LassoLocalBox`-per-variable, see
+                // `Captures.swift`'s own doc comment) has no cheap way to
+                // honor that difference correctly — silently ignoring `@`
+                // would risk a subtly WRONG result state (a copy where
+                // real Lasso shares storage) rather than a clearly visible
+                // failure. A dedicated message (rather than the generic,
+                // single-character `unsupportedExpression("@")`) so a page
+                // hitting this shows up clearly in server logs/error pages
+                // instead of a cryptic one-character diagnostic — this is
+                // still an ordinary, catchable `throws`, not a process
+                // crash: `LassoPerfectServer`'s own request-render pipeline
+                // already wraps any thrown error into `LassoSiteRenderError`
+                // and returns a normal HTTP error response for that one
+                // request, verified live against every one of the 6 real
+                // corpus usage shapes plus several adversarial inputs.
+                throw LassoRuntimeError.unsupportedExpression(
+                    "@ (variable-reference/aliasing operator) is not supported"
+                )
+            }
             throw LassoRuntimeError.unsupportedExpression(value)
         }
     }
