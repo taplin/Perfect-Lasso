@@ -2550,11 +2550,25 @@ final class ServerResponseSink: LassoResponseSink, @unchecked Sendable {
     }
 
     func redirect(to url: String) throws {
-        redirectURL = url
+        // `url` is Lasso-script-controlled (real corpus: TS_lasso9's
+        // graphics/headeradmincourt.lasso has a redirect_url target with
+        // an accidentally-embedded raw newline in its own source) and was
+        // previously stored completely unsanitized, later handed straight
+        // into RedirectOutput's Location header -- unlike headerSafe's
+        // existing use for -Type/-Disposition/filename, matching how
+        // Cookie_Set's own name/value already got the same CRLF-stripping
+        // treatment. Live-verified: an unsanitized embedded newline here
+        // corrupted the HTTP response badly enough that the client saw
+        // the connection drop entirely rather than a clean redirect or
+        // error.
+        redirectURL = headerSafe(url)
     }
 
     func setHeader(name: String, value: String) throws {
-        headerPairs.append((name, value))
+        // Same CRLF/header-injection class as redirect(to:) above -- a
+        // Lasso-script-controlled header name or value reaches raw HTTP
+        // output here with no sanitization otherwise.
+        headerPairs.append((headerSafe(name), headerSafe(value)))
     }
 
     func setCookie(name: String, value: String) throws {

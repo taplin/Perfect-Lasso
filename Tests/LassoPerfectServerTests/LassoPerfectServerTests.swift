@@ -27,6 +27,40 @@ import PerfectNIO
     #expect(quotedStringSafe("plain.pdf") == "plain.pdf")
 }
 
+// ServerResponseSink.redirect(to:)/setHeader(name:value:) previously
+// stored their Lasso-script-controlled arguments completely unsanitized,
+// later handed straight into raw HTTP output (RedirectOutput's Location
+// header / headers.add(contentsOf:)) -- the same CRLF/header-injection
+// class headerSafe already guards against elsewhere in this file (and
+// Cookie_Set's own name/value, fixed separately in LassoParser). Found
+// live: TS_lasso9's graphics/headeradmincourt.lasso has a real
+// redirect_url call with an accidentally-embedded raw newline in its own
+// source, and the crawler's HTTP client saw the connection drop entirely
+// rather than a clean redirect.
+
+@Test func redirectStripsCRLFFromTheTargetURL() throws {
+    let sink = ServerResponseSink()
+    try sink.redirect(to: "http://example.test/path\r\nX-Injected: evil")
+    #expect(sink.redirectURL == "http://example.test/pathX-Injected: evil")
+}
+
+@Test func redirectReproducesTheRealCorpusEmbeddedNewlineShape() throws {
+    // Exact real corpus shape (credentials/domain genericized): a
+    // redirect target string literal with a literal newline embedded
+    // mid-URL, as if a line break landed inside the quotes by accident.
+    let sink = ServerResponseSink()
+    try sink.redirect(to: "http://example.test/~app\n/administration/admin_login.lasso")
+    #expect(sink.redirectURL == "http://example.test/~app/administration/admin_login.lasso")
+}
+
+@Test func setHeaderStripsCRLFFromBothNameAndValue() throws {
+    let sink = ServerResponseSink()
+    try sink.setHeader(name: "X-Custom\r\nX-Injected", value: "value\r\nX-Injected: evil")
+    #expect(sink.headerPairs.count == 1)
+    #expect(sink.headerPairs[0].name == "X-CustomX-Injected")
+    #expect(sink.headerPairs[0].value == "valueX-Injected: evil")
+}
+
 // reference.lassosoft.com: "[Server_Name] returns the domain name of the
 // current server. If the name ... cannot be determined then the IP
 // address ... is returned instead." ServerRequestProvider previously used
