@@ -1442,9 +1442,43 @@ struct Evaluator {
         case "hasmethod":
             let requested = (arguments.first != nil ? try await evaluate(arguments[0].value).outputString : "").lowercased()
             return .boolean(hasMethod(named: requested, on: value))
+        case "istype":
+            // `tag->istype()` (`lassoguide.com/9.2/language/types.html`,
+            // "Type/Object Introspection Methods": "Check if a type with
+            // the same name as the given tag exists" -- e.g.
+            // `::string->istype // => true`). Since this codebase has no
+            // dedicated `tag` runtime type (`::name` tag literals already
+            // desugar to a plain string at parse time -- see
+            // `ExpressionParser`'s own Tag Literals doc comment), `value`
+            // here IS the name to check, not an argument: real corpus
+            // (zeroloop/ds's activerow.lasso) uses this as a defensive
+            // guard -- `::json_encode->istype ? define
+            // json_encode->encodeValue(...) => ...` -- only patching a
+            // type this codebase never registers (no json_encode support
+            // exists at all), so returning `false` for it is exactly the
+            // graceful, correct outcome rather than a gap to fill in.
+            return .boolean(typeExists(named: value.outputString))
         default:
             return nil
         }
+    }
+
+    /// The exact primitive `LassoValue` case names `typeName` (`Runtime.swift`)
+    /// itself would report, plus anything registered in either of the two
+    /// live type registries (`nativeTypes`, `tagRegistry`) -- kept as its
+    /// own literal list rather than derived from `primitiveMethodNames`
+    /// just below, since that dictionary is about which METHOD NAMES a
+    /// primitive supports, a different (if overlapping) question from
+    /// which type NAMES this codebase considers to genuinely exist.
+    private static let primitiveTypeNames: Set<String> = [
+        "void", "null", "boolean", "integer", "decimal", "string", "array", "map", "pair", "capture",
+    ]
+
+    private func typeExists(named name: String) -> Bool {
+        let normalized = name.lowercased()
+        return Self.primitiveTypeNames.contains(normalized)
+            || context.nativeTypes.containsType(named: normalized)
+            || context.tagRegistry.containsType(named: normalized)
     }
 
     /// `.object`: consults the SAME two registries the `.object` case
@@ -1478,7 +1512,7 @@ struct Evaluator {
         return Self.primitiveMethodNames[value.typeName]?.contains(requested) ?? false
     }
 
-    private static let introspectionMethodNames: Set<String> = ["type", "isa", "isnota", "hasmethod"]
+    private static let introspectionMethodNames: Set<String> = ["type", "isa", "isnota", "hasmethod", "istype"]
 
     private static let primitiveMethodNames: [String: Set<String>] = [
         "string": [
