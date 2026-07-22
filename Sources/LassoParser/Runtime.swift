@@ -1600,7 +1600,16 @@ public struct LassoNativeRegistry: Sendable {
                 "new": .boolean(result.isNew),
             ])
         }
-        register("session_addvar") { arguments, context in
+        // `Session_AddVar`/`Session_RemoveVar` are Lasso 9's shorthand
+        // names; `Session_AddVariable`/`Session_RemoveVariable` are the
+        // original Lasso 8.5 longhand this adapter hadn't registered at
+        // all (unknownFunction) — real corpus (TS_lasso9, 21/60 files,
+        // the single most prevalent gap found live-crawling that site)
+        // uses only the longhand. Registered as aliases of one identical
+        // implementation, matching the File_Serve/File_Stream precedent
+        // above — no documented behavioral distinction between the two
+        // names beyond spelling.
+        let sessionAddVarHandler: LassoNativeFunction = { arguments, context in
             guard let resolved = resolveSessionName(in: arguments, stringValue: { $0.value.outputString }) else { return .void }
             let name = resolved.name
             let varName = resolved.remainingPositional.first?.value.outputString ?? ""
@@ -1611,7 +1620,9 @@ public struct LassoNativeRegistry: Sendable {
             }
             return .void
         }
-        register("session_removevar") { arguments, context in
+        register("session_addvar", function: sessionAddVarHandler)
+        register("session_addvariable", function: sessionAddVarHandler)
+        let sessionRemoveVarHandler: LassoNativeFunction = { arguments, context in
             guard let resolved = resolveSessionName(in: arguments, stringValue: { $0.value.outputString }) else { return .void }
             let name = resolved.name
             let varName = resolved.remainingPositional.first?.value.outputString ?? ""
@@ -1619,6 +1630,8 @@ public struct LassoNativeRegistry: Sendable {
             context.trackedSessionVariables.removeAll { $0.session == name && $0.varName == varName }
             return .void
         }
+        register("session_removevar", function: sessionRemoveVarHandler)
+        register("session_removevariable", function: sessionRemoveVarHandler)
         register("session_end") { arguments, context in
             guard let resolved = resolveSessionName(in: arguments, stringValue: { $0.value.outputString }) else { return .void }
             context.sessionProvider?.end(session: resolved.name)
