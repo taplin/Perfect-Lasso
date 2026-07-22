@@ -4961,6 +4961,51 @@ final class FullyRecordingResponseSink: LassoResponseSink, @unchecked Sendable {
     var endContext = LassoContext(sessionProvider: endProvider)
     _ = try await LassoRenderer().render("[session_start('cart')][session_end('cart')]", context: &endContext)
     #expect(endProvider.endedNames.contains("cart"))
+
+    // Session_AddVariable/Session_RemoveVariable: real Lasso 8.5 longhand
+    // for the same session_addvar/session_removevar this adapter already
+    // registered — real corpus (TS_lasso9, 21/60 files, the single most
+    // prevalent gap found live-crawling that site) uses only the
+    // longhand, previously unknownFunction.
+    let longhandProvider = SessionProvider()
+    var longhandContext = LassoContext(sessionProvider: longhandProvider)
+    let longhandOutput = try await LassoRenderer().render(
+        "[session_start('cart')][var(cartvalue = 'open')][session_AddVariable: -Name = 'cart', 'cartvalue'][cartvalue]",
+        context: &longhandContext
+    )
+    #expect(longhandOutput == "open")
+    #expect(longhandProvider.persisted["cart"]?["cartvalue"] == .string("open"))
+
+    let longhandRemoveProvider = SessionProvider()
+    var longhandRemoveContext = LassoContext(sessionProvider: longhandRemoveProvider)
+    _ = try await LassoRenderer().render(
+        "[session_start('cart')][var(a = 'x')][session_AddVariable:'cart','a'][session_RemoveVariable:'cart','a']",
+        context: &longhandRemoveContext
+    )
+    #expect(longhandRemoveProvider.persisted["cart"] == nil)
+}
+
+@Test func varSetBracketColonCallAliasesVarAssignment() async throws {
+    // Real corpus shape (TS_lasso9, 15/60 files): `[var_set:'name' =
+    // value]` -- Lasso 8.5's original free-tag name for what Lasso 9
+    // shortened to `Var`/`Variable`, previously unknownFunction("var_set").
+    var context = LassoContext()
+    let output = try await LassoRenderer().render(
+        "[var_set:'tsid' = 42][var:'tsid']",
+        context: &context
+    )
+    #expect(output == "42")
+
+    // Global scope, matching plain `var` -- readable from a nested inline
+    // block without re-declaring, not just the same top-level scope.
+    var globalScopeContext = LassoContext(inlineProvider: LassoInMemoryInlineProvider(tables: [
+        "skus": [LassoDataRow(["mfr_style_no": .string("A")])],
+    ]))
+    let globalScopeOutput = try await LassoRenderer().render(
+        "[var_set:'greeting' = 'hi'][inline(-database='catalog',-table='skus',-search)][records][var:'greeting'][/records][/inline]",
+        context: &globalScopeContext
+    )
+    #expect(globalScopeOutput == "hi")
 }
 
 // The parse-time `LassoSessionPreflight` scan (and its tests, formerly

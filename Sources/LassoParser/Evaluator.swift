@@ -1498,7 +1498,12 @@ struct Evaluator {
     /// codebase with no references to detach in the first place.
     private static func declarationScope(for name: String) -> VariableScope? {
         switch name.lowercased() {
-        case "var", "variable", "var_reset": .global
+        // `Var_Set` is Lasso 8.5's original free-tag name for what Lasso 9
+        // shortened to `Var`/`Variable` (real corpus: TS_lasso9, 15/60
+        // files use `[var_set:'name' = value]`, currently unknownFunction
+        // since only the shortened names were registered) — same global
+        // scope, no separate semantics.
+        case "var", "variable", "var_reset", "var_set": .global
         case "local", "local_reset": .local
         case "global", "global_reset": .trueGlobal
         default: nil
@@ -2861,6 +2866,7 @@ struct Evaluator {
         guard case let .identifier(name) = callee else { return false }
         return name.caseInsensitiveCompare("var") == .orderedSame
             || name.caseInsensitiveCompare("variable") == .orderedSame
+            || name.caseInsensitiveCompare("var_set") == .orderedSame
             || name.caseInsensitiveCompare("local") == .orderedSame
     }
 
