@@ -716,18 +716,19 @@ struct ExpressionParser {
         index += 1
         let source = parseExpression()
         // Ch. "Query Expressions", "Operations": zero or more `where`/
-        // `let`/`skip`/`take`/`order by` clauses (Stage 8.2 added the
-        // first four, Stage 8.3 adds `order by`), in ANY order, applied
-        // IN THE ORDER WRITTEN — `tryParseQueryOperation` returns `nil`
-        // (with no index mutation) as soon as the next token doesn't
-        // match a known operation keyword, which is exactly when the
-        // action is expected next. `group` (Stage 8.4's own real,
-        // documented operation) isn't recognized here yet — a query
-        // expression using it falls all the way through to this
-        // function's own full backtrack below, same as any other
-        // unrecognized shape, rather than a targeted "not yet
-        // implemented" diagnostic; disclosed, not a silent wrong answer
-        // (the resulting bareword-`with` reinterpretation fails loudly
+        // `let`/`skip`/`take`/`order by`/`group ... by ... into` clauses
+        // (Stage 8.2 added the first four, Stage 8.3 added `order by`,
+        // Stage 8.4 added `group by`), in ANY order, applied IN THE
+        // ORDER WRITTEN — `tryParseQueryOperation` returns `nil` (with no
+        // index mutation) as soon as the next token doesn't match a
+        // known operation keyword, which is exactly when the action is
+        // expected next. Any OTHER unrecognized shape (a bareword that
+        // isn't `where`/`let`/`skip`/`take`/`order`/`group`, or a
+        // recognized keyword whose own required parts are malformed)
+        // falls all the way through to this function's own full
+        // backtrack below rather than a targeted "not yet implemented"
+        // diagnostic; disclosed, not a silent wrong answer (the
+        // resulting bareword-`with` reinterpretation fails loudly
         // downstream, matching this codebase's established "unsupported
         // input surfaces as a real error, never a silent wrong result"
         // convention elsewhere).
@@ -830,6 +831,38 @@ struct ExpressionParser {
                 keys.append(QueryOrderKey(expression: keyExpression, descending: descending))
             } while consume(",")
             return .orderBy(keys)
+        case "group":
+            // Ch. "Query Expressions", "Group By": "a group by operation
+            // consists of three elements: the object going into the
+            // group, the key by which the objects are grouped, and a
+            // new local variable name. It has the following form: `group
+            // new_object_expression by key_expression into
+            // new_local_name`." Same backtrack-on-mismatch discipline as
+            // `let`/`order` above — any of the three missing pieces
+            // (a well-formed object expression, the literal `by`
+            // keyword, a well-formed key expression, the literal `into`
+            // keyword, or the new name itself) fully resets, falling
+            // through to `tryParseQueryExpression`'s own final backtrack.
+            let start = index
+            index += 1
+            let objectExpression = parseExpression()
+            guard case let .identifier(byKeyword) = peek, byKeyword.caseInsensitiveCompare("by") == .orderedSame else {
+                index = start
+                return nil
+            }
+            index += 1
+            let keyExpression = parseExpression()
+            guard case let .identifier(intoKeyword) = peek, intoKeyword.caseInsensitiveCompare("into") == .orderedSame else {
+                index = start
+                return nil
+            }
+            index += 1
+            guard case let .identifier(newName) = peek else {
+                index = start
+                return nil
+            }
+            index += 1
+            return .groupBy(objectExpression: objectExpression, keyExpression: keyExpression, into: newName)
         default:
             return nil
         }

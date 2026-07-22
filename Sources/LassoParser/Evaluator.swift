@@ -657,6 +657,12 @@ struct Evaluator {
             switch object.typeName.lowercased() {
             case "list", "queue", "stack", "set":
                 return LassoCollectionValue.elements(from: object)
+            case "queriable_grouping":
+                // Ch. "Query Expressions": "a queriable_grouping object
+                // maintains a reference to each of the original elements
+                // within the group" — reuses the SAME `_elements`
+                // storage-key convention as List/Set/etc. (Stage 8.4).
+                return LassoCollectionValue.elements(from: object)
             case "priorityqueue":
                 return LassoPriorityQueueValue.elements(from: object)
             case "treemap":
@@ -766,6 +772,9 @@ struct Evaluator {
             if case let .let(name, _) = operation {
                 queryOwnedBoxes[name.lowercased()] = LassoLocalBox(.void)
             }
+            if case let .groupBy(_, _, newName) = operation {
+                queryOwnedBoxes[newName.lowercased()] = LassoLocalBox(.void)
+            }
         }
         var scopedLocals = savedLocals
         for (name, box) in queryOwnedBoxes { scopedLocals[name] = box }
@@ -864,6 +873,67 @@ struct Evaluator {
                     return false
                 }
                 rows = keyedRows.map(\.row)
+            case let .groupBy(objectExpression, keyExpression, newName):
+                // Ch. "Query Expressions", "Group By": for each row,
+                // evaluate the object and key expressions (using
+                // whatever variables were bound BEFORE this group by
+                // fired), then bucket rows sharing an EQUAL key value
+                // together (reusing the existing `binary(_:"==",_:)` —
+                // real Lasso doesn't document precisely which equality
+                // group-by uses, so this reuses the SAME operator this
+                // codebase's own `==` already implements, consistent
+                // with `order by`/`min`/`max` reusing `<`/`>` rather than
+                // inventing a parallel comparison). Groups are kept in
+                // FIRST-OCCURRENCE order — the docs don't specify a
+                // default order either, and this is the most natural
+                // reading absent one (the docs' own worked example
+                // re-sorts explicitly with a trailing `order by`
+                // afterward, so its own output order doesn't depend on
+                // this choice).
+                var groupsInOrder: [(key: LassoValue, elements: [LassoValue])] = []
+                for row in rows {
+                    bind(row)
+                    let objectValue = try await evaluate(objectExpression)
+                    let keyValue = try await evaluate(keyExpression)
+                    var matchedIndex: Int?
+                    for (index, group) in groupsInOrder.enumerated() {
+                        if try binary(group.key, "==", keyValue).isTruthy {
+                            matchedIndex = index
+                            break
+                        }
+                    }
+                    if let matchedIndex {
+                        groupsInOrder[matchedIndex].elements.append(objectValue)
+                    } else {
+                        groupsInOrder.append((keyValue, [objectValue]))
+                    }
+                    if context.shouldStopRenderingCurrentBody() { break }
+                }
+                // "From this point forward, no previously introduced
+                // variables are available. Only [the new name] exists
+                // now" — each resulting row is a FRESH dictionary with
+                // ONLY the new name, not a superset of the old row (a
+                // disclosed, minor imperfection: the OLD with-/let-
+                // variables' own boxes still technically exist in
+                // `queryOwnedBoxes`/`context.locals`, so reading them
+                // after this point doesn't throw — it just reads
+                // whatever STALE value the last-processed row left
+                // behind, rather than becoming truly undefined; a real
+                // user doing this would immediately notice something is
+                // wrong, so this isn't a silent correctness trap, just
+                // an imperfect enforcement of the documented hard
+                // boundary — perfectly enforcing it would need either an
+                // error-on-access mechanism or explicitly unbinding boxes
+                // mid-query, neither of which fits this codebase's
+                // existing box-lifetime model without deeper rework, and
+                // there's zero corpus evidence pushing for it).
+                rows = groupsInOrder.map { group in
+                    let groupingObject = LassoObjectInstance(
+                        typeName: "queriable_grouping",
+                        data: ["_key": group.key, "_elements": .array(group.elements)]
+                    )
+                    return [newName.lowercased(): .object(groupingObject)]
+                }
             }
         }
         switch action {
@@ -2781,5 +2851,27 @@ struct Evaluator {
             return .void
         }
         return try await evaluate(expression)
+    }
+}
+
+extension LassoNativeTypeRegistry {
+    /// `queriable_grouping` (Ch. "Query Expressions", "Group By") — a
+    /// `group ... by ... into NAME` operation's own result type (Stage
+    /// 8.4). "A `queriable_grouping` object maintains a reference to
+    /// each of the original elements within the group. It also
+    /// possesses a `key` method which produces the value by which the
+    /// particular elements were mutually grouped." `_elements` uses the
+    /// SAME storage-key convention `LassoCollectionValue` already
+    /// established for List/Set/etc. (`Collections.swift`), so
+    /// `Evaluator.forEachElements(of:)` recognizing this type name for
+    /// free makes a grouping "further usable throughout the query
+    /// expression" (as a nested with-source, or via `->forEach`) with no
+    /// additional plumbing — exactly matching that documented framing.
+    static func makeQueriableGroupingType() -> LassoNativeType {
+        var type = LassoNativeType(name: "queriable_grouping")
+        type.register("key") { receiver, _, _ in
+            receiver.value(for: "_key")
+        }
+        return type
     }
 }

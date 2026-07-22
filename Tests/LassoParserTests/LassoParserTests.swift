@@ -13275,3 +13275,90 @@ struct IncludeURLTests {
     #expect(output == "|||")
 }
 
+// MARK: - Captures Stage 8.4 (Query Expressions: group by operation, queriable_grouping type)
+
+@Test func groupByBucketsRowsSharingAnEqualKeyAndPreservesEachGroupsElements() async throws {
+    // Ch. "Query Expressions", "Group By": "a group by operation permits
+    // similar elements to be grouped together by a particular key
+    // expression". Verifies grouping CORRECTNESS directly -- one group
+    // per distinct key, in first-occurrence order, each retaining
+    // exactly its own original elements -- rather than a fragile string
+    // match against a `queriable_grouping`'s own (undocumented, and
+    // therefore deliberately unspecified -- see `Runtime.swift`'s own
+    // "no documented bare-output contract" policy) auto-string format.
+    var context = LassoContext()
+    let output = try await LassoRenderer().render(
+        """
+        [(with n in array('a'=1, 'a'=2, 'b'=3, 'a'=4, 'b'=5)
+            group #n->second by #n->first into g
+            select #g->key + ':' + (with x in #g select #x)->join('-'))->join(',')]
+        """,
+        context: &context
+    )
+    #expect(output == "a:1-2-4,b:3-5")
+}
+
+@Test func groupByMatchesTheDocsOwnWorkedExampleGroupMembershipVerbatim() async throws {
+    // Ch. "Query Expressions", "Group By" worked example, verbatim data
+    // and pipeline (swap first/last name into a Pair, group by original
+    // surname, sort resulting groups by key). The doc's own "expected
+    // output" for this example is informal narrative prose ("Line
+    // breaks added for readability"), not a verified literal runtime
+    // transcript, so this checks the same GROUPING the doc's prose
+    // describes -- which given names ended up in which surname's group,
+    // and in what sorted-by-key order the groups themselves come out --
+    // via `->key` and a nested `with` over each `queriable_grouping`,
+    // rather than trusting the prose's own formatting.
+    var context = LassoContext()
+    let output = try await LassoRenderer().render(
+        """
+        [(with n in array('Jones'='Krinn', 'Hammershaimb'='Ármarinn', 'Jones'='Kjarni', 'Skywalker'='Halbjörg', 'Riley'='Björg', 'Hammershaimb'='Hjörtur')
+            let swapped = pair(#n->second, #n->first)
+            group #swapped by #n->first into g
+            let key = #g->key
+            order by #key
+            select #key + ': ' + (with x in #g select #x->first)->join(','))->join(' | ')]
+        """,
+        context: &context
+    )
+    #expect(output == "Hammershaimb: Ármarinn,Hjörtur | Jones: Krinn,Kjarni | Riley: Björg | Skywalker: Halbjörg")
+}
+
+@Test func queriableGroupingIsItselfQueriableAsANestedWithSource() async throws {
+    // Ch. "Query Expressions", "Group By": "This new object can be
+    // further used throughout the query expression" -- a
+    // `queriable_grouping` supports `trait_queriable` just like an
+    // array or list, exercising the new `forEachElements(of:)` case
+    // (Stage 8.4) added alongside List/Set/Queue's own (Stage 4).
+    var context = LassoContext()
+    let output = try await LassoRenderer().render(
+        """
+        [with n in array('a'=1, 'a'=2, 'b'=3)
+            group #n->second by #n->first into g
+            select (with x in #g where #x > 1 select #x)->join(',')]
+        """,
+        context: &context
+    )
+    #expect(output == "23")
+}
+
+@Test func groupByKeyIsAccessibleButOnlyTheNewVariableCarriesForwardIntoLaterOperations() async throws {
+    // Ch. "Query Expressions", "Group By": "From this point forward, no
+    // previously introduced variables are available. Only [the new
+    // name] exists now." Confirms the CORE, observable behavior: after
+    // `group ... into g`, a later `order by`/`select` sees rows keyed
+    // ONLY by `g` -- ordering by `#g->key` (not the original `#n`, which
+    // no longer has a live per-row binding) still works correctly.
+    var context = LassoContext()
+    let output = try await LassoRenderer().render(
+        """
+        [(with n in array('b'=1, 'a'=2, 'b'=3)
+            group #n->second by #n->first into g
+            order by #g->key
+            select #g->key)->join(',')]
+        """,
+        context: &context
+    )
+    #expect(output == "a,b")
+}
+

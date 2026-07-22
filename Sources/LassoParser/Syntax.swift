@@ -195,8 +195,9 @@ public indirect enum LassoExpression: Equatable, Sendable {
     /// skip 3` vs `skip 3 take 4` — so this is a real sequential
     /// pipeline, not a set of independent filters). Stage 8.3 added the
     /// `order by` operation and the `sum`/`average`/`min`/`max` actions.
-    /// Still no `group by` operation or comma-separated multi with-clause
-    /// nesting — each a later stage's own addition, per
+    /// Stage 8.4 added `group by`. Still no comma-separated multi
+    /// with-clause nesting, `generateSeries`, or `eacher` — each a later
+    /// stage's own addition, per
     /// `Documentation/captures-subsystem-plan.md`'s Stage 8 breakdown.
     case queryExpression(variable: String, source: LassoExpression, operations: [QueryOperation], action: QueryAction)
     case unknown(String)
@@ -230,6 +231,15 @@ public enum QueryOperation: Equatable, Sendable {
     case skip(LassoExpression)
     case take(LassoExpression)
     case orderBy([QueryOrderKey])
+    /// `group OBJECT by KEY into NAME` (Ch. "Query Expressions", "Group
+    /// By") — Stage 8.4. Real Lasso: "a group by consists of three
+    /// elements: the object going into the group, the key by which the
+    /// objects are grouped, and a new local variable name." Unlike every
+    /// OTHER operation, this one REPLACES the entire row variable set
+    /// going forward with just `into` — "from this point forward, no
+    /// previously introduced variables are available. Only [the new
+    /// name] exists now."
+    case groupBy(objectExpression: LassoExpression, keyExpression: LassoExpression, into: String)
 }
 
 /// One `order by` sort key (Ch. "Query Expressions", "Order By") —

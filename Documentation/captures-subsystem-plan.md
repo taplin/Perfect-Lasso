@@ -1347,6 +1347,91 @@ as still deferred.
 started): 8.4 (`group by` + `queriable_grouping` type), 8.5 (multiple
 with-clauses/nesting, `generateSeries` type + literal syntax, `eacher`).
 
+**Stage 8.4 — `group by` operation + `queriable_grouping` type** ✅ done
+(2026-07-21). `group by` is the last real OPERATION on the Stage 8 plan
+and architecturally different from every prior one: it has THREE
+syntactic components (`group OBJECT_EXPR by KEY_EXPR into NAME`, not one
+or two), it COLLAPSES the row count (many original rows fold into fewer
+grouped rows) rather than filtering/reordering/annotating the existing
+set, and it REPLACES the entire row variable set going forward — real
+Lasso's own wording: "from this point forward, no previously introduced
+variables are available. Only [the new name] exists now."
+
+`ExpressionParser.tryParseQueryOperation()` gained a `case "group":`
+mirroring the exact backtrack-on-any-mismatch discipline already
+established for `let`/`order` — a missing `by`, missing `into`, or
+missing final identifier fully resets the parse index. `Evaluator
+.evaluateQueryExpression`'s new `.groupBy` case buckets rows via a
+manual linear find-or-create scan (`for (index, group) in
+groupsInOrder.enumerated()`, not `Array.firstIndex(where:)` — Swift's
+stdlib doesn't support async/throwing closures there) comparing keys via
+the existing `binary(_:"==",_:)` operator (the docs don't specify
+grouping-key equality semantics, so this reuses the SAME already-
+reviewed `==` this codebase already has, matching the "reuse existing
+operators" precedent Stage 8.3 set for `<`/`>` via `lassoLessThan`).
+Groups are kept in first-occurrence order (undocumented either way; the
+doc's own worked example re-sorts explicitly with a trailing `order by`
+anyway). After processing every row, `rows` is REPLACED (not extended)
+with one fresh single-key dictionary per group — implementing the
+documented "only the new name exists now" rule for `rows` itself, while
+old with-/let-variable BOXES remain present-but-stale in
+`context.locals` rather than becoming truly inaccessible (a disclosed
+simplification: perfectly enforcing hard inaccessibility would need
+either an error-on-access mechanism or mid-query box removal, neither of
+which fits the established persistent-box architecture without deeper
+rework, and a real user hitting this would see visibly wrong/stale data,
+not silent corruption).
+
+The new `queriable_grouping` native type (`NativeTypes
+.makeQueriableGroupingType()`) registers exactly the ONE method the docs
+actually document — `->key`, returning the stored `_key` field. No
+`->size` or custom auto-string format was added: neither has a
+documented contract (the doc's own "expected output" for its group-by
+worked example is explicitly informal, "line breaks added for
+readability" prose, not a verified literal transcript), and this
+codebase has an established, comment-disclosed policy (`Runtime.swift`'s
+`LassoValue.outputString`) of only giving a native type a custom
+auto-string when an actual documented worked example establishes the
+contract — `queriable_grouping` correctly falls back to the same bare
+type-name output every other undocumented native type uses.
+`queriable_grouping` reuses the exact same `_elements` storage-key
+convention `LassoCollectionValue` already established for List/Set/etc.,
+so `Evaluator.forEachElements(of:)` recognizing the new type name for
+free makes a grouping "further usable throughout the query expression"
+(as a nested with-source, or via `->forEach`) with zero additional
+plumbing — exactly matching that documented framing.
+
+Every doc worked example verified: the full six-user, three-step
+Icelandic-name grouping example (swap first/last into a Pair, group by
+original surname, sort groups by key) matches the docs' own prose
+exactly — Hammershaimb groups Ármarinn+Hjörtur, Jones groups
+Krinn+Kjarni, Riley groups Björg alone, Skywalker groups Halbjörg alone,
+in that sorted-by-key order. Verified via `->key` and a nested `with`
+over each `queriable_grouping`'s own membership (robust
+correctness-checking), not a fragile full-string match against the
+docs' own unverified prose formatting for the whole pipeline's output.
+
+**Architect + code-reviewer review (parallel) found the algorithm,
+parser, binding order, row-replacement, `Sendable` correctness, and all
+4 new tests fully correct** — both independently hand-traced the
+find-or-create grouping scan against multiple-elements-per-group,
+non-adjacent key order, single-row, zero-row, all-same-key, and
+all-distinct-key inputs and found no off-by-one, double-count, dropped-
+row, or stale-binding risk. **One real, low-severity finding, fixed**:
+architect caught a stale comment in `ExpressionParser
+.tryParseQueryExpression()` — written when only `Syntax.swift`'s
+`QueryOperation.groupBy` case existed but the parser's own `case
+"group":` handling hadn't landed yet — still claiming `group` "isn't
+recognized here yet" directly above the exact loop that, in this same
+diff, now fully parses it. Fixed by rewriting the comment to accurately
+describe `group by` as one of the five now-recognized operation
+keywords.
+
+647/647 tests passing (4 new this stage). Remaining Stage 8 sub-stage
+(not yet started): 8.5 (multiple with-clauses/nesting, `generateSeries`
+type + literal syntax, `eacher`) — the last piece of the entire Captures
+subsystem plan.
+
 ## 6. Deferred, With Reasoning
 
 - **Everything in §5 as a whole** — see §7; not merely sequenced carefully,
