@@ -402,6 +402,198 @@ import PerfectSessionCore
     }
 }
 
+// MARK: - mysqlds connector tag (Task #178's last blocker: real \#datasource->invoke)
+
+@Test func mysqldsBridgeExecutesASearchAgainstTheConfiguredInlineProviderAndReturnsPositionalFields() async throws {
+    // Exercises the low-level `__ds_mysql_execute` bridge directly (not
+    // through the `mysqlds` tag's own `ds_result(...)` construction,
+    // which needs a real `ds_result` type defined -- see the
+    // ds_result-shaped integration test below for that). Real corpus
+    // shape: `dsinfo->keycolumns` as a staticarray of (field, operator,
+    // value) tuples (`ds.lasso`'s own `keyvalue(p::pair)` helper).
+    var context = LassoContext(inlineProvider: LassoInMemoryInlineProvider(tables: [
+        "widgets": [
+            LassoDataRow(["sku": .string("abc"), "name": .string("Widget A")]),
+            LassoDataRow(["sku": .string("xyz"), "name": .string("Widget B")]),
+        ],
+    ]))
+    let output = try await LassoRenderer().render(
+        """
+        <?lassoscript
+        local(di) = dsinfo
+        #di->action = lcapi_datasourcesearch
+        #di->tablename = 'widgets'
+        #di->returncolumns = (:'sku', 'name')
+        #di->keycolumns = (:(:'sku', lcapi_datasourceopeq, 'abc'))
+        local(r) = __ds_mysql_execute(#di)
+        ?>
+        [#r->get(3)->get(1)->get(1)]/[#r->get(3)->get(1)->get(2)]/[#r->get(5)]
+        """,
+        context: &context
+    ).trimmingCharacters(in: .whitespacesAndNewlines)
+    #expect(output == "abc/Widget A/1")
+}
+
+@Test func mysqldsBridgeExecutesFindallWithNoCriteria() async throws {
+    var context = LassoContext(inlineProvider: LassoInMemoryInlineProvider(tables: [
+        "widgets": [
+            LassoDataRow(["sku": .string("abc")]),
+            LassoDataRow(["sku": .string("xyz")]),
+        ],
+    ]))
+    let output = try await LassoRenderer().render(
+        """
+        <?lassoscript
+        local(di) = dsinfo
+        #di->action = lcapi_datasourcefindall
+        #di->tablename = 'widgets'
+        #di->returncolumns = (:'sku')
+        local(r) = __ds_mysql_execute(#di)
+        ?>
+        [#r->get(3)->size]/[#r->get(5)]
+        """,
+        context: &context
+    ).trimmingCharacters(in: .whitespacesAndNewlines)
+    #expect(output == "2/2")
+}
+
+@Test func mysqldsBridgeThrowsForAnUnsupportedAction() async throws {
+    // v1 scope decision (`MysqldsConnector.swift`'s own doc comment):
+    // only search/findall -- everything else fails loudly by name rather
+    // than silently no-opping or guessing at a write-path mapping.
+    var context = LassoContext(inlineProvider: LassoInMemoryInlineProvider(tables: ["widgets": []]))
+    await #expect(throws: LassoRuntimeError.datasourceUnsupportedAction("lcapi_datasourceadd")) {
+        _ = try await LassoRenderer().render(
+            """
+            <?lassoscript
+            local(di) = dsinfo
+            #di->action = lcapi_datasourceadd
+            #di->tablename = 'widgets'
+            __ds_mysql_execute(#di)
+            ?>
+            """,
+            context: &context
+        )
+    }
+}
+
+@Test func mysqldsBridgeThrowsForAnUnsupportedOperator() async throws {
+    // `opft` (full-text) has no equivalent in `PerfectCRUDLassoExecutor`'s
+    // recognized `-Op=` alias set at all -- a real, disclosed gap, not an
+    // oversight.
+    var context = LassoContext(inlineProvider: LassoInMemoryInlineProvider(tables: ["widgets": []]))
+    await #expect(throws: LassoRuntimeError.datasourceUnsupportedOperator("lcapi_datasourceopft")) {
+        _ = try await LassoRenderer().render(
+            """
+            <?lassoscript
+            local(di) = dsinfo
+            #di->action = lcapi_datasourcesearch
+            #di->tablename = 'widgets'
+            #di->keycolumns = (:(:'sku', lcapi_datasourceopft, 'abc'))
+            __ds_mysql_execute(#di)
+            ?>
+            """,
+            context: &context
+        )
+    }
+}
+
+@Test func mysqldsBridgeThrowsForTheUnsupportedValueOnlyKeyColumnShorthand() async throws {
+    // Real corpus (`ds.lasso`'s `keyvalue(p::string)`) can also produce a
+    // `(value, operator, null)` tuple shape -- deliberately rejected
+    // rather than guessed at (see `criterionArguments`'s own doc
+    // comment).
+    var context = LassoContext(inlineProvider: LassoInMemoryInlineProvider(tables: ["widgets": []]))
+    await #expect(throws: LassoRuntimeError.datasourceMalformedKeyColumn) {
+        _ = try await LassoRenderer().render(
+            """
+            <?lassoscript
+            local(di) = dsinfo
+            #di->action = lcapi_datasourcesearch
+            #di->tablename = 'widgets'
+            #di->keycolumns = (:(:'abc', lcapi_datasourceopeq, null))
+            __ds_mysql_execute(#di)
+            ?>
+            """,
+            context: &context
+        )
+    }
+}
+
+@Test func mysqldsBridgeThrowsInlineNotConfiguredWithNoInlineProviderWired() async throws {
+    var context = LassoContext()
+    await #expect(throws: LassoRuntimeError.inlineNotConfigured) {
+        _ = try await LassoRenderer().render(
+            """
+            <?lassoscript
+            local(di) = dsinfo
+            #di->action = lcapi_datasourcesearch
+            #di->tablename = 'widgets'
+            __ds_mysql_execute(#di)
+            ?>
+            """,
+            context: &context
+        )
+    }
+}
+
+@Test func mysqldsTagConstructsARealDsResultObjectFromTheBridgesRawTuple() async throws {
+    // Full chain: `\#datasource->invoke(#dsinfo)` (the real corpus call
+    // shape) resolves the dynamic tag reference to the registered
+    // `mysqlds` tag, which calls the bridge and constructs `ds_result(...)`
+    // via genuine Lasso type instantiation -- this test defines a
+    // MINIMAL `ds_result` stand-in (just the 8-parameter `oncreate` this
+    // connector actually targets, plus enough accessors to observe the
+    // binding) rather than the full real corpus file, keeping this a
+    // focused unit test independent of the third-party ds package.
+    var context = LassoContext(inlineProvider: LassoInMemoryInlineProvider(tables: [
+        "widgets": [
+            LassoDataRow(["sku": .string("abc"), "name": .string("Widget A")]),
+        ],
+    ]))
+    let output = try await LassoRenderer().render(
+        """
+        <?lassoscript
+        define ds_result => type {
+            data public index
+            data public cols
+            data public rows
+            data public set
+            data public found::integer = 0
+            data public affected::integer = 0
+            data public error
+            data public num::integer = 0
+            public oncreate(
+                index, cols, rows::staticarray, set::staticarray,
+                found::integer=0, affected::integer=0, error=null, num::integer=0
+            ) => {
+                .'index' = #index
+                .'cols' = #cols
+                .'rows' = #rows
+                .'set' = #set
+                .'found' = #found
+                .'affected' = #affected
+                .'error' = #error
+                .'num' = #num
+            }
+        }
+
+        local(datasource) = 'mysqlds'
+        local(capi) = \\#datasource
+        local(di) = dsinfo
+        #di->action = lcapi_datasourcesearch
+        #di->tablename = 'widgets'
+        #di->returncolumns = (:'sku', 'name')
+        #di->keycolumns = (:(:'sku', lcapi_datasourceopeq, 'abc'))
+        local(result) = #capi->invoke(#di)
+        ?>
+        [#result->rows->size]/[#result->rows->get(1)->get(1)]/[#result->found]/[#result->index->find('sku')]
+        """,
+        context: &context
+    ).trimmingCharacters(in: .whitespacesAndNewlines)
+    #expect(output == "1/abc/1/1")
+}
+
 // MARK: - Comment apostrophes desyncing readBalanced's brace/paren tracking
 
 @Test func lineCommentApostropheInATypeMethodBodyDoesNotSwallowTheNextMethod() async throws {

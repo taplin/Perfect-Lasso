@@ -46,6 +46,12 @@ public final class LassoTagRegistry: @unchecked Sendable {
         // class's own doc comment above), matching a genuine Lasso 9
         // built-in's always-available semantics.
         types["dsinfo"] = LassoDsInfoType.makeDefinition()
+        // A real, invocable `mysqlds` connector tag — see
+        // `MysqldsConnector.swift`'s own doc comment for the full design
+        // and scope decision (search/findall only, v1). Registered here,
+        // not per-caller, matching `dsinfo`'s own precedent immediately
+        // above: present in every `LassoTagRegistry` ever constructed.
+        tags["mysqlds"] = LassoMysqldsConnector.makeDefinition()
     }
 
     public func registerTag(_ definition: LassoCustomTagDefinition) {
