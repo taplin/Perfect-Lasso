@@ -491,6 +491,7 @@ private struct RecordingExecutor: LassoDynamicQueryExecutor {
 // name-lookup miss path).
 
 private func sampleServerConfig(
+    siteRoot: URL = URL(fileURLWithPath: "/tmp/sample-site"),
     datasourceMap: [String: String] = [:],
     filemakerDatasourceAliases: Set<String> = [],
     filemakerHostOverrides: [String: FileMakerHostOverride] = [:],
@@ -511,7 +512,7 @@ private func sampleServerConfig(
     smtpMTASTSEnforce: Bool = false
 ) -> ServerConfig {
     ServerConfig(
-        siteRoot: URL(fileURLWithPath: "/tmp/sample-site"),
+        siteRoot: siteRoot,
         port: 8181,
         lassoExtensions: ["lasso", "inc"],
         renderExcludePaths: renderExcludePaths,
@@ -1043,4 +1044,73 @@ private func makeExecutableFixture() throws -> (directory: URL, filename: String
     let registry = FileMakerConnectionRegistry(config: config)
     #expect(await registry.switchAlias("not_configured", to: "primary") == nil)
     #expect(await registry.switchAlias("fm_catalog", to: "not_a_real_profile") == nil)
+}
+
+/// Real corpus: a site with only `index.html` (no `.lasso` files anywhere)
+/// returned "File not found: index.lasso" for every request to "/" —
+/// `resolveRequestPath` used to hardcode "index.lasso" for an empty
+/// trailing path, which short-circuited `fileURL(for:)`'s own
+/// `directoryIndexURL` fallback (which already tried `index.html`) by
+/// handing it a literal, nonexistent "index.lasso" relative path instead
+/// of an empty one.
+private func makeSiteRootFixture(files: [String]) throws -> URL {
+    let directory = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString, isDirectory: true)
+    try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+    for name in files {
+        try Data("content".utf8).write(to: directory.appendingPathComponent(name))
+    }
+    return directory
+}
+
+@Test func resolveRequestPathNoLongerHardcodesIndexLassoForAnEmptyPath() throws {
+    let directory = try makeSiteRootFixture(files: [])
+    defer { try? FileManager.default.removeItem(at: directory) }
+    let config = sampleServerConfig(siteRoot: directory)
+    let siteServer = try LassoSiteServer(config: config)
+    #expect(try siteServer.resolveRequestPath("") == "")
+    #expect(try siteServer.resolveRequestPath("/") == "")
+    #expect(try siteServer.resolveRequestPath("about") == "about")
+}
+
+@Test func directoryIndexURLFindsIndexHtmlWhenNoLassoFilesExistAtAll() throws {
+    let directory = try makeSiteRootFixture(files: ["index.html"])
+    defer { try? FileManager.default.removeItem(at: directory) }
+    let config = sampleServerConfig(siteRoot: directory)
+    let siteServer = try LassoSiteServer(config: config)
+
+    let resolvedPath = try siteServer.resolveRequestPath("")
+    let fileURL = try siteServer.fileURL(for: resolvedPath)
+    #expect(fileURL.lastPathComponent == "index.html")
+    #expect(siteServer.relativePath(of: fileURL) == "index.html")
+}
+
+@Test func directoryIndexURLFindsIndexHtmDirectoryWideOnAnHtmOnlySite() throws {
+    let directory = try makeSiteRootFixture(files: ["index.htm"])
+    defer { try? FileManager.default.removeItem(at: directory) }
+    let config = sampleServerConfig(siteRoot: directory)
+    let siteServer = try LassoSiteServer(config: config)
+
+    let fileURL = try siteServer.fileURL(for: siteServer.resolveRequestPath(""))
+    #expect(fileURL.lastPathComponent == "index.htm")
+}
+
+@Test func directoryIndexURLStillPrefersIndexLassoWhenBothExist() throws {
+    let directory = try makeSiteRootFixture(files: ["index.lasso", "index.html"])
+    defer { try? FileManager.default.removeItem(at: directory) }
+    let config = sampleServerConfig(siteRoot: directory)
+    let siteServer = try LassoSiteServer(config: config)
+
+    let fileURL = try siteServer.fileURL(for: siteServer.resolveRequestPath(""))
+    #expect(fileURL.lastPathComponent == "index.lasso")
+}
+
+@Test func directoryIndexURLThrowsNotFoundWhenNoIndexFileExistsAtAll() throws {
+    let directory = try makeSiteRootFixture(files: ["about.html"])
+    defer { try? FileManager.default.removeItem(at: directory) }
+    let config = sampleServerConfig(siteRoot: directory)
+    let siteServer = try LassoSiteServer(config: config)
+
+    #expect(throws: (any Error).self) {
+        _ = try siteServer.fileURL(for: siteServer.resolveRequestPath(""))
+    }
 }
