@@ -8,6 +8,87 @@ import PerfectCRUD
 import PerfectFileMaker
 import PerfectSessionCore
 
+// MARK: - Comment apostrophes desyncing readBalanced's brace/paren tracking
+
+@Test func lineCommentApostropheInATypeMethodBodyDoesNotSwallowTheNextMethod() async throws {
+    // Real corpus (zeroloop/ds's ds.lasso): `// Don't store connections
+    // when the thread has been closed off` -- a `//` comment containing
+    // an apostrophe, inside a type method's `{...}` body. TypeBodyParser's
+    // readBalanced tracked quote state for `'`/`"`/backtick but had ZERO
+    // comment awareness, so this apostrophe was mistaken for an OPENING
+    // string quote and the scanner hunted for the next apostrophe
+    // anywhere later in the source to "close" it -- silently swallowing
+    // everything in between, including an entire subsequent method
+    // definition, into the current method's own body text. An extremely
+    // common trigger (don't/it's/won't/can't in ordinary English
+    // comments). Found via a real failing case: a type's second `store`
+    // overload vanished entirely (absorbed into the first `store`
+    // method's body), and once inside there was misparsed as an ordinary
+    // unbound `store(...)` call -- surfacing as unknownFunction("store").
+    var context = LassoContext()
+    let output = try await LassoRenderer().render(
+        """
+        <?lassoscript
+        define Widget => type {
+            public foo => {
+                // Don't do this
+                return 1
+            }
+            public bar => 2
+        }
+        local(w::Widget = Widget())
+        ?>
+        [#w->foo]/[#w->bar]
+        """,
+        context: &context
+    ).trimmingCharacters(in: .whitespacesAndNewlines)
+    #expect(output == "1/2")
+}
+
+@Test func blockCommentInATypeMethodBodyDoesNotSwallowTheNextMethod() async throws {
+    // Same bug class, `/* ... */` form -- confirms the fix's block-comment
+    // branch (not just the `//` branch) is exercised too.
+    var context = LassoContext()
+    let output = try await LassoRenderer().render(
+        """
+        <?lassoscript
+        define Widget2 => type {
+            public foo => {
+                /* Don't do this either */
+                return 1
+            }
+            public bar => 2
+        }
+        local(w::Widget2 = Widget2())
+        ?>
+        [#w->foo]/[#w->bar]
+        """,
+        context: &context
+    ).trimmingCharacters(in: .whitespacesAndNewlines)
+    #expect(output == "1/2")
+}
+
+@Test func lineCommentApostropheInsideABareParenParameterListDoesNotDesyncParsing() async throws {
+    // Same underlying bug, but in a top-level (not type-body) `{...}`
+    // block reached via ScriptBodyParser's own readBalanced (used for
+    // `if`/`while`/custom-tag bodies etc., not just type methods) --
+    // confirms the identical fix in ScriptBodyParser.swift.
+    var context = LassoContext()
+    let output = try await LassoRenderer().render(
+        """
+        <?lassoscript
+        define greeting => {
+            // Don't forget to say hi
+            return 'hello'
+        }
+        ?>
+        [greeting]
+        """,
+        context: &context
+    ).trimmingCharacters(in: .whitespacesAndNewlines)
+    #expect(output == "hello")
+}
+
 @Test func allFixturesParseWithoutDiagnostics() throws {
     let fixtureURL = try #require(Bundle.module.resourceURL?.appendingPathComponent("Fixtures"))
     let files = try FileManager.default.contentsOfDirectory(
