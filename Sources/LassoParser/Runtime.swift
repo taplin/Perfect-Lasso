@@ -2761,6 +2761,13 @@ public enum LassoRuntimeError: Error, Equatable {
     case includeCycle(String)
     case includeDepthExceeded
     case inlineNotConfigured
+    /// `inline(...)`'s `-Host` array specified a `-DataSource` connector
+    /// type this build doesn't implement an ad-hoc-connection path for
+    /// (only "mysqlds"/"filemakerds", case-insensitive, are recognized
+    /// today). Carries the exact `-DataSource` value supplied, so the
+    /// error names what was actually requested rather than silently
+    /// guessing a backend and sending the wrong credentials to it.
+    case unsupportedInlineHostDataSource(String)
     /// Thrown by `email_send` (and any future email-family native function
     /// dispatching through `LassoContext.emailProvider`) when no
     /// `LassoEmailProvider` is configured — mirrors `.inlineNotConfigured`'s

@@ -16,7 +16,7 @@ let databaseName = environment["LASSO_MYSQL_DATABASE"] ?? "catalog"
 let username = environment["LASSO_MYSQL_USER"]
 let password = environment["LASSO_MYSQL_PASSWORD"]
 
-let executor = PerfectCRUDLassoExecutor { datasource, query in
+let executor = PerfectCRUDLassoExecutor { datasource, query, _ in
     guard datasource == "catalog_mysql" else {
         throw LiveMySQLSmokeError.unknownDatasource(datasource)
     }

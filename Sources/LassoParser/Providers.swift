@@ -151,9 +151,43 @@ public struct LassoInlineAssignment: Equatable, Sendable {
     }
 }
 
+/// Real Lasso 8.5/9's documented `-Host` array parameter on `inline(...)`
+/// (Lasso 8.5 Language Guide, Table 13 "-Host Array Parameters") — an
+/// ad-hoc, per-call datasource connection that bypasses the server's
+/// pre-configured named-datasource lookup entirely. `-DataSource` selects
+/// which backend connector handles the request (e.g. "MySQLDS"/
+/// "FileMakerDS", matched case-insensitively); the surrounding inline's
+/// own `-Database` argument still selects the schema/file on whichever
+/// server this resolves to, exactly as it would with a pre-configured
+/// host. Real corpus: TS_lasso9's every page builds a
+/// `var(host_array) = array(-datasource='MySQLDS', -name='<ip>',
+/// -username=..., -password=...)` once and passes it as `-host=$host_array`
+/// to every `inline(...)` call on the page — the site has no pre-configured
+/// datasource alias for its database at all, so every inline failed with
+/// `inlineNotConfigured` before this existed.
+///
+/// `-Host='inherit'` (a bare string, not an array) and nested-inline
+/// implicit inheritance ("nested inlines with no `-Database` inherit the
+/// surrounding inline's host") are real, documented parts of this feature
+/// but are deliberately not implemented yet — no real corpus evidence
+/// needs them; every real example found repeats `-Host=` explicitly on
+/// every nested inline rather than relying on inheritance. `schema` is
+/// parsed for completeness but not consumed by either backend executor
+/// yet — neither MySQL nor FileMaker has a "schema" concept distinct from
+/// `-Database`.
+public struct LassoInlineHostOverride: Equatable, Sendable {
+    public let dataSource: String
+    public let name: String
+    public let port: Int?
+    public let username: String?
+    public let password: String?
+    public let schema: String?
+}
+
 public struct LassoInlineRequest: Equatable, Sendable {
     public let action: LassoInlineAction
     public let database: String?
+    public let hostOverride: LassoInlineHostOverride?
     public let table: String?
     public let sql: String?
     public let returnFields: [String]
@@ -191,6 +225,7 @@ public struct LassoInlineRequest: Equatable, Sendable {
     public init(arguments: [EvaluatedArgument]) throws {
         rawArguments = arguments
         database = arguments.lastString(named: "database")
+        hostOverride = Self.parseHostOverride(arguments.lastValue(named: "host"))
         // `-Table`/`-ReturnField`/`-SortField`/`-KeyField` values all
         // eventually become raw SQL identifiers (DynamicQuery/
         // DynamicMutation.table, DynamicQuery.fields, DynamicOrdering.field,
@@ -354,10 +389,48 @@ public struct LassoInlineRequest: Equatable, Sendable {
         }
     }
 
+    /// Parses `-Host`'s array value (a real `array(-DataSource=..., -Name=...,
+    /// -Port=..., -Username=..., -Password=..., -Schema=...)` -- each
+    /// labeled argument to `array()` becomes a `.pair(.string(label),
+    /// value)` element, per `array`'s own registered behavior in
+    /// Runtime.swift). `-DataSource` and `-Name` are the only two fields
+    /// every real backend needs (Table 13: "-Name -- Required for most
+    /// data source[s]"; the two connectors actually implemented,
+    /// MySQL/FileMaker, both always need it) -- an array missing either
+    /// is treated as not specifying a usable override at all, falling
+    /// through to the pre-configured alias-lookup path unchanged.
+    private static func parseHostOverride(_ value: LassoValue?) -> LassoInlineHostOverride? {
+        guard case let .array(elements)? = value else { return nil }
+        var dataSource: String?
+        var name: String?
+        var port: Int?
+        var username: String?
+        var password: String?
+        var schema: String?
+        for element in elements {
+            guard case let .pair(keyValue, fieldValue) = element else { continue }
+            switch keyValue.outputString.lowercased() {
+            case "datasource": dataSource = fieldValue.outputString
+            case "name": name = fieldValue.outputString
+            case "port": port = fieldValue.number.map(Int.init)
+            case "username": username = fieldValue.outputString
+            case "password": password = fieldValue.outputString
+            case "schema": schema = fieldValue.outputString
+            default: break
+            }
+        }
+        guard let dataSource, let name else { return nil }
+        return LassoInlineHostOverride(
+            dataSource: dataSource, name: name, port: port,
+            username: username, password: password, schema: schema
+        )
+    }
+
     private static let reservedNames: Set<String> = Set<String>([
         "search", "find", "findall", "add", "update", "delete", "show", "prepare", "nothing",
         "database", "table", "sql", "returnfield", "sortfield", "sortorder", "maxrecords",
         "skiprecords", "keyfield", "keyvalue", "op", "operator", "username", "password", "statementonly",
+        "host", "datasource",
         // A bare `-Not` flag (real corpus: order_history.page.lasso,
         // order_reporting.page.lasso) negates a query group — it is not
         // itself a field name. Without this, it fell into fieldArguments

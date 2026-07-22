@@ -1243,27 +1243,39 @@ struct LassoSiteServer: Sendable {
         }
 
         let mysqlProvider: LassoDynamicInlineProvider?
-        if config.datasourceMap.isEmpty == false {
+        do {
             // The set of real MySQL schema names this deployment is
             // configured for — LassoDynamicInlineProvider remaps a
             // recognized Lasso-side alias to one of these before this
             // executor ever sees it; an unrecognized alias passes through
             // unmapped and is rejected here rather than allowing queries
             // against arbitrary named schemas that happen to already
-            // exist on the server.
+            // exist on the server. This gate is bypassed entirely when a
+            // request carries its own `-Host` override — real Lasso's own
+            // documented behavior ("If an inline host is specified with a
+            // -Host array then step 2 [the Lasso security check] is
+            // skipped") — an ad-hoc connection is never something a
+            // deployment pre-approves by datasource name, it's approved by
+            // the site's own code supplying real credentials at the call
+            // site. This provider is now always constructed (previously
+            // only when `config.datasourceMap` was non-empty) so ad-hoc
+            // `-Host` MySQL connections work even on a deployment with zero
+            // pre-configured MySQL datasources — real corpus: TS_lasso9
+            // has no server-side datasource config at all, every inline
+            // supplies `-Host=$host_array` itself.
             let knownDatabases = Set(config.datasourceMap.values)
-            @Sendable func makeDatabase(_ database: String) throws -> Database<MySQLDatabaseConfiguration> {
+            @Sendable func makeDatabase(_ database: String, hostOverride: LassoInlineHostOverride?) throws -> Database<MySQLDatabaseConfiguration> {
                 try Database(configuration: MySQLDatabaseConfiguration(
                     database: database,
-                    host: config.mysqlHost,
-                    port: config.mysqlPort,
-                    username: config.mysqlUser,
-                    password: config.mysqlPassword
+                    host: hostOverride?.name ?? config.mysqlHost,
+                    port: hostOverride?.port ?? config.mysqlPort,
+                    username: hostOverride?.username ?? config.mysqlUser,
+                    password: hostOverride?.password ?? config.mysqlPassword
                 ))
             }
             let executor = PerfectCRUDLassoExecutor(
-                capabilities: { datasource in
-                    guard knownDatabases.contains(datasource) else { return .readOnly }
+                capabilities: { datasource, hostOverride in
+                    guard hostOverride != nil || knownDatabases.contains(datasource) else { return .readOnly }
                     return LassoDatasourceCapabilities(
                         allowsInsert: config.mysqlAllowWrites,
                         allowsUpdate: config.mysqlAllowWrites,
@@ -1271,12 +1283,12 @@ struct LassoSiteServer: Sendable {
                         allowsRawSQL: config.mysqlAllowRawSQL
                     )
                 },
-                queryHandler: { datasource, query in
-                    guard knownDatabases.contains(datasource) else {
+                queryHandler: { datasource, query, hostOverride in
+                    guard hostOverride != nil || knownDatabases.contains(datasource) else {
                         throw LassoSiteServerError.unknownDatasource(datasource)
                     }
                     do {
-                        return try makeDatabase(datasource).select(query)
+                        return try makeDatabase(datasource, hostOverride: hostOverride).select(query)
                     } catch let error as LassoDatabaseActionError {
                         throw error
                     } catch {
@@ -1284,12 +1296,12 @@ struct LassoSiteServer: Sendable {
                         throw LassoDatabaseActionError(kind: .search, datasource: datasource, underlying: error)
                     }
                 },
-                mutationHandler: { datasource, mutation in
-                    guard knownDatabases.contains(datasource) else {
+                mutationHandler: { datasource, mutation, hostOverride in
+                    guard hostOverride != nil || knownDatabases.contains(datasource) else {
                         throw LassoSiteServerError.unknownDatasource(datasource)
                     }
                     do {
-                        return try makeDatabase(datasource).mutate(mutation)
+                        return try makeDatabase(datasource, hostOverride: hostOverride).mutate(mutation)
                     } catch let error as LassoDatabaseActionError {
                         throw error
                     } catch {
@@ -1302,12 +1314,12 @@ struct LassoSiteServer: Sendable {
                         throw LassoDatabaseActionError(kind: kind, datasource: datasource, underlying: error)
                     }
                 },
-                rawSQLHandler: { datasource, sql in
-                    guard knownDatabases.contains(datasource) else {
+                rawSQLHandler: { datasource, sql, hostOverride in
+                    guard hostOverride != nil || knownDatabases.contains(datasource) else {
                         throw LassoSiteServerError.unknownDatasource(datasource)
                     }
                     do {
-                        return try makeDatabase(datasource).execute(sql)
+                        return try makeDatabase(datasource, hostOverride: hostOverride).execute(sql)
                     } catch let error as LassoDatabaseActionError {
                         throw error
                     } catch {
@@ -1320,23 +1332,29 @@ struct LassoSiteServer: Sendable {
                 executor: executor,
                 datasourceAliases: config.datasourceMap
             )
-        } else {
-            mysqlProvider = nil
         }
 
         let fileMakerProvider: LassoDynamicInlineProvider?
-        if config.filemakerDatasourceAliases.isEmpty == false {
+        do {
             // ServerConfig.load() already validates filemakerHost is set
             // whenever any FileMaker alias is configured
             // (ServerConfigError.missingFileMakerHost) — "localhost" here
             // is just a defensive fallback for a ServerConfig built by
-            // hand (e.g. in tests) rather than through .load().
+            // hand (e.g. in tests) rather than through .load(), and for a
+            // deployment relying entirely on ad-hoc `-Host` FileMaker
+            // connections with no aliases configured at all.
             let filemakerHost = config.filemakerHost ?? "localhost"
             let filemakerPort = config.filemakerPort ?? 80
             let filemakerUser = config.filemakerUser ?? ""
             let filemakerPassword = config.filemakerPassword ?? ""
             let filemakerUseTLS = filemakerPort == 443
             let filemakerScheme = filemakerUseTLS ? "https" : "http"
+            // Always constructed (previously only when
+            // `config.filemakerDatasourceAliases` was non-empty) — an
+            // empty `FileMakerConnectionRegistry` just means every
+            // `resolve(alias:)` call falls through to the shared
+            // connection below, exactly as it already did for any
+            // unrecognized alias.
             let registry = FileMakerConnectionRegistry(config: config)
             fileMakerRegistry = registry
             // Container-field URLs (FMPFieldValue.container) are prefixed
@@ -1350,15 +1368,27 @@ struct LassoSiteServer: Sendable {
             let executor = PerfectFileMakerLassoExecutor(
                 allowWrites: config.filemakerAllowWrites,
                 baseURL: "\(filemakerScheme)://\(filemakerHost):\(filemakerPort)"
-            ) { query, kind, datasource in
-                // Live resolution via the registry, not a value captured
-                // once at startup — this is what makes the admin console's
-                // "switch datasource" action take effect on the very next
-                // query. Falls back to the shared connection if the
-                // registry somehow doesn't recognize this alias (shouldn't
-                // happen for anything in config.filemakerDatasourceAliases,
-                // but a safe default beats a crash).
-                let (host, port) = await registry.resolve(alias: datasource) ?? (filemakerHost, filemakerPort)
+            ) { query, kind, datasource, hostOverride in
+                // An ad-hoc `-Host` override supplies its own full
+                // connection (real Lasso's own documented behavior — see
+                // `LassoInlineHostOverride`'s doc comment); everything else
+                // still goes through the registry's live alias resolution,
+                // which is what makes the admin console's "switch
+                // datasource" action take effect on the very next query.
+                let host: String
+                let port: Int
+                let user: String
+                let password: String
+                if let hostOverride {
+                    host = hostOverride.name
+                    port = hostOverride.port ?? 80
+                    user = hostOverride.username ?? ""
+                    password = hostOverride.password ?? ""
+                } else {
+                    (host, port) = await registry.resolve(alias: datasource) ?? (filemakerHost, filemakerPort)
+                    user = filemakerUser
+                    password = filemakerPassword
+                }
                 let useTLS = port == 443
                 // A fresh FileMakerServer per call (matching makeDatabase's
                 // own per-call construction above), even though the
@@ -1369,7 +1399,7 @@ struct LassoSiteServer: Sendable {
                 // FileMakerServer wasn't Sendable at all.
                 let server = FileMakerServer(
                     host: host, port: port,
-                    userName: filemakerUser, password: filemakerPassword,
+                    userName: user, password: password,
                     useTLS: useTLS
                 )
                 // FileMakerServer.query(_:) is genuine async/await (the
@@ -1389,9 +1419,6 @@ struct LassoSiteServer: Sendable {
             // No alias remapping needed — the alias itself IS the
             // FileMaker database-file name.
             fileMakerProvider = LassoDynamicInlineProvider(executor: executor, datasourceAliases: [:])
-        } else {
-            fileMakerRegistry = nil
-            fileMakerProvider = nil
         }
 
         if mysqlProvider == nil, fileMakerProvider == nil {

@@ -37,6 +37,26 @@ struct LassoMultiBackendInlineProvider: LassoInlineProvider {
 
     func executeInline(arguments: [EvaluatedArgument], context: LassoContext) async throws -> LassoInlineFrame {
         let request = try LassoInlineRequest(arguments: arguments)
+        // A `-Host` array's own `-DataSource` selects the backend directly
+        // — an ad-hoc connection, never a pre-configured alias, so it must
+        // be checked before (and instead of) the alias-set lookup below.
+        // Case-insensitive, matching every other real-Lasso string
+        // comparison in this codebase. An unrecognized connector type
+        // fails loudly rather than silently falling through to whichever
+        // backend happens to be configured — that would mean sending, say,
+        // FileMaker credentials to a MySQL connection attempt.
+        if let hostOverride = request.hostOverride {
+            switch hostOverride.dataSource.lowercased() {
+            case "mysqlds":
+                guard let mysqlProvider else { throw LassoRuntimeError.inlineNotConfigured }
+                return try await mysqlProvider.executeInline(arguments: arguments, context: context)
+            case "filemakerds":
+                guard let fileMakerProvider else { throw LassoRuntimeError.inlineNotConfigured }
+                return try await fileMakerProvider.executeInline(arguments: arguments, context: context)
+            default:
+                throw LassoRuntimeError.unsupportedInlineHostDataSource(hostOverride.dataSource)
+            }
+        }
         if let database = request.database, fileMakerAliases.contains(database.lowercased()),
            let fileMakerProvider {
             return try await fileMakerProvider.executeInline(arguments: arguments, context: context)

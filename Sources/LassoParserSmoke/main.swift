@@ -214,7 +214,7 @@ precondition(
     "Corpus closeout carousel query failed: \(corpusCloseoutOutput)"
 )
 
-let perfectCRUDExecutor = PerfectCRUDLassoExecutor { datasource, query in
+let perfectCRUDExecutor = PerfectCRUDLassoExecutor { datasource, query, _ in
     precondition(datasource == "catalog")
     precondition(query.table == "skus")
     precondition(query.predicates.count == 2)
