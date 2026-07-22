@@ -6321,6 +6321,56 @@ final class FullyRecordingResponseSink: LassoResponseSink, @unchecked Sendable {
     #expect(context.value(for: "sawError", scope: .global) == .string("Add failed"))
 }
 
+@Test func defineAtendRunsAfterTheMainPageBodyFinishesMatchingRealCorpusShape() async throws {
+    // Ch. "Web Requests and Responses" > "define_atBegin and
+    // define_atEnd": "Executes at the request's end... normally run
+    // before data is sent to the client." Real corpus (zeroloop/ds's
+    // `_init.lasso`): `web_request ? define_atend({ds_close_connections})`
+    // -- a capture literal registered mid-page, whose text only appears
+    // once the WHOLE request finishes, after everything the page itself
+    // already produced (unlike `handle`, scoped to just the enclosing
+    // block).
+    var context = LassoContext()
+    let output = try await LassoRenderer().render(
+        "before-[define_atend({'-atend'})]after",
+        context: &context
+    )
+    #expect(output == "before-after-atend")
+}
+
+@Test func defineAtendStillRunsWhenThePageThrowsAnError() async throws {
+    // Real corpus need: `ds_close_connections` is cleanup (closing DB
+    // connections) that must not leak just because the page itself
+    // failed -- matching `handle`'s own "still runs on error" precedent.
+    var natives = LassoNativeRegistry()
+    natives.register("fail_now") { _, _ in
+        throw LassoRecoverableError(LassoErrorState(code: 1, message: "boom", kind: "test"))
+    }
+    var context = LassoContext(natives: natives)
+    await #expect(throws: LassoRecoverableError(LassoErrorState(code: 1, message: "boom", kind: "test"))) {
+        _ = try await LassoRenderer().render(
+            "[define_atend({var(cleanedUp) = true})][fail_now]",
+            context: &context
+        )
+    }
+    #expect(context.value(for: "cleanedUp", scope: .global) == .boolean(true))
+}
+
+@Test func defineAtendRunsMultipleRegistrationsInRegistrationOrder() async throws {
+    var context = LassoContext()
+    let output = try await LassoRenderer().render(
+        "[define_atend({'-A'})][define_atend({'-B'})]main",
+        context: &context
+    )
+    #expect(output == "main-A-B")
+}
+
+@Test func defineAtendWithNoRegistrationsAddsNothingRegressionGuard() async throws {
+    var context = LassoContext()
+    let output = try await LassoRenderer().render("just-text", context: &context)
+    #expect(output == "just-text")
+}
+
 @Test func handleConditionSkipsExecutionWhenFalse() async throws {
     // "can take a single parameter that is a conditional expression,
     // defaulting to true. If the conditional expression evaluates as

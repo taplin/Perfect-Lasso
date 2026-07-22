@@ -41,6 +41,12 @@ public struct LassoRenderer: Sendable {
             ) {
                 output += returned.outputString
             }
+            // Ch. "Web Requests and Responses" > "define_atBegin and
+            // define_atEnd": whole-request scope, drained exactly once
+            // here (this function is the single top-level entry point
+            // every request goes through) — NOT per nested body render,
+            // unlike `handle`'s own frame-stack draining just above.
+            output += try await engine.evaluator.drainAtEndRegistrations()
             engine.evaluator.context.finalizeSessions()
             context = engine.evaluator.context
             return output
@@ -54,6 +60,11 @@ public struct LassoRenderer: Sendable {
             // that was never written back on the throw path — the
             // caller's `context` argument would silently stay exactly as
             // it was *before* rendering ever started.
+            // At-end registrations still run on a thrown error too —
+            // real-corpus usage (`ds_close_connections`) is cleanup that
+            // must not leak just because the page itself failed,
+            // matching `handle`'s own "still runs on error" precedent.
+            _ = try? await engine.evaluator.drainAtEndRegistrations()
             context = engine.evaluator.context
             throw error
         }

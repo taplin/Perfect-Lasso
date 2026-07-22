@@ -1323,6 +1323,22 @@ public struct LassoNativeRegistry: Sendable {
             }
             return .void
         }
+        // Ch. "Web Requests and Responses" > "define_atBegin and
+        // define_atEnd": registers `arguments.first` (typically a
+        // capture literal, per the docs' own recommendation of a tag
+        // reference for efficiency -- real corpus only ever passes a
+        // capture) to run once at THIS request's end -- see
+        // `LassoContext.atEndRegistrations`/`Evaluator
+        // .drainAtEndRegistrations` for storage and invocation. Only
+        // `define_atend` is implemented here, not `define_atbegin`/
+        // `web_response->addAtEnd` -- no corpus evidence for either yet
+        // (zeroloop/ds's `_init.lasso`: `web_request ?
+        // define_atend({ds_close_connections})`).
+        register("define_atend") { arguments, context in
+            guard case let .capture(capture) = arguments.first?.value else { return .void }
+            context.atEndRegistrations.append(capture)
+            return .void
+        }
         register("return") { arguments, context in
             context.setNonLocalReturnSignal(arguments.first?.value ?? .void)
             return .void
@@ -2257,6 +2273,15 @@ public struct LassoContext: Sendable {
     mutating func popHandlerFrame() -> [LassoPendingHandler] {
         pendingHandlerFrames.popLast() ?? []
     }
+
+    /// Ch. "Web Requests and Responses" > "define_atBegin and
+    /// define_atEnd": captures registered via `define_atend`, to be run
+    /// once at the very end of the CURRENT request — a flat list, not a
+    /// frame stack like `pendingHandlerFrames` above, since this is a
+    /// documented whole-request concept, not scoped to each nested body
+    /// render. See `Evaluator.drainAtEndRegistrations` for where these
+    /// actually run.
+    var atEndRegistrations: [LassoCaptureValue] = []
     /// Real Lasso's request-local `error_currentError` state — reset to
     /// `.noError` on every fresh context, updated by `setError`/`clearError`.
     /// `lastError` preserves the previous error across a `clearError()` call,

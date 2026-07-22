@@ -746,6 +746,32 @@ struct Evaluator {
         return output
     }
 
+    /// Ch. "Web Requests and Responses" > "define_atBegin and define_atEnd":
+    /// runs every capture registered via `define_atend` during this
+    /// request, in registration order, then clears the list. Unlike
+    /// `drainPendingHandlers` (a nested per-`render()`-call frame stack —
+    /// `handle`'s documented "container" scoping), `define_atend` is a
+    /// documented WHOLE-REQUEST concept ("Executes at the request's
+    /// end... normally run before data is sent to the client"), so this
+    /// is called exactly once, from `LassoRenderer.render(_:context:)`'s
+    /// single top-level entry point, not from every nested body render.
+    /// Real corpus (zeroloop/ds's `_init.lasso`): `web_request ?
+    /// define_atend({ds_close_connections})` — cleanup with no output of
+    /// its own, but any real output an at-end capture DOES produce is
+    /// still appended, matching the docs' own "can... manipulate outgoing
+    /// headers and content body" and `drainPendingHandlers`'s identical
+    /// treatment of `handle` block output.
+    mutating func drainAtEndRegistrations() async throws -> String {
+        let captures = context.atEndRegistrations
+        guard !captures.isEmpty else { return "" }
+        context.atEndRegistrations = []
+        var output = ""
+        for capture in captures {
+            output += (try await invokeCapture(capture, arguments: [], forceStringOutput: true)).outputString
+        }
+        return output
+    }
+
     private static func errorState(from error: Error) -> LassoErrorState {
         if let recoverable = error as? LassoRecoverableError {
             return recoverable.state
