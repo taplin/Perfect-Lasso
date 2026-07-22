@@ -155,3 +155,26 @@ public final class LassoCaptureValue: @unchecked Sendable, Equatable {
         lhs === rhs
     }
 }
+
+/// Ch. "Error Handling" > "handle and handle_failure": a `handle => {...}`/
+/// `handle_failure => {...}` call registers one of these against the
+/// currently-active `Renderer.render(_:)` frame (see
+/// `LassoContext.pendingHandlerFrames`'s own doc comment) rather than
+/// invoking its capture immediately — it runs once that frame's body
+/// finishes, in registration order, whether the body completed normally
+/// or a thrown error unwound through it. `condition` is evaluated eagerly
+/// at registration time (not lazily at drain time) — real corpus
+/// (zeroloop/ds's own `_init.lasso`) never supplies one at all, so this
+/// is a disclosed simplification rather than a corpus-driven choice: the
+/// Guide's wording ("can take a single parameter that is a conditional
+/// expression") doesn't specify eager-vs-lazy evaluation either way, and
+/// eager evaluation avoids needing to snapshot/re-evaluate a raw
+/// expression against a possibly-already-torn-down local scope at drain
+/// time. `failureOnly` distinguishes `handle_failure` (only runs when
+/// the frame actually failed) from plain `handle` (runs regardless,
+/// subject only to `condition`) — otherwise identical.
+struct LassoPendingHandler: Sendable {
+    let condition: LassoValue
+    let capture: LassoCaptureValue
+    let failureOnly: Bool
+}

@@ -223,6 +223,12 @@ struct Evaluator {
                 // handles instead.
                 return try await evaluateTreeMapConstructorCall(arguments)
             }
+            if name.caseInsensitiveCompare("handle") == .orderedSame {
+                return try await registerHandle(arguments, failureOnly: false)
+            }
+            if name.caseInsensitiveCompare("handle_failure") == .orderedSame {
+                return try await registerHandle(arguments, failureOnly: true)
+            }
             if let function = context.natives.function(named: name) {
                 return try await function(try await evaluate(arguments), &context)
             }
@@ -473,7 +479,21 @@ struct Evaluator {
     private mutating func invokeCapture(
         _ capture: LassoCaptureValue,
         arguments: [EvaluatedArgument],
-        updatesAutoCollectBuffer: Bool = true
+        updatesAutoCollectBuffer: Bool = true,
+        // `handle`/`handle_failure` (Ch. "Error Handling") blocks are
+        // rendered for their literal text output regardless of whether
+        // they happen to be written as an ordinary `{...}` or an
+        // auto-collect `{^...^}` capture — real Lasso's own docs describe
+        // their body as ordinary page content ("can... replace the
+        // contents of the page being served"), not a value-producing
+        // expression a caller reads back. Forces the same `.string(output)`
+        // result an auto-collect capture already produces, WITHOUT
+        // marking the capture itself auto-collect (so `capture.autoCollect`/
+        // `->autoCollectBuffer` stay exactly as documented for every other
+        // caller) and without touching the auto-collect buffer at all
+        // (irrelevant here — `drainPendingHandlers` is the only caller,
+        // and nothing ever reads a handle block's "return value").
+        forceStringOutput: Bool = false
     ) async throws -> LassoValue {
         // Stage 2 (Captures): see `skipIfNonLocalReturnAlreadyPending()`'s
         // own doc comment — without this, a SECOND `#cap->invoke` in the
@@ -561,7 +581,7 @@ struct Evaluator {
         // invocation must not manufacture an auto-collect/void value of
         // its own — it produces `.void` here and its caller's render loop
         // keeps unwinding, exactly like `invokeCustomTag`/`invokeMemberMethod`.
-        let result: LassoValue = capture.autoCollect ? .string(output) : .void
+        let result: LassoValue = (capture.autoCollect || forceStringOutput) ? .string(output) : .void
         // Stage 7: "the auto-collected value will be returned and can be
         // accessed using `capture->autoCollectBuffer`" — retained on the
         // capture itself after a normal `->invoke()`/`()` call so a LATER,
@@ -637,6 +657,62 @@ struct Evaluator {
     /// associated at all (real Lasso's own forEach has no meaningful
     /// return value of its own; callers rely on side effects or a
     /// non-local exit, never this function's own result).
+    /// Ch. "Error Handling" > "handle and handle_failure": registers a
+    /// capture to run once the immediately-enclosing `Renderer.render(_:)`
+    /// frame finishes (see `LassoContext.pendingHandlerFrames`'s own doc
+    /// comment for where that actually happens) — does NOT invoke the
+    /// capture here. `handle`/`handle_failure` differ only in
+    /// `failureOnly`; see `LassoPendingHandler`'s own doc comment for
+    /// both fields' exact semantics.
+    private mutating func registerHandle(_ arguments: [LassoArgument], failureOnly: Bool) async throws -> LassoValue {
+        let (givenBlock, remaining) = Self.extractGivenBlock(from: try await evaluate(arguments))
+        guard case let .capture(capture) = givenBlock else { return .void }
+        // "can take a single parameter that is a conditional expression,
+        // defaulting to true" -- real corpus (zeroloop/ds's own
+        // _init.lasso) never supplies one.
+        let condition = remaining.first?.value ?? .boolean(true)
+        context.registerHandler(LassoPendingHandler(condition: condition, capture: capture, failureOnly: failureOnly))
+        return .void
+    }
+
+    /// Runs every handler registered against the CURRENT (innermost)
+    /// `LassoContext.pendingHandlerFrames` frame, in registration order,
+    /// then pops that frame — see `Renderer.render(_:)` for where this is
+    /// called (both the success and thrown-error paths) and
+    /// `LassoPendingHandler`'s own doc comment for what "qualifies" means.
+    /// `afterError`, when non-nil, means the frame's own body did NOT
+    /// complete normally — `handle_failure`-flagged handlers only run in
+    /// that case, and `context.currentError` is set from it (synthesizing
+    /// a generic `LassoErrorState` for anything that isn't already a
+    /// `LassoRecoverableError`) so `error_msg`/`error_currenterror`
+    /// correctly reflect it from inside a handler's own body, matching
+    /// how `protect` already does the same for its own catch.
+    mutating func drainPendingHandlers(afterError: Error?) async throws -> String {
+        let handlers = context.popHandlerFrame()
+        guard !handlers.isEmpty else { return "" }
+        if let afterError {
+            context.setError(Self.errorState(from: afterError))
+        }
+        var output = ""
+        for handler in handlers {
+            if handler.failureOnly, afterError == nil { continue }
+            guard handler.condition.isTruthy else { continue }
+            output += (try await invokeCapture(handler.capture, arguments: [], forceStringOutput: true)).outputString
+        }
+        return output
+    }
+
+    private static func errorState(from error: Error) -> LassoErrorState {
+        if let recoverable = error as? LassoRecoverableError {
+            return recoverable.state
+        }
+        return LassoErrorState(
+            code: LassoErrorHandling.Code.genericCustom,
+            message: String(describing: error),
+            kind: "runtime"
+        )
+    }
+
     private mutating func invokeForEachCapture(
         over elements: [LassoValue],
         evaluatedArguments: [EvaluatedArgument]
