@@ -15510,3 +15510,93 @@ struct IncludeURLTests {
     #expect(caught != nil)
     #expect(caught is LassoRuntimeError)
 }
+
+@Test func protectArrowBlockActuallyRunsItsOwnBodyInsteadOfTheFollowingStatement() async throws {
+    // Real corpus (zeroloop/ds's ds.lasso): `protect => { ... }`, used
+    // dozens of times, has no explicit `/protect;` closer -- its body is
+    // the `{...}` right there. `protect` isn't one of the six keywords
+    // (if/while/loop/match/iterate/define) with their own dedicated
+    // character-level arrow-block parsing, so `protect => { ... }`
+    // previously fell through to `ExpressionParser`'s fully generic
+    // association-operator folding, producing an UNCLOSED `.tag(...,
+    // closing: false, ...)` node that `BlockBuilder` then (wrongly)
+    // paired with whatever statement happened to follow in the source --
+    // silently discarding protect's own real body and running the NEXT
+    // statement in its place instead. Confirmed via `local(log)`
+    // ordering: before the fix this rendered "after protect;" only.
+    var context = LassoContext()
+    let output = try await LassoRenderer().render(
+        """
+        <?lassoscript
+        local(log) = ''
+        protect => {
+            #log += 'inside protect;'
+        }
+        #log += 'after protect;'
+        ?>
+        [#log]
+        """,
+        context: &context
+    ).trimmingCharacters(in: .whitespacesAndNewlines)
+    #expect(output == "inside protect;after protect;")
+}
+
+@Test func returnInsideAProtectArrowBlockInsideAMethodExitsTheMethodCorrectly() async throws {
+    // Same bug, observed via control flow rather than output ordering --
+    // before the fix, `return` inside `protect => { ... }` never took
+    // effect at all (its statement got silently discarded per the
+    // finding above), so the method fell through to its own NEXT
+    // statement's `return` instead.
+    var context = LassoContext()
+    let output = try await LassoRenderer().render(
+        """
+        <?lassoscript
+        define widget => type {
+            public run => {
+                protect => {
+                    return 'from protect'
+                }
+                return 'after protect'
+            }
+        }
+        local(w) = widget
+        ?>
+        [#w->run]
+        """,
+        context: &context
+    ).trimmingCharacters(in: .whitespacesAndNewlines)
+    #expect(output == "from protect")
+}
+
+@Test func recordsBareIdentifierArrowBlockIteratesRealFoundSetRows() async throws {
+    // Closes Task #169: real corpus (TS_lasso9's index.lasso)
+    // `inline(...)=>{records=>{...}}}` — same underlying parser gap as
+    // `protect => {...}` above (`records` also has no dedicated
+    // character-level arrow-block parser and is TagCatalog-registered
+    // for bare-open recognition), fixed by the same general
+    // `emitStatement` change: `records=>{ ... }` previously silently
+    // fell through to an ordinary (nonexistent) function call producing
+    // empty output, never actually iterating the current inline frame's
+    // rows at all.
+    var context = LassoContext(inlineProvider: LassoInMemoryInlineProvider(tables: [
+        "widgets": [
+            LassoDataRow(["sku": .string("abc")]),
+            LassoDataRow(["sku": .string("xyz")]),
+        ],
+    ]))
+    let output = try await LassoRenderer().render(
+        """
+        <?lassoscript
+        local(log) = ''
+        inline(-database='catalog', -table='widgets', -findall) => {
+            records => {
+                #log += field('sku') + ';'
+            }
+        }
+        ?>
+        [#log]
+        """,
+        context: &context
+    ).trimmingCharacters(in: .whitespacesAndNewlines)
+    #expect(output == "abc;xyz;")
+}
