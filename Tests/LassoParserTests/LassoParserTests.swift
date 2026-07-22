@@ -4347,6 +4347,83 @@ func perfectCRUDConnectorFailuresBecomeInlineErrorFrames(source: String, expecte
     #expect(output == "SemRush/DotBot/2")
 }
 
+// MARK: - Staticarray literals `(: ... )`
+
+@Test func staticarrayLiteralParsesAsAnOrdinaryArrayValue() async throws {
+    // Ch. "Literals" > "Staticarray Literals": "an open parenthesis
+    // immediately followed by a colon, then zero or more comma-delimited
+    // expressions, ending with the closing parenthesis" -- the Guide's
+    // own worked example. This codebase already treats real Lasso's
+    // distinct staticarray type as equivalent to its own .array runtime
+    // value everywhere else (no separate immutable-array type), so this
+    // literal desugars straight into the same array(...) call shape.
+    var context = LassoContext()
+    let output = try await LassoRenderer().render(
+        "[(: 1, 2, 'hello')->size]/[(: 1, 2, 'hello')->get(3)]",
+        context: &context
+    )
+    #expect(output == "3/hello")
+}
+
+@Test func emptyStaticarrayLiteralParsesAsAnEmptyArray() async throws {
+    // "zero or more comma-delimited expressions" -- an empty list is
+    // explicitly documented as valid.
+    var context = LassoContext()
+    let output = try await LassoRenderer().render("[(:)->size]", context: &context)
+    #expect(output == "0")
+}
+
+@Test func staticarrayLiteralWorksAsAWithInSourceMatchingRealCorpusShape() async throws {
+    // Real corpus shape (zeroloop/ds LassoApp's own _init.lasso, seen
+    // live in TS_lasso9's index copy 2.lasso and previously in the
+    // "scrubs" corpus): `with file in (: 'a.lasso', 'b.lasso') do { ... }`
+    // spanning multiple lines, no trailing comma issue, previously
+    // failed entirely with unsupportedExpression(":") since a bare `:`
+    // right after `(` fell through to `.unknown(":")`.
+    var context = LassoContext()
+    let output = try await LassoRenderer().render(
+        """
+        <?lassoscript
+        with file in (:
+            'sequential.lasso',
+            'tables.lasso',
+            'activerow.lasso'
+        ) do {
+            #file + ';'
+        }
+        ?>
+        """,
+        context: &context
+    )
+    #expect(output == "sequential.lasso;tables.lasso;activerow.lasso;")
+}
+
+@Test func parenthesizedGroupingStillWorksAlongsideTheStaticarrayLiteralFix() async throws {
+    // Regression guard: an ordinary parenthesized expression `(x)` --
+    // where the very next token after `(` is NOT a bare colon -- must
+    // keep parsing exactly as before.
+    var context = LassoContext(globals: ["x": .integer(5)])
+    let output = try await LassoRenderer().render("[(($x + 1) * 2)]", context: &context)
+    #expect(output == "12")
+}
+
+@Test func typeConstraintDoubleColonStillWorksAlongsideTheStaticarrayLiteralFix() async throws {
+    // Regression guard: `::` (type constraint, e.g. inside a define
+    // signature) is a completely different token from a bare `:`
+    // immediately after `(` -- must be unaffected.
+    var context = LassoContext()
+    let output = try await LassoRenderer().render(
+        """
+        <?lassoscript
+        define typedEcho(n::integer) => { return(#n + 1) }
+        ?>
+        [typedEcho(41)]
+        """,
+        context: &context
+    ).trimmingCharacters(in: .whitespacesAndNewlines)
+    #expect(output == "42")
+}
+
 @Test func bareIdentifierCallsZeroArgCustomTag() async throws {
     var context = LassoContext()
     let output = try await LassoRenderer().render(
