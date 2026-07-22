@@ -160,7 +160,20 @@ public indirect enum LassoExpression: Equatable, Sendable {
     /// how this resolves.
     case tagReference(String)
     case call(callee: LassoExpression, arguments: [LassoArgument])
-    case member(base: LassoExpression, name: String, arguments: [LassoArgument]?)
+    /// `isQuoted` distinguishes `.name`/`->name` (bareword) from
+    /// `.'name'`/`->'name'` (single-quoted) member access — a REAL,
+    /// documented Lasso semantic (Ch. "Types" > "Custom Getters and
+    /// Setters": "Within a manual getter or setter, it is vital to refer
+    /// to the data member using the single-quoted name syntax.
+    /// Otherwise, an infinite recursion situation may arise as the
+    /// getter/setter continually re-calls itself"), not merely a lexical
+    /// styling choice — quoted access bypasses a same-named custom
+    /// getter/setter method entirely and goes straight to the raw stored
+    /// field. `Evaluator.member(_:_:_:)` (reads) and
+    /// `Evaluator.assign(_:to:defaultScope:)` (writes) both check this
+    /// flag before ever consulting `context.tagRegistry`'s custom-method
+    /// dispatch for `.object` values.
+    case member(base: LassoExpression, name: String, arguments: [LassoArgument]?, isQuoted: Bool)
     case unary(operator: String, value: LassoExpression)
     case binary(left: LassoExpression, operator: String, right: LassoExpression)
     case assignment(target: LassoExpression, value: LassoExpression)

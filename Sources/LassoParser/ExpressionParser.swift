@@ -672,7 +672,8 @@ struct ExpressionParser {
         case let .symbol(op) where ["!", "-", "+"].contains(op):
             expression = .unary(operator: op, value: parseExpression(minimumPrecedence: 8))
         case .symbol("."):
-            expression = .member(base: .identifier("self"), name: readMemberName(), arguments: nil)
+            let member = readMemberName()
+            expression = .member(base: .identifier("self"), name: member.name, arguments: nil, isQuoted: member.isQuoted)
         case .symbol("::") where isIdentifierToken(peek):
             // Ch. "Literals" > "Tag Literals": "A tag is an object that
             // uniquely represents a particular string of characters...
@@ -1063,6 +1064,15 @@ struct ExpressionParser {
             boundType = firstName
             methodName = secondName
         }
+        // Ch. "Types" > "Custom Getters and Setters": `public firstName=
+        // (value) => {...}` -- a method NAME ending in `=`. Unambiguous
+        // at the TOKEN level: `==`/`=>` are their own distinct compound
+        // tokens (see the lexer's own operator list), so a bare
+        // `.symbol("=")` here can only ever be this setter-name suffix,
+        // never the start of an equality/association operator.
+        if consume("=") {
+            methodName += "="
+        }
 
         var parameters: [LassoArgument] = []
         if consume("(") {
@@ -1141,7 +1151,8 @@ struct ExpressionParser {
                 eligible = false
                 index += 1 // consume "->"
                 let wrapped = consume("(")
-                let name = readMemberName()
+                let member = readMemberName()
+                let name = member.name
                 let arguments: [LassoArgument]?
                 if wrapped {
                     if consume(":") {
@@ -1177,7 +1188,7 @@ struct ExpressionParser {
                 } else {
                     arguments = consume("(") ? parseArguments(closing: ")") : nil
                 }
-                expression = .member(base: expression, name: name, arguments: arguments)
+                expression = .member(base: expression, name: name, arguments: arguments, isQuoted: member.isQuoted)
             } else if peek == .symbol("=>") {
                 // The association operator — Ch. "Captures": "When using
                 // the association operator (`=>`) to invoke an object by
@@ -1243,8 +1254,8 @@ struct ExpressionParser {
         switch callee {
         case let .call(innerCallee, arguments):
             return .call(callee: innerCallee, arguments: arguments + [captureArgument])
-        case let .member(base, name, arguments):
-            return .member(base: base, name: name, arguments: (arguments ?? []) + [captureArgument])
+        case let .member(base, name, arguments, isQuoted):
+            return .member(base: base, name: name, arguments: (arguments ?? []) + [captureArgument], isQuoted: isQuoted)
         case let .identifier(name):
             return .call(callee: .identifier(name), arguments: [captureArgument])
         default:
@@ -1423,12 +1434,18 @@ struct ExpressionParser {
         return false
     }
 
-    mutating private func readMemberName() -> String {
+    /// `isQuoted` reports whether the name came from a `.string` token
+    /// (`.'name'`/`->'name'`) rather than a bareword `.identifier`
+    /// (`.name`/`->name`) — see `LassoExpression.member`'s own doc
+    /// comment for why this distinction is load-bearing, not cosmetic.
+    mutating private func readMemberName() -> (name: String, isQuoted: Bool) {
         switch advance() {
-        case let .identifier(name), let .string(name):
-            return name
+        case let .identifier(name):
+            return (name, false)
+        case let .string(name):
+            return (name, true)
         default:
-            return "<unknown>"
+            return ("<unknown>", false)
         }
     }
 

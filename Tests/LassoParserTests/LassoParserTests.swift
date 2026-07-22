@@ -1405,6 +1405,142 @@ import PerfectSessionCore
     #expect(output == "3")
 }
 
+// MARK: - Custom setter methods (`name=`)
+
+@Test func customSetterMethodInATypeBodyTakesPriorityOverRawFieldWrite() async throws {
+    // Ch. "Types" > "Custom Getters and Setters": `public firstName=(value) => {...}`,
+    // called via `#someone->firstName = "Bob"`. Real corpus (zeroloop/ds's
+    // activerow.lasso): `public set=(val,col::tag) => ...`. Previously
+    // TypeBodyParser.parseMethod's readIdentifier() stopped at "firstname"
+    // and never consumed the trailing "=", so the whole method definition
+    // was silently dropped as malformed (a diagnostic, not a thrown
+    // error) -- confirmed via ->hasMethod('firstname=') reporting false
+    // before this fix.
+    var context = LassoContext()
+    let output = try await LassoRenderer().render(
+        """
+        <?lassoscript
+        define Person => type {
+            data firstName::string = ''
+            public firstName => .'firstName'
+            public firstName=(value) => { .'firstName' = #value }
+        }
+        local(p::Person = Person())
+        #p->firstName = 'Bob'
+        ?>
+        [#p->hasMethod('firstname=')]/[#p->firstName]
+        """,
+        context: &context
+    ).trimmingCharacters(in: .whitespacesAndNewlines)
+    #expect(output == "true/Bob")
+}
+
+@Test func customSetterMethodFallsBackToRawFieldWriteWhenNoMatchingSetterExists() async throws {
+    // Regression guard: a plain data member with no custom setter must
+    // keep working exactly as before -- `invokeMemberMethod` returning
+    // `nil` (no such method) falls through to the ordinary field write,
+    // not silently swallowed.
+    var context = LassoContext()
+    let output = try await LassoRenderer().render(
+        """
+        <?lassoscript
+        define Widget => type {
+            data plain = 0
+        }
+        local(w::Widget = Widget())
+        #w->plain = 42
+        ?>
+        [#w->plain]
+        """,
+        context: &context
+    ).trimmingCharacters(in: .whitespacesAndNewlines)
+    #expect(output == "42")
+}
+
+@Test func multiParameterSetterPassesExtraArgumentsAfterTheAssignedValue() async throws {
+    // Ch. "Types": "Setters can be defined to accept more than one
+    // parameter... the first parameter is always the new value for the
+    // assignment. All additional parameters follow" -- called as
+    // `#someone->firstName("Big Wheels") = "Bob"`.
+    var context = LassoContext()
+    let output = try await LassoRenderer().render(
+        """
+        <?lassoscript
+        define Person2 => type {
+            data label::string = ''
+            public label => .'label'
+            public label=(value, nick) => { .'label' = #nick + ': ' + #value }
+        }
+        local(p::Person2 = Person2())
+        #p->label('Big Wheels') = 'Bob'
+        ?>
+        [#p->label]
+        """,
+        context: &context
+    ).trimmingCharacters(in: .whitespacesAndNewlines)
+    #expect(output == "Big Wheels: Bob")
+}
+
+@Test func topLevelUnboundDefineSetterStyleNameParsesAndRegistersMatchingRealCorpusShape() async throws {
+    // Real corpus shape (zeroloop/ds's ds.lasso): `define ds_connections_closed = (p::integer) => ...`,
+    // called elsewhere in the SAME file as a bare `ds_connections_closed = 1`
+    // -- an UNBOUND, top-level setter-style tag (not a type member),
+    // invoked via plain assignment syntax, not `name(args)`. Previously
+    // ScriptBodyParser.parseDefineOpening's readIdentifier() stopped at
+    // "counter_bump" and never consumed the trailing "=", so the whole
+    // line fell through to the generic statement parser, eventually
+    // throwing unsupportedExpression("Binary ::") once its `(p::integer)`
+    // was misparsed as an ordinary grouped expression. Separately,
+    // `assign(_:to:defaultScope:)`'s `.identifier`/`.string` targets
+    // needed their own new setter-tag dispatch check (mirroring the
+    // `.member` bound-setter check) for the CALLING convention itself to
+    // work at all. Uses plain `=` rather than the real corpus's own
+    // `:=` (assign-produce) inside the body -- confirmed separately that
+    // `:=` isn't implemented in this codebase at all (a genuine, unrelated
+    // pre-existing gap), so this test sticks to already-supported `=`.
+    var context = LassoContext()
+    let output = try await LassoRenderer().render(
+        """
+        <?lassoscript
+        define counter_bump = (p::integer) => var(counter_value) = #p
+        counter_bump = 41
+        ?>
+        [$counter_value]
+        """,
+        context: &context
+    ).trimmingCharacters(in: .whitespacesAndNewlines)
+    #expect(output == "41")
+}
+
+@Test func boundDefineSetterStyleNameWorksAsATernaryActionMatchingRealCorpusShape() async throws {
+    // The exact real corpus shape this whole investigation traced back
+    // to (zeroloop/ds's activerow.lasso, scrubbed): a BOUND setter-style
+    // name (`TypeName->method=`) registered conditionally as a ternary's
+    // action -- only registering when the guard is true, per
+    // `defineAsATernaryActionRegistersABoundMethodMatchingRealCorpusShape`'s
+    // own precedent. Assignment expressions always evaluate to `.void`
+    // in this codebase (matching every other assignment), so the setter's
+    // effect is observed via a separate getter read afterward, not by
+    // printing the assignment itself.
+    var context = LassoContext()
+    let output = try await LassoRenderer().render(
+        """
+        <?lassoscript
+        define Ex_Widget => type {
+            data tagValue::string = ''
+            public tag => .'tagValue'
+        }
+        true ? define Ex_Widget->tag=(value) => { .'tagValue' = #value + '!' }
+        local(w::Ex_Widget = Ex_Widget())
+        #w->tag = 'hi'
+        ?>
+        [#w->tag]
+        """,
+        context: &context
+    ).trimmingCharacters(in: .whitespacesAndNewlines)
+    #expect(output == "hi!")
+}
+
 @Test func mathArithmeticTagsMatchTheLanguageGuidesOwnWorkedExamples() async throws {
     // Lasso 8.5 Language Guide Ch. 28 Table 10, confirmed by reading the
     // PDF directly (including the visual page render, since the raw text
