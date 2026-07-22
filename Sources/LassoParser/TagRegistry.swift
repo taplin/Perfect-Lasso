@@ -37,7 +37,16 @@ public final class LassoTagRegistry: @unchecked Sendable {
     private var types: [String: LassoTypeDefinition] = [:]
     private var includeCache: [String: LassoCachedInclude] = [:]
 
-    public init() {}
+    public init() {
+        // Real Lasso 9's own built-in `dsinfo` type (see `DsInfo.swift`'s
+        // own doc comment) — registered here, not per-caller, so it's
+        // present in every `LassoTagRegistry` ever constructed
+        // (per-request default instances AND the single shared instance
+        // `lasso-perfect-server` hands to every request, per this
+        // class's own doc comment above), matching a genuine Lasso 9
+        // built-in's always-available semantics.
+        types["dsinfo"] = LassoDsInfoType.makeDefinition()
+    }
 
     public func registerTag(_ definition: LassoCustomTagDefinition) {
         lock.lock()

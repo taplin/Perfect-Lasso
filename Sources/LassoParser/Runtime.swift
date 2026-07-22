@@ -756,6 +756,27 @@ public struct LassoNativeRegistry: Sendable {
                 return argument.value
             })
         }
+        // Bare `staticarray` (no parens/args) as a VALUE, not the `(:
+        // ...)` literal syntax already handled at parse time — real
+        // corpus (zeroloop/ds's ds.lasso): `#rest || staticarray` (~20+
+        // call sites, e.g. every `public updaterows(...) =>
+        // .updaterow(: #rest || staticarray)` shape) and data-member
+        // defaults like `data public inputcolumns::staticarray =
+        // staticarray`. This codebase has no distinct StaticArray type
+        // (established precedent — see `NativeTypes.swift`'s
+        // `eachCharacter` comment and `cipher_list`'s own use of `array`
+        // as its stand-in), so this is registered as a plain alias for
+        // `array`'s own zero-or-more-argument behavior, reachable via
+        // both the bare-identifier dispatch path (`.identifier`, no
+        // parens) and an explicit `staticarray(...)` call.
+        register("staticarray") { arguments, _ in
+            .array(arguments.map { argument in
+                if let label = argument.label {
+                    return .pair(.string(label), argument.value)
+                }
+                return argument.value
+            })
+        }
         // Real Lasso's Pair constructor (LassoGuide, "Collections"):
         // pair() -> both null; pair(anotherPair) -> copies first/second;
         // pair(value, value) -> two positional elements; pair(value=value)

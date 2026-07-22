@@ -8,6 +8,162 @@ import PerfectCRUD
 import PerfectFileMaker
 import PerfectSessionCore
 
+// MARK: - dsinfo built-in type, bare type-name instantiation, bare staticarray
+
+@Test func dsinfoConstructsWithDocumentedDefaultsMatchingRealCorpusFieldUsage() async throws {
+    // Real Lasso 9's own built-in `dsinfo` type (see DsInfo.swift's own
+    // doc comment — undocumented in LassoGuide itself, reverse-engineered
+    // from every real field access across zeroloop/ds's full source,
+    // Task #178). Fields ds.lasso always sets explicitly before reading
+    // default to the type's natural empty value; `connection` (gated via
+    // `if(#dsinfo->connection)`) defaults falsy.
+    var context = LassoContext()
+    let output = try await LassoRenderer().render(
+        """
+        <?lassoscript
+        local(d) = dsinfo
+        ?>
+        [#d->connection]/[#d->action]/[#d->numsets]/[#d->hostname->type]/[#d->statementonly]/[#d->inputcolumns->type]
+        """,
+        context: &context
+    ).trimmingCharacters(in: .whitespacesAndNewlines)
+    #expect(output == "0/0/1/String/false/Array")
+}
+
+@Test func dsinfoFieldsAreMutableViaOrdinaryMemberAssignmentMatchingRealCorpusShape() async throws {
+    // ds.lasso mutates dsinfo fields directly and extensively
+    // (`#dsinfo->hostname = #host`) -- this ONLY works if dsinfo is
+    // registered as a tagRegistry (Lasso-defined-shaped) type, not a
+    // NativeTypes.swift Swift-backed one (Evaluator.assign's `.member`
+    // case explicitly rejects raw field writes on native types).
+    var context = LassoContext()
+    let output = try await LassoRenderer().render(
+        """
+        <?lassoscript
+        local(d) = dsinfo
+        #d->hostname = 'localhost'
+        #d->hostport = '3306'
+        ?>
+        [#d->hostname]:[#d->hostport]
+        """,
+        context: &context
+    ).trimmingCharacters(in: .whitespacesAndNewlines)
+    #expect(output == "localhost:3306")
+}
+
+@Test func dsinfoMakeInheritedCopyProducesAnIndependentCopyMatchingRealCorpusUsage() async throws {
+    // Real corpus (ds.lasso's `ascopy`): `#ds->dsinfo =
+    // .dsinfo->makeinheritedcopy` -- mutating the copy afterward must not
+    // affect the original.
+    var context = LassoContext()
+    let output = try await LassoRenderer().render(
+        """
+        <?lassoscript
+        local(d) = dsinfo
+        #d->hostname = 'original'
+        local(copy) = #d->makeinheritedcopy
+        #copy->hostname = 'copy'
+        ?>
+        [#d->hostname]/[#copy->hostname]
+        """,
+        context: &context
+    ).trimmingCharacters(in: .whitespacesAndNewlines)
+    #expect(output == "original/copy")
+}
+
+@Test func dsinfoGetsetIsStubbedToVoidUntilARealConnectorExists() async throws {
+    // Deliberately unimplemented -- see DsInfo.swift's own doc comment.
+    // `.void`'s own member dispatch (Evaluator.swift's `case (.void, _):`,
+    // a pre-existing, deliberate design choice) redirects EVERY member
+    // access on `.void` to `.string("")`'s own behavior, so `->isa(::void)`
+    // can never observe void-ness through that path (the same redirect
+    // this session already found while testing rest parameters) --
+    // `->type` reporting "String" (an empty string's introspection type
+    // name) is what genuine void looks like here.
+    var context = LassoContext()
+    let output = try await LassoRenderer().render(
+        "[dsinfo->getset(1)->type]",
+        context: &context
+    ).trimmingCharacters(in: .whitespacesAndNewlines)
+    #expect(output == "String")
+}
+
+@Test func bareTypeNameWithNoParensConstructsAZeroArgumentInstanceMatchingRealCorpusDefaultIdiom() async throws {
+    // Real corpus (zeroloop/ds's ds.lasso): `-dsinfo::dsinfo=dsinfo` --
+    // a PARAMETER DEFAULT that's a bare, unparenthesized type name.
+    // Previously only `TypeName()` (explicit parens, the `.call` path)
+    // constructed an instance; the bare `.identifier` path fell through
+    // to plain (undefined) variable lookup, silently returning void/null
+    // instead of a real object.
+    var context = LassoContext()
+    let output = try await LassoRenderer().render(
+        """
+        <?lassoscript
+        define WidgetBareCtor => type {
+            data public greeting::string = 'hi'
+        }
+        local(w) = WidgetBareCtor
+        ?>
+        [#w->greeting]
+        """,
+        context: &context
+    ).trimmingCharacters(in: .whitespacesAndNewlines)
+    #expect(output == "hi")
+}
+
+@Test func explicitParensStillConstructAZeroArgumentInstanceAlongsideTheBareFormFix() async throws {
+    // Regression guard: the pre-existing `TypeName()` (`.call`) path must
+    // stay completely unaffected by adding the bare-identifier form.
+    var context = LassoContext()
+    let output = try await LassoRenderer().render(
+        """
+        <?lassoscript
+        define WidgetParenCtor => type {
+            data public greeting::string = 'hi'
+        }
+        local(w) = WidgetParenCtor()
+        ?>
+        [#w->greeting]
+        """,
+        context: &context
+    ).trimmingCharacters(in: .whitespacesAndNewlines)
+    #expect(output == "hi")
+}
+
+@Test func bareUndefinedIdentifierStillFallsBackToVariableLookupAlongsideTheTypeInstantiationFix() async throws {
+    // Regression guard: a bare identifier that names neither a type nor
+    // a tag must still fall back to plain (undefined) variable lookup,
+    // not throw.
+    var context = LassoContext()
+    let output = try await LassoRenderer().render("[totallyUndefinedName]", context: &context)
+    #expect(output == "")
+}
+
+@Test func bareStaticarrayKeywordProducesAnEmptyArrayMatchingRealCorpusFallbackIdiom() async throws {
+    // Real corpus (zeroloop/ds's ds.lasso): `#rest || staticarray` (20+
+    // call sites) and data-member defaults like `data public
+    // inputcolumns::staticarray = staticarray` -- the bare keyword (no
+    // parens/args), distinct from the already-supported `(: ...)`
+    // staticarray LITERAL syntax. Previously unregistered entirely, so
+    // it silently resolved to void/null via plain undefined-variable
+    // fallback instead of an empty array.
+    var context = LassoContext()
+    let output = try await LassoRenderer().render(
+        "[staticarray->size]/[staticarray->isa(::array)]",
+        context: &context
+    ).trimmingCharacters(in: .whitespacesAndNewlines)
+    #expect(output == "0/true")
+}
+
+@Test func staticarrayWithArgumentsBehavesIdenticallyToArrayAlongsideTheBareFormFix() async throws {
+    var context = LassoContext()
+    let output = try await LassoRenderer().render(
+        "[staticarray(1, 2, 3)->size]",
+        context: &context
+    ).trimmingCharacters(in: .whitespacesAndNewlines)
+    #expect(output == "3")
+}
+
 // MARK: - Comment apostrophes desyncing readBalanced's brace/paren tracking
 
 @Test func lineCommentApostropheInATypeMethodBodyDoesNotSwallowTheNextMethod() async throws {
