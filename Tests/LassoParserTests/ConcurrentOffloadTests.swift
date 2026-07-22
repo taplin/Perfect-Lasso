@@ -79,8 +79,8 @@ private final class HeartbeatMonitor {
     let recordedThreads = ThreadRecorder()
 
     let executor = PerfectCRUDLassoExecutor(
-        capabilities: { _ in .readOnly },
-        queryHandler: { _, _ in
+        capabilities: { _, _ in .readOnly },
+        queryHandler: { _, _, _ in
             recordedThreads.record(callingThread: Thread.current)
             // Simulate a blocking PerfectMySQL call.
             Thread.sleep(forTimeInterval: 0.3)
@@ -129,8 +129,8 @@ private final class HeartbeatMonitor {
     let concurrentCallCount = 10
 
     let executor = PerfectCRUDLassoExecutor(
-        capabilities: { _ in .readOnly },
-        queryHandler: { _, _ in
+        capabilities: { _, _ in .readOnly },
+        queryHandler: { _, _, _ in
             // Simulate a blocking PerfectMySQL call.
             Thread.sleep(forTimeInterval: singleCallDuration)
             return DynamicResult(rows: [], statement: "SELECT 1 /* concurrent-load check */")

@@ -2498,7 +2498,7 @@ import PerfectSessionCore
 }
 
 @Test func perfectCRUDExecutorMapsSearchWithoutApplicationSpecificAPI() async throws {
-    let executor = PerfectCRUDLassoExecutor { datasource, query in
+    let executor = PerfectCRUDLassoExecutor { datasource, query, _ in
         #expect(datasource == "catalog")
         #expect(query.table == "skus")
         #expect(query.fields == ["mfr_style_no", "color"])
@@ -2548,8 +2548,8 @@ import PerfectSessionCore
     }
     let recorder = QueryRecorder()
     let executor = PerfectCRUDLassoExecutor(
-        capabilities: { _ in .readOnly },
-        queryHandler: { _, query in
+        capabilities: { _, _ in .readOnly },
+        queryHandler: { _, query, _ in
             recorder.record(query)
             return DynamicResult(rows: [], statement: "SELECT ...")
         }
@@ -2700,6 +2700,106 @@ import PerfectSessionCore
     #expect(request.criteriaGroups.first?.criteria == request.criteria)
 }
 
+// MARK: - LassoInlineRequest -Host array parsing
+
+@Test func inlineRequestParsesHostArrayIntoHostOverride() throws {
+    // Real corpus shape (TS_lasso9, every page): var(host_array) =
+    // array(-datasource='MySQLDS', -name='<ip>', -username=..., -password=...)
+    // passed as -host=$host_array to every inline() call.
+    let hostArray = LassoValue.array([
+        .pair(.string("datasource"), .string("MySQLDS")),
+        .pair(.string("name"), .string("192.168.1.50")),
+        .pair(.string("port"), .integer(3307)),
+        .pair(.string("username"), .string("dbuser")),
+        .pair(.string("password"), .string("dbpass")),
+        .pair(.string("schema"), .string("catalog")),
+    ])
+    let request = try LassoInlineRequest(arguments: [
+        EvaluatedArgument(label: "host", value: hostArray),
+        EvaluatedArgument(label: "table", value: .string("skus")),
+        EvaluatedArgument(label: "findall", value: .boolean(true)),
+    ])
+    #expect(request.hostOverride == LassoInlineHostOverride(
+        dataSource: "MySQLDS", name: "192.168.1.50", port: 3307,
+        username: "dbuser", password: "dbpass", schema: "catalog"
+    ))
+
+    // -Host's own field labels must not leak into criteria/fieldAssignments
+    // as bogus field names (reservedNames covers "host"/"datasource").
+    #expect(request.criteria == [])
+}
+
+@Test func inlineRequestHostArrayFieldLabelsAreCaseInsensitive() throws {
+    let hostArray = LassoValue.array([
+        .pair(.string("DataSource"), .string("FileMakerDS")),
+        .pair(.string("Name"), .string("fm.internal")),
+    ])
+    let request = try LassoInlineRequest(arguments: [
+        EvaluatedArgument(label: "host", value: hostArray),
+    ])
+    #expect(request.hostOverride == LassoInlineHostOverride(
+        dataSource: "FileMakerDS", name: "fm.internal", port: nil,
+        username: nil, password: nil, schema: nil
+    ))
+}
+
+@Test func inlineRequestHostArrayMissingDataSourceYieldsNoOverride() throws {
+    // -Name with no -DataSource isn't a usable override -- falls through
+    // to the pre-configured alias-lookup path unchanged, per
+    // parseHostOverride's doc comment.
+    let hostArray = LassoValue.array([
+        .pair(.string("name"), .string("192.168.1.50")),
+    ])
+    let request = try LassoInlineRequest(arguments: [
+        EvaluatedArgument(label: "host", value: hostArray),
+    ])
+    #expect(request.hostOverride == nil)
+}
+
+@Test func inlineRequestHostArrayMissingNameYieldsNoOverride() throws {
+    let hostArray = LassoValue.array([
+        .pair(.string("datasource"), .string("MySQLDS")),
+    ])
+    let request = try LassoInlineRequest(arguments: [
+        EvaluatedArgument(label: "host", value: hostArray),
+    ])
+    #expect(request.hostOverride == nil)
+}
+
+@Test func inlineRequestHostArrayIgnoresUnknownFieldLabels() throws {
+    let hostArray = LassoValue.array([
+        .pair(.string("datasource"), .string("MySQLDS")),
+        .pair(.string("name"), .string("192.168.1.50")),
+        .pair(.string("bogusfield"), .string("ignored")),
+    ])
+    let request = try LassoInlineRequest(arguments: [
+        EvaluatedArgument(label: "host", value: hostArray),
+    ])
+    #expect(request.hostOverride == LassoInlineHostOverride(
+        dataSource: "MySQLDS", name: "192.168.1.50", port: nil,
+        username: nil, password: nil, schema: nil
+    ))
+}
+
+@Test func inlineRequestWithNoHostArgumentHasNilHostOverride() throws {
+    let request = try LassoInlineRequest(arguments: [
+        EvaluatedArgument(label: "database", value: .string("catalog")),
+        EvaluatedArgument(label: "table", value: .string("skus")),
+        EvaluatedArgument(label: "findall", value: .boolean(true)),
+    ])
+    #expect(request.hostOverride == nil)
+}
+
+@Test func inlineRequestHostArgumentThatIsNotAnArrayYieldsNoOverride() throws {
+    // Real Lasso also documents -Host='inherit' (a bare string) --
+    // deliberately unimplemented; must not crash or misparse into a
+    // bogus override.
+    let request = try LassoInlineRequest(arguments: [
+        EvaluatedArgument(label: "host", value: .string("inherit")),
+    ])
+    #expect(request.hostOverride == nil)
+}
+
 @Test func keyfieldValueReadsLassoDataRowKeyValueAndIsNullWhenAbsent() async throws {
     var context = LassoContext(inlineProvider: LassoInMemoryInlineProvider(tables: [
         "storefront": [LassoDataRow(["status": .string("unchecked")], keyValue: .integer(101))],
@@ -2732,7 +2832,7 @@ private enum TestFileMakerProbeError: Error {
 }
 
 @Test func fileMakerExecutorThrowsMissingDatasourceWhenDatabaseAbsent() async throws {
-    let executor = PerfectFileMakerLassoExecutor { _, _, _ in
+    let executor = PerfectFileMakerLassoExecutor { _, _, _, _ in
         Issue.record("queryHandler should not be called before -database is validated")
         throw TestFileMakerProbeError.stopAfterCapture
     }
@@ -2746,7 +2846,7 @@ private enum TestFileMakerProbeError: Error {
 }
 
 @Test func fileMakerExecutorThrowsMissingTableWhenTableAbsent() async throws {
-    let executor = PerfectFileMakerLassoExecutor { _, _, _ in
+    let executor = PerfectFileMakerLassoExecutor { _, _, _, _ in
         Issue.record("queryHandler should not be called before -table is validated")
         throw TestFileMakerProbeError.stopAfterCapture
     }
@@ -2760,7 +2860,7 @@ private enum TestFileMakerProbeError: Error {
 }
 
 @Test func fileMakerExecutorThrowsUnsupportedActionForShow() async throws {
-    let executor = PerfectFileMakerLassoExecutor { _, _, _ in
+    let executor = PerfectFileMakerLassoExecutor { _, _, _, _ in
         Issue.record("queryHandler should not be called for an unsupported action")
         throw TestFileMakerProbeError.stopAfterCapture
     }
@@ -2775,7 +2875,7 @@ private enum TestFileMakerProbeError: Error {
 }
 
 @Test func fileMakerExecutorGatesAddUpdateDeleteBehindAllowWrites() async throws {
-    let executor = PerfectFileMakerLassoExecutor(allowWrites: false) { _, _, _ in
+    let executor = PerfectFileMakerLassoExecutor(allowWrites: false) { _, _, _, _ in
         Issue.record("queryHandler should not be called while writes are disabled")
         throw TestFileMakerProbeError.stopAfterCapture
     }
@@ -2810,7 +2910,7 @@ private enum TestFileMakerProbeError: Error {
 }
 
 @Test func fileMakerExecutorThrowsMissingAssignmentsForUpdateWithNoFields() async throws {
-    let executor = PerfectFileMakerLassoExecutor(allowWrites: true) { _, _, _ in
+    let executor = PerfectFileMakerLassoExecutor(allowWrites: true) { _, _, _, _ in
         Issue.record("queryHandler should not be called with no field assignments")
         throw TestFileMakerProbeError.stopAfterCapture
     }
@@ -2839,7 +2939,7 @@ private enum TestFileMakerProbeError: Error {
         var query: FMPQuery?
     }
     let capture = Capture()
-    let executor = PerfectFileMakerLassoExecutor(allowWrites: true) { query, _, _ in
+    let executor = PerfectFileMakerLassoExecutor(allowWrites: true) { query, _, _, _ in
         capture.query = query
         throw TestFileMakerProbeError.stopAfterCapture
     }
@@ -2854,7 +2954,7 @@ private enum TestFileMakerProbeError: Error {
 }
 
 @Test func fileMakerExecutorReturnsRecoverableFrameWhenKeyValueMissingOrInvalid() async throws {
-    let executor = PerfectFileMakerLassoExecutor(allowWrites: true) { _, _, _ in
+    let executor = PerfectFileMakerLassoExecutor(allowWrites: true) { _, _, _, _ in
         Issue.record("queryHandler should not be called with an invalid record id")
         throw TestFileMakerProbeError.stopAfterCapture
     }
@@ -2886,7 +2986,7 @@ private enum TestFileMakerProbeError: Error {
         var query: FMPQuery?
     }
     let capture = Capture()
-    let executor = PerfectFileMakerLassoExecutor { query, _, _ in
+    let executor = PerfectFileMakerLassoExecutor { query, _, _, _ in
         capture.query = query
         throw TestFileMakerProbeError.stopAfterCapture
     }
@@ -2926,7 +3026,7 @@ private enum TestFileMakerProbeError: Error {
         var query: FMPQuery?
     }
     let capture = Capture()
-    let executor = PerfectFileMakerLassoExecutor { query, _, _ in
+    let executor = PerfectFileMakerLassoExecutor { query, _, _, _ in
         capture.query = query
         throw TestFileMakerProbeError.stopAfterCapture
     }
@@ -2947,7 +3047,7 @@ private enum TestFileMakerProbeError: Error {
         var query: FMPQuery?
     }
     let capture = Capture()
-    let executor = PerfectFileMakerLassoExecutor { query, _, _ in
+    let executor = PerfectFileMakerLassoExecutor { query, _, _, _ in
         capture.query = query
         throw TestFileMakerProbeError.stopAfterCapture
     }
@@ -2975,7 +3075,7 @@ private enum TestFileMakerProbeError: Error {
 }
 
 @Test func fileMakerExecutorThrowsUnsupportedComparisonForUnknownOperator() async throws {
-    let executor = PerfectFileMakerLassoExecutor { _, _, _ in
+    let executor = PerfectFileMakerLassoExecutor { _, _, _, _ in
         Issue.record("queryHandler should not be called for an unsupported operator")
         throw TestFileMakerProbeError.stopAfterCapture
     }
@@ -2999,7 +3099,7 @@ private enum TestFileMakerProbeError: Error {
         var query: FMPQuery?
     }
     let capture = Capture()
-    let executor = PerfectFileMakerLassoExecutor { query, _, _ in
+    let executor = PerfectFileMakerLassoExecutor { query, _, _, _ in
         capture.query = query
         throw TestFileMakerProbeError.stopAfterCapture
     }
@@ -3026,7 +3126,7 @@ private enum TestFileMakerProbeError: Error {
         var query: FMPQuery?
     }
     let capture = Capture()
-    let executor = PerfectFileMakerLassoExecutor(allowWrites: true) { query, _, _ in
+    let executor = PerfectFileMakerLassoExecutor(allowWrites: true) { query, _, _, _ in
         capture.query = query
         throw TestFileMakerProbeError.stopAfterCapture
     }
@@ -3047,7 +3147,7 @@ private enum TestFileMakerProbeError: Error {
         var query: FMPQuery?
     }
     let capture = Capture()
-    let executor = PerfectFileMakerLassoExecutor(allowWrites: true) { query, _, _ in
+    let executor = PerfectFileMakerLassoExecutor(allowWrites: true) { query, _, _, _ in
         capture.query = query
         throw TestFileMakerProbeError.stopAfterCapture
     }
@@ -3072,7 +3172,7 @@ private enum TestFileMakerProbeError: Error {
         var query: FMPQuery?
     }
     let capture = Capture()
-    let executor = PerfectFileMakerLassoExecutor(allowWrites: true) { query, _, _ in
+    let executor = PerfectFileMakerLassoExecutor(allowWrites: true) { query, _, _, _ in
         capture.query = query
         throw TestFileMakerProbeError.stopAfterCapture
     }
@@ -3097,7 +3197,7 @@ private enum TestFileMakerProbeError: Error {
     // executor -- is the only place with enough context (kind/datasource
     // are passed to it directly) to classify the failure.
     struct FakeServerError: Error {}
-    let executor = PerfectFileMakerLassoExecutor { _, kind, datasource in
+    let executor = PerfectFileMakerLassoExecutor { _, kind, datasource, _ in
         throw LassoFileMakerDatabaseActionError(kind: kind, datasource: datasource, underlying: FakeServerError())
     }
     let request = try LassoInlineRequest(arguments: [
@@ -3122,7 +3222,7 @@ private enum TestFileMakerProbeError: Error {
     // can't match a non-Equatable error by value, so this asserts the
     // throw happens and (separately) that it's the same instance.
     struct FakeBugError: Error {}
-    let executor = PerfectFileMakerLassoExecutor { _, _, _ in
+    let executor = PerfectFileMakerLassoExecutor { _, _, _, _ in
         throw FakeBugError()
     }
     let request = try LassoInlineRequest(arguments: [
@@ -3138,7 +3238,7 @@ private enum TestFileMakerProbeError: Error {
 }
 
 @Test func fileMakerExecutorRendersRecoverableErrorThroughInlineWhenWritesDisabled() async throws {
-    let executor = PerfectFileMakerLassoExecutor(allowWrites: false) { _, _, _ in
+    let executor = PerfectFileMakerLassoExecutor(allowWrites: false) { _, _, _, _ in
         throw TestFileMakerProbeError.stopAfterCapture
     }
     let provider = LassoDynamicInlineProvider(executor: executor, datasourceAliases: ["fm_catalog": "fm_catalog"])
@@ -3151,7 +3251,7 @@ private enum TestFileMakerProbeError: Error {
 }
 
 @Test func lassoValueMapsFileMakerFieldTypesToLassoValue() throws {
-    let executor = PerfectFileMakerLassoExecutor(baseURL: "http://203.0.113.10:80") { _, _, _ in
+    let executor = PerfectFileMakerLassoExecutor(baseURL: "http://203.0.113.10:80") { _, _, _, _ in
         throw TestFileMakerProbeError.stopAfterCapture
     }
     #expect(executor.lassoValue(.text("Jane Doe")) == .string("Jane Doe"))
@@ -3173,9 +3273,9 @@ private enum TestFileMakerProbeError: Error {
     }
     let recorder = MutationRecorder()
     let executor = PerfectCRUDLassoExecutor(
-        capabilities: { _ in .full },
-        queryHandler: { _, _ in DynamicResult(rows: [], statement: "SELECT ...") },
-        mutationHandler: { datasource, mutation in
+        capabilities: { _, _ in .full },
+        queryHandler: { _, _, _ in DynamicResult(rows: [], statement: "SELECT ...") },
+        mutationHandler: { datasource, mutation, _ in
             #expect(datasource == "catalog")
             recorder.record(mutation)
             return DynamicResult(rows: [], affectedRows: 1, statement: "...", insertedID: mutation.action == .insert ? 99 : nil)
@@ -3220,9 +3320,9 @@ private enum TestFileMakerProbeError: Error {
     }
     let recorder = SQLRecorder()
     let executor = PerfectCRUDLassoExecutor(
-        capabilities: { _ in .full },
-        queryHandler: { _, _ in DynamicResult(rows: [], statement: "") },
-        rawSQLHandler: { datasource, sql in
+        capabilities: { _, _ in .full },
+        queryHandler: { _, _, _ in DynamicResult(rows: [], statement: "") },
+        rawSQLHandler: { datasource, sql, _ in
             #expect(datasource == "catalog")
             recorder.record(sql)
             return DynamicResult(rows: [DynamicRow(["n": .int(3)])], affectedRows: 0, statement: sql.sql)
@@ -3250,9 +3350,9 @@ private enum TestFileMakerProbeError: Error {
     // need a protect wrapper to observe: error_currentError just reflects
     // it once the inline block runs.
     let executor = PerfectCRUDLassoExecutor(
-        queryHandler: { _, _ in DynamicResult(rows: [], statement: "") },
-        mutationHandler: { _, mutation in DynamicResult(rows: [], affectedRows: 1, statement: "") },
-        rawSQLHandler: { _, sql in DynamicResult(rows: [], statement: sql.sql) }
+        queryHandler: { _, _, _ in DynamicResult(rows: [], statement: "") },
+        mutationHandler: { _, mutation, _ in DynamicResult(rows: [], affectedRows: 1, statement: "") },
+        rawSQLHandler: { _, sql, _ in DynamicResult(rows: [], statement: sql.sql) }
     )
     var context = LassoContext(inlineProvider: LassoDynamicInlineProvider(
         executor: executor,
@@ -3299,11 +3399,11 @@ func perfectCRUDConnectorFailuresBecomeInlineErrorFrames(source: String, expecte
     }
 
     let executor = PerfectCRUDLassoExecutor(
-        capabilities: { _ in .full },
-        queryHandler: { datasource, _ in
+        capabilities: { _, _ in .full },
+        queryHandler: { datasource, _, _ in
             throw LassoDatabaseActionError(kind: .search, datasource: datasource, underlying: ConnectorFailure.unavailable)
         },
-        mutationHandler: { datasource, mutation in
+        mutationHandler: { datasource, mutation, _ in
             let kind: LassoDatabaseActionFailureKind = switch mutation.action {
             case .insert: .add
             case .update: .update
@@ -3311,7 +3411,7 @@ func perfectCRUDConnectorFailuresBecomeInlineErrorFrames(source: String, expecte
             }
             throw LassoDatabaseActionError(kind: kind, datasource: datasource, underlying: ConnectorFailure.unavailable)
         },
-        rawSQLHandler: { datasource, _ in
+        rawSQLHandler: { datasource, _, _ in
             throw LassoDatabaseActionError(kind: .sql, datasource: datasource, underlying: ConnectorFailure.unavailable)
         }
     )
@@ -3327,8 +3427,8 @@ func perfectCRUDConnectorFailuresBecomeInlineErrorFrames(source: String, expecte
 @Test func perfectCRUDExecutorPreservesRecoverableErrorsThrownByHandlers() async throws {
     let state = LassoErrorState(code: 4242, message: "Connector-specific failure", kind: "connector")
     let executor = PerfectCRUDLassoExecutor(
-        capabilities: { _ in .full },
-        queryHandler: { _, _ in throw LassoRecoverableError(state) }
+        capabilities: { _, _ in .full },
+        queryHandler: { _, _, _ in throw LassoRecoverableError(state) }
     )
     var context = LassoContext(inlineProvider: LassoDynamicInlineProvider(
         executor: executor,
@@ -3345,7 +3445,7 @@ func perfectCRUDConnectorFailuresBecomeInlineErrorFrames(source: String, expecte
 
 @Test func perfectCRUDExecutorStillThrowsFatalValidationErrorsBeforeConnectorCalls() async throws {
     let executor = PerfectCRUDLassoExecutor(
-        queryHandler: { _, _ in DynamicResult(rows: [], statement: "") }
+        queryHandler: { _, _, _ in DynamicResult(rows: [], statement: "") }
     )
     var context = LassoContext(inlineProvider: LassoDynamicInlineProvider(
         executor: executor,
@@ -3366,7 +3466,7 @@ func perfectCRUDConnectorFailuresBecomeInlineErrorFrames(source: String, expecte
     }
 
     let executor = PerfectCRUDLassoExecutor(
-        queryHandler: { _, _ in throw ProgrammerError.unexpected }
+        queryHandler: { _, _, _ in throw ProgrammerError.unexpected }
     )
     var context = LassoContext(inlineProvider: LassoDynamicInlineProvider(
         executor: executor,
@@ -6748,8 +6848,8 @@ struct IncludeURLTests {
     }
     let recorder = QueryRecorder()
     let executor = PerfectCRUDLassoExecutor(
-        capabilities: { _ in .readOnly },
-        queryHandler: { _, query in
+        capabilities: { _, _ in .readOnly },
+        queryHandler: { _, query, _ in
             recorder.record(query)
             return DynamicResult(rows: [], statement: "SELECT ...")
         }
@@ -6788,8 +6888,8 @@ struct IncludeURLTests {
     }
     let recorder = QueryRecorder()
     let executor = PerfectCRUDLassoExecutor(
-        capabilities: { _ in .readOnly },
-        queryHandler: { _, query in
+        capabilities: { _, _ in .readOnly },
+        queryHandler: { _, query, _ in
             recorder.record(query)
             return DynamicResult(rows: [], statement: "SELECT ...")
         }
@@ -6832,8 +6932,8 @@ struct IncludeURLTests {
     }
     let recorder = QueryRecorder()
     let executor = PerfectCRUDLassoExecutor(
-        capabilities: { _ in .readOnly },
-        queryHandler: { _, query in
+        capabilities: { _, _ in .readOnly },
+        queryHandler: { _, query, _ in
             recorder.record(query)
             return DynamicResult(rows: [], statement: "SELECT ...")
         }
@@ -7780,8 +7880,8 @@ struct IncludeURLTests {
     // (the loop construct driven by `inline`'s query results rather than
     // an array/count/condition).
     let executor = PerfectCRUDLassoExecutor(
-        capabilities: { _ in .readOnly },
-        queryHandler: { _, _ in
+        capabilities: { _, _ in .readOnly },
+        queryHandler: { _, _, _ in
             DynamicResult(
                 rows: [
                     DynamicRow(["size": .string("XS")]),
@@ -8042,8 +8142,8 @@ struct IncludeURLTests {
     // found row. On the real product detail page this silently built a
     // one-size dropdown instead of one `<option>` per real SKU.
     let executor = PerfectCRUDLassoExecutor(
-        capabilities: { _ in .readOnly },
-        queryHandler: { _, _ in
+        capabilities: { _, _ in .readOnly },
+        queryHandler: { _, _, _ in
             DynamicResult(
                 rows: [
                     DynamicRow(["size": .string("XS")]),
@@ -10650,7 +10750,7 @@ struct IncludeURLTests {
     // ordinary `var(...)` statement preceding the bare `records` here
     // (matching mini_cart.lasso's own `var(marker...) records` shape) is
     // what makes `records` NOT the span's first statement.
-    let executor = PerfectCRUDLassoExecutor { _, _ in
+    let executor = PerfectCRUDLassoExecutor { _, _, _ in
         DynamicResult(
             rows: [
                 DynamicRow(["mfr_style_no": .string("A")]),

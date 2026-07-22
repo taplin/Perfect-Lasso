@@ -414,10 +414,11 @@ private final class InlineProviderCallRecorder: @unchecked Sendable {
 private struct RecordingExecutor: LassoDynamicQueryExecutor {
     let label: String
     let recorder: InlineProviderCallRecorder
+    var rows: [LassoDataRow] = []
 
     func execute(_ request: LassoInlineRequest) async throws -> LassoInlineFrame {
         recorder.calls.append(label)
-        return LassoInlineFrame(rows: [])
+        return LassoInlineFrame(rows: rows)
     }
 }
 
@@ -479,6 +480,136 @@ private struct RecordingExecutor: LassoDynamicQueryExecutor {
         )
     }
     #expect(recorder.calls == [])
+}
+
+@Test func multiBackendInlineProviderRoutesHostOverrideByDataSourceCaseInsensitively() async throws {
+    let recorder = InlineProviderCallRecorder()
+    let mysqlProvider = LassoDynamicInlineProvider(executor: RecordingExecutor(label: "mysql", recorder: recorder))
+    let fileMakerProvider = LassoDynamicInlineProvider(executor: RecordingExecutor(label: "filemaker", recorder: recorder))
+    let provider = LassoMultiBackendInlineProvider(
+        mysqlProvider: mysqlProvider,
+        fileMakerProvider: fileMakerProvider,
+        fileMakerAliases: []
+    )
+    var context = LassoContext(inlineProvider: provider)
+
+    // A -Host array's -DataSource picks the backend directly -- no
+    // pre-configured alias is registered for either 'ad_hoc_mysql' or
+    // 'ad_hoc_fm' here, so this only succeeds if the override path is
+    // actually checked before the alias-set lookup.
+    _ = try await LassoRenderer().render(
+        "[inline(-host=array(-datasource='mysqlds',-name='192.168.1.50',-username='u',-password='p'),-database='ad_hoc_mysql',-table='skus',-findall)][/inline]",
+        context: &context
+    )
+    _ = try await LassoRenderer().render(
+        "[inline(-host=array(-datasource='FileMakerDS',-name='fm.internal'),-database='ad_hoc_fm',-table='storefront',-findall)][/inline]",
+        context: &context
+    )
+
+    #expect(recorder.calls == ["mysql", "filemaker"])
+}
+
+@Test func multiBackendInlineProviderThrowsUnsupportedInlineHostDataSourceForUnrecognizedConnector() async throws {
+    let recorder = InlineProviderCallRecorder()
+    let mysqlProvider = LassoDynamicInlineProvider(executor: RecordingExecutor(label: "mysql", recorder: recorder))
+    let fileMakerProvider = LassoDynamicInlineProvider(executor: RecordingExecutor(label: "filemaker", recorder: recorder))
+    let provider = LassoMultiBackendInlineProvider(
+        mysqlProvider: mysqlProvider,
+        fileMakerProvider: fileMakerProvider,
+        fileMakerAliases: []
+    )
+    var context = LassoContext(inlineProvider: provider)
+
+    await #expect(throws: LassoRuntimeError.unsupportedInlineHostDataSource("OracleDS")) {
+        try await LassoRenderer().render(
+            "[inline(-host=array(-datasource='OracleDS',-name='192.168.1.50'),-table='skus',-findall)][/inline]",
+            context: &context
+        )
+    }
+    #expect(recorder.calls == [])
+}
+
+@Test func multiBackendInlineProviderHostOverrideThrowsInlineNotConfiguredWhenBackendMissing() async throws {
+    let recorder = InlineProviderCallRecorder()
+    let fileMakerProvider = LassoDynamicInlineProvider(executor: RecordingExecutor(label: "filemaker", recorder: recorder))
+    let provider = LassoMultiBackendInlineProvider(
+        mysqlProvider: nil,
+        fileMakerProvider: fileMakerProvider,
+        fileMakerAliases: []
+    )
+    var context = LassoContext(inlineProvider: provider)
+
+    await #expect(throws: LassoRuntimeError.inlineNotConfigured) {
+        try await LassoRenderer().render(
+            "[inline(-host=array(-datasource='mysqlds',-name='192.168.1.50'),-table='skus',-findall)][/inline]",
+            context: &context
+        )
+    }
+    #expect(recorder.calls == [])
+}
+
+@Test func multiBackendInlineProviderWithNoHostArgumentStillRoutesByAlias() async throws {
+    // Regression: adding the -Host override check must not disturb the
+    // pre-existing alias-based routing for requests with no -Host at all.
+    let recorder = InlineProviderCallRecorder()
+    let mysqlProvider = LassoDynamicInlineProvider(executor: RecordingExecutor(label: "mysql", recorder: recorder))
+    let fileMakerProvider = LassoDynamicInlineProvider(executor: RecordingExecutor(label: "filemaker", recorder: recorder))
+    let provider = LassoMultiBackendInlineProvider(
+        mysqlProvider: mysqlProvider,
+        fileMakerProvider: fileMakerProvider,
+        fileMakerAliases: ["fm_catalog"]
+    )
+    var context = LassoContext(inlineProvider: provider)
+
+    _ = try await LassoRenderer().render(
+        "[inline(-database='fm_catalog',-table='storefront',-findall)][/inline]",
+        context: &context
+    )
+
+    #expect(recorder.calls == ["filemaker"])
+}
+
+@Test func multiBackendInlineProviderHandlesRealCorpusHostArrayVariableReferenceSyntax() async throws {
+    // Reproduces the exact real-corpus shape found in TS_lasso9's
+    // index.lasso (credentials/IP genericized, never checked into the
+    // public repo): a `var(host_array) = array(-datasource=...,
+    // -name=..., -username=..., -password=...)` built once, then referenced
+    // via `-host=$host_array` on two separate `inline(...)=>{ }` arrow-block
+    // calls, the second nested inside the first's `[records]` body,
+    // reached only via each row's iteration. This is what actually
+    // exercises the parser/evaluator path (variable reference + nesting)
+    // that the synthetic `-host=array(...)` literal tests above don't
+    // reach. Uses bracket-tag form throughout ([records], not the
+    // arrow-block `records=>{ }` real TS_lasso9 also uses -- that form
+    // was found, while writing this test, to silently no-op instead of
+    // iterating rows at all, a genuine separate pre-existing bug, filed
+    // as its own investigation rather than folded into this change; see
+    // Task #169.
+    let recorder = InlineProviderCallRecorder()
+    let mysqlProvider = LassoDynamicInlineProvider(executor: RecordingExecutor(
+        label: "mysql", recorder: recorder, rows: [LassoDataRow(["icon_name": .string("home")])]
+    ))
+    let provider = LassoMultiBackendInlineProvider(
+        mysqlProvider: mysqlProvider,
+        fileMakerProvider: nil,
+        fileMakerAliases: []
+    )
+    var context = LassoContext(inlineProvider: provider)
+
+    let source = """
+    [var(host_array) = array(-datasource='MySQLDS',-name='203.0.113.10',-username='demo_user',-password='demo_pass')]
+    [var(tsdb) = 'exampledb']
+    [inline(-host=$host_array,-database='catalog',-sql='select * from menu_map',-maxrows='all')]
+    [records]
+    [inline(-host=$host_array,-database=$tsdb,-sql='select * from court_selection',-maxrows='all')]
+    [records][/records]
+    [/inline]
+    [/records]
+    [/inline]
+    """
+    _ = try await LassoRenderer().render(source, context: &context)
+
+    #expect(recorder.calls == ["mysql", "mysql"])
 }
 
 // MARK: - LassoAdminDelegate

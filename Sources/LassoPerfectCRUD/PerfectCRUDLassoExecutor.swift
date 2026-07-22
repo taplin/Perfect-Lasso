@@ -97,19 +97,26 @@ public struct LassoDatabaseActionError: Error, Sendable {
 }
 
 public struct PerfectCRUDLassoExecutor: LassoDynamicQueryExecutor {
+    /// `hostOverride`: non-nil exactly when the originating `inline(...)`
+    /// specified a `-Host` array (`LassoInlineRequest.hostOverride`) — an
+    /// ad-hoc, per-call connection that should be used instead of this
+    /// deployment's single pre-configured MySQL host/user/password.
     public typealias QueryHandler = @Sendable (
         _ datasource: String,
-        _ query: DynamicQuery
+        _ query: DynamicQuery,
+        _ hostOverride: LassoInlineHostOverride?
     ) throws -> DynamicResult
     public typealias MutationHandler = @Sendable (
         _ datasource: String,
-        _ mutation: DynamicMutation
+        _ mutation: DynamicMutation,
+        _ hostOverride: LassoInlineHostOverride?
     ) throws -> DynamicResult
     public typealias RawSQLHandler = @Sendable (
         _ datasource: String,
-        _ sql: DynamicSQL
+        _ sql: DynamicSQL,
+        _ hostOverride: LassoInlineHostOverride?
     ) throws -> DynamicResult
-    public typealias CapabilitiesResolver = @Sendable (_ datasource: String) -> LassoDatasourceCapabilities
+    public typealias CapabilitiesResolver = @Sendable (_ datasource: String, _ hostOverride: LassoInlineHostOverride?) -> LassoDatasourceCapabilities
 
     private let queryHandler: QueryHandler
     private let mutationHandler: MutationHandler?
@@ -117,7 +124,7 @@ public struct PerfectCRUDLassoExecutor: LassoDynamicQueryExecutor {
     private let capabilitiesResolver: CapabilitiesResolver
 
     public init(
-        capabilities: @escaping CapabilitiesResolver = { _ in .readOnly },
+        capabilities: @escaping CapabilitiesResolver = { _, _ in .readOnly },
         queryHandler: @escaping QueryHandler,
         mutationHandler: MutationHandler? = nil,
         rawSQLHandler: RawSQLHandler? = nil
@@ -153,7 +160,7 @@ public struct PerfectCRUDLassoExecutor: LassoDynamicQueryExecutor {
         guard let datasource = request.database, datasource.isEmpty == false else {
             throw PerfectCRUDLassoError.missingDatasource
         }
-        let capabilities = capabilitiesResolver(datasource)
+        let capabilities = capabilitiesResolver(datasource, request.hostOverride)
 
         switch request.action {
         case .search, .find, .findAll:
@@ -208,7 +215,7 @@ public struct PerfectCRUDLassoExecutor: LassoDynamicQueryExecutor {
         )
         let result: DynamicResult
         do {
-            result = try queryHandler(datasource, query)
+            result = try queryHandler(datasource, query, request.hostOverride)
         } catch let error as LassoRecoverableError {
             return LassoInlineFrame(rows: [], error: error.state)
         } catch let error as LassoDatabaseActionError {
@@ -257,7 +264,7 @@ public struct PerfectCRUDLassoExecutor: LassoDynamicQueryExecutor {
         )
         let result: DynamicResult
         do {
-            result = try mutationHandler(datasource, mutation)
+            result = try mutationHandler(datasource, mutation, request.hostOverride)
         } catch let error as LassoRecoverableError {
             return LassoInlineFrame(rows: [], error: error.state)
         } catch let error as LassoDatabaseActionError {
@@ -275,7 +282,7 @@ public struct PerfectCRUDLassoExecutor: LassoDynamicQueryExecutor {
                 table: table,
                 predicates: [DynamicPredicate(field: keyField, comparison: .equal, value: .int(insertedID))],
                 limit: 1
-            )) {
+            ), request.hostOverride) {
                 rows = followUp.rows.map(lassoRow)
             }
         }
@@ -316,7 +323,7 @@ public struct PerfectCRUDLassoExecutor: LassoDynamicQueryExecutor {
         )
         let result: DynamicResult
         do {
-            result = try mutationHandler(datasource, mutation)
+            result = try mutationHandler(datasource, mutation, request.hostOverride)
         } catch let error as LassoRecoverableError {
             return LassoInlineFrame(rows: [], error: error.state)
         } catch let error as LassoDatabaseActionError {
@@ -325,7 +332,7 @@ public struct PerfectCRUDLassoExecutor: LassoDynamicQueryExecutor {
 
         var rows: [LassoDataRow] = []
         if request.maxRecords != 0 {
-            if let followUp = try? queryHandler(datasource, DynamicQuery(table: table, predicates: mutation.predicates)) {
+            if let followUp = try? queryHandler(datasource, DynamicQuery(table: table, predicates: mutation.predicates), request.hostOverride) {
                 rows = followUp.rows.map(lassoRow)
             }
         }
@@ -360,7 +367,7 @@ public struct PerfectCRUDLassoExecutor: LassoDynamicQueryExecutor {
         )
         let result: DynamicResult
         do {
-            result = try mutationHandler(datasource, mutation)
+            result = try mutationHandler(datasource, mutation, request.hostOverride)
         } catch let error as LassoRecoverableError {
             return LassoInlineFrame(rows: [], error: error.state)
         } catch let error as LassoDatabaseActionError {
@@ -388,7 +395,7 @@ public struct PerfectCRUDLassoExecutor: LassoDynamicQueryExecutor {
         let dynamicSQL = DynamicSQL(sql: sqlText, allowsMultipleStatements: capabilities.allowsMultipleStatements)
         let result: DynamicResult
         do {
-            result = try rawSQLHandler(datasource, dynamicSQL)
+            result = try rawSQLHandler(datasource, dynamicSQL, request.hostOverride)
         } catch let error as LassoRecoverableError {
             return LassoInlineFrame(rows: [], error: error.state)
         } catch let error as LassoDatabaseActionError {

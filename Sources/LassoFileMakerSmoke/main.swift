@@ -21,7 +21,7 @@ let scheme = useTLS ? "https" : "http"
 let executor = PerfectFileMakerLassoExecutor(
     allowWrites: false,
     baseURL: "\(scheme)://\(host):\(port)"
-) { query, kind, datasource in
+) { query, kind, datasource, _ in
     let server = FileMakerServer(host: host, port: port, userName: user, password: password, useTLS: useTLS)
     do {
         return try await server.query(query)
