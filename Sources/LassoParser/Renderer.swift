@@ -408,7 +408,18 @@ private struct RendererEngine {
     private mutating func renderExpression(_ expression: LassoExpression) async throws -> String {
         if case let .call(callee, arguments) = expression,
            case let .identifier(name) = callee {
-            if name.caseInsensitiveCompare("include") == .orderedSame {
+            // `lassoapp_include` (LassoGuide "Operations > LassoApps" >
+            // "LassoApp Includes") is real Lasso 9's app-scoped include —
+            // for the "library" use of LassoApps this adapter supports
+            // (see `loadLassoApps`'s doc comment), it needs no separate
+            // resolution logic of its own: `loadLassoApps` already builds
+            // each app's `_init*.lasso` context with an app-scoped
+            // `LassoFileSystemIncludeLoader` as `context.includeLoader`,
+            // so aliasing straight into the existing `include()` mechanism
+            // resolves relative to that same app's own directory, never
+            // another app's or the site's own root.
+            if name.caseInsensitiveCompare("include") == .orderedSame
+                || name.caseInsensitiveCompare("lassoapp_include") == .orderedSame {
                 return try await renderInclude(arguments)
             }
             if name.caseInsensitiveCompare("library") == .orderedSame {

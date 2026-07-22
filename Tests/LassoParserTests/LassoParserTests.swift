@@ -2529,6 +2529,141 @@ import PerfectSessionCore
     #expect(output == "hello!")
 }
 
+// MARK: - LassoApps (library-loading slice — see loadLassoApps's own doc comment)
+
+@Test func lassoAppsLoadsInitFilesAcrossMultipleAppsAndSkipsHiddenEntries() async throws {
+    let root = FileManager.default.temporaryDirectory
+        .appendingPathComponent("lasso-apps-\(UUID().uuidString)")
+    let appA = root.appendingPathComponent("AppA")
+    let appB = root.appendingPathComponent("AppB")
+    let hidden = root.appendingPathComponent(".DS_Store")
+    try FileManager.default.createDirectory(at: appA, withIntermediateDirectories: true)
+    try FileManager.default.createDirectory(at: appB, withIntermediateDirectories: true)
+    try "junk".write(to: hidden, atomically: true, encoding: .utf8)
+    defer { try? FileManager.default.removeItem(at: root) }
+
+    try "<?lassoscript define greetFromA => { return('hi from A') } ?>".write(
+        to: appA.appendingPathComponent("_init.lasso"), atomically: true, encoding: .utf8
+    )
+    try "<?lassoscript define greetFromB => { return('hi from B') } ?>".write(
+        to: appB.appendingPathComponent("_init.lasso"), atomically: true, encoding: .utf8
+    )
+
+    let registry = LassoTagRegistry()
+    let result = await loadLassoApps(at: root, tagRegistry: registry)
+
+    #expect(Set(result.loadedFiles) == ["AppA/_init.lasso", "AppB/_init.lasso"])
+    #expect(result.failedFiles.isEmpty)
+    #expect(registry.containsTag(named: "greetFromA"))
+    #expect(registry.containsTag(named: "greetFromB"))
+}
+
+@Test func lassoAppsOnlyLoadsInitPrefixedLassoFilesAtAnAppsOwnRoot() async throws {
+    // Real Lasso: "named beginning with '_init.' ... Only initialization
+    // files at the root of the LassoApp are executed" — an ordinary
+    // sibling file (like ds's own `ds.lasso`) must NOT auto-run; it's
+    // only ever reached via an _init file's own `lassoapp_include`.
+    let root = FileManager.default.temporaryDirectory
+        .appendingPathComponent("lasso-apps-\(UUID().uuidString)")
+    let app = root.appendingPathComponent("ds")
+    let subdir = app.appendingPathComponent("nested")
+    try FileManager.default.createDirectory(at: subdir, withIntermediateDirectories: true)
+    defer { try? FileManager.default.removeItem(at: root) }
+
+    try "<?lassoscript define fromInit => { return('init ran') } ?>".write(
+        to: app.appendingPathComponent("_init.lasso"), atomically: true, encoding: .utf8
+    )
+    try "<?lassoscript define fromSibling => { return('should not auto-run') } ?>".write(
+        to: app.appendingPathComponent("ds.lasso"), atomically: true, encoding: .utf8
+    )
+    try "<?lassoscript define fromNested => { return('should not auto-run either') } ?>".write(
+        to: subdir.appendingPathComponent("_init.lasso"), atomically: true, encoding: .utf8
+    )
+
+    let registry = LassoTagRegistry()
+    let result = await loadLassoApps(at: root, tagRegistry: registry)
+
+    #expect(result.loadedFiles == ["ds/_init.lasso"])
+    #expect(result.failedFiles.isEmpty)
+    #expect(registry.containsTag(named: "fromInit"))
+    #expect(registry.containsTag(named: "fromSibling") == false)
+    #expect(registry.containsTag(named: "fromNested") == false)
+}
+
+@Test func lassoAppsContinuesPastAFailingAppInitFileAndReportsIt() async throws {
+    let root = FileManager.default.temporaryDirectory
+        .appendingPathComponent("lasso-apps-\(UUID().uuidString)")
+    let goodApp = root.appendingPathComponent("Good")
+    let brokenApp = root.appendingPathComponent("Broken")
+    try FileManager.default.createDirectory(at: goodApp, withIntermediateDirectories: true)
+    try FileManager.default.createDirectory(at: brokenApp, withIntermediateDirectories: true)
+    defer { try? FileManager.default.removeItem(at: root) }
+
+    try "<?lassoscript define stillWorks => { return('ok') } ?>".write(
+        to: goodApp.appendingPathComponent("_init.lasso"), atomically: true, encoding: .utf8
+    )
+    try "<?lassoscript totallyUndefinedFunctionCall() ?>".write(
+        to: brokenApp.appendingPathComponent("_init.lasso"), atomically: true, encoding: .utf8
+    )
+
+    let registry = LassoTagRegistry()
+    let result = await loadLassoApps(at: root, tagRegistry: registry)
+
+    #expect(result.loadedFiles == ["Good/_init.lasso"])
+    #expect(result.failedFiles.count == 1)
+    #expect(result.failedFiles.first?.file == "Broken/_init.lasso")
+    #expect(result.failedFiles.first?.error.contains("totallyUndefinedFunctionCall") == true)
+    #expect(registry.containsTag(named: "stillWorks"))
+}
+
+@Test func lassoAppsHandlesMissingDirectoryGracefully() async {
+    let missing = FileManager.default.temporaryDirectory
+        .appendingPathComponent("lasso-apps-does-not-exist-\(UUID().uuidString)")
+    let registry = LassoTagRegistry()
+
+    let result = await loadLassoApps(at: missing, tagRegistry: registry)
+
+    #expect(result.loadedFiles.isEmpty)
+    #expect(result.failedFiles.count == 1)
+    #expect(result.failedFiles.first?.error == "not a directory or does not exist")
+}
+
+@Test func lassoappIncludeResolvesRelativeToItsOwnAppsDirectoryNotAnotherAppsOrTheSiteRoot() async throws {
+    // Real corpus shape (zeroloop/ds's own _init.lasso): a loop over
+    // sibling filenames, each pulled in via lassoapp_include -- must
+    // resolve against THIS app's own folder even though a
+    // same-named file also exists in a sibling app's folder, to prove
+    // it isn't accidentally falling through to some other root.
+    let root = FileManager.default.temporaryDirectory
+        .appendingPathComponent("lasso-apps-\(UUID().uuidString)")
+    let dsApp = root.appendingPathComponent("ds")
+    let otherApp = root.appendingPathComponent("other")
+    try FileManager.default.createDirectory(at: dsApp, withIntermediateDirectories: true)
+    try FileManager.default.createDirectory(at: otherApp, withIntermediateDirectories: true)
+    defer { try? FileManager.default.removeItem(at: root) }
+
+    try "<?lassoscript define whichDs => { return('real ds sibling') } ?>".write(
+        to: dsApp.appendingPathComponent("sequential.lasso"), atomically: true, encoding: .utf8
+    )
+    try "<?lassoscript define whichOther => { return('wrong app entirely') } ?>".write(
+        to: otherApp.appendingPathComponent("sequential.lasso"), atomically: true, encoding: .utf8
+    )
+    try """
+    <?lassoscript
+    with file in array('sequential.lasso') do {
+        lassoapp_include(#file)
+    }
+    ?>
+    """.write(to: dsApp.appendingPathComponent("_init.lasso"), atomically: true, encoding: .utf8)
+
+    let registry = LassoTagRegistry()
+    let result = await loadLassoApps(at: root, tagRegistry: registry)
+
+    #expect(result.failedFiles.isEmpty)
+    #expect(registry.containsTag(named: "whichDs"))
+    #expect(registry.containsTag(named: "whichOther") == false)
+}
+
 @Test func dynamicInlineProviderMapsDatasourceForPerfectCRUDExecutor() async throws {
     struct Executor: LassoDynamicQueryExecutor {
         func execute(_ request: LassoInlineRequest) async throws -> LassoInlineFrame {
@@ -13837,4 +13972,3 @@ struct IncludeURLTests {
     #expect(caught != nil)
     #expect(caught is LassoRuntimeError)
 }
-
