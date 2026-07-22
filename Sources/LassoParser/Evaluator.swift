@@ -115,6 +115,17 @@ struct Evaluator {
             if let function = context.natives.function(named: name) {
                 return try await function([], &context)
             }
+            // A bare type name (no parens) constructs a zero-argument
+            // instance too — the `.call(.identifier(name), [])` path just
+            // below already does this (`context.tagRegistry.type(named:)`
+            // → `instantiate`); mirrored here for the BARE form, needed
+            // by real corpus's own parameter-default idiom (zeroloop/ds's
+            // ds.lasso: `-dsinfo::dsinfo=dsinfo` — the default value is a
+            // bare, unparenthesized type name). Checked before
+            // `tagRegistry.tag`, matching that same call-path's ordering.
+            if let type = context.tagRegistry.type(named: name) {
+                return try await instantiate(type, callArguments: [])
+            }
             if let definition = context.tagRegistry.tag(named: name) {
                 return try await invokeCustomTag(definition, callArguments: [])
             }
