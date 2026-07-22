@@ -209,6 +209,21 @@ public indirect enum LassoExpression: Equatable, Sendable {
     /// the FULLY general `eacher()` free-function + escaped-method-
     /// reference mechanism itself remains out of scope).
     case queryExpression(withClauses: [QueryWithClause], operations: [QueryOperation], action: QueryAction)
+    /// `define [TypeName->]name(params) => body` used in EXPRESSION
+    /// position, not just as its own top-level statement
+    /// (`ScriptBodyParser.parseDefineOpening`). Ch. "Methods" > "Type
+    /// Binding": a bound signature `type_name->method_name(...)`
+    /// "cannot be called except with a target instance of type_name" --
+    /// real corpus (zeroloop/ds's activerow.lasso) uses this bound form
+    /// as the ACTION of a ternary, a guarded monkey-patch that should
+    /// only register the method if the target type actually exists:
+    /// `::json_encode->istype ? define json_encode->encodeValue(p::activerow) => .encodeValue(#p->asmap)`.
+    /// `boundType` is `nil` for an ordinary unbound `define name(...) => body`
+    /// (registers a ordinary custom tag, same as the statement form).
+    /// Return-type constraints (`::ReturnType`) are parsed and discarded,
+    /// matching the statement-level `define`'s own existing behavior --
+    /// this codebase enforces no return-type constraints anywhere.
+    case definition(boundType: String?, name: String, parameters: [LassoArgument], body: [LassoNode])
     case unknown(String)
 }
 

@@ -57,6 +57,34 @@ struct Evaluator {
             ))
         case let .queryExpression(withClauses, operations, action):
             return try await evaluateQueryExpression(withClauses: withClauses, operations: operations, action: action)
+        case let .definition(boundType, name, parameters, body):
+            // `define [TypeName->]name(...) => body` reached from
+            // EXPRESSION position (see `LassoExpression.definition`'s own
+            // doc comment) — registers exactly like the pre-existing
+            // STATEMENT-level `"define"`/`"define_type"` block cases in
+            // `Renderer.swift` do, just triggered by evaluating an
+            // expression (e.g. a ternary's guarded action) instead of
+            // rendering a top-level `.block` node. `boundType` appends a
+            // method onto that type's registered definition (creating a
+            // minimal one — no data members — if none is registered yet,
+            // matching real Lasso's own "Type Binding" semantics: the
+            // bound signature only becomes callable "with a target
+            // instance of type_name", it doesn't require the type to
+            // have been defined via a `type { ... }` body specifically).
+            if let boundType {
+                let existing = context.tagRegistry.type(named: boundType)
+                let method = LassoMethodDefinition(
+                    name: name, parameters: parameters, returnType: nil, visibility: .public, body: body
+                )
+                context.tagRegistry.registerType(LassoTypeDefinition(
+                    name: boundType,
+                    dataMembers: existing?.dataMembers ?? [],
+                    methods: (existing?.methods ?? []) + [method]
+                ))
+            } else {
+                context.tagRegistry.registerTag(LassoCustomTagDefinition(name: name, parameters: parameters, body: body))
+            }
+            return .void
         case let .variable(name, scope): return context.value(for: name, scope: scope)
         case let .identifier(name):
             if name.caseInsensitiveCompare("self") == .orderedSame, let object = context.currentSelf {

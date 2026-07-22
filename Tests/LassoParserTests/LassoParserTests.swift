@@ -4458,6 +4458,108 @@ func perfectCRUDConnectorFailuresBecomeInlineErrorFrames(source: String, expecte
     #expect(output == "SemRush/DotBot/2")
 }
 
+// MARK: - `define` in expression position
+
+@Test func defineAsATernaryActionRegistersAnUnboundTagOnlyWhenTheConditionIsTrue() async throws {
+    // Real corpus shape (zeroloop/ds's activerow.lasso, scrubbed to an
+    // unbound tag): `cond ? define name => body` -- previously `define`
+    // reached from expression position (not its own top-level statement)
+    // was just an ordinary identifier, throwing unsupportedExpression on
+    // whatever followed it. Parsing must succeed regardless of the
+    // condition's truth (both branches of a ternary are parsed eagerly),
+    // but the registration itself (a real side effect) must only happen
+    // when the guard is actually true -- the ternary's own short-circuit.
+    var trueContext = LassoContext()
+    let trueOutput = try await LassoRenderer().render(
+        """
+        <?lassoscript
+        true ? define greeting => 'hello';
+        ?>
+        [greeting]
+        """,
+        context: &trueContext
+    ).trimmingCharacters(in: .whitespacesAndNewlines)
+    #expect(trueOutput == "hello")
+
+    var falseContext = LassoContext()
+    let falseOutput = try await LassoRenderer().render(
+        """
+        <?lassoscript
+        false ? define greeting2 => 'hello';
+        ?>
+        [greeting2]
+        """,
+        context: &falseContext
+    ).trimmingCharacters(in: .whitespacesAndNewlines)
+    #expect(falseOutput == "")
+}
+
+@Test func defineAsATernaryActionRegistersABoundMethodMatchingRealCorpusShape() async throws {
+    // Real corpus shape (zeroloop/ds's activerow.lasso):
+    // `::json_encode->istype` / `? define json_encode->encodeValue(p::activerow) => .encodeValue(#p->asmap)`
+    // -- a bound signature (Ch. "Methods" > "Type Binding") only
+    // registering onto an ALREADY-existing type, guarded so it never
+    // fires for a type this codebase doesn't implement. Scrubbed here to
+    // a type this codebase DOES define, confirming the guard-true path
+    // actually appends a real, callable method.
+    var context = LassoContext()
+    let output = try await LassoRenderer().render(
+        """
+        [
+        define_type: 'Ex_Timer', 'integer', -prototype;
+        /define_type;
+        ]
+        [::Ex_Timer->istype ? define Ex_Timer->bump(n) => #n + 1;]
+        [Local(t = Ex_Timer())][#t->bump(41)]
+        """,
+        context: &context
+    ).trimmingCharacters(in: .whitespacesAndNewlines)
+    #expect(output == "42")
+}
+
+@Test func defineWithBraceBodyWorksInExpressionPositionMatchingTheTopLevelStatementForm() async throws {
+    var context = LassoContext()
+    let output = try await LassoRenderer().render(
+        """
+        <?lassoscript
+        true ? define timesTwenty(n) => {
+            return(#n * 20)
+        };
+        ?>
+        [timesTwenty(2)]
+        """,
+        context: &context
+    ).trimmingCharacters(in: .whitespacesAndNewlines)
+    #expect(output == "40")
+}
+
+@Test func bareDefineIdentifierStillWorksAlongsideTheDefineExpressionFix() async throws {
+    // Regression guard: a bare `define` with nothing shaped like a real
+    // definition after it (no identifier following) must fall back to an
+    // ordinary (undefined) identifier lookup rather than throwing a parse
+    // error, matching `with`'s own established fallback precedent.
+    var context = LassoContext(globals: ["define": .string("not-a-keyword-here")])
+    let output = try await LassoRenderer().render("[$define]", context: &context)
+    #expect(output == "not-a-keyword-here")
+}
+
+@Test func topLevelDefineStatementStillWorksAlongsideTheDefineExpressionFix() async throws {
+    // Regression guard: the pre-existing, far more common STATEMENT-level
+    // `define` (ScriptBodyParser.parseDefineOpening) must be completely
+    // unaffected by adding the new expression-level path.
+    var context = LassoContext()
+    let output = try await LassoRenderer().render(
+        """
+        <?lassoscript
+        define timesTwenty(n) => { return(#n * 20) }
+        ?>
+        [timesTwenty(3)]
+        """,
+        context: &context
+    ).trimmingCharacters(in: .whitespacesAndNewlines)
+    #expect(output == "60")
+}
+
 // MARK: - Staticarray literals `(: ... )`
 
 @Test func staticarrayLiteralParsesAsAnOrdinaryArrayValue() async throws {
