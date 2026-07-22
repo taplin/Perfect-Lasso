@@ -1292,10 +1292,60 @@ evidence for that specific shape (every real worked example reads row
 values immediately) — disclosed via a code comment rather than built
 around.
 
-634/634 tests passing (9 new). Remaining Stage 8 sub-stages (not yet
-started): 8.3 (`order by` + `sum`/`average`/`min`/`max` actions), 8.4
-(`group by` + `queriable_grouping` type), 8.5 (multiple with-clauses/
-nesting, `generateSeries` type + literal syntax, `eacher`).
+634/634 tests passing (9 new).
+
+**Stage 8.3 — `order by` operation + `sum`/`average`/`min`/`max`
+actions** ✅ done (2026-07-21). `order by` is another OPERATION
+(positioned like `where`/`let`/`skip`/`take`, same real docs section);
+`sum`/`average`/`min`/`max` are new ACTIONS alongside `select`/`do`.
+`order by EXPR [ascending|descending]` accepts one or more comma-
+separated keys — real Lasso's own worked example (ordering users by
+surname then given name) confirms multiple keys form a LEXICOGRAPHIC
+sort (primary key decides, ties broken by the next key), not independent
+sorts. For each row, every key expression is evaluated ONCE (async),
+producing a `[LassoValue]` tuple; the resulting `(row, keys)` pairs are
+then sorted SYNCHRONOUSLY via Swift's stable `sorted(by:)`, using
+`Evaluator.lassoLessThan` — the SAME existing, already-reviewed function
+this codebase already uses for `Array->Sort`/Set/PriorityQueue/TreeMap
+ordering and the raw `<`/`>` operators, reused rather than inventing a
+second, parallel comparison (matches real Lasso's own wording: "the
+standard less than and greater than operators are used").
+`sum`/`average` fold rows via the existing `binary(_:"+",_:)` (real
+Lasso's own `+`, which the docs' own wording explicitly ties the
+summation to — handles both numeric addition and string concatenation
+identically to the real operator); `average` divides the fold by row
+count via `binary(_:"/",_:)`; `min`/`max` reuse `lassoLessThan` again.
+All four actions return `.null` for an EMPTY row set — no doc guidance
+covers this case; chosen for consistency with this codebase's own
+established `Array->First`-on-empty convention (returns `.null`) rather
+than assuming an arbitrary numeric identity (e.g. `0` for sum), and
+`average`'s own empty-guard unconditionally skips the division entirely
+rather than risking a divide-by-zero.
+
+**Architect + code-reviewer review (run in parallel) found no bugs in
+the new logic** — both independently traced the multi-key sort
+comparator by hand against the real doc's own worked example (confirming
+each key's direction is applied to the correct key with no cross-
+contamination, and the lexicographic short-circuit is correct), the
+`sum`/`average` accumulator (correctly seeds from the first row, no off-
+by-one), `min`/`max`'s tie behavior (first-seen value wins on an exact
+tie, matching that tied values are semantically interchangeable), that
+every action evaluates its own expression EXACTLY once per row (no
+double-fire risk for a side-effecting expression), and that the new
+two-word `order`-not-followed-by-`by` backtracking fully unwinds through
+the existing outer backtrack with no partial-index corruption, mirroring
+the established `let`-without-`=` precedent. **One real, low-severity
+finding, fixed**: code-reviewer caught a STALE doc comment on
+`LassoExpression.queryExpression` itself, still claiming
+`sum`/`average`/`min`/`max`/`order by` were "still" missing — written
+during Stage 8.2, never updated when this stage implemented them, sitting
+directly next to the code that disproves it. Fixed by updating the
+comment to accurately reflect only `group by`/multi with-clause nesting
+as still deferred.
+
+643/643 tests passing (9 new). Remaining Stage 8 sub-stages (not yet
+started): 8.4 (`group by` + `queriable_grouping` type), 8.5 (multiple
+with-clauses/nesting, `generateSeries` type + literal syntax, `eacher`).
 
 ## 6. Deferred, With Reasoning
 

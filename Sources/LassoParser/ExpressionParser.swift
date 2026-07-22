@@ -715,16 +715,17 @@ struct ExpressionParser {
         }
         index += 1
         let source = parseExpression()
-        // Ch. "Query Expressions", "Operations" (Stage 8.2): zero or
-        // more `where`/`let`/`skip`/`take` clauses, in ANY order, applied
+        // Ch. "Query Expressions", "Operations": zero or more `where`/
+        // `let`/`skip`/`take`/`order by` clauses (Stage 8.2 added the
+        // first four, Stage 8.3 adds `order by`), in ANY order, applied
         // IN THE ORDER WRITTEN — `tryParseQueryOperation` returns `nil`
-        // (with no index mutation) as soon as the next token isn't one of
-        // these four keywords, which is exactly when the action
-        // (`select`/`do`) is expected next. `order`/`group` (later
-        // stages' own real, documented operations) aren't recognized
-        // here yet — a query expression using either falls all the way
-        // through to this function's own full backtrack below, same as
-        // any other unrecognized shape, rather than a targeted "not yet
+        // (with no index mutation) as soon as the next token doesn't
+        // match a known operation keyword, which is exactly when the
+        // action is expected next. `group` (Stage 8.4's own real,
+        // documented operation) isn't recognized here yet — a query
+        // expression using it falls all the way through to this
+        // function's own full backtrack below, same as any other
+        // unrecognized shape, rather than a targeted "not yet
         // implemented" diagnostic; disclosed, not a silent wrong answer
         // (the resulting bareword-`with` reinterpretation fails loudly
         // downstream, matching this codebase's established "unsupported
@@ -734,23 +735,39 @@ struct ExpressionParser {
         while let operation = tryParseQueryOperation() {
             operations.append(operation)
         }
-        if case let .identifier(actionKeyword) = peek, actionKeyword.caseInsensitiveCompare("select") == .orderedSame {
-            index += 1
-            let transform = parseExpression()
-            return .queryExpression(variable: variable, source: source, operations: operations, action: .select(transform))
-        }
-        if case let .identifier(actionKeyword) = peek, actionKeyword.caseInsensitiveCompare("do") == .orderedSame {
-            index += 1
-            let payload = parseExpression()
-            return .queryExpression(variable: variable, source: source, operations: operations, action: .perform(payload))
+        if case let .identifier(actionKeyword) = peek {
+            switch actionKeyword.lowercased() {
+            case "select":
+                index += 1
+                let transform = parseExpression()
+                return .queryExpression(variable: variable, source: source, operations: operations, action: .select(transform))
+            case "do":
+                index += 1
+                let payload = parseExpression()
+                return .queryExpression(variable: variable, source: source, operations: operations, action: .perform(payload))
+            case "sum":
+                index += 1
+                return .queryExpression(variable: variable, source: source, operations: operations, action: .sum(parseExpression()))
+            case "average":
+                index += 1
+                return .queryExpression(variable: variable, source: source, operations: operations, action: .average(parseExpression()))
+            case "min":
+                index += 1
+                return .queryExpression(variable: variable, source: source, operations: operations, action: .min(parseExpression()))
+            case "max":
+                index += 1
+                return .queryExpression(variable: variable, source: source, operations: operations, action: .max(parseExpression()))
+            default:
+                break
+            }
         }
         index = start
         return nil
     }
 
-    /// One `where`/`let`/`skip`/`take` operation (Stage 8.2) — `nil`,
+    /// One `where`/`let`/`skip`/`take`/`order by` operation — `nil`,
     /// with NO index mutation, as soon as the next token doesn't match
-    /// any of the four keywords (the caller's loop then expects the
+    /// a known operation keyword (the caller's loop then expects the
     /// action next). `let` additionally requires `NAME =` after the
     /// keyword itself (Ch. "Query Expressions": "the word `let` followed
     /// by a new variable name, the assignment operator (`=`), and then
@@ -758,7 +775,8 @@ struct ExpressionParser {
     /// shape is treated as a hard parse failure for the WHOLE query
     /// expression (falls through to `tryParseQueryExpression`'s own
     /// final backtrack), not silently reinterpreted as some other
-    /// construct, since `let` alone is otherwise meaningless here.
+    /// construct, since `let` alone is otherwise meaningless here. Same
+    /// discipline for `order` not followed by `by`.
     mutating private func tryParseQueryOperation() -> QueryOperation? {
         guard case let .identifier(keyword) = peek else { return nil }
         switch keyword.lowercased() {
@@ -784,6 +802,34 @@ struct ExpressionParser {
                 return nil
             }
             return .let(name: name, value: parseExpression())
+        case "order":
+            let start = index
+            index += 1
+            guard case let .identifier(byKeyword) = peek, byKeyword.caseInsensitiveCompare("by") == .orderedSame else {
+                index = start
+                return nil
+            }
+            index += 1
+            // Ch. "Query Expressions", "Order By": "further ordering
+            // criteria can be specified by following the initial order
+            // by expression with a comma, and then the next ordering
+            // expression and optional direction indicator" — one or
+            // more comma-separated `EXPR [ascending|descending]` keys.
+            var keys: [QueryOrderKey] = []
+            repeat {
+                let keyExpression = parseExpression()
+                var descending = false
+                if case let .identifier(direction) = peek {
+                    if direction.caseInsensitiveCompare("descending") == .orderedSame {
+                        descending = true
+                        index += 1
+                    } else if direction.caseInsensitiveCompare("ascending") == .orderedSame {
+                        index += 1
+                    }
+                }
+                keys.append(QueryOrderKey(expression: keyExpression, descending: descending))
+            } while consume(",")
+            return .orderBy(keys)
         default:
             return nil
         }

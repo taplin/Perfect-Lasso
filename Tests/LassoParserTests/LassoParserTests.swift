@@ -13151,3 +13151,127 @@ struct IncludeURLTests {
     #expect(output == "999|1,4,9")
 }
 
+// MARK: - Captures Stage 8.3 (Query Expressions: order by operation, sum/average/min/max actions)
+
+@Test func orderByAscendingIsTheDefaultDirectionMatchingTheDocsOwnExampleVerbatim() async throws {
+    // Ch. "Query Expressions" worked example, verbatim: "with n in
+    // array(9,2,1,3,5,4,6,7,0,8) order by #n select #n // => 0, 1, 2, 3,
+    // 4, 5, 6, 7, 8, 9".
+    var context = LassoContext()
+    let output = try await LassoRenderer().render(
+        "[(with n in array(9, 2, 1, 3, 5, 4, 6, 7, 0, 8) order by #n select #n)->join(',')]",
+        context: &context
+    )
+    #expect(output == "0,1,2,3,4,5,6,7,8,9")
+}
+
+@Test func orderByDescendingReversesTheOrderMatchingTheDocsOwnExampleVerbatim() async throws {
+    // Ch. "Query Expressions" worked example, verbatim: same array,
+    // "order by #n descending select #n // => 9, 8, 7, 6, 5, 4, 3, 2, 1,
+    // 0".
+    var context = LassoContext()
+    let output = try await LassoRenderer().render(
+        "[(with n in array(9, 2, 1, 3, 5, 4, 6, 7, 0, 8) order by #n descending select #n)->join(',')]",
+        context: &context
+    )
+    #expect(output == "9,8,7,6,5,4,3,2,1,0")
+}
+
+@Test func orderByAcceptsAnArbitraryExpressionMatchingTheDocsOwnStringSizeExampleVerbatim() async throws {
+    // Ch. "Query Expressions": "the expression provided to an order by
+    // can be any arbitrary expression" -- the doc's own worked example,
+    // verbatim: ordering a series of strings by their LENGTH (`#n->
+    // size`), not the strings themselves. => the, fox, the, quick,
+    // brown, shark, jumped.
+    var context = LassoContext()
+    let output = try await LassoRenderer().render(
+        """
+        [(with n in array('the', 'quick', 'brown', 'fox', 'jumped', 'the', 'shark') order by #n->size select #n)->join(',')]
+        """,
+        context: &context
+    )
+    #expect(output == "the,fox,the,quick,brown,shark,jumped")
+}
+
+@Test func orderByWithMultipleKeysSortsByThePrimaryKeyThenBreaksTiesWithTheSecondaryKey() async throws {
+    // Ch. "Query Expressions" worked example, verbatim (the doc's own
+    // "order the elements in an alphabetical manner" user-list example):
+    // `order by #n->second, #n->first` -- sorts primarily by surname
+    // (`second`), and for the two surnames that tie (both
+    // "Hammershaimb"), breaks the tie using the given name (`first`).
+    var context = LassoContext()
+    let output = try await LassoRenderer().render(
+        """
+        [(with n in array('Krinn'='Jones', 'Ármarinn'='Hammershaimb', 'Kjarni'='Jones', 'Halbjörg'='Skywalker', 'Björg'='Riley', 'Hjörtur'='Hammershaimb') order by #n->second, #n->first select #n)->join(', ')]
+        """,
+        context: &context
+    )
+    #expect(output == "(Hjörtur)=(Hammershaimb), (Ármarinn)=(Hammershaimb), (Kjarni)=(Jones), (Krinn)=(Jones), (Björg)=(Riley), (Halbjörg)=(Skywalker)")
+}
+
+@Test func orderByComposesCorrectlyWithWhereAndTakeInTheSamePipeline() async throws {
+    // Confirms `order by` (Stage 8.3) correctly composes with earlier
+    // operations (Stage 8.2) in the SAME sequential pipeline -- filters
+    // odd numbers, sorts them descending, then takes only the top 3.
+    var context = LassoContext()
+    let output = try await LassoRenderer().render(
+        "[(with n in array(0, 1, 2, 3, 4, 5, 6, 7, 8, 9) where #n % 2 != 0 order by #n descending take 3 select #n)->join(',')]",
+        context: &context
+    )
+    #expect(output == "9,7,5")
+}
+
+@Test func sumAddsEveryElementTogetherMatchingTheDocsOwnExampleVerbatim() async throws {
+    // Ch. "Query Expressions" worked example, verbatim: "with n in
+    // array(1,2,...,9) sum #n // => 45".
+    var context = LassoContext()
+    let output = try await LassoRenderer().render(
+        "[with n in array(1, 2, 3, 4, 5, 6, 7, 8, 9) sum #n]",
+        context: &context
+    )
+    #expect(output == "45")
+}
+
+@Test func averageComputesTheMeanMatchingTheDocsOwnExampleVerbatim() async throws {
+    // Ch. "Query Expressions" worked example, verbatim: "with n in
+    // array(1,2,...,9) average #n // => 5".
+    var context = LassoContext()
+    let output = try await LassoRenderer().render(
+        "[with n in array(1, 2, 3, 4, 5, 6, 7, 8, 9) average #n]",
+        context: &context
+    )
+    #expect(output == "5")
+}
+
+@Test func minAndMaxProduceTheSmallestAndLargestElementsMatchingTheDocsOwnExamplesVerbatim() async throws {
+    // Ch. "Query Expressions" worked examples, verbatim: "with n in
+    // array(1,2,...,9) min #n // => 1" / "... max #n // => 9".
+    var context = LassoContext()
+    let min = try await LassoRenderer().render(
+        "[with n in array(1, 2, 3, 4, 5, 6, 7, 8, 9) min #n]",
+        context: &context
+    )
+    var context2 = LassoContext()
+    let max = try await LassoRenderer().render(
+        "[with n in array(1, 2, 3, 4, 5, 6, 7, 8, 9) max #n]",
+        context: &context2
+    )
+    #expect(min == "1")
+    #expect(max == "9")
+}
+
+@Test func aggregateActionsOnAnEmptyResultSetProduceVoidRatherThanAnArbitraryNumericDefault() async throws {
+    // No worked example in the real docs covers an empty result set for
+    // any of sum/average/min/max. Disclosed choice: all four produce
+    // void (renders as an empty string) rather than assuming an
+    // arbitrary numeric identity (e.g. 0 for sum) -- consistent with
+    // this codebase's own established Array->First-on-empty convention,
+    // and avoids a divide-by-zero for average specifically.
+    var context = LassoContext()
+    let output = try await LassoRenderer().render(
+        "[with n in array() sum #n]|[with n in array() average #n]|[with n in array() min #n]|[with n in array() max #n]",
+        context: &context
+    )
+    #expect(output == "|||")
+}
+

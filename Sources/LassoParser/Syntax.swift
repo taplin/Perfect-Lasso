@@ -187,16 +187,16 @@ public indirect enum LassoExpression: Equatable, Sendable {
     /// exact non-overlapping boundary between the two).
     ///
     /// Stage 8.1 added the core `with...select`/`with...do` pipeline
-    /// (single with-clause, `select`/`do` actions only). Stage 8.2 adds
-    /// `operations` — zero or more `where`/`let`/`skip`/`take` clauses
-    /// (Ch. "Query Expressions", "Operations"), applied IN THE ORDER
-    /// WRITTEN between the with-clause and the action (real Lasso's own
-    /// worked examples show `skip`/`take`'s relative order changing the
-    /// result — `take 4 skip 3` vs `skip 3 take 4` — so this is a real
-    /// sequential pipeline, not a set of independent filters). Still no
-    /// `sum`/`average`/`min`/`max` actions, `order by`/`group by`
-    /// operations, or comma-separated multi with-clause nesting — each a
-    /// later stage's own addition, per
+    /// (single with-clause, `select`/`do` actions only). Stage 8.2 added
+    /// `operations` — `where`/`let`/`skip`/`take` clauses (Ch. "Query
+    /// Expressions", "Operations"), applied IN THE ORDER WRITTEN between
+    /// the with-clause and the action (real Lasso's own worked examples
+    /// show `skip`/`take`'s relative order changing the result — `take 4
+    /// skip 3` vs `skip 3 take 4` — so this is a real sequential
+    /// pipeline, not a set of independent filters). Stage 8.3 added the
+    /// `order by` operation and the `sum`/`average`/`min`/`max` actions.
+    /// Still no `group by` operation or comma-separated multi with-clause
+    /// nesting — each a later stage's own addition, per
     /// `Documentation/captures-subsystem-plan.md`'s Stage 8 breakdown.
     case queryExpression(variable: String, source: LassoExpression, operations: [QueryOperation], action: QueryAction)
     case unknown(String)
@@ -205,21 +205,44 @@ public indirect enum LassoExpression: Equatable, Sendable {
 /// The action ending a Query Expression (Ch. "Query Expressions",
 /// "Actions") — see `LassoExpression.queryExpression`'s own doc comment
 /// for this stage's scope. `perform` corresponds to the real `do`
-/// keyword (`do` is a Swift reserved word).
+/// keyword (`do` is a Swift reserved word). Stage 8.3 adds `sum`/
+/// `average`/`min`/`max` — each reduces the surviving rows to a single
+/// value via a single expression, evaluated once per row.
 public enum QueryAction: Equatable, Sendable {
     case select(LassoExpression)
     case perform(LassoExpression)
+    case sum(LassoExpression)
+    case average(LassoExpression)
+    case min(LassoExpression)
+    case max(LassoExpression)
 }
 
 /// A Query Expression operation (Ch. "Query Expressions", "Operations")
 /// — see `LassoExpression.queryExpression`'s own doc comment for scope.
 /// `filter` corresponds to the real `where` keyword (`where` is a Swift
-/// keyword, reserved for pattern-match guards).
+/// keyword, reserved for pattern-match guards). Stage 8.3 adds
+/// `orderBy` (the real `order by` operation, two words) — one or more
+/// comma-separated `(key expression, direction)` pairs, evaluated per
+/// row and used to sort the surviving row list.
 public enum QueryOperation: Equatable, Sendable {
     case filter(LassoExpression)
     case `let`(name: String, value: LassoExpression)
     case skip(LassoExpression)
     case take(LassoExpression)
+    case orderBy([QueryOrderKey])
+}
+
+/// One `order by` sort key (Ch. "Query Expressions", "Order By") —
+/// `descending` defaults to `false` ("when a direction is not
+/// specified, ascending order is assumed").
+public struct QueryOrderKey: Equatable, Sendable {
+    public let expression: LassoExpression
+    public let descending: Bool
+
+    public init(expression: LassoExpression, descending: Bool) {
+        self.expression = expression
+        self.descending = descending
+    }
 }
 
 public indirect enum LassoNode: Equatable, Sendable {

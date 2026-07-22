@@ -825,6 +825,45 @@ struct Evaluator {
                 let count = try await evaluate(expr).number.map(Int.init) ?? 0
                 context.replaceLocals(scopedLocals)
                 rows = Array(rows.prefix(max(0, count)))
+            case let .orderBy(keys):
+                // Ch. "Query Expressions", "Order By": each row's sort
+                // key(s) are computed ONCE per row (async), then the row
+                // list is sorted SYNCHRONOUSLY using
+                // `Evaluator.lassoLessThan` — the SAME single source of
+                // truth this codebase already uses for `Array->Sort`/
+                // Set/PriorityQueue/TreeMap ordering and the raw `<`/`>`
+                // operators, reused here rather than inventing a second,
+                // parallel comparison (real Lasso's own wording: "the
+                // standard less than and greater than operators are used
+                // to find the result value"). Multiple keys compare
+                // LEXICOGRAPHICALLY (first key decides unless tied, then
+                // the next, and so on) — matching "further ordering
+                // criteria can be specified... the next ordering
+                // expression" as tiebreakers, not independent sorts.
+                // `sorted(by:)` is a stable sort (guaranteed since Swift
+                // 5), so fully-tied rows keep their relative order.
+                var keyedRows: [(row: [String: LassoValue], keys: [LassoValue])] = []
+                keyedRows.reserveCapacity(rows.count)
+                for row in rows {
+                    bind(row)
+                    var rowKeys: [LassoValue] = []
+                    rowKeys.reserveCapacity(keys.count)
+                    for key in keys {
+                        rowKeys.append(try await evaluate(key.expression))
+                    }
+                    keyedRows.append((row, rowKeys))
+                    if context.shouldStopRenderingCurrentBody() { break }
+                }
+                let directions = keys.map(\.descending)
+                keyedRows.sort { lhs, rhs in
+                    for index in 0..<min(lhs.keys.count, rhs.keys.count) {
+                        let descending = directions[index]
+                        if Evaluator.lassoLessThan(lhs.keys[index], rhs.keys[index]) { return !descending }
+                        if Evaluator.lassoLessThan(rhs.keys[index], lhs.keys[index]) { return descending }
+                    }
+                    return false
+                }
+                rows = keyedRows.map(\.row)
             }
         }
         switch action {
@@ -886,6 +925,70 @@ struct Evaluator {
                 }
             }
             return .void
+        case let .sum(expr):
+            // Ch. "Query Expressions": "the summation is performed using
+            // the `+` operator, so each element in the sequence must
+            // support the addition operator for the sum to succeed" —
+            // reuses this codebase's own existing `binary(_:"+"​:_:)`
+            // rather than a separate numeric-only accumulator, so
+            // string-concatenation-style sums (real Lasso's `+` handles
+            // both) work identically to the real operator. No worked
+            // example covers an EMPTY result set — `.null` chosen for
+            // consistency with `min`/`max` below (a fold with no seed
+            // value has nothing to report), not an assumed `0` identity.
+            var accumulated: LassoValue?
+            for row in rows {
+                bind(row)
+                let value = try await evaluate(expr)
+                accumulated = try accumulated.map { try binary($0, "+", value) } ?? value
+                if context.shouldStopRenderingCurrentBody() { break }
+            }
+            return accumulated ?? .null
+        case let .average(expr):
+            // "As expected, using average will take the sum of each
+            // element and then divide that value by the number of
+            // elements" — literally sum via the same `+` fold as `.sum`
+            // above, then a single `binary(_:"/"​:_:)` division; same
+            // disclosed `.null`-on-empty choice (also sidesteps a
+            // divide-by-zero for the genuinely-empty case, which isn't
+            // really an ERROR condition here so much as "nothing to
+            // average").
+            var accumulated: LassoValue?
+            var count = 0
+            for row in rows {
+                bind(row)
+                let value = try await evaluate(expr)
+                accumulated = try accumulated.map { try binary($0, "+", value) } ?? value
+                count += 1
+                if context.shouldStopRenderingCurrentBody() { break }
+            }
+            guard let sum = accumulated, count > 0 else { return .null }
+            return try binary(sum, "/", .integer(count))
+        case let .min(expr):
+            // "The standard less than (<) and greater than (>) operators
+            // are used to find the result value" — reuses the SAME
+            // `Evaluator.lassoLessThan` `order by` above already reuses,
+            // not a separate min/max-specific comparison. `.null` on
+            // empty matches this codebase's own established
+            // `Array->First`-on-empty convention (`Evaluator.swift`'s
+            // `.array, "first"` case).
+            var best: LassoValue?
+            for row in rows {
+                bind(row)
+                let value = try await evaluate(expr)
+                if best == nil || Evaluator.lassoLessThan(value, best!) { best = value }
+                if context.shouldStopRenderingCurrentBody() { break }
+            }
+            return best ?? .null
+        case let .max(expr):
+            var best: LassoValue?
+            for row in rows {
+                bind(row)
+                let value = try await evaluate(expr)
+                if best == nil || Evaluator.lassoLessThan(best!, value) { best = value }
+                if context.shouldStopRenderingCurrentBody() { break }
+            }
+            return best ?? .null
         }
     }
 
