@@ -11,10 +11,26 @@ minimum across the full dependency graph behind `lasso-perfect-server`:
 declares `platforms: [.macOS(.v14)]`.
 
 This document records two things: (1) exactly what is fixed and why 14.0 is
-the real floor, and (2) — since Tim asked for this as reference material, not
-because we're building it now — what it would additionally take to reach
-13.0 (Ventura) or 12.0 (Monterey), in case a future need makes that worth
-revisiting.
+the real floor, and (2) what it would additionally take to reach three
+progressively lower targets — **13.0 (Ventura)**, **12.0 (Monterey)**, and
+**10.15 (Catalina) / 11 (Big Sur)** — motivated by real demand: there's a
+family of hardware whose OS support ended at 10.15, and people currently
+running Lasso on that hardware would be able to test and onboard this
+project if it ran there too, with a clear upgrade path to newer hardware
+afterward. None of the three levels below are built/merged yet — this is
+scoping, not a changelog — but each is broken down by exactly what's known,
+what's already built-and-verified-but-unmerged, and what's still an open
+question, so a future session can pick up any one of them without
+re-deriving this research.
+
+**Status at a glance:**
+
+| Target | Blockers found | Built & verified | Merged |
+|---|---|---|---|
+| 14.0 (current) | — | — | ✅ |
+| 13.0 (Ventura) | 2 packages, 15 call sites | ❌ | ❌ |
+| 12.0 (Monterey) | + 2 independent Perfect-NIO API gaps | 1 of 2 | ❌ |
+| 10.15/11 (Catalina/Big Sur) | + concurrency runtime back-deployment packaging, + an unaudited API range | ❌ | ❌ |
 
 ## Method
 
@@ -103,7 +119,29 @@ of anything in this Swift code.
 
 ## Baseline: what it would take to reach macOS 13.0 (Ventura)
 
-Only one package needs a change:
+**Two packages need changes** — this is wider than it first looked. The
+original pass through this investigation only checked the dependency graph
+(`Perfect-SMTP`) and found the floor there; a later pass swept
+`Perfect-Lasso`'s *own* source (`grep` for `Duration`/`ContinuousClock`/
+`Task.sleep(for:)`) and found the identical API family used **13 more times
+across 5 files**, previously undocumented:
+
+| File | Call sites |
+|---|---|
+| `Sources/LassoCrawlReport/CrawlReport.swift` | 1 |
+| `Sources/LassoPerfectSMTP/LassoEmailProviderImpl.swift` | 1 |
+| `Sources/LassoPerfectServer/AdminConsoleIntegration.swift` | 5 (3× `Task.sleep(for:)`, 2× bare `ContinuousClock()` construction sites, plus a `ContinuousClock.Instant`-typed helper) |
+| `Sources/LassoPerfectServer/RestartReadiness.swift` | 2 |
+| `Sources/LassoPerfectServer/main.swift` | 6 |
+
+All of these are `Task.sleep(for: .milliseconds(...))`/`.seconds(...)` or
+`ContinuousClock()`/`ContinuousClock.Instant` — the same fix pattern as
+`Perfect-SMTP`'s already-scoped rewrite below applies directly: swap
+`Task.sleep(for:)` for `Task.sleep(nanoseconds:)` (no floor beyond basic
+concurrency), and replace `ContinuousClock`-based monotonic deadline/elapsed
+tracking with `DispatchTime` arithmetic. Mechanical and bounded, but real
+work across meaningfully more surface area than previously documented — not
+yet scoped file-by-file the way `Perfect-SMTP`'s two sites are below.
 
 **`Perfect-SMTP`**'s floor is exactly 13.0, from two `Duration`/
 `ContinuousClock` call sites:
@@ -239,3 +277,98 @@ Perfect-XML's fix (already shipped) + Perfect-SMTP's fix (documented above,
 not done) + Perfect-NIO's accept-loop fix (built, verified, not merged) get
 everything to **13.0**. Reaching 12.0 specifically requires the additional,
 unscoped WebSocket-upgrade-handler rework in Perfect-NIO.
+
+## Baseline: what it would take to reach macOS 10.15 (Catalina) / 11 (Big Sur)
+
+This is new ground — nothing below 12.0 had been investigated before this
+pass, and this machine's toolchain can't even reach it via a normal `swift
+build` (see Method above: `SDKSettings.plist` clamps at 12.0). Everything in
+this section comes from direct `swiftc`/`clang` invocation and outside
+research, not a real SwiftPM build of this project, and none of it has been
+tested against real 10.15/11 hardware or a VM.
+
+### The core issue: Swift's concurrency runtime isn't part of the OS below 12.0
+
+Async/await, actors, and task groups themselves are **not** the blocker —
+this is the one genuinely good news item in this whole investigation.
+Verified directly: a minimal async/await + `TaskGroup` program compiles,
+links, and *runs* when built with `swiftc -target x86_64-apple-macosx10.15`
+on this machine (`otool -l` confirms `minos 10.15` on the resulting binary).
+What actually changes below macOS 12.0 is that the OS no longer ships
+`libswift_Concurrency.dylib` as part of its own built-in Swift runtime — the
+compiled binary weak-links `@rpath/libswift_Concurrency.dylib` with an rpath
+of `/usr/lib/swift`, which macOS 12+ populates itself but 10.15/11 do not.
+
+Apple has genuinely, officially supported back-deploying concurrency to
+macOS 10.15/iOS 13 since Xcode 13.2 (announced alongside the original
+concurrency rollout) — the toolchain ships a back-deployment copy of the
+dylib at
+`$(xcode-select -p)/Toolchains/XcodeDefault.xctoolchain/usr/lib/swift-5.5/macosx/libswift_Concurrency.dylib`
+(confirmed present on this machine, ~1.1 MB) for exactly this purpose.
+
+### The complication: this support is undocumented for command-line tools
+
+Apple's back-deployment story is well-trodden for **app bundles** — embed
+the dylib in `Contents/Frameworks/`, which Xcode/`.app` structure already
+has a natural place for. `lasso-perfect-server` is a bare SwiftPM
+executable, not an app bundle, and Apple's release notes and official docs
+say nothing about that case at all. A community-established, [Apple-DTS-confirmed
+recipe exists](https://nonstrict.eu/blog/2023/using-async-await-in-a-commandline-tool-on-older-macos-versions/)
+for CLI tools specifically:
+
+1. Copy `libswift_Concurrency.dylib` from the toolchain path above to
+   alongside the built executable.
+2. Add an executable-relative rpath so the dynamic linker finds the bundled
+   copy: in `Package.swift`'s executable target,
+   ```swift
+   linkerSettings: [
+       .unsafeFlags(["-Xlinker", "-rpath", "-Xlinker", "@executable_path"])
+   ]
+   ```
+   (or `@executable_path/../lib` if the dylib ships in a sibling `lib/`
+   directory instead of directly alongside the binary).
+
+Reported caveats from that write-up: ~1.1 MB size overhead, and Apple DTS
+involvement was needed to confirm the bundle-placement approach avoids code
+signing issues — this is real but non-trivial ground, not a one-line fix.
+
+**Verification gap, found directly and worth being honest about**: I built
+both the plain and the bundled-dylib versions of the probe binary on this
+machine (macOS 27) and used `DYLD_PRINT_LIBRARIES=1` to see which copy of
+`libswift_Concurrency.dylib` actually got loaded at runtime. Even with the
+bundled copy present and `@executable_path` in the rpath list, **dyld on
+this machine loaded the system's own `/usr/lib/swift/libswift_Concurrency.dylib`
+instead of the bundled one** — modern dyld silently prefers an OS-cached
+copy of a system-install-name dylib over a same-named bundled one. This
+means the actual runtime-resolution behavior of this recipe is **not
+verifiable on any machine that already has the system copy** — which is
+every machine capable of building this project today. Confirming this
+recipe genuinely works requires a real bare 10.15 or 11 install (or VM)
+with no system-provided concurrency runtime at all; that verification has
+not been done and shouldn't be assumed from the write-up alone.
+
+### What's still completely unscoped for this range
+
+- **The 13 additional 13.0-floor call sites and Perfect-NIO's two 12.0
+  items** (both sections above) still apply on top of everything in this
+  section — they don't go away at a lower target, they compound.
+- **No API audit has been done for the 10.15–12.0 range itself.** Everything
+  above 12.0 was checked via real `swift build`; everything below 12.0 has
+  only had the concurrency-runtime question probed directly. `Perfect-CRUD`,
+  `Perfect-MySQL`, `Perfect-Session`, `Perfect-FileMaker`/`-AdminAPI` were
+  asserted in the 14.0 section above to have "a real code floor at or below
+  13.0" — but that check only confirmed *at or below 13.0*, not specifically
+  *at or above 10.15*. A real audit needs either an Xcode version whose SDK
+  doesn't clamp below 12.0, or continued direct `swiftc`/`clang` probing
+  package-by-package the way the concurrency-runtime question was probed
+  here.
+- **The C client libraries** (`mysql-client` for `Perfect-MySQL`,
+  `libpq` for `Perfect-PostgreSQL`) are a separate, already-flagged concern
+  from the 14.0 section above (Homebrew bottles built at whatever macOS
+  version Homebrew currently targets, independent of this project's own
+  Swift code) — this gets *more* binding, not less, at a 10.15/11 target,
+  since it's less likely a current Homebrew bottle for either library
+  supports linking against something that old at all. Unverified either
+  way; would need checking against whatever a real 10.15/11 deployment
+  actually uses for its C client library (a from-source build, a vendored
+  older bottle, or a different distribution channel entirely).
