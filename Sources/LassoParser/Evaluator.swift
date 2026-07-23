@@ -183,6 +183,15 @@ struct Evaluator {
             let evaluated = try await evaluate(value)
             try await assign(evaluated, to: target, defaultScope: .unscoped)
             return .void
+        case let .assignmentProducing(target, value):
+            // `target := value` — Ch. "Operators", assign-produce: same
+            // assignment as `=`, but the expression evaluates to the
+            // assigned value instead of `.void`. Real corpus
+            // (zeroloop/ds's `ds.lasso`): `define ds_connections_closed
+            // = (p::integer) => var(__ds_connections_closed) := #p`.
+            let evaluated = try await evaluate(value)
+            try await assign(evaluated, to: target, defaultScope: .unscoped)
+            return evaluated
         case let .ternary(condition, whenTrue, whenFalse):
             return try await evaluate(condition).isTruthy ? try await evaluate(whenTrue) : try await evaluate(whenFalse)
         case let .unary(op, value):
@@ -247,6 +256,22 @@ struct Evaluator {
                 let calleeValue = try await evaluate(callee)
                 if case let .capture(capture) = calleeValue {
                     return try await invokeCapture(capture, arguments: try await evaluate(arguments))
+                }
+                // `#creator(#1)` — Ch. "Operators" > escape method
+                // operators: a "memberstream" (this codebase's
+                // "tagreference" object — `\name`/`\#variable`) is
+                // documented as supporting direct invocation with `()`,
+                // not just `->invoke(...)` — real corpus (zeroloop/ds's
+                // ds_result.lasso): `public rows(creator::memberstream)
+                // => { ... #creator(#1) ... }`, where the caller passes
+                // a `\methodName`-style reference through as an ordinary
+                // parameter and calls it bare. Delegates to the exact
+                // same native `"invoke"` method `->invoke(...)` itself
+                // dispatches to (`NativeTypes.swift`'s
+                // `makeTagReferenceType`) rather than duplicating its
+                // custom-tag/native-function fallback chain here.
+                if case let .object(object) = calleeValue, object.typeName == LassoTagReferenceValue.typeName {
+                    return try await member(calleeValue, "invoke", arguments, isQuoted: false)
                 }
                 throw LassoRuntimeError.unsupportedExpression("Dynamic call")
             }
