@@ -477,11 +477,43 @@ struct Evaluator {
         // inside one, and leak back out to abort/skip whatever loop
         // iteration is calling this tag. See `LassoContext.loopDepth`.
         context.loopDepth = 0
+        // Same reasoning for `currentCaptureHomeDepth`: an ordinary tag
+        // call is NOT a capture invocation, so a bare `return` inside
+        // ITS OWN body must always be purely local to THIS frame,
+        // regardless of whether the CALLER happens to be executing
+        // inside some enclosing capture's rendering right now (e.g. this
+        // tag was invoked from a `define_atend`-registered capture body,
+        // or from inside a `->foreach`'s associated block). Without
+        // this, `setNonLocalReturnSignal` (used by `return`/`yield`)
+        // reads the ENCLOSING capture's own home depth via
+        // `currentCaptureHomeDepth` (a stack `invokeCapture` alone
+        // pushes/pops) and tags this tag's `return` with THAT target —
+        // `consumeReturnValueRespectingNonLocalTarget` below then
+        // compares it against `context.tagCallStack.count` (a DIFFERENT
+        // counter), the target never matches, the signal is never
+        // consumed here, and it stays live: this call silently returns
+        // `.void` instead of its real value, and the STILL-LIVE signal
+        // then aborts every remaining sibling statement in the CALLER's
+        // own body too (`shouldStopRenderingCurrentBody()` sees it and
+        // stops rendering) — found live via a `define_atend`-registered
+        // capture whose body called an ordinary bareword tag with its
+        // own `return`, then went on to a `->foreach` call that never
+        // ran at all, with no error and no visible symptom beyond the
+        // missing output (Task #189). Uses
+        // `saveAndClearCaptureHomeDepthStack`/`restoreCaptureHomeDepthStack`
+        // (clearing the WHOLE stack), not `pushCaptureHomeDepth(nil)` —
+        // see that method's own doc comment for why a plain `nil` push
+        // is a subtly different, WRONG fix (it breaks any capture
+        // literal CREATED directly inside this tag's own body, making
+        // it incorrectly compute itself as detached instead of homed to
+        // THIS call — a real regression caught by the full suite).
+        let savedCaptureHomeDepthStack = context.saveAndClearCaptureHomeDepthStack()
         defer {
             context.popGivenBlock()
             context.replaceLocals(savedLocals)
             context.popTagCall()
             context.loopDepth = savedLoopDepth
+            context.restoreCaptureHomeDepthStack(savedCaptureHomeDepthStack)
         }
 
         guard let renderNodes else { return .void }
@@ -1719,14 +1751,22 @@ struct Evaluator {
         context.replaceLocals(boundLocals)
         context.pushSelf(object)
         context.pushGivenBlock(givenBlock)
-        // See the matching comment in `invokeCustomTag`.
+        // See the matching comment in `invokeCustomTag` — a type-method
+        // call is likewise never itself a capture invocation, so its own
+        // `return` must always target THIS frame, not whatever capture
+        // (if any) happens to be executing in the caller. Same
+        // save/clear/restore approach as `invokeCustomTag`, not a bare
+        // `pushCaptureHomeDepth(nil)` — see that method's own doc
+        // comment for why the difference matters.
         context.loopDepth = 0
+        let savedCaptureHomeDepthStack = context.saveAndClearCaptureHomeDepthStack()
         defer {
             context.popGivenBlock()
             context.popSelf()
             context.popTagCall()
             context.replaceLocals(savedLocals)
             context.loopDepth = savedLoopDepth
+            context.restoreCaptureHomeDepthStack(savedCaptureHomeDepthStack)
         }
 
         guard let renderNodes else { return .void }

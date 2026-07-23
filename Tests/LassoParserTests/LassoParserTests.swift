@@ -15680,3 +15680,78 @@ struct IncludeURLTests {
     ).trimmingCharacters(in: .whitespacesAndNewlines)
     #expect(output == "A/B/C")
 }
+
+
+// MARK: - Ordinary tag/method calls inside a capture don't inherit its home depth
+
+@Test func anOrdinaryTagAndMethodsOwnReturnStayLocalWhenCalledFromInsideACapture() async throws {
+    // Found while digging into Task #178's next `ds()` blocker: a
+    // `define_atend`-registered capture whose body called an ordinary
+    // bareword custom tag (itself with an explicit `return`), then went
+    // on to call `->foreach` on that same tag's result -- the `->foreach`
+    // call silently never ran at all, with no error and no visible
+    // symptom besides the missing side effect.
+    //
+    // Root cause: `setNonLocalReturnSignal` (used by both `return`/
+    // `yield`) tags every signal with `context.currentCaptureHomeDepth`
+    // -- a stack ONLY `Evaluator.invokeCapture` pushes/pops. Neither
+    // `invokeCustomTag` nor `invokeMemberMethod` pushed anything onto
+    // it, so an ordinary tag/method's own `return`, when that tag
+    // happens to be CALLED from inside some enclosing capture's
+    // rendering (a `define_atend` capture, a `->foreach` associated
+    // block, etc.), inherited the ENCLOSING capture's home depth instead
+    // of targeting its own invocation frame. The consume step then
+    // compares that mistargeted depth against `context.tagCallStack
+    // .count` (a different counter entirely), never matches, and never
+    // consumes the signal -- the call silently returns `.void` instead
+    // of its real value, AND the still-live signal aborts every
+    // remaining sibling statement in the CALLER's own body too
+    // (`shouldStopRenderingCurrentBody()` sees it and stops).
+    //
+    // Exercises both fixed call sites in one repro: `widget_connections`
+    // (an ordinary custom tag, `invokeCustomTag`) and `.close` (a type
+    // method, `invokeMemberMethod`) each have their own explicit
+    // `return`. Real corpus shape: `web_request ? define_atend({tagname})`
+    // (zeroloop/ds's `ds_connections`/`ds_close_connections`). Inspects
+    // final state via `context` rather than page output text, since the
+    // at-end drain runs AFTER the page's own top-level nodes finish
+    // rendering (`LassoRenderer.render`'s own single top-level entry
+    // point) -- any in-page `[...]` output would be captured before the
+    // drain (and its side effects) ever happen.
+    var context = LassoContext()
+    _ = try await LassoRenderer().render(
+        """
+        <?lassoscript
+        define widget => type {
+            data public label::string = ''
+            public close => {
+                .label = .label + '-closed'
+                return .label
+            }
+        }
+        define widget_connections => {
+            if(var(__t189__)->isnota(::map)) => {
+                $__t189__ = map
+                web_request ? define_atend({widget_close_connections})
+            }
+            return $__t189__
+        }
+        define widget_close_connections => {
+            widget_connections->foreach => {
+                #1->second->close
+            }
+        }
+        widget_connections
+        local(w) = widget
+        $__t189__->insert('k' = #w)
+        ?>
+        """,
+        context: &context
+    )
+    guard case let .map(connections) = context.value(for: "__t189__", scope: .global),
+          case let .object(storedWidget)? = connections["k"] else {
+        Issue.record("Expected the shared connections map to contain the stored widget")
+        return
+    }
+    #expect(storedWidget.value(for: "label") == .string("-closed"))
+}
