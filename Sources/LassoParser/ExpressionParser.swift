@@ -106,7 +106,7 @@ private struct ExpressionLexer {
         // lexed as separate `+`/`=` tokens, which broke parsing outright
         // (a bare `=` with nothing before it is not a valid expression on
         // its own) and silently dropped large chunks of built-up page HTML.
-        for op in ["->", "==", "!=", ">=", "<=", "&&", "||", "::", "=>", ">>", "+=", "-=", "*=", "/="] where matches(op) {
+        for op in ["->", "==", "!=", ">=", "<=", "&&", "||", "::", "=>", ">>", "+=", "-=", "*=", "/=", ":="] where matches(op) {
             index += op.count
             return .symbol(op)
         }
@@ -520,10 +520,12 @@ struct ExpressionParser {
               let precedence = Self.precedence[op],
               precedence >= minimumPrecedence {
             index += 1
-            let isAssignment = op == "=" || Self.compoundAssignmentOperators[op] != nil
+            let isAssignment = op == "=" || op == ":=" || Self.compoundAssignmentOperators[op] != nil
             let right = parseExpression(minimumPrecedence: precedence + (isAssignment ? 0 : 1))
             if op == "=" {
                 left = .assignment(target: left, value: right)
+            } else if op == ":=" {
+                left = .assignmentProducing(target: left, value: right)
             } else if let baseOperator = Self.compoundAssignmentOperators[op] {
                 left = .assignment(target: left, value: .binary(left: left, operator: baseOperator, right: right))
             } else {
@@ -1558,7 +1560,7 @@ struct ExpressionParser {
     }
 
     private static let precedence = [
-        "=": 1, "+=": 1, "-=": 1, "*=": 1, "/=": 1,
+        "=": 1, "+=": 1, "-=": 1, "*=": 1, "/=": 1, ":=": 1,
         "||": 2, "&&": 3, "==": 4, "!=": 4, ">": 5, "<": 5,
         ">=": 5, "<=": 5, ">>": 5, "+": 6, "-": 6, "*": 7, "/": 7, "%": 7,
     ]

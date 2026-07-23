@@ -15755,3 +15755,73 @@ struct IncludeURLTests {
     }
     #expect(storedWidget.value(for: "label") == .string("-closed"))
 }
+
+// MARK: - Memberstream direct-call and the assign-produce operator (:=)
+
+@Test func aMemberstreamValuePassedAsAParameterCanBeInvokedDirectlyWithParens() async throws {
+    // Real corpus (zeroloop/ds's ds_result.lasso): `public rows(creator
+    // ::memberstream) => { ... #creator(#1) ... }` -- a "memberstream"
+    // (this codebase's "tagreference" object, produced by `\name`/
+    // `\#variable`) passed through as an ordinary parameter and called
+    // BARE with `()`, not via `->invoke(...)`. Previously fell into
+    // `Evaluator.evaluate`'s generic "Dynamic call" fallback (the same
+    // one `#cap(...)`'s capture-shorthand check sits next to) since a
+    // tagreference object isn't a `.capture` value -- fixed by
+    // delegating to the exact same native `"invoke"` method `->invoke`
+    // itself already dispatches to, rather than duplicating its custom-
+    // tag/native-function fallback chain.
+    var context = LassoContext()
+    let output = try await LassoRenderer().render(
+        """
+        <?lassoscript
+        define double(n::integer) => #n * 2
+        define applyit(fn, value::integer) => #fn(#value)
+        ?>
+        [applyit(\\double, 21)]
+        """,
+        context: &context
+    ).trimmingCharacters(in: .whitespacesAndNewlines)
+    #expect(output == "42")
+}
+
+@Test func assignProduceOperatorAssignsAndEvaluatesToTheAssignedValue() async throws {
+    // Real corpus (zeroloop/ds's ds.lasso): `define ds_connections_closed
+    // = (p::integer) => var(__ds_connections_closed) := #p` -- a setter-
+    // style method whose body both stores AND returns its parameter in
+    // one expression. `:=` previously lexed as two separate `:`/`=`
+    // tokens (no compound-token recognition at all), so `var(name) :=
+    // value` mis-parsed into a bogus double-call shape
+    // (`var(name)(...)`), surfacing as `unsupportedExpression("Dynamic
+    // call")`. `assignProducing` is deliberately a SEPARATE expression
+    // case from ordinary `.assignment` (which evaluates to `.void`) --
+    // `:=`'s whole point is evaluating to the assigned value instead.
+    var context = LassoContext()
+    let output = try await LassoRenderer().render(
+        """
+        <?lassoscript
+        local(x) = 0
+        local(y) = (#x := 5)
+        ?>
+        [#x]/[#y]
+        """,
+        context: &context
+    ).trimmingCharacters(in: .whitespacesAndNewlines)
+    #expect(output == "5/5")
+}
+
+@Test func assignProduceOperatorWorksWithVarScopeMatchingRealCorpusShape() async throws {
+    // The exact real-corpus shape: `var(name) := value` inside a
+    // top-level setter-style define.
+    var context = LassoContext()
+    let output = try await LassoRenderer().render(
+        """
+        <?lassoscript
+        define counter_set = (p::integer) => var(__t190_counter__) := #p
+        counter_set = 7
+        ?>
+        [var(__t190_counter__)]
+        """,
+        context: &context
+    ).trimmingCharacters(in: .whitespacesAndNewlines)
+    #expect(output == "7")
+}

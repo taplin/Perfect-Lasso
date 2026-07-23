@@ -188,6 +188,18 @@ public indirect enum LassoExpression: Equatable, Sendable {
     case unary(operator: String, value: LassoExpression)
     case binary(left: LassoExpression, operator: String, right: LassoExpression)
     case assignment(target: LassoExpression, value: LassoExpression)
+    /// `target := value` — Ch. "Operators", the assign-produce operator:
+    /// assigns `value` to `target`, exactly like `=`, but the WHOLE
+    /// expression evaluates to the assigned value instead of `.void` —
+    /// useful for assigning inline as part of a larger expression. A
+    /// separate case from `.assignment` rather than an extra flag on it,
+    /// since every existing `.assignment` construction site (there are
+    /// many) would otherwise need updating to supply a "which kind" they
+    /// don't actually have an opinion about. Real corpus (zeroloop/ds's
+    /// `ds.lasso`): `define ds_connections_closed = (p::integer) =>
+    /// var(__ds_connections_closed) := #p` — a setter-style method whose
+    /// body both stores AND returns `#p` in one expression.
+    case assignmentProducing(target: LassoExpression, value: LassoExpression)
     case ternary(condition: LassoExpression, whenTrue: LassoExpression, whenFalse: LassoExpression)
     /// A Lasso 9 Capture literal (`{ ... }`/auto-collect `{^ ... ^}`) —
     /// see `Captures.swift`'s own doc comment. `body` is already fully
