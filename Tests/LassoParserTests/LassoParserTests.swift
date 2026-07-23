@@ -15600,3 +15600,83 @@ struct IncludeURLTests {
     ).trimmingCharacters(in: .whitespacesAndNewlines)
     #expect(output == "abc;xyz;")
 }
+
+// MARK: - Comma-continued type data blocks with blank lines / trailing comments
+
+@Test func commaContinuedDataBlockWithABlankLineAndAStandaloneCommentStillParsesEveryField() async throws {
+    // Real corpus (zeroloop/ds's `ds` type): a blank line + a
+    // `// Legacy: support action_params` comment sit between
+    // `results = staticarray,` and the next field. `readLineContinuingCommas`
+    // previously stopped the comma-continuation scan at the first line that
+    // didn't itself end in a comma -- a bare blank line trivially doesn't --
+    // silently dropping every field after it from the type entirely (not
+    // just losing that field's own default value, the narrower, already-
+    // documented gap `DsInfo.swift` worked around by using one field per
+    // line). The dropped text then got mis-parsed by the OUTER parse loop
+    // as malformed method definitions instead of data fields.
+    var context = LassoContext()
+    let output = try await LassoRenderer().render(
+        """
+        <?lassoscript
+        define minitype => type{
+
+            data
+                public	a::string,
+                public	b::string = '',
+
+                // Legacy: comment between fields
+                public	c = staticarray,
+
+                //	Another comment
+                public d
+
+            public oncreate => {
+                .'a' = 'A'
+                .'b' = 'B'
+                .'d' = 'D'
+            }
+        }
+        local(m) = minitype
+        ?>
+        [#m->a]/[#m->b]/[#m->d]
+        """,
+        context: &context
+    ).trimmingCharacters(in: .whitespacesAndNewlines)
+    #expect(output == "A/B/D")
+}
+
+@Test func commaContinuedDataBlockWithTrailingLineCommentsStillParsesEveryField() async throws {
+    // Real corpus (zeroloop/ds's `ds_row` type): every field in its
+    // comma-continued `data` block has a `//` comment trailing on the SAME
+    // line (`private ds::ds,\t\t\t\t\t//\tReference to ds`). The comma-
+    // suffix check ran against the line's raw trimmed text, which ends
+    // with the COMMENT's own text, not the comma before it -- the
+    // declaration silently truncated after the FIRST such field, exactly
+    // the same "fields after this point get mis-parsed as methods"
+    // failure mode as the blank-line/standalone-comment case above, just
+    // triggered by a comment sharing a line with real content instead of
+    // occupying its own line.
+    var context = LassoContext()
+    let output = try await LassoRenderer().render(
+        """
+        <?lassoscript
+        define minitype2 => type{
+            data
+                public a::string,	//	first field
+                public b::string = '',	//	second field, with a default
+                public c	//	last field, no default, no comma
+
+            public oncreate => {
+                .'a' = 'A'
+                .'b' = 'B'
+                .'c' = 'C'
+            }
+        }
+        local(m) = minitype2
+        ?>
+        [#m->a]/[#m->b]/[#m->c]
+        """,
+        context: &context
+    ).trimmingCharacters(in: .whitespacesAndNewlines)
+    #expect(output == "A/B/C")
+}
