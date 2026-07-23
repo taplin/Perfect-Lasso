@@ -2767,6 +2767,40 @@ public struct LassoContext: Sendable {
         _ = captureHomeDepthStack.popLast()
     }
 
+    /// Temporarily hides the ENTIRE capture-home-depth stack (not just
+    /// its top entry) — used by `Evaluator.invokeCustomTag`/
+    /// `invokeMemberMethod` to isolate an ordinary tag/method call's own
+    /// body from whatever capture (if any) happens to be executing in
+    /// the CALLER right now. Deliberately NOT implemented as
+    /// `pushCaptureHomeDepth(nil)`/`popCaptureHomeDepth()`: pushing a
+    /// plain `nil` (an `Int?` value) makes `currentCaptureHomeDepth`
+    /// read back as `.some(nil)` — which a bare `return` inside this
+    /// frame correctly treats as "purely local" (same outcome either
+    /// way), but which ALSO makes ANY new capture literal CREATED
+    /// directly inside this frame's own body incorrectly compute itself
+    /// as DETACHED (`homeDepth: context.currentCaptureHomeDepth ??
+    /// context.tagCallStack.count` never reaches the `??` fallback when
+    /// the left side is `.some(nil)`, only when it's the OUTER `nil`) —
+    /// instead of correctly homing to THIS call frame, matching Ch.
+    /// "Captures"' own "the home is the method/tag call the capture
+    /// literal was created within." Clearing the whole stack (so
+    /// `.last` on the now-empty array returns the true outer `nil`)
+    /// gets both cases right at once. Found live: a `define_atend`-
+    /// registered capture whose body called an ordinary bareword tag
+    /// with its own `return`, invoked from inside that capture's
+    /// rendering — the tag's `return` was mistargeted to the capture's
+    /// home instead of its own frame, silently discarding the tag's
+    /// real return value and aborting every remaining sibling statement
+    /// in the CALLER's body too (Task #189).
+    mutating func saveAndClearCaptureHomeDepthStack() -> [Int?] {
+        defer { captureHomeDepthStack = [] }
+        return captureHomeDepthStack
+    }
+
+    mutating func restoreCaptureHomeDepthStack(_ saved: [Int?]) {
+        captureHomeDepthStack = saved
+    }
+
     /// Stage 7 (`currentCapture()`): the capture actively executing right
     /// now, or `nil` outside any capture invocation. See
     /// `currentCaptureStack`'s own doc comment above.
