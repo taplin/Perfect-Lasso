@@ -380,15 +380,76 @@ struct TypeBodyParser {
     private mutating func readLineContinuingCommas() -> String {
         var lines: [String] = []
         while index < characters.count {
-            let line = readStatement()
+            // A trailing `//...` comment on the SAME line as a field
+            // (real corpus: zeroloop/ds's `ds_row` type -- `private
+            // ds::ds,\t\t\t\t\t//\tReference to ds`) must be stripped
+            // BEFORE checking for a trailing comma, or the comment's own
+            // text becomes the line's effective suffix and the comma
+            // right before it is invisible to `hasSuffix(",")` -- same
+            // silent-truncation failure mode as the blank/comment-only
+            // LINE case just below, just triggered by a comment sharing
+            // a line with real content instead of occupying its own.
+            let rawLine = readStatement()
+            let line = Self.strippingTrailingLineComment(from: rawLine)
+            let trimmed = line.trimmingCharacters(in: .whitespacesAndNewlines)
+            // A blank or comment-only line between comma-continued
+            // fields doesn't itself end the declaration -- real corpus
+            // (zeroloop/ds's `ds` type) has a blank line + a
+            // `// Legacy: support action_params` comment sitting
+            // between `results = staticarray,` and the next field.
+            // Previously any such line (trivially not ending in a
+            // comma) stopped the scan right there, silently dropping
+            // every field after it from the type entirely -- not just
+            // "losing a default value" (the narrower, already-known gap
+            // `DsInfo.swift`'s own doc comment worked around by using
+            // one field per line) but discarding the field
+            // declarations themselves, which then got mis-parsed by the
+            // OUTER `parse()` loop as malformed method definitions
+            // instead. Must NOT be appended to `lines` -- the comment
+            // text has no comma of its own to split on, so it would
+            // otherwise glue onto whichever adjacent field's
+            // declaration text follows and corrupt `parseDataMember`'s
+            // visibility-prefix detection.
+            if trimmed.isEmpty || trimmed.hasPrefix("//") {
+                skipTrivia()
+                continue
+            }
             lines.append(line)
-            if line.trimmingCharacters(in: .whitespacesAndNewlines).hasSuffix(",") {
+            if trimmed.hasSuffix(",") {
                 skipTrivia()
                 continue
             }
             break
         }
         return lines.joined(separator: "\n")
+    }
+
+    /// Truncates `line` at the first `//` that isn't inside a quoted
+    /// string (`'`/`"`/`` ` ``, matching `readStatement`'s own quote
+    /// tracking) -- a plain substring search would misfire on a `//`
+    /// that happens to appear inside a string literal value, though no
+    /// real corpus sighting of that shape exists yet for this
+    /// specific call site.
+    private static func strippingTrailingLineComment(from line: String) -> String {
+        let chars = Array(line)
+        var quote: Character?
+        var index = 0
+        while index < chars.count {
+            let character = chars[index]
+            if let activeQuote = quote {
+                if character == "\\", activeQuote != "`" {
+                    index += 1
+                } else if character == activeQuote {
+                    quote = nil
+                }
+            } else if character == "'" || character == "\"" || character == "`" {
+                quote = character
+            } else if character == "/", index + 1 < chars.count, chars[index + 1] == "/" {
+                return String(chars[0..<index])
+            }
+            index += 1
+        }
+        return line
     }
 
     private mutating func readStatement() -> String {
