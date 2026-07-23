@@ -25,7 +25,7 @@
       "location" : "https://github.com/taplin/Perfect-FileMaker-AdminAPI.git",
       "state" : {
         "branch" : "main",
-        "revision" : "6972003fe2e9d812dbc00acaf78ff4b053b81769"
+        "revision" : "3f71a2e790bb62313a8f40021a7db77524d57d85"
       }
     },
     {
@@ -34,7 +34,7 @@
       "location" : "https://github.com/taplin/Perfect-MySQL.git",
       "state" : {
         "branch" : "main",
-        "revision" : "b81fbd477f09999d29b5c4d01104684696d6f54d"
+        "revision" : "9209cf17db5f542dde25d90b3cfd9ba6bfc281d4"
       }
     },
     {
