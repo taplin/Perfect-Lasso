@@ -39,6 +39,7 @@ This repo has no CI yet, so these are the only verification gate — don't skip 
    swift build -c release --product lasso-perfect-server
    ```
    (`--no-local` forces a real clone over the git protocol layer even for a local path, rather than a hardlink-optimized copy that could hide a real remote-fetch issue.)
+5. **Review documentation, not just code — before tagging, not after.** Read this repo's own `README.md` top-to-bottom and confirm it's still accurate against what's actually shipping (version/feature claims, platform requirements, anything this release's commits changed). If this release touched or bumped a dependency (a `branch: "main"`-tracked sibling in `Package.swift`), skim that sibling's own `README.md` too for claims that might now be stale (a deployment-target bump, a new capability, a removed one) — dependency repos drift silently since their own doc updates don't show up in this repo's diff. **Why this is here**: `v0.2.1` (2026-07-23) was an entire extra release cut solely to fix a README that had been stale since before `v0.2.0`, plus a docs-only pointer this repo's own README should have gotten in `v0.2.0` in the first place — both were catchable in one pre-flight read, and doing that read one release earlier would have meant one release instead of two.
 
 ## Cutting the tag and release
 
