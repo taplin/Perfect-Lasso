@@ -1,5 +1,5 @@
 {
-  "originHash" : "2d0205681654e7669a30c80990df9e50be6ba499a8bbe7aac0d60bc62a95cfd7",
+  "originHash" : "bb28ca7528bc902e78d11b9d6dafba3f8fe1721bb867e3987be15c329b4abc7e",
   "pins" : [
     {
       "identity" : "perfect-crud",
@@ -7,7 +7,7 @@
       "location" : "https://github.com/taplin/Perfect-CRUD.git",
       "state" : {
         "branch" : "main",
-        "revision" : "80e7b1263980121abb316011046bfc3612f98065"
+        "revision" : "52ad2eeed8c693cd43108f5df42f967311b64506"
       }
     },
     {
@@ -16,7 +16,7 @@
       "location" : "https://github.com/taplin/Perfect-FileMaker.git",
       "state" : {
         "branch" : "main",
-        "revision" : "7f7d6da0ac574789c3c7264b3fc54ef143cca5bc"
+        "revision" : "cdc8bff1124eaec6124c5dea7df1063d35a15395"
       }
     },
     {
@@ -25,7 +25,7 @@
       "location" : "https://github.com/taplin/Perfect-FileMaker-AdminAPI.git",
       "state" : {
         "branch" : "main",
-        "revision" : "3f71a2e790bb62313a8f40021a7db77524d57d85"
+        "revision" : "745241244bd2ac93d89e0e8f61b631a5aa45730b"
       }
     },
     {
@@ -34,7 +34,7 @@
       "location" : "https://github.com/taplin/Perfect-MySQL.git",
       "state" : {
         "branch" : "main",
-        "revision" : "9209cf17db5f542dde25d90b3cfd9ba6bfc281d4"
+        "revision" : "fa2dc731bb8b649f1e64325e7bb8fc5fff74b60a"
       }
     },
     {
@@ -43,7 +43,7 @@
       "location" : "https://github.com/taplin/Perfect-NIO.git",
       "state" : {
         "branch" : "main",
-        "revision" : "91209560d0342850dba6ac073243313e700bfee0"
+        "revision" : "ee6e9b8e6fd7a3d1fb6e2dee15e90f57dfa54ffa"
       }
     },
     {
@@ -70,7 +70,7 @@
       "location" : "https://github.com/taplin/Perfect-Session.git",
       "state" : {
         "branch" : "main",
-        "revision" : "022e7b7a495b49964dd0a7d56073e80c17e3e071"
+        "revision" : "044afa636e95b6391f991619d2e05b2ee1e8955a"
       }
     },
     {
@@ -97,7 +97,7 @@
       "location" : "https://github.com/taplin/Perfect-XML.git",
       "state" : {
         "branch" : "main",
-        "revision" : "964bd9f2e0147787bdaa9982b076b60573169dee"
+        "revision" : "41299cd60331be3bb72b4ea8026ae83938af3966"
       }
     },
     {
