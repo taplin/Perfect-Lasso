@@ -6,7 +6,7 @@ This repo has no pre-built binary releases yet — you build it from source, aga
 
 ## Releases
 
-See the [GitHub Releases page](https://github.com/taplin/Perfect-Lasso/releases) for what's changed in each version. The current release, [v0.2.0](https://github.com/taplin/Perfect-Lasso/releases/tag/v0.2.0), is validated on **macOS only** (build + full test suite green). Linux support is in progress: two dependency-level portability gaps are already fixed, and three gaps remain inside Perfect-Lasso itself, all documented in the release notes.
+See the [GitHub Releases page](https://github.com/taplin/Perfect-Lasso/releases) for what's changed in each version. The current release, [v0.2.1](https://github.com/taplin/Perfect-Lasso/releases/tag/v0.2.1), is validated on **macOS only** (build + full test suite green). Linux support is in progress: two dependency-level portability gaps are already fixed, and three gaps remain inside Perfect-Lasso itself, all documented in the release notes.
 
 ## Trying it against your own site
 
@@ -15,7 +15,7 @@ If you have an existing Lasso site and are curious how much of it this server al
 ## Requirements
 
 - **Xcode 27 or later** (Swift 6.4 toolchain, confirmed working). `Package.swift` declares a `swift-tools-version: 6.2` minimum, but only Xcode 27 has been verified.
-- **macOS 14.0 (Sonoma) or later at runtime**, on either Apple Silicon or Intel. `Package.swift` declares this as the deployment target across the whole dependency graph; Intel support has been verified via real cross-compilation (`swift build --triple x86_64-apple-macosx14.0`), not just assumed from the code. See [`Documentation/macos-deployment-targets.md`](Documentation/macos-deployment-targets.md) for the full findings, including what a lower target (13.0/12.0) would additionally require.
+- **macOS 12.0 (Monterey) or later at runtime**, on either Apple Silicon or Intel. `Package.swift` declares this as the deployment target across the whole dependency graph; Intel support has been verified via real cross-compilation (`swift build --triple x86_64-apple-macosx12.0`), not just assumed from the code. See [`Documentation/macos-deployment-targets.md`](Documentation/macos-deployment-targets.md) for the full findings. If you're on older Intel hardware Apple no longer supports past macOS 10.15/11, native support for that was attempted and set aside as too much ongoing maintenance burden for one hardware tier — see that document's Verdict section. The recommended path there is [OpenCore Legacy Patcher](https://github.com/dortania/OpenCore-Legacy-Patcher) to get the machine onto 12.0+, where this project already just works.
 - **[Homebrew](https://brew.sh)**, with one formula installed:
 
   ```bash
