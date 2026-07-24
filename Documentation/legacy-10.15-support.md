@@ -7,16 +7,28 @@ logic this document covers.
 
 This document is the single source of truth for this branch: why it exists,
 exactly what it does and doesn't do, its security model, and how to build,
-package, and deploy it. Read it in full before touching
-`linkerSettings`/`Scripts/package-legacy-release.sh`, or before running
-anything this branch produces on real hardware.
+package, and deploy it.
 
-## Status
+## Status: concluded, not being pursued further (2026-07-24)
 
-**Unverified.** Nothing in this document should be represented as
-"working" until it has actually run on real 10.15/11 hardware or a VM —
-see [Known limitations](#known-limitations) for exactly what that means and
-why it can't be verified any other way.
+**Verdict**: real hardware confirmed the concurrency-dylib bundling in this
+document works, but also surfaced a second, harder blocker
+(`libmysqlclient` needing a from-source rebuild — see
+[First real-hardware result](#first-real-hardware-result-2026-07-24)) on
+top of the already-known `URLSession.data(for:)` gap. Together, that's more
+from-scratch C/Swift rebuild effort than is reasonable to maintain as an
+ongoing burden for one hardware tier. **Recommendation: use
+[OpenCore Legacy Patcher](https://github.com/dortania/OpenCore-Legacy-Patcher)
+to get 10.15/11-capped hardware onto macOS 12+ instead**, where this
+project's existing, fully verified support just works — see
+`Documentation/macos-deployment-targets.md`'s Verdict section for the full
+reasoning.
+
+This branch, its release (`v0.2.1-legacy10.15`), and everything below are
+kept for the record, not deleted — matching this project's usual practice
+for superseded investigations. Nothing here should be represented as
+"working": the real-hardware run below is the closest this got, and it
+didn't reach a launched server.
 
 ## Why this branch exists and what it actually changes
 
