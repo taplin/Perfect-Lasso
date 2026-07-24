@@ -85,7 +85,7 @@ enum RestartReadiness {
         executablePath: String,
         environment: [String: String],
         markerPrefix: String,
-        timeout: Duration = .seconds(10)
+        timeout: TimeInterval = 10
     ) async -> Outcome {
         let process = Process()
         process.executableURL = URL(fileURLWithPath: executablePath)
@@ -125,8 +125,8 @@ enum RestartReadiness {
         }
 
         let timeoutTask = Task {
-            try? await Task.sleep(for: timeout)
-            await box.resolve(.failed("New instance did not become healthy within \(timeout)."))
+            try? await Task.sleep(nanoseconds: UInt64(max(0, timeout) * 1_000_000_000))
+            await box.resolve(.failed("New instance did not become healthy within \(timeout)s."))
         }
 
         let outcome = await box.wait()
@@ -152,7 +152,7 @@ enum RestartReadiness {
         process.terminate()
         for _ in 0..<20 { // ~2s grace period, checked every 100ms
             if !process.isRunning { return }
-            try? await Task.sleep(for: .milliseconds(100))
+            try? await Task.sleep(nanoseconds: 100_000_000)
         }
         if process.isRunning {
             kill(process.processIdentifier, SIGKILL)

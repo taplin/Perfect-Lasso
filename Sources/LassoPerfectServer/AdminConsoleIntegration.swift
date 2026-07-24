@@ -353,7 +353,7 @@ final class LassoAdminDelegate: AdminConsoleDelegate {
             // own pattern — this action's HTTP response (below) needs to actually
             // reach the caller before anything disruptive happens.
             Task {
-                try? await Task.sleep(for: .milliseconds(300))
+                try? await Task.sleep(nanoseconds: 300_000_000)
                 // Stop the janitor's poll loop too, so it can't leave an
                 // in-flight Admin API call running past this process's exit.
                 cwpJanitorTask?.cancel()
@@ -381,7 +381,7 @@ final class LassoAdminDelegate: AdminConsoleDelegate {
                         return true
                     }
                     group.addTask {
-                        try? await Task.sleep(for: .seconds(10))
+                        try? await Task.sleep(nanoseconds: 10_000_000_000)
                         return false
                     }
                     let result = await group.next() ?? false
@@ -463,8 +463,7 @@ final class LassoAdminDelegate: AdminConsoleDelegate {
     func testDatasource(name: String) async throws -> DatasourceTestResult {
         let target = name.lowercased()
         if let schema = config.datasourceMap.first(where: { $0.key.lowercased() == target })?.value {
-            let clock = ContinuousClock()
-            let start = clock.now
+            let start = DispatchTime.now()
             do {
                 _ = try Database(configuration: MySQLDatabaseConfiguration(
                     database: schema,
@@ -473,7 +472,7 @@ final class LassoAdminDelegate: AdminConsoleDelegate {
                     username: config.mysqlUser,
                     password: config.mysqlPassword
                 ))
-                return .ok(latencyMs: Self.milliseconds(since: start, clock: clock), message: "Connected to MySQL schema '\(schema)'")
+                return .ok(latencyMs: Self.milliseconds(since: start), message: "Connected to MySQL schema '\(schema)'")
             } catch {
                 return .failed("MySQL connect failed: \(error)")
             }
@@ -487,11 +486,10 @@ final class LassoAdminDelegate: AdminConsoleDelegate {
                 userName: config.filemakerUser ?? "", password: config.filemakerPassword ?? "",
                 useTLS: port == 443
             )
-            let clock = ContinuousClock()
-            let start = clock.now
+            let start = DispatchTime.now()
             do {
                 _ = try await server.databaseNames()
-                return .ok(latencyMs: Self.milliseconds(since: start, clock: clock), message: "Connected to FileMaker Server at \(host):\(port)")
+                return .ok(latencyMs: Self.milliseconds(since: start), message: "Connected to FileMaker Server at \(host):\(port)")
             } catch {
                 return .failed("FileMaker connect failed: \(error)")
             }
@@ -532,8 +530,7 @@ final class LassoAdminDelegate: AdminConsoleDelegate {
             return .failed("Unknown datasource or config id: \(name) -> \(configID)")
         }
         await logCapture?.capture("[admin] datasource-switch \(name) -> \(profile.id) (\(profile.host):\(profile.port))")
-        let clock = ContinuousClock()
-        let start = clock.now
+        let start = DispatchTime.now()
         let server = FileMakerServer(
             host: profile.host, port: profile.port,
             userName: config.filemakerUser ?? "", password: config.filemakerPassword ?? "",
@@ -542,7 +539,7 @@ final class LassoAdminDelegate: AdminConsoleDelegate {
         do {
             _ = try await server.databaseNames()
             return .ok(
-                latencyMs: Self.milliseconds(since: start, clock: clock),
+                latencyMs: Self.milliseconds(since: start),
                 message: "\(name) now using '\(profile.id)' (\(profile.host):\(profile.port))"
             )
         } catch {
@@ -550,12 +547,7 @@ final class LassoAdminDelegate: AdminConsoleDelegate {
         }
     }
 
-    /// `Duration.components` is `(seconds, attoseconds)` where `attoseconds`
-    /// is only the **sub-second remainder** (0..<1e18), not the total
-    /// duration — dropping the `seconds` component here would silently
-    /// truncate any test that took a full second or more.
-    private static func milliseconds(since start: ContinuousClock.Instant, clock: ContinuousClock) -> Double {
-        let components = (clock.now - start).components
-        return Double(components.seconds) * 1000 + Double(components.attoseconds) / 1_000_000_000_000_000
+    private static func milliseconds(since start: DispatchTime) -> Double {
+        Double(DispatchTime.now().uptimeNanoseconds &- start.uptimeNanoseconds) / 1_000_000
     }
 }

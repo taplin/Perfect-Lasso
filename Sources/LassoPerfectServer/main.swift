@@ -1585,7 +1585,7 @@ struct LassoSiteServer: Sendable {
             // optional feature).
             smtpConnectionReaperTask = Task {
                 while !Task.isCancelled {
-                    try? await Task.sleep(for: .seconds(60))
+                    try? await Task.sleep(nanoseconds: 60_000_000_000)
                     _ = await connectionRegistry.sweepIdleConnections(idleTimeout: 300)
                 }
             }
@@ -1600,7 +1600,7 @@ struct LassoSiteServer: Sendable {
             // NOT also tracked this way).
             emailJobSweepTask = Task {
                 while !Task.isCancelled {
-                    try? await Task.sleep(for: .seconds(60))
+                    try? await Task.sleep(nanoseconds: 60_000_000_000)
                     _ = await jobTracker.sweepExpiredJobs()
                 }
             }
@@ -2672,7 +2672,7 @@ let siteServerTask = Task.detached {
             // buffer indefinitely instead of ever reaching the parent.
             fflush(stdout)
             while !Task.isCancelled {
-                try? await Task.sleep(for: .seconds(3600))
+                try? await Task.sleep(nanoseconds: 3600_000_000_000)
             }
         }
 }
@@ -2719,7 +2719,7 @@ if config.crawlReportMode {
     Task {
         // Give the NIO server a moment to actually bind before hitting it —
         // there's no separate "ready" signal to await here.
-        try? await Task.sleep(for: .seconds(1))
+        try? await Task.sleep(nanoseconds: 1_000_000_000)
 
         // Focused rerun: an explicit path list wins outright; otherwise a
         // baseline + failure substring derives one. Neither set -> the
@@ -2803,7 +2803,7 @@ if config.cwpJanitorEnabled {
                 tracker: janitorTracker,
                 log: { line in await logCapture?.capture(line) }
             )
-            try? await Task.sleep(for: .seconds(config.cwpJanitorPollIntervalSeconds))
+            try? await Task.sleep(nanoseconds: UInt64(config.cwpJanitorPollIntervalSeconds) * 1_000_000_000)
         }
     }
 } else {
@@ -2863,7 +2863,7 @@ if config.adminConsoleEnabled {
             } catch {
                 lastError = error
                 if attempt < 20 {
-                    try? await Task.sleep(for: .milliseconds(500))
+                    try? await Task.sleep(nanoseconds: 500_000_000)
                 }
             }
         }
