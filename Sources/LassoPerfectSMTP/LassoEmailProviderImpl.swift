@@ -378,7 +378,7 @@ public struct LassoEmailProviderImpl: LassoEmailProvider {
                     let interval = dueDate.timeIntervalSinceNow
                     if interval > 0 {
                         let millis = Int((interval * 1000).rounded(.up))
-                        try? await Task.sleep(for: .milliseconds(millis))
+                        try? await Task.sleep(nanoseconds: UInt64(millis) * 1_000_000)
                     }
                 }
                 if mergeMode {

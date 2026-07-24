@@ -6,7 +6,7 @@ import PackageDescription
 let package = Package(
     name: "LassoSubsetCrawler",
     platforms: [
-        .macOS(.v13),
+        .macOS(.v12),
     ],
     products: [
         .library(name: "LassoParser", targets: ["LassoParser"]),

@@ -254,7 +254,7 @@ public enum CrawlReport {
 
             let isLastPath = index == sortedPaths.count - 1
             if requestDelayMS > 0, isLastPath == false {
-                try? await Task.sleep(for: .milliseconds(requestDelayMS))
+                try? await Task.sleep(nanoseconds: UInt64(requestDelayMS) * 1_000_000)
             }
         }
         return (results, excludedCount, false, sitemapSummary)

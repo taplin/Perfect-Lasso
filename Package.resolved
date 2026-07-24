@@ -1,5 +1,5 @@
 {
-  "originHash" : "bb28ca7528bc902e78d11b9d6dafba3f8fe1721bb867e3987be15c329b4abc7e",
+  "originHash" : "cae4d1f8ac3312f74ed575a35972f6b949d163fc10ede45aed87dd12fe70c01c",
   "pins" : [
     {
       "identity" : "perfect-crud",
@@ -43,7 +43,7 @@
       "location" : "https://github.com/taplin/Perfect-NIO.git",
       "state" : {
         "branch" : "main",
-        "revision" : "ee6e9b8e6fd7a3d1fb6e2dee15e90f57dfa54ffa"
+        "revision" : "328b063ab8dd04f26a2a7aa17bb885173669bd8f"
       }
     },
     {
