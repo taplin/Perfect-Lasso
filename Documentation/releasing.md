@@ -75,3 +75,28 @@ gh release delete v0.1.0 --yes
 git push origin :refs/tags/v0.1.0
 git tag -d v0.1.0
 ```
+
+## Legacy 10.15/11 release (`legacy_10.15` branch only)
+
+Everything above is for `main`'s normal `vX.Y.Z` source-tarball releases.
+The `legacy_10.15` branch is the one exception to the build-from-source
+model (`release-target-plan.md §2` explains why pre-built binaries were
+originally set aside for `main`) — the target OS there can't run a modern
+enough Swift toolchain to build this project itself, so that branch ships
+a pre-built binary instead. This is a separate, manual process with its
+own tag suffix (`vX.Y.Z-legacy10.15`), not part of this repo's CI (which
+doesn't exist yet, same as everything else in this document).
+
+**Read `Documentation/legacy-10.15-support.md` in full before cutting one
+of these** — it has the security review (this artifact bundles dylibs with
+an `@executable_path` rpath, a real attack surface if the deploy
+directory's permissions are ever wrong), the known-broken-on-10.15/11
+findings from its API audit, and the full deploy runbook.
+
+```bash
+git checkout legacy_10.15
+git merge main          # pick up whatever's landed since the last cut
+swift test               # full suite, native arch — confirms nothing broke
+Scripts/package-legacy-release.sh vX.Y.Z-legacy10.15
+# review the printed `gh release create` command before running it
+```

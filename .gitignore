@@ -7,3 +7,4 @@ DerivedData/
 .swiftpm/configuration/mirrors.json
 .swiftpm/xcode/package.xcworkspace/contents.xcworkspacedata
 .netrc
+/dist

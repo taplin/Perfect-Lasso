@@ -5,6 +5,10 @@ import PackageDescription
 
 let package = Package(
     name: "LassoSubsetCrawler",
+    // Deliberately NOT lowered to .v10_15 on this branch: this toolchain's SDKSettings.plist
+    // clamps `swift build` to 12.0 regardless of what's declared here, so a lower value would
+    // just be misleading. See Documentation/legacy-10.15-support.md for the full explanation
+    // and what this branch actually does instead (dylib bundling + rpath, not a lower minos).
     platforms: [
         .macOS(.v12),
     ],
@@ -119,6 +123,13 @@ let package = Package(
                 .product(name: "PerfectSMTP", package: "Perfect-SMTP"),
                 .product(name: "NIOCore", package: "swift-nio"),
                 .product(name: "NIOPosix", package: "swift-nio"),
+            ],
+            // legacy_10.15-only: lets the binary find a bundled libswift_Concurrency.dylib
+            // alongside itself at runtime, since 10.15/11 don't ship it as part of the OS.
+            // Scoped to @executable_path only - see Documentation/legacy-10.15-support.md's
+            // security review before touching this.
+            linkerSettings: [
+                .unsafeFlags(["-Xlinker", "-rpath", "-Xlinker", "@executable_path"])
             ]
         ),
         // Targets are the basic building blocks of a package, defining a module or a test suite.
