@@ -314,54 +314,90 @@ Two possible outcomes, both useful:
   on any machine capable of building this project — see
   [Known limitations](#known-limitations)).
 
+## First real-hardware result (2026-07-24)
+
+`v0.2.1-legacy10.15` was actually run on real 10.15/11 hardware for the
+first time. Mixed result, but the harder half of the two open questions
+came back **positive**:
+
+- **The Swift concurrency dylib bundling worked.** No duplicate Objective-C
+  class registration, no `Foundation.framework`-conflict crash — the
+  specific failure mode that could never be reproduced or ruled out on any
+  machine with the system runtime already present (see below) simply didn't
+  happen. This is the first real evidence the core premise of this whole
+  branch is sound.
+- **It failed one step later, on `libmysqlclient.24.dylib` itself:**
+  ```
+  dyld: Symbol not found: __ZTTNSt3__118basic_stringstreamIcNS_11char_traitsIcEENS_9allocatorIcEEEE
+    Referenced from: /Users/gsp/lasso-legacy/./libmysqlclient.24.dylib (which was built for Mac OS X 14.0)
+    Expected in: /usr/lib/libc++.1.dylib
+  Abort trap: 6
+  ```
+  Exactly the gap flagged below as suspected — now confirmed with the
+  precise missing symbol. **This is a full launch blocker, not a degraded
+  MySQL-only feature**: dyld resolves every needed symbol for the whole
+  binary before any code runs, so `lasso-perfect-server` cannot start at
+  all — independent of whether the deployment actually uses MySQL — until
+  this is fixed. The Homebrew bottle's C++ standard library usage needs
+  something from a newer `libc++.1.dylib` than 10.15/11 ships.
+- **Not yet reached**: the `URLSession.data(for:)` gap, full MySQL runtime
+  behavior, or anything else — the process aborts at dyld load time, before
+  any application code runs.
+
+**Next step**: build `libmysqlclient` from source with an explicit low
+deployment target (e.g. `-DCMAKE_OSX_DEPLOYMENT_TARGET=10.15`) rather than
+relying on the current Homebrew bottle — not yet attempted, real work
+(MySQL's client library pulls in OpenSSL, which would need the same
+treatment). This is now the critical-path item for this tier: nothing else
+can be verified until the binary can launch at all.
+
 ## Known limitations
 
 - **`minos` reads 12.0, not 10.15.** This is expected and documented above,
   not a bug to "fix" by editing `Package.swift`'s `platforms:` — see the
   toolchain-constraint section.
-- **The dylib-resolution question is fundamentally unverifiable on any
-  machine that already has the system Swift concurrency runtime** — which
-  is every machine capable of building this project today. This session
-  reproduced and precisely diagnosed the exact mechanism (an earlier probe
-  in `macos-deployment-targets.md` had only observed the symptom): running
-  the fully-bundled, fully-rewritten binary on this dev machine crashes at
-  startup with `objc[...]: Class _TtCs25CheckedContinuationCanary is
-  implemented in both /usr/lib/swift/libswift_Concurrency.dylib and
-  .../libswift_Concurrency.dylib` — **`Foundation.framework` itself (this
-  machine's build, for macOS 27) has its own direct, absolute-path
-  dependency on the system `libswift_Concurrency.dylib`**, which loads
-  independently of and *in addition to* this binary's own (correctly
-  rewritten, `@executable_path`-relative) reference, producing duplicate
-  Objective-C class registrations. This is not a flaw in the bundling
-  recipe: a genuine 10.15/11 `Foundation.framework` predates Swift
-  concurrency entirely and has no such dependency to begin with, so there'd
-  be nothing to duplicate against — the bundled copy would be the *only*
-  loader. But it does mean this specific failure mode can never be
-  reproduced or ruled out except on real hardware or a VM with no
-  system-provided concurrency runtime at all.
+- **The dylib-resolution question was unverifiable on any machine that
+  already has the system Swift concurrency runtime — until the first real
+  10.15/11 run (above) confirmed it works.** This session had reproduced
+  and precisely diagnosed why *dev-machine* testing could never settle this
+  (an earlier probe in `macos-deployment-targets.md` had only observed the
+  symptom): running the fully-bundled binary here crashes at startup with
+  `objc[...]: Class _TtCs25CheckedContinuationCanary is implemented in both
+  /usr/lib/swift/libswift_Concurrency.dylib and .../libswift_Concurrency.dylib`
+  — `Foundation.framework` on any machine capable of building this project
+  has its own direct, absolute-path dependency on the system
+  `libswift_Concurrency.dylib`, which loads independently of and *in
+  addition to* this binary's own (correctly rewritten,
+  `@executable_path`-relative) reference, producing duplicate Objective-C
+  class registrations. A genuine 10.15/11 `Foundation.framework` predates
+  Swift concurrency entirely and has no such dependency — and indeed, the
+  real-hardware run above hit no such conflict.
 - **`URLSession.data(for:)` is a known, real, unresolved blocker** for
-  several code paths — see the audit above. Not attempted in this branch.
-- **Only the static dependency graph was verified, not full runtime
-  behavior.** `otool -L` confirms the final binary has no remaining
-  non-`@executable_path`/non-system dependency paths, and each bundled
+  several code paths — see the audit above. Not yet reached on real
+  hardware (the `libmysqlclient` failure above happens first, before any
+  application code runs) or attempted in this branch.
+- **Confirmed on real hardware: the bundled `libmysqlclient` cascade does
+  not work** — see [First real-hardware result](#first-real-hardware-result-2026-07-24)
+  above for the exact symbol and why it's a full launch blocker.
+  `otool -L` had already confirmed the final binary has no remaining
+  non-`@executable_path`/non-system dependency *paths*, and each bundled
   dylib was individually re-signed and its own `install_name`/rpath
-  double-checked — but the concurrency-dylib duplicate-class crash above
-  happens at process startup, before any application code (including
-  MySQL connection code) ever runs. Whether the bundled `libmysqlclient`
-  cascade actually *works* at runtime — not just whether its paths resolve
-  statically — is untested for the same underlying reason: it can't be
-  reached on a machine where startup itself fails first.
-- **The Intel `mysql-client` Homebrew bottle is itself built for macOS 14.0,
-  not 12.0 or below** — confirmed directly, not just suspected: cross-
-  compiling at `-target x86_64-apple-macosx12.0` and linking against
-  `/usr/local/opt/mysql-client/lib/libmysqlclient.24.dylib` produces a real
-  linker warning: `building for macOS-12.0, but linking with dylib
-  '...libmysqlclient.24.dylib' which was built for newer version 14.0`. The
-  link still succeeds (it's a warning, not an error) and the resulting
-  binary's own `minos` stays 12.0, but **MySQL connectivity specifically
-  should be assumed broken on 10.15/11** until a real from-source
-  `mysql-client` build (or an older bottle) targeting that range is
-  substituted — not attempted in this branch. `libpq` (`Perfect-PostgreSQL`)
-  is unverified in the same way, untested either direction.
+  double-checked — but static path resolution was never sufficient to
+  predict this: the actual C++ symbols the bottle needs simply aren't
+  present in 10.15/11's own `libc++.1.dylib`. This blocks the whole binary
+  from launching, so `URLSession.data(for:)` and everything else downstream
+  remains untested for the same reason: nothing gets the chance to run.
+- **Root cause identified: the Intel `mysql-client` Homebrew bottle is
+  itself built for macOS 14.0, not 12.0 or below.** Suspected from a build-
+  time linker warning (`building for macOS-12.0, but linking with dylib
+  '...libmysqlclient.24.dylib' which was built for newer version 14.0`),
+  now confirmed as the actual real-hardware failure — a missing
+  `libc++` symbol (`__ZTTNSt3__118basic_stringstreamIcNS_11char_traitsIcEENS_9allocatorIcEEEE`)
+  that 10.15/11's own `libc++.1.dylib` doesn't export. Fixing this needs a
+  `mysql-client` build (from source, with an explicit low deployment
+  target, or an older bottle/release) that doesn't depend on anything newer
+  — not attempted yet; see the critical-path note above. `libpq`
+  (`Perfect-PostgreSQL`) is unverified in the same way, untested either
+  direction.
 - **The audit above is grep-based, not compiler-verified** — treat it as a
   starting point for real-hardware testing, not a guarantee.
