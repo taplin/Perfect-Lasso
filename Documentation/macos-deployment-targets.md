@@ -2,35 +2,40 @@
 
 ## Current target
 
-**macOS 14.0 (Sonoma), Apple Silicon + Intel.** This is the actual, enforced
-minimum across the full dependency graph behind `lasso-perfect-server`:
-`Perfect-XML` → `Perfect-FileMaker` / `Perfect-FileMaker-AdminAPI`,
-`Perfect-CRUD` → `Perfect-MySQL`, `Perfect-Session` (+ its `Perfect-PostgreSQL`
-/ `Perfect-Redis` / `Perfect-SQLite` resolution deps), `Perfect-NIO`,
-`Perfect-SMTP`, and `Perfect-Lasso` itself. Every manifest in that graph
-declares `platforms: [.macOS(.v14)]`.
+**macOS 12.0 (Monterey), Apple Silicon + Intel.** This is the actual,
+enforced, `otool`-verified minimum across the full dependency graph behind
+`lasso-perfect-server` as of 2026-07-24: `Perfect-CRUD`, `Perfect-XML`,
+`Perfect-MySQL`, `Perfect-PostgreSQL`, `Perfect-Redis`, `Perfect-SQLite`,
+`Perfect-FileMaker` / `-AdminAPI`, `Perfect-Session`, `Perfect-SMTP`,
+`Perfect-NIO`, and `Perfect-Lasso` itself all declare `platforms:
+[.macOS(.v12)]` on `main`, and all build/test/`otool`-verify clean there.
+Tiers 1 (13.0) and 2 (12.0) below, originally scoped as open questions, are
+both done — see each tier's own section for exactly what changed. Intel
+support has been verified via real cross-compilation
+(`swift build --triple x86_64-apple-macosx12.0`), not just assumed from the
+code.
 
-This document records two things: (1) exactly what is fixed and why 14.0 is
-the real floor, and (2) what it would additionally take to reach three
-progressively lower targets — **13.0 (Ventura)**, **12.0 (Monterey)**, and
-**10.15 (Catalina) / 11 (Big Sur)** — motivated by real demand: there's a
-family of hardware whose OS support ended at 10.15, and people currently
-running Lasso on that hardware would be able to test and onboard this
-project if it ran there too, with a clear upgrade path to newer hardware
-afterward. None of the three levels below are built/merged yet — this is
-scoping, not a changelog — but each is broken down by exactly what's known,
-what's already built-and-verified-but-unmerged, and what's still an open
-question, so a future session can pick up any one of them without
-re-deriving this research.
+This document records: (1) exactly what is fixed and why 12.0 is the real
+floor, (2) what it took to get there from the original 14.0 floor (tiers 1
+and 2, both landed on `main`), and (3) what was learned attempting to go
+one tier lower still — **10.15 (Catalina) / 11 (Big Sur)** — motivated by
+real demand: there's a family of hardware whose OS support ended at 10.15,
+and people currently running Lasso on that hardware would be able to test
+and onboard this project if it ran there too. **Tier 3 was attempted and is
+not being pursued further** — see its section's Verdict at the end of this
+document, and `Documentation/legacy-10.15-support.md` for the full
+investigation. The recommended path for that hardware is now an
+OS-upgrade patcher rather than native pre-12.0 support; see the Verdict for
+why and what's recommended instead.
 
 **Status at a glance:**
 
 | Target | Blockers found | Built & verified | Merged |
 |---|---|---|---|
-| 14.0 (current) | — | — | ✅ |
-| 13.0 (Ventura) | 2 packages, 15 call sites | ❌ | ❌ |
-| 12.0 (Monterey) | + 2 independent Perfect-NIO API gaps | 1 of 2 | ❌ |
-| 10.15/11 (Catalina/Big Sur) | + concurrency runtime back-deployment packaging, + an unaudited API range | ❌ | ❌ |
+| 14.0 (original floor) | — | — | ✅ (superseded) |
+| 13.0 (Ventura) | 2 packages, 15 call sites | ✅ | ✅ (`main`) |
+| 12.0 (Monterey) | + 2 independent Perfect-NIO API gaps | ✅ | ✅ (`main`) |
+| 10.15/11 (Catalina/Big Sur) | Real hardware confirmed at least 2 further blockers (`URLSession.data(for:)`, `libmysqlclient`'s libc++ dependency) needing substantial from-source work | Partial (concurrency dylib bundling confirmed working; C library rebuilds not attempted) | ❌ — not pursued further, see Verdict |
 
 ## Method
 
@@ -372,3 +377,53 @@ not been done and shouldn't be assumed from the write-up alone.
   way; would need checking against whatever a real 10.15/11 deployment
   actually uses for its C client library (a from-source build, a vendored
   older bottle, or a different distribution channel entirely).
+
+### Verdict (2026-07-24): attempted, not being pursued further
+
+Everything above was actually built and tried — see the `legacy_10.15`
+branch and `Documentation/legacy-10.15-support.md` for the full attempt
+(security-reviewed dylib bundling, a real cross-compiled release, and an
+actual run on real 10.15/11 hardware). The result:
+
+- The hardest *suspected* problem — whether the Swift concurrency runtime
+  could genuinely be back-deployed via a bundled dylib — turned out to work.
+  Confirmed on real hardware, not just reasoned about.
+- But real hardware then surfaced what the toolchain couldn't predict:
+  `libmysqlclient` needs a `libc++` symbol 10.15/11's own system library
+  doesn't export, which is a full launch blocker (dyld resolves every
+  linked symbol before any code runs — not a "MySQL degraded" situation).
+  Fixing it needs `libmysqlclient` — and likely the OpenSSL it depends on —
+  rebuilt from source with an explicit low deployment target.
+- Separately, the API audit had already found `URLSession.data(for:)` (used
+  by the network-request tag, crawl-report, sitemap fetching, FileMaker
+  connectivity, and SMTP's MTA-STS check) as a confirmed macOS-12.0-exact
+  Apple API with no back-deployment path at all.
+
+Two real, independent from-scratch C/Swift rebuild efforts, on top of an
+already-uncertain concurrency-runtime bet that happened to pay off — this
+is more effort than is reasonable to carry as an ongoing maintenance
+burden for one hardware tier, especially given every dependency below 12.0
+would need re-verifying by hand every time any of this project's siblings
+change (no compiler to check it automatically, per the Method section
+above).
+
+**Recommendation for 10.15/11-capped hardware: use
+[OpenCore Legacy Patcher](https://github.com/dortania/OpenCore-Legacy-Patcher)
+to install macOS 12 (Monterey) or newer instead of chasing native pre-12.0
+support.** OCLP is a mature, actively maintained open-source project
+(Dortania) that installs modern macOS on Macs Apple no longer officially
+supports, covering hardware back to 2007 and macOS versions through
+Sequoia (15) as of this writing. Once a machine is running 12.0+, it needs
+none of this document's tier-3 work at all — `main`'s existing, fully
+verified `.v12` support just works. This converts an open-ended, hard-to-
+verify compatibility burden on this project into a one-time OS upgrade on
+the operator's side, which is both less work overall and something OCLP's
+own community — not this project — is positioned to keep current as new
+macOS versions ship.
+
+This tier's branch, release, and documentation are kept for the record
+(matching this project's usual practice — see `release-target-plan.md §2`
+for the same treatment of the earlier pre-built-binary investigation), not
+deleted. If a real need to revisit native pre-12.0 support ever comes up,
+the dylib-bundling mechanism, security review, and packaging script are
+still there and still verified as far as this session could take them.
