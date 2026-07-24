@@ -280,19 +280,25 @@ permission steps:
 curl -fsSL -O https://github.com/taplin/Perfect-Lasso/releases/download/vX.Y.Z-legacy10.15/lasso-perfect-server-vX.Y.Z-legacy10.15-x86_64.tar.gz
 curl -fsSL -O https://github.com/taplin/Perfect-Lasso/releases/download/vX.Y.Z-legacy10.15/CHECKSUMS.txt
 
-# 2. Verify BEFORE extracting anything
-shasum -a 256 -c CHECKSUMS.txt
-
-# 3. Extract and lock down permissions
+# 2. Extract — CHECKSUMS.txt lists the files *inside* the tarball, so it
+#    can only be checked against them after extracting. Extracting itself
+#    is harmless (nothing executes); the checksum gate that matters is the
+#    one below, which runs before anything is ever launched.
 mkdir -p ~/lasso-legacy && tar -xzf lasso-perfect-server-*.tar.gz -C ~/lasso-legacy
+cp CHECKSUMS.txt ~/lasso-legacy/
+
+# 3. Verify BEFORE running anything
+cd ~/lasso-legacy && shasum -a 256 -c CHECKSUMS.txt
+
+# 4. Lock down permissions
 chmod 750 ~/lasso-legacy
 chmod 750 ~/lasso-legacy/lasso-perfect-server
 chmod 640 ~/lasso-legacy/*.dylib
 
-# 4. Confirm permissions before ever running it — this is not optional
+# 5. Confirm permissions before ever running it — this is not optional
 ls -la ~/lasso-legacy
 
-# 5. First real-hardware test
+# 6. First real-hardware test
 ~/lasso-legacy/lasso-perfect-server
 ```
 
